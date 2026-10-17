@@ -38,3 +38,12 @@ Print out/bench.json and the zmap JSONs at the end. Run `/opt/homebrew/bin/pytho
 - UPDATE: samples/cavity_front_setup.step now exists and is ALREADY in setup coordinates (do not transform).
   orient.py should only verify its bbox (X +-126.36, Y +-69.85, Z 0..60.96, tol 0.05). The empty
   cavity_front.step is gone.
+
+## Supervisor finding (round 3, read first)
+The Fusion "gouges" are a zmap parsing bug, not misalignment (Z lines up: part floor 24.8, Fusion ZMIN 24.95).
+Split at "(INSERT CONTOUR)": Overall Roughing alone = 0 gouges; ALL 7778 gouges come from INSERT CONTOUR, which uses
+  `G18 G02 X.. Z.. I..` (arc in the XZ plane, I/K centre) then `G17`, and `G41 ... D03` cutter compensation.
+Fix zmap.py: track the active plane (G17 XY with I/J, G18 XZ with I/K, G19 YZ with J/K) and interpolate arcs in
+that plane; parse K. For G41/G42 assume Fusion "wear" compensation (path is already the tool centre, D register
+~0): simulate as programmed but count and report comp-active moves in the JSON. Add tests for a G18 arc and a G19 arc.
+Then rerun the Fusion benchmark (out/bench.json) and finish items 5 and 6. Stop mirroring experiments.
