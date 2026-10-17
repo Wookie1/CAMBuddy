@@ -32,3 +32,16 @@ Acceptance (verify yourself by running the command before saying done):
 - exits 0; both ops > 100 path commands; every cutter Z >= about -12 mm; every X/Y within stock (+ a few mm lead-in);
   out/core_front.ngc exists and is non-empty.
 Iterate: run, read the error, fix, rerun, until acceptance passes. Then report the JSON summary.
+
+## Starting points (confirmed paths; read these, do not grep the whole app)
+C=/Applications/VibeCAD.app/Contents/Resources/Mod/CAM
+- Copy setup patterns from FreeCAD's own headless tests: $C/CAMTests/TestPathAdaptive.py, TestPathSteepShallow.py,
+  TestPathToolController.py, TestPathStock.py, TestLinuxCNCPost.py (and TestFanucPost.py).
+- Factories: Path.Main.Job.Create (Job.py:1341), Path.Main.Stock.CreateBox(job, extent, placement) (Stock.py:494)
+  or CreateFromBase(job, neg, pos) (Stock.py:464), Path.Tool.Controller.Create (Controller.py:486),
+  Path.Op.Adaptive.Create(name, obj, parentJob, toolController) (Adaptive.py:2056),
+  Path.Op.SteepShallow.Create(name, obj, parentJob, toolController) (SteepShallow.py:492).
+- Posting: Path/Post/Processor.py PostProcessorFactory (line 218).
+- STEP import: Part.read(path) -> shape, then doc.addObject("Part::Feature").Shape = shape.
+Workflow: write spike/run_cam.py FIRST (best guess), run it, fix errors from the traceback, rerun. Read a named
+file only when an error points at it.
