@@ -1,31 +1,91 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "model": "omlx/Qwen3.8-Flash-Next-oQ4e-mtp",
-  "mcp": {
-    "servers": {
-      "pcb-creator": {
-        "enabled": false
+  "providers": {
+    "omlx": {
+      "name": "oMLX",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://192.168.0.14:8010/v1"
       },
-      "fusion360": {
-        "enabled": false
-      },
-      "vibecad": {
-        "enabled": false
-      },
-      "firecrawl": {
-        "enabled": false
-      },
-      "steve": {
-        "enabled": false
-      },
-      "rmfg": {
-        "enabled": false
-      },
-      "obscura": {
-        "enabled": false
-      },
-      "brave-search": {
-        "enabled": false
+      "models": {
+        "DeepSeek-V4-Flash-0731-oQ2e-mtp": {
+          "name": "DeepSeek-V4-Flash-0731-oQ2e-mtp",
+          "modelID": "DeepSeek-V4-Flash-0731-oQ2e-mtp",
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          }
+        },
+        "Qwen3.6-35B-A3B-oQ6": {
+          "name": "Qwen3.6-35B-A3B-oQ6",
+          "modelID": "Qwen3.6-35B-A3B-oQ6",
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          }
+        },
+        "Qwen3.8-27B-oQ6e-MTP-MLX": {
+          "name": "Qwen3.8-27B-oQ6e-MTP-MLX",
+          "modelID": "Qwen3.8-27B-oQ6e-mtp-mlx",
+          "settings": {
+            "reasoningEffort": "medium"
+          },
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          }
+        },
+        "Qwen3.8-Flash-Next-oQ4e-mtp": {
+          "name": "Qwen3.8-Flash-Next",
+          "modelID": "Qwen3.8-Flash-Next-oQ4e-mtp",
+          "settings": {
+            "reasoningEffort": "medium"
+          },
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          }
+        }
       }
     }
   }

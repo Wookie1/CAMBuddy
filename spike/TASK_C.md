@@ -30,3 +30,8 @@ Everything so far cut the back of the core. Fix the orientation first.
 6. Trim spike/NOTES.md to <= 80 lines (keep the API notes, errors and the part ground truth).
 Do not commit; the supervisor commits. Skip cavity toolpaths; only generate and verify its STEP.
 Print out/bench.json and the zmap JSONs at the end. Run `/opt/homebrew/bin/python3 -m pytest verify -q` before finishing.
+
+## Supervisor update
+- samples/cavity_front.step is an EMPTY export (3.6 KB, no geometry: Part.read -> "null shape"). Not your bug.
+  Make orient.py skip a source with no geometry with a clear message; do core only. A new cavity file will come.
+- Do NOT use Fusion or any MCP tools; never ask questions. orient.py core part already passes its bbox check.
