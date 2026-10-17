@@ -282,3 +282,122 @@ G1 X4. F500.
     with open(str(j3)) as f:
         rep = json.load(f)
     assert rep["stock_in"] == str(out1)
+
+
+# ---------------------------------------------------------------------------
+# Plane-aware arcs (G17/G18/G19, I/J/K) and cutter compensation reporting
+# ---------------------------------------------------------------------------
+
+def test_parse_g18_arc_with_k():
+    moves = zmap.parse_gcode(
+        "G21 G90\nG18 G02 X10. Z5. I2. K-3. F100\nG17\n")
+    assert len(moves) == 1
+    mv = moves[0]
+    assert mv["motion"] == "G2"
+    assert mv["plane"] == 18
+    assert abs(mv["i"] - 2.0) < 1e-12
+    assert abs(mv["k"] + 3.0) < 1e-12
+    assert abs(mv["j"]) < 1e-12
+
+
+def test_g18_arc_interpolated_in_xz_plane():
+    """A G18 XZ arc bulges 5 mm below its chord; chord-only (or XY-arc)
+    handling would miss the gouge entirely (chord stays at part top)."""
+    # footprint filter needs relief: block of top=10 over lo=0
+    part = block_part(hi=10.0, lo=0.0, half=15.0)
+    res = run("""
+G21 G90 F500
+G0 X-5. Y0. Z10.
+G18 G02 X5. Z10. I5. K0. F100.
+G17
+""", part, tool="flat", dia=6.0)
+    assert res["gouges"]["count"] > 0
+    assert abs(res["gouges"]["max_depth"] - 5.0) < 0.2
+    wx, wy = res["gouges"]["worst_xy"]
+    assert math.hypot(wx, wy) <= 3.0 + CELL  # dip at (x=0, y=0)
+    # the arc must not sweep an XY circle: removal stays near y = 0
+    removed = np.isfinite(res["stock"]) & (res["stock"] < 10.0 - 0.02)
+    ys = centers()[np.where(removed.any(axis=1))[0]]
+    assert ys.max() - ys.min() <= 6.0 + 2 * CELL
+
+
+def test_g19_arc_interpolated_in_yz_plane():
+    """G19 YZ arc (J/K): moves Y and Z, X stays put; dips 5 mm below top."""
+    part = block_part(hi=10.0, lo=0.0, half=15.0)
+    res = run("""
+G21 G90 F500
+G0 X0. Y-5. Z10.
+G19 G03 Y5. Z10. J5. K0. F100.
+G17
+""", part, tool="flat", dia=6.0)
+    assert res["gouges"]["count"] > 0
+    assert abs(res["gouges"]["max_depth"] - 5.0) < 0.2
+    wx, wy = res["gouges"]["worst_xy"]
+    assert math.hypot(wx, wy) <= 3.0 + CELL  # dip at (x=0, y=0)
+    removed = np.isfinite(res["stock"]) & (res["stock"] < 10.0 - 0.02)
+    xs = centers()[np.where(removed.any(axis=0))[0]]
+    assert xs.max() - xs.min() <= 6.0 + 2 * CELL  # stays near x = 0
+
+
+def test_cutter_comp_reporting():
+    """G41/G42 moves are counted and reported; G40 line is not comp-active."""
+    part = np.full((N, N), 10.0)
+    res = run("""
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 Z12. F100.
+G1 G41 X-10. Y-5. D03
+G1 X10. Y-5.
+G1 X10. Y5.
+G1 G40 X-10. Y5.
+G0 Z20.
+""", part)
+    cc = res["cutter_comp"]
+    assert cc["active_moves"] == 3  # activation + 2 interior, cancel excluded
+    assert cc["d_registers"] == [3]
+    assert cc["first_line"] < cc["last_line"]
+
+
+def test_cutter_comp_radius_offset():
+    """CCW circular contour R12 with a R3 tool: as-programmed the edge
+    reaches R15 and cuts into the pocket wall (floor R14.5 at Z 4, block
+    top 10); with registry comp R3 the path offsets inward and nothing
+    gouges."""
+    xs = centers()[None, :]
+    ys = centers()[:, None]
+    r = np.hypot(xs, ys)
+    part = np.where(r <= 14.5, 4.0, np.where(r <= 18.0, 10.0, 0.0))
+    gcode = """
+G21 G90 F500
+G0 X6. Y0. Z20.
+G1 Z4. F100.
+G1 G41 X12. Y0. D01
+G3 X12. Y0. I-12. J0. F500.
+G1 G40 X6. Y0.
+"""
+    plain = run(gcode, part, tool="flat", dia=6.0)
+    assert plain["gouges"]["count"] > 0  # wear model cuts the wall
+
+    gcode = """
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z4. F100.
+G1 G41 X6. Y-6. D01
+G3 X12. Y0. I0. J6. F500.
+G3 X12. Y0. I-12. J0.
+G3 X6. Y6. I-6. J0.
+G1 G40 X0. Y0.
+"""
+    moves = zmap.apply_cutter_comp(zmap.resolve_moves(zmap.parse_gcode(gcode)),
+                                   3.0)
+    # G41 left of a CCW loop offsets inward: contour R12 -> arc R9, and the
+    # compensated centre path stays inside R9 + lead points
+    sec = [m for m in moves if m.get("comp")]
+    arcs = [m["arc"] for m in sec if m.get("arc")]
+    assert any(abs(a[4] - 9.0) < 1e-9 for a in arcs)
+    assert all(math.hypot(m["x"], m["y"]) <= 9.0 + 1e-6 for m in sec)
+    res = zmap.simulate(moves, part, CELL, X0, Y0, STOCK, tool="flat",
+                       dia=6.0)
+    assert res["gouges"]["count"] == 0
+    # the pocket floor really got cut along the compensated path
+    assert res["stock"].min() <= 4.0 + 1e-9

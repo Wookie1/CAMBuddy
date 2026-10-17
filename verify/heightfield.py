@@ -6,7 +6,10 @@
 Run under FreeCAD's console, e.g.:
   /Applications/VibeCAD.app/Contents/Resources/bin/freecadcmd \
       verify/heightfield.py samples/core_front.step out/core_front_hf.npy 0.5
-Args may also come from env vars STEP_IN, HF_OUT, CELL.
+Args may also come from env vars STEP_IN, HF_OUT, CELL, PAD.
+PAD (mm, default 0) grows the grid outward from the part bbox so the field
+covers a larger machine stock; cells with no geometry keep the fill value
+(shape ZMin) exactly like unpadded empty columns.
 """
 import json
 import math
@@ -25,22 +28,23 @@ def get_args():
     step = os.environ.get("STEP_IN") or (argv[0] if len(argv) > 0 else None)
     out = os.environ.get("HF_OUT") or (argv[1] if len(argv) > 1 else None)
     cell = float(os.environ.get("CELL") or (argv[2] if len(argv) > 2 else 0.5))
+    pad = float(os.environ.get("PAD") or (argv[3] if len(argv) > 3 else 0.0))
     if not step or not out:
         raise SystemExit("usage: freecadcmd heightfield.py STEP_IN HF_OUT [CELL]"
-                        " (or env STEP_IN/HF_OUT/CELL)")
-    return step, out, cell
+                        " [PAD] (or env STEP_IN/HF_OUT/CELL/PAD)")
+    return step, out, cell, pad
 
 
-def rasterize(shape, cell=0.5, tol=0.05):
+def rasterize(shape, cell=0.5, tol=0.05, pad=0.0):
     """Tessellate `shape` and rasterize triangles into a max-Z grid.
 
     Returns (hf, meta). Empty cells get the shape's bottom Z.
     """
     verts, tris = shape.tessellate(tol)
     bb = shape.BoundBox
-    x0, y0 = float(bb.XMin), float(bb.YMin)
-    nx = max(1, int(math.ceil((float(bb.XMax) - x0) / cell)))
-    ny = max(1, int(math.ceil((float(bb.YMax) - y0) / cell)))
+    x0, y0 = float(bb.XMin) - pad, float(bb.YMin) - pad
+    nx = max(1, int(math.ceil((float(bb.XMax) + pad - x0) / cell)))
+    ny = max(1, int(math.ceil((float(bb.YMax) + pad - y0) / cell)))
     zmin = float(bb.ZMin)
     hf = np.full((ny, nx), zmin, dtype=np.float64)
 
@@ -79,9 +83,9 @@ def rasterize(shape, cell=0.5, tol=0.05):
 
 
 def main():
-    step, out, cell = get_args()
+    step, out, cell, pad = get_args()
     shape = Part.read(step)
-    hf, meta = rasterize(shape, cell=cell, tol=0.05)
+    hf, meta = rasterize(shape, cell=cell, tol=0.05, pad=pad)
     outdir = os.path.dirname(os.path.abspath(out))
     if outdir:
         os.makedirs(outdir, exist_ok=True)

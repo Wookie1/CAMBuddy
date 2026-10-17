@@ -5,7 +5,9 @@ Fusion machines Core Front from design -Z, so the raw STEPs (design coords)
 must be flipped into the machine WCS before CAM/verification:
 
   Core Front   : rotate 180 deg about X (x, y, z -> x, -y, -z), then Z + 34.925
-  Cavity Front : rotate 180 deg about Z (x, y, z -> -x, -y,  z), then Z + 60.96
+  Cavity Front : delivered ALREADY in setup coordinates (round 3) -> bbox check
+                 only; if a design-coordinate cavity_front.step appears instead,
+                 rotate 180 deg about Z (x, y, z -> -x, -y, z), then Z + 60.96
 
 Origin of the outputs = Fusion WCS (bottom-centre of the stock); reference
 NC code lines up with core_front_setup.step exactly.
@@ -38,6 +40,10 @@ def resolve_dirs():
 
 def transform(step_in, step_out, rotation_axis, angle_deg, dz):
     shape = Part.read(step_in)
+    if shape.isNull() or (not shape.Solids and not shape.Shells
+                          and not shape.Faces and not shape.Edges):
+        raise ValueError("source %s contains no geometry (null shape)"
+                        % step_in)
     pl = App.Placement(App.Vector(0.0, 0.0, dz),
                        App.Rotation(App.Vector(*rotation_axis), angle_deg))
     shape.Placement = pl.multiply(shape.Placement)
@@ -67,15 +73,50 @@ def main():
     jobs = [
         # (source, destination, axis, angle, dz)
         ("core_front.step", "core_front_setup.step", (1, 0, 0), 180, 34.925),
-        ("cavity_front.step", "cavity_front_setup.step", (0, 0, 1), 180, 60.96),
     ]
+    done = 0
     for src_name, dst_name, axis, angle, dz in jobs:
         step_in = os.path.join(src, src_name)
         step_out = os.path.join(dst, dst_name)
-        shape = transform(step_in, step_out, axis, angle, dz)
+        try:
+            shape = transform(step_in, step_out, axis, angle, dz)
+        except Exception as exc:
+            # Supervisor round 3: samples/cavity_front.step was an empty export;
+            # Part.read either returns a null shape or raises "File to load not
+            # existing or not readable". Skip such sources with a clear
+            # message; a replacement cavity file is expected.
+            print("SKIP %s: no geometry (%s)" % (step_in, exc), flush=True)
+            continue
         # verify the re-imported file: STEP round-trip is what CAM reads
         check_bbox(os.path.splitext(dst_name)[0], Part.read(step_out))
         print("wrote %s" % step_out, flush=True)
+        done += 1
+
+    # Cavity Front: supervisor round 3 UPDATE — samples/cavity_front_setup.step
+    # is delivered ALREADY in setup coordinates (do NOT transform). Verify its
+    # bbox only. If a design-coordinate cavity_front.step ever shows up again,
+    # transform it (rotate 180 deg about Z, Z +60.96) instead.
+    cav_setup = os.path.join(dst, "cavity_front_setup.step")
+    cav_src = os.path.join(src, "cavity_front.step")
+    if os.path.exists(cav_setup):
+        check_bbox("cavity_front_setup", Part.read(cav_setup))
+        print("verified %s (delivered in setup coordinates, untransformed)"
+              % cav_setup, flush=True)
+        done += 1
+    elif os.path.exists(cav_src):
+        try:
+            transform(cav_src, cav_setup, (0, 0, 1), 180, 60.96)
+        except Exception as exc:
+            print("SKIP %s: no geometry (%s)" % (cav_src, exc), flush=True)
+        else:
+            check_bbox("cavity_front_setup", Part.read(cav_setup))
+            print("wrote %s" % cav_setup, flush=True)
+            done += 1
+    else:
+        print("SKIP cavity: neither %s nor %s exists" % (cav_setup, cav_src),
+              flush=True)
+    if done == 0:
+        raise SystemExit("FAIL: no source produced geometry")
 
 
 main()

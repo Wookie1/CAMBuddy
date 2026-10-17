@@ -1,17 +1,20 @@
 # -*- coding: utf-8 -*-
-"""Headless FreeCAD CAM spike on a mold core.
+"""Headless FreeCAD CAM spike on a mold core (machining setup coordinates).
 
 Usage:
-    freecadcmd spike/run_cam.py samples/core_front.step out/
-Falls back to env vars STEP_IN / OUT_DIR if no script args are passed.
+    freecadcmd spike/run_cam.py [step] [outdir] [--stock XMIN XMAX YMIN YMAX ZMIN ZMAX]
+Env: STEP_IN / OUT_DIR / STOCK "xmin xmax ymin ymax zmin zmax" / MODEL_AWARE=1.
+Defaults: samples/core_front_setup.step, out/, real stock X +-128.651 Y +-82.55
+Z 0..60.96 (Task C #2).
 
-Builds a CAM Job (box stock = part bbox +2mm X/Y each side, +1mm top),
+Builds a CAM Job with the REAL box stock (not part bbox + margin),
 two tool controllers (12.7 flat end mill, 6 mm ball end mill).
 
 Roughing: plain (NON-model-aware) Adaptive ops, one per horizontal floor
 level, each with explicit StartDepth/FinalDepth so it stops 0.3 mm above its
 floor (the STEP's degenerate BSpline edges break the model-aware projection;
-see NOTES.md — no healing, no monkeypatching).
+see NOTES.md — no healing, no monkeypatching).  With MODEL_AWARE=1 a single
+model-aware trial op is built instead (Task C #3: try ONCE, record the error).
 Finishing: SteepShallow with explicit depths so it reaches the low floors.
 
 Posts the combined job to <out>/core_front.ngc and each stage separately to
@@ -75,8 +78,10 @@ def report_degeneracies(shape):
     for fi, stype, msg in bad_faces:
         print("  face[%d] (%s): %s" % (fi, stype, msg), flush=True)
 
-    # the exact call model-aware Adaptive makes: solid projection at slice Z
-    for z in (-11.62, -8.0, 10.16, 22.0):
+    # the exact call model-aware Adaptive makes: solid projection at slice Z.
+    # Values in setup coordinates (design z -> 34.925 - z): the failing design
+    # slices -11.62 / -8 map to 46.545 / 42.925.
+    for z in (46.545, 42.925, 24.765, 12.925):
         try:
             r = PathAdaptive._getSolidProjection(shape, z)
             print("PROBE: _getSolidProjection(z=%.2f) ok, faces=%d"
@@ -118,11 +123,30 @@ def select_horizontal_faces(shape, zlo, zhi, min_area=5.0):
     return subs, (min(zs) if zs else None)
 
 
+# Real machine stock for Core Front (Task C #2): box, not part bbox + margin.
+DEFAULT_STOCK = (-128.651, 128.651, -82.55, 82.55, 0.0, 60.96)
+# Cavity Front stock (STEP generation only, toolpaths skipped):
+CAVITY_STOCK = (-127.762, 127.762, -76.2, 76.2, 0.0, 62.23)
+
+
 def resolve_args():
+    """step, outdir, stock_box, model_aware from argv or env."""
     args = sys.argv[1:]
     # freecadcmd may or may not pass script arguments through; support env too.
-    step = os.environ.get("STEP_IN")
+    step = os.environ.get("STEP_IN", "samples/core_front_setup.step")
     outdir = os.environ.get("OUT_DIR", "out")
+    stock_env = os.environ.get("STOCK")
+    model_aware = os.environ.get("MODEL_AWARE", "0") in ("1", "true", "True")
+    stock = None
+    if "--stock" in args:
+        k = args.index("--stock")
+        stock = tuple(float(v) for v in args[k + 1:k + 7])
+        if len(stock) != 6:
+            raise SystemExit("usage: --stock XMIN XMAX YMIN YMAX ZMIN ZMAX")
+        args = args[:k] + args[k + 7:]
+    if "--model-aware" in args:
+        model_aware = True
+        args.remove("--model-aware")
     positional = [a for a in args if not a.startswith("-")]
     # drop the script path itself if it is present
     if positional and os.path.basename(positional[0]) == "run_cam.py":
@@ -131,9 +155,15 @@ def resolve_args():
         step = positional[0]
     if len(positional) >= 2:
         outdir = positional[1]
-    if not step:
-        raise SystemExit("usage: freecadcmd spike/run_cam.py <step> [outdir]")
-    return step, outdir
+    if stock is None and stock_env:
+        parts = [float(v) for v in stock_env.replace(",", " ").split()]
+        if len(parts) != 6:
+            raise SystemExit('usage: STOCK="XMIN XMAX YMIN YMAX ZMIN ZMAX"')
+        stock = tuple(parts)
+    if stock is None:
+        name = os.path.splitext(os.path.basename(step))[0]
+        stock = CAVITY_STOCK if "cavity" in name else DEFAULT_STOCK
+    return step, outdir, stock, model_aware
 
 
 def op_stats(op, seconds):
@@ -239,7 +269,7 @@ def make_rough_op(job, tc, base, name, subs, start_depth, final_depth):
 
 
 def main():
-    step_in, out_dir = resolve_args()
+    step_in, out_dir, stock_box, model_aware = resolve_args()
     os.makedirs(out_dir, exist_ok=True)
 
     doc = App.newDocument("CoreCAM")
@@ -254,12 +284,14 @@ def main():
     # ---------------------------------------------------------------- Job
     job = PathJob.Create("Job", [base], createDefaultStock=False)
 
-    # Box stock: bbox + 2 mm each X/Y side, +1 mm on top.
-    extent = App.Vector(bb.XLength + 4.0, bb.YLength + 4.0, bb.ZLength + 1.0)
-    placement = App.Placement(App.Vector(bb.XMin - 2.0, bb.YMin - 2.0, bb.ZMin),
-                             App.Rotation())
+    # Real box stock (Task C #2): given extents, origin at its min corner.
+    sxmin, sxmax, symin, symax, szmin, szmax = stock_box
+    extent = App.Vector(sxmax - sxmin, symax - symin, szmax - szmin)
+    placement = App.Placement(App.Vector(sxmin, symin, szmin), App.Rotation())
     stock = PathStock.CreateBox(job, extent, placement)
     job.Stock = stock
+    print("STOCK: X[%.3f %.3f] Y[%.3f %.3f] Z[%.3f %.3f]" % stock_box,
+          flush=True)
 
     # ------------------------------------------------------ Tool controllers
     tc1 = PathToolController.Create("TC: 12.7mm Flat Endmill", toolNumber=1,
@@ -283,29 +315,49 @@ def main():
     doc.recompute()
 
     # ------------------------------------------ Op A1/A2: Adaptive rough levels
-    # The part is a plateau (Z ~ 34.92) with pockets that have a ring shelf
-    # at Z ~ 22.2 and a narrow (Ø ~10 mm) deep bore down to -11.92.  The
-    # 12.7 mm rougher can clear the plateau top and the Ø18 shelf bores,
-    # but physically cannot enter the Ø10 deep bores -> those floors are left
-    # to the 6 mm ball finish.  Plain Adaptive, explicit depths per level.
-    start_z = bb.ZMax + 1.0
+    # Setup coordinates (Task C #1): plateau top Z 46.845, ring shelves at
+    # Z ~38.78, bore-mouth fillets down to ~27.3; the deep "floors" (design
+    # -11.92 / 10.16 -> 46.84 / 24.77) are through-bores / underside, NOT
+    # top-accessible (see NOTES.md ground truth).  Plain Adaptive, explicit
+    # depths per level, cut from the real stock top down.
+    start_z = szmax + 1.0
 
     subs_top, z_top = select_horizontal_faces(shape, bb.ZMax - 1.5, bb.ZMax)
     if not subs_top:
         raise SystemExit("ERROR: no top plateau faces found for roughing")
+
+    if model_aware:
+        # Task C #3: try ModelAwareExperiment ONCE on the reoriented shape.
+        # No healing loops: whatever happens (path or exact error) is printed
+        # and recorded in NOTES.md by the operator.
+        op_m = make_rough_op(job, tc1, base, "AdaptiveModelAwareTrial",
+                             subs_top, start_z, z_top + Z_LEAVE)
+        op_m.ModelAwareExperiment = True
+        t0 = time.time()
+        doc.recompute()
+        t_m = time.time() - t0
+        print("MODEL_AWARE trial: ModelAwareExperiment=True, %d commands in "
+              "%.1f s" % (len(op_m.Path.Commands), t_m), flush=True)
+        require_path(op_m)
+        raise SystemExit(0)
+
     op_a1 = make_rough_op(job, tc1, base, "AdaptiveRoughTop", subs_top,
                           start_z, z_top + Z_LEAVE)
 
-    subs_shelf, z_shelf = select_horizontal_faces(shape, 21.0, 24.0)
+    subs_shelf, z_shelf = select_horizontal_faces(shape, 10.925, 13.925)
     rough_ops = [op_a1]
     op_a2 = None
     if subs_shelf:
-        op_a2 = make_rough_op(job, tc1, base, "AdaptiveRoughShelf", subs_shelf,
-                              start_z, z_shelf + Z_LEAVE)
-        rough_ops.append(op_a2)
-    else:
-        print("WARN: no shelf faces found in Z[21,24]; skipping shelf level",
-              flush=True)
+        # In the SETUP orientation the ring shelves (Z 12.7) sit UNDER the
+        # plateau: the annulus above each shelf is only ~4 mm wide (the
+        # Ø~10 bores), so a 12.7 mm flat cutter cannot reach the shelves from
+        # above without ploughing through the plateau roof.  A purely-2D
+        # plain-Adaptive op on the shelf outlines gouges up to ~29 mm (zmap:
+        # out/zmap_setup_rough.json round 3) -> the shelves are left to the
+        # 6 mm ball finish, which reaches them (annulus ~8 mm wide at floor).
+        print("SKIP shelf roughing: shelves Z~%.2f not reachable by the "
+              "12.7 mm cutter from above (annulus ~4 mm); ball finish covers "
+              "them" % z_shelf, flush=True)
 
     print("ROUGH: top faces=%s floorZ=%.3f -> FinalDepth=%.3f"
           % (subs_top, z_top, z_top + Z_LEAVE), flush=True)
@@ -332,7 +384,7 @@ def main():
     # part top, clamping every pass high above the floors.
     for prop in ("StartDepth", "FinalDepth", "StepDown"):
         op_b.setExpression(prop, None)
-    op_b.StartDepth.Value = bb.ZMax + 1.0
+    op_b.StartDepth.Value = start_z
     op_b.FinalDepth.Value = bb.ZMin
     op_b.StepDown.Value = 0.3
     # Slope classification / boundary + coverage properties (from
@@ -386,9 +438,9 @@ def main():
     summary = {
         "step_file": step_in,
         "stock": {
-            "x": [round(bb.XMin - 2.0, 3), round(bb.XMax + 2.0, 3)],
-            "y": [round(bb.YMin - 2.0, 3), round(bb.YMax + 2.0, 3)],
-            "z": [round(bb.ZMin, 3), round(bb.ZMax + 1.0, 3)],
+            "x": [round(sxmin, 3), round(sxmax, 3)],
+            "y": [round(symin, 3), round(symax, 3)],
+            "z": [round(szmin, 3), round(szmax, 3)],
         },
         "ops": stats_a + [stats_b],
         "post": {
@@ -418,12 +470,12 @@ def main():
         if st["name"] != "AdaptiveRoughShelf" and st["path_commands"] <= 100:
             print("FAIL: %s has only %d path commands" % (st["name"], st["path_commands"]), flush=True)
             ok = False
-        if st["min_z"] < bb.ZMin - 0.02:
+        if st["min_z"] < szmin - 0.02:
             print("FAIL: %s cutter Z below stock bottom %.3f (%.3f)"
-                  % (st["name"], bb.ZMin, st["min_z"]), flush=True)
+                  % (st["name"], szmin, st["min_z"]), flush=True)
             ok = False
-        if (st["min_x"] < bb.XMin - 2.0 - lead or st["max_x"] > bb.XMax + 2.0 + lead
-                or st["min_y"] < bb.YMin - 2.0 - lead or st["max_y"] > bb.YMax + 2.0 + lead):
+        if (st["min_x"] < sxmin - lead or st["max_x"] > sxmax + lead
+                or st["min_y"] < symin - lead or st["max_y"] > symax + lead):
             print("FAIL: %s leaves stock bounds (+lead)" % st["name"], flush=True)
             ok = False
         if tc is tc1:
