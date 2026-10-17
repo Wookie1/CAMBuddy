@@ -43,3 +43,21 @@ for e in s3.Edges:
     except Exception:
         n += 1
 print("after fix():", ok, "bad:", n, "edges:", len(s3.Edges), "valid:", s3.isValid())
+
+# reproduce the exact CAM-side failures (supervisor round 2 record):
+import Path.Geom as PathGeom
+for fi, f in enumerate(s.Faces):
+    try:
+        PathGeom.isVertical(f)
+    except Exception as exc:
+        print("face[%d] (%s) Path.Geom.isVertical -> %s: %s"
+              % (fi, type(f.Surface).__name__, type(exc).__name__, exc))
+import Path.Op.Adaptive as A
+for z in (-11.62, -8.0, 10.16, 22.0):
+    try:
+        r = A._getSolidProjection(s, z)
+        print("_getSolidProjection(z=%.2f) ok, faces=%d" % (z, len(r.Faces)))
+    except Exception as exc:
+        print("_getSolidProjection(z=%.2f) FAILED: %s: %s"
+              % (z, type(exc).__name__, exc))
+

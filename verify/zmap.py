@@ -181,17 +181,27 @@ def _resolve_arcs(moves, x_init, y_init):
 
 
 def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
-             corner=0.0):
+             corner=0.0, stock_init=None):
     """Run the toolpath over a stock heightfield.
 
     part      : (ny, nx) array of part top-Z heights
     cell,x0,y0: grid geometry (cell center of [j, i] is x0+(i+.5)*cell, ...)
     stock_box : (xmin, xmax, ymin, ymax, zmin, zmax)
+    stock_init: optional (ny, nx) array; starting stock heights (e.g. the
+                'stock' output of a previous op via --stock-out) so multiple
+                toolpaths can be chained. Cells outside stock_box are still
+                set to -inf. Default: start from the stock box top.
     Returns dict with 'stock' array and report fields.
     """
     sxmin, sxmax, symin, symax, szmin, szmax = stock_box
     ny, nx = part.shape
-    stock = np.full((ny, nx), float(szmax))
+    if stock_init is not None:
+        stock = np.array(stock_init, dtype=float)
+        if stock.shape != (ny, nx):
+            raise ValueError("stock_init shape %r does not match part grid %r"
+                             % (stock.shape, (ny, nx)))
+    else:
+        stock = np.full((ny, nx), float(szmax))
     ii = np.arange(nx)
     jj = np.arange(ny)
     xs = x0 + (ii + 0.5) * cell
@@ -351,11 +361,20 @@ def main(argv=None):
     p.add_argument("--corner", type=float, default=0.0,
                    help="bull-nose corner radius mm")
     p.add_argument("--stock", type=float, nargs=6, metavar=("XMIN", "XMAX",
-                   "YMIN", "YMAX", "ZMIN", "ZMAX"), required=True,
-                   help="stock bounding box mm")
+                   "YMIN", "YMAX", "ZMIN", "ZMAX"), default=None,
+                   help="stock bounding box mm (required unless --stock-in)")
+    p.add_argument("--stock-in", dest="stock_in", default=None,
+                  help="continue from a stock heightfield .npy saved by a "
+                       "previous run's --stock-out (same grid as --part)")
+    p.add_argument("--stock-out", dest="stock_out", default=None,
+                  help="save the final stock heightfield to this .npy so a "
+                       "later toolpath can continue via --stock-in")
     p.add_argument("--out-json", default=None, help="write report JSON here")
     p.add_argument("--png", default=None, help="optional leftover heatmap PNG")
     args = p.parse_args(argv)
+
+    if args.stock is None and not args.stock_in:
+        p.error("--stock is required unless --stock-in provides the stock state")
 
     if args.tool == "ball" and abs(args.corner - args.dia / 2) > 1e-9:
         args.corner = args.dia / 2
@@ -365,14 +384,31 @@ def main(argv=None):
     with open(args.gcode) as f:
         moves = parse_gcode(f.read())
     part, cell, x0, y0 = load_part(args.part)
-    res = simulate(moves, part, cell, x0, y0, tuple(args.stock),
-                   tool=args.tool, dia=args.dia, corner=args.corner)
+
+    stock_init = None
+    if args.stock_in:
+        stock_init = np.load(args.stock_in)
+    if args.stock is not None:
+        stock_box = tuple(args.stock)
+    else:
+        # Derive the box from the saved state's finite cells.
+        jj, ii = np.where(np.isfinite(stock_init))
+        if jj.size == 0:
+            p.error("--stock-in file has no finite cells")
+        stock_box = (x0 + ii.min() * cell, x0 + (ii.max() + 1) * cell,
+                    y0 + jj.min() * cell, y0 + (jj.max() + 1) * cell,
+                    float(np.nanmin(stock_init)),
+                    float(np.nanmax(stock_init)))
+    res = simulate(moves, part, cell, x0, y0, stock_box,
+                   tool=args.tool, dia=args.dia, corner=args.corner,
+                   stock_init=stock_init)
 
     report = {
         "gcode": os.path.abspath(args.gcode),
         "part": os.path.abspath(args.part),
         "tool": {"type": args.tool, "dia": args.dia, "corner": args.corner},
-        "stock_box": list(args.stock),
+        "stock_box": [float(v) for v in stock_box],
+        "stock_in": os.path.abspath(args.stock_in) if args.stock_in else None,
         "cell": cell,
         "gouges": res["gouges"],
         "leftover": res["leftover"],
@@ -385,6 +421,8 @@ def main(argv=None):
             f.write(text + "\n")
     else:
         print(text)
+    if args.stock_out:
+        np.save(args.stock_out, res["stock"])
     if args.png:
         ok = write_png(res["stock"], part, cell, x0, y0, args.png)
         if not ok:

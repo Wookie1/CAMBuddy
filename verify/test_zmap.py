@@ -184,3 +184,101 @@ G1 X20. Y0. F500.
     assert abs(moves[0]["x"] - 25.4) < 1e-9
     assert abs(moves[0]["y"] - 12.7) < 1e-9
     assert abs(moves[0]["z"] + 12.7) < 1e-9
+
+
+def pocket_part(floor=4.0, top=10.0, half=12.0, block=20.0):
+    """Part: block of `top` (footprint |x|,|y| <= block) with a pocket of
+    `floor` in the middle; outside the footprint = 0 (no part)."""
+    xs = centers()[None, :]
+    ys = centers()[:, None]
+    in_block = (np.abs(xs) <= block) & (np.abs(ys) <= block)
+    in_pocket = (np.abs(xs) <= half) & (np.abs(ys) <= half)
+    return np.where(in_pocket, floor, np.where(in_block, top, 0.0))
+
+
+def test_stock_chain_simulate_equivalence():
+    """Chaining stage1 -> stock_init(stage1) -> stage2 must equal one sim."""
+    part = pocket_part()
+    stage1 = """
+G21 G90 F500
+G0 X-8. Y0. Z20.
+G1 Z6. F100.
+G1 X8. F500.
+"""
+    stage2 = """
+G21 G90 F500
+G0 X-4. Y0. Z20.
+G1 Z4.5 F100.
+G1 X4. F500.
+"""
+    combined = run(stage1 + stage2, part)
+    s1 = run(stage1, part)
+    chained = zmap.simulate(zmap.parse_gcode(stage2), part, CELL, X0, Y0,
+                           STOCK, stock_init=s1["stock"])
+    assert np.array_equal(combined["stock"], chained["stock"])
+    # the saved state really was applied: alone, stage2 leaves the outer band
+    # at stock top; chained it sits at stage1's depth
+    alone = run(stage2, part)
+    assert not np.array_equal(alone["stock"], chained["stock"])
+
+    # a gouge made in stage 1 persists into the chained stage-2 report
+    s1_gouge = run(stage1.replace("Z6.", "Z3.5."), part)
+    assert s1_gouge["gouges"]["count"] > 0
+    assert abs(s1_gouge["gouges"]["max_depth"] - 0.5) < 1e-6
+    s2_after = zmap.simulate(zmap.parse_gcode(stage2), part, CELL, X0, Y0,
+                             STOCK, stock_init=s1_gouge["stock"])
+    assert s2_after["gouges"]["count"] > 0
+
+
+def test_stock_chain_cli(tmp_path):
+    """--stock-out / --stock-in round trip through the CLI."""
+    import json
+    part = pocket_part()
+    hf = tmp_path / "part.npy"
+    np.save(hf, part)
+    with open(str(hf).replace(".npy", ".json"), "w") as f:
+        json.dump({"cell": CELL, "x0": X0, "y0": Y0}, f)
+    g1 = tmp_path / "s1.ngc"
+    g2 = tmp_path / "s2.ngc"
+    g1.write_text("""
+G21 G90 F500
+G0 X-8. Y0. Z20.
+G1 Z6. F100.
+G1 X8. F500.
+""")
+    g2.write_text("""
+G21 G90 F500
+G0 X-4. Y0. Z20.
+G1 Z4.5 F100.
+G1 X4. F500.
+""")
+    out1 = tmp_path / "stock1.npy"
+    out2 = tmp_path / "stock2.npy"
+    j1 = tmp_path / "r1.json"
+    j2 = tmp_path / "r2.json"
+    stock_args = ["--stock"] + [str(v) for v in STOCK]
+    assert zmap.main([str(g1), "--part", str(hf)] + stock_args
+                    + ["--stock-out", str(out1), "--out-json", str(j1)]) == 0
+    assert out1.exists()
+    assert zmap.main([str(g2), "--part", str(hf)] + stock_args
+                     + ["--stock-in", str(out1), "--stock-out", str(out2),
+                        "--out-json", str(j2)]) == 0
+
+    combined_g = tmp_path / "comb.ngc"
+    combined_g.write_text(g1.read_text() + g2.read_text())
+    jc = tmp_path / "rc.json"
+    assert zmap.main([str(combined_g), "--part", str(hf)] + stock_args
+                     + ["--out-json", str(jc)]) == 0
+
+    chained = np.load(str(out2))
+    combined_stock = zmap.simulate(zmap.parse_gcode(combined_g.read_text()),
+                                  part, CELL, X0, Y0, STOCK)["stock"]
+    assert np.array_equal(chained, combined_stock)
+
+    # --stock can be omitted when --stock-in provides the state
+    j3 = tmp_path / "r3.json"
+    assert zmap.main([str(g2), "--part", str(hf), "--stock-in", str(out1),
+                      "--out-json", str(j3)]) == 0
+    with open(str(j3)) as f:
+        rep = json.load(f)
+    assert rep["stock_in"] == str(out1)

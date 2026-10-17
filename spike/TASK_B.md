@@ -25,3 +25,11 @@ Targets: 0 gouges, 0 rapid collisions; leftover after roughing ~0.3 mm on reacha
 corners); after finishing small except where a 6 mm ball cannot reach. If zmap takes > 10 min on the full
 program, profile and vectorize it rather than coarsening the check.
 Write both zmap JSONs to out/zmap_rough.json and out/zmap_finish.json and print them. Commit nothing; I do that.
+
+## Update from supervisor (round 2)
+STOP trying to heal the degenerate edges; the healing rounds are used up. The probe_heal*/probe_* scripts
+already showed: Path.Geom.isVertical -> "undefined curve type" on 3 point-sized BSpline edges, and
+projection at z=-11.62/-8/10.16/22 -> "Invalid input shape for boolean CMN". Record those exact errors in
+NOTES.md. Then for Adaptive use the plain (non-model-aware) mode with explicit depths and no monkeypatch,
+and finish items 1, 3, 4, 5 and the zmap runs. Delete the spike/probe_*.py scripts you no longer need
+(keep at most one that reproduces the error). Run `python3 -m pytest verify -q` before finishing.
