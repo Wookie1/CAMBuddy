@@ -339,6 +339,76 @@ G17
     assert xs.max() - xs.min() <= 6.0 + 2 * CELL  # stays near x = 0
 
 
+def test_parallel_rapid_collisions_exact():
+    """--jobs chunking must report the SAME rapid collisions as serial.
+
+    Regression for the Fusion-rough artifact: a rapid descending into material
+    already removed by an earlier chunk used to be a false collision (chunks
+    started from fresh stock). Now chunks re-run with the prefix stock of all
+    earlier chunks (two-pass), so false positives are gone and real collisions
+    are still caught.
+    """
+    part = pocket_part(floor=4.0, top=10.0, half=12.0, block=20.0)
+    gcode = """
+G21 G90 F500
+G0 X-8. Y0. Z20.
+G1 Z6. F100.
+G1 X8. F500.
+G0 Z20.
+G0 X0. Y0.
+G0 Z7.
+G0 Z20.
+G0 X0. Y18.
+G0 Z5.
+"""
+    moves = zmap.parse_gcode(gcode)
+    seq = zmap.simulate(moves, part, CELL, X0, Y0, STOCK, tool="flat",
+                        dia=6.0)
+    # serial truth: the Z7 rapid over the cut groove is air; the Z5 rapid at
+    # (0,18) descends 5 mm into uncut block top -> exactly one collision
+    assert seq["rapid_collisions"]["count"] == 1
+    for jobs in (2, 4, 7):
+        par = zmap.simulate_parallel(moves, part, CELL, X0, Y0, STOCK, jobs,
+                                    tool="flat", dia=6.0)
+        assert par["rapid_collisions"]["count"] == 1, \
+            "jobs=%d: %d collisions != serial 1" % (
+                jobs, par["rapid_collisions"]["count"])
+        assert par["rapid_collisions"]["first_line"] == \
+            seq["rapid_collisions"]["first_line"]
+        assert np.array_equal(par["stock"], seq["stock"])
+
+
+def test_parallel_rapid_collisions_stock_init_chain():
+    """Prefix-stock fix must also hold when the parallel sim continues from a
+    saved stock state (--stock-in)."""
+    part = pocket_part(floor=4.0, top=10.0, half=12.0, block=20.0)
+    stage1 = """
+G21 G90 F500
+G0 X-8. Y0. Z20.
+G1 Z6. F100.
+G1 X8. F500.
+"""
+    stage2 = """
+G21 G90 F500
+G0 Z20.
+G0 X0. Y0.
+G0 Z7.
+G0 Z20.
+G0 X0. Y18.
+G0 Z5.
+"""
+    s1 = zmap.simulate(zmap.parse_gcode(stage1), part, CELL, X0, Y0, STOCK,
+                       tool="flat", dia=6.0)
+    moves = zmap.parse_gcode(stage2)
+    seq = zmap.simulate(moves, part, CELL, X0, Y0, STOCK, tool="flat",
+                       dia=6.0, stock_init=s1["stock"])
+    assert seq["rapid_collisions"]["count"] == 1  # only the (0,18) Z5 rapid
+    par = zmap.simulate_parallel(moves, part, CELL, X0, Y0, STOCK, 3,
+                                tool="flat", dia=6.0, stock_init=s1["stock"])
+    assert par["rapid_collisions"]["count"] == 1
+    assert np.array_equal(par["stock"], seq["stock"])
+
+
 def test_cutter_comp_reporting():
     """G41/G42 moves are counted and reported; G40 line is not comp-active."""
     part = np.full((N, N), 10.0)

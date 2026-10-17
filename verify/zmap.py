@@ -557,7 +557,8 @@ def apply_cutter_comp(moves, radius):
 
 
 def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
-             corner=0.0, stock_init=None, window=None, rapid_feed=RAPID_FEED):
+             corner=0.0, stock_init=None, window=None, rapid_feed=RAPID_FEED,
+             start=None):
     """Run the toolpath over a stock heightfield.
 
     part      : (ny, nx) array of part top-Z heights
@@ -571,6 +572,9 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 window are cut/collided/evaluated (focused sims near steep
                 walls); everything outside is treated as -inf.
     rapid_feed: assumed G0 feed (mm/min) for the cycle-time estimate.
+    start     : optional (x, y, z) machine position before the first move;
+                used by chunked parallel sims so a chunk's first move starts
+                from the previous chunk's end instead of its own target.
     Returns dict with 'stock' array and report fields.
     """
     sxmin, sxmax, symin, symax, szmin, szmax = stock_box
@@ -621,7 +625,9 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                                               if m.get("x") is not None
                                               or m.get("y") is not None),
                                              (0.0, 0.0)), fz_init)
-    if resolved:
+    if start is not None:
+        cur = [start[0], start[1], start[2]]
+    elif resolved:
         first_xy = next(((m["x"], m["y"]) for m in resolved
                          if m["x"] is not None and m["y"] is not None),
                         (0.0, 0.0))
@@ -746,9 +752,16 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
 # --------------------------------------------------------------------------
 # Stock updates are a running per-cell minimum, so splitting the (globally
 # modal-resolved) move list and combining chunk stocks with an element-wise
-# min is EXACT for the final heightfield and gouge/leftover stats. Only
-# rapid-collision counts and air_fraction are approximate (a chunk cannot see
-# stock removed by earlier chunks); the chunked report flags this.
+# min is EXACT for the final heightfield and gouge/leftover stats.
+# Rapid collisions need the stock state as it was EARLIER in the program, so
+# a naive chunked count is wrong (a rapid descending into material already cut
+# by an earlier chunk looks like a collision against fresh stock). Fixed with
+# two passes: pass 1 computes each chunk's own removal field; each chunk then
+# re-runs with stock_init = min(base, removals of all earlier chunks), which
+# reproduces the sequential stock state at its start (earlier chunks all cut
+# before later ones). With chunk start positions also carried across, the
+# chunked result (stock, gouges, rapids, cycle time) is identical to serial;
+# air_fraction is reconstructed exactly from the per-chunk values.
 
 _CHUNK = {}
 
@@ -758,8 +771,10 @@ def _chunk_worker(idx):
     return simulate(g["moves"][g["spans"][idx]], g["part"], g["cell"],
                     g["x0"], g["y0"],
                     g["stock_box"], tool=g["tool"], dia=g["dia"],
-                    corner=g["corner"], stock_init=g["stock_init"],
-                    window=g["window"], rapid_feed=g["rapid_feed"])
+                    corner=g["corner"],
+                    stock_init=g["stock_init_per"][idx],
+                    window=g["window"], rapid_feed=g["rapid_feed"],
+                    start=g["start_per"][idx])
 
 
 def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
@@ -774,8 +789,31 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
     _CHUNK.update(moves=moves, spans=spans, part=part, cell=cell, x0=x0,
                   y0=y0,
                   stock_box=stock_box, tool=tool, dia=dia, corner=corner,
-                  stock_init=stock_init, window=window, rapid_feed=rapid_feed)
+                  window=window, rapid_feed=rapid_feed)
+    # true machine position at each chunk start = end of the previous chunk's
+    # last move (chunks must not simulate their first move from its own target)
+    start_per = []
+    for sp in spans:
+        if sp.start == 0:
+            start_per.append(None)
+        else:
+            p = moves[sp.start - 1]
+            start_per.append((p["x"], p["y"], p["z"]))
+    _CHUNK["start_per"] = start_per
     ctx = mp.get_context("fork")
+    # pass 1: every chunk simulates from the base stock to get its own removals
+    _CHUNK["stock_init_per"] = [stock_init] * len(spans)
+    with ctx.Pool(len(spans)) as pool:
+        pass1 = pool.map(_chunk_worker, range(len(spans)))
+    # prefix stock for chunk c = base stock cut by ALL chunks before c, so
+    # rapid-collision checks see the same material state as in a serial run
+    # (pass-1 chunk stocks already have stock_init applied to them)
+    prefixes, acc = [], stock_init
+    for r in pass1:
+        prefixes.append(acc)
+        acc = r["stock"] if acc is None else np.minimum(acc, r["stock"])
+    # pass 2: re-run chunks with their true starting stock (exact rapids)
+    _CHUNK["stock_init_per"] = prefixes
     with ctx.Pool(len(spans)) as pool:
         results = pool.map(_chunk_worker, range(len(spans)))
     combined = {
@@ -786,7 +824,7 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                               for r in results
                               if r["rapid_collisions"]["first_line"]),
                              default=None),
-            "note": "counted per chunk; approximate under --jobs",
+            "note": "exact under --jobs (two-pass prefix stock + chunk starts)",
         },
         "air_fraction": 0.0,
         "cutting_length_mm": sum(r["cutting_length_mm"] for r in results),
@@ -918,8 +956,8 @@ def main(argv=None):
                        "Default 0 = wear model: simulate as programmed and "
                        "only count/report comp-active moves")
     p.add_argument("--jobs", type=int, default=1,
-                   help="parallel worker processes (exact for stock/stats; "
-                        "rapid-collision counts become approximate)")
+                   help="parallel worker processes (results identical to "
+                        "serial: prefix stock + chunk start states)")
     args = p.parse_args(argv)
 
     if args.stock is None and not args.stock_in:

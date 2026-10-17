@@ -27,3 +27,10 @@ Part samples/core_front_setup.step (Z 0..46.844, main floor 24.8). Stock X+-128.
    are an artifact (stock thinner than a cell, footprint rounding, rapid sampling). If artifact: fix zmap (e.g.
    ignore < one cell depth, or sample rapids at 0.25 cell) + a test. If real: show one (line, XY, depth).
 Run `/opt/homebrew/bin/python3 -m pytest verify -q` and the engine tests before finishing. Print the bench JSON.
+
+## Supervisor note (relaunch after an OpenCode hang)
+Your previous session hung right after: "a2d is the bottleneck (52-255 s/level, serial). Testing keepToolDown/
+tolerance impact and then parallelizing levels". Levels are independent: run Adaptive2d per level in a
+multiprocessing pool (this Mac has many cores; use os.cpu_count()-2 workers), keep levels ordered top-down in the
+output. Keep tolerance sane (FreeCAD default ~0.1) and log per-level timing. Check git diff/out/engine_rough_run.log
+for where you were, then finish items 1-5.
