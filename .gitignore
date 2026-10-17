@@ -4,3 +4,5 @@ __pycache__/
 .opencode/
 reference/*.cps
 .oc-config/
+samples/cavity_front.step
+samples/core_check.step

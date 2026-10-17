@@ -35,3 +35,6 @@ Print out/bench.json and the zmap JSONs at the end. Run `/opt/homebrew/bin/pytho
 - samples/cavity_front.step is an EMPTY export (3.6 KB, no geometry: Part.read -> "null shape"). Not your bug.
   Make orient.py skip a source with no geometry with a clear message; do core only. A new cavity file will come.
 - Do NOT use Fusion or any MCP tools; never ask questions. orient.py core part already passes its bbox check.
+- UPDATE: samples/cavity_front_setup.step now exists and is ALREADY in setup coordinates (do not transform).
+  orient.py should only verify its bbox (X +-126.36, Y +-69.85, Z 0..60.96, tol 0.05). The empty
+  cavity_front.step is gone.
