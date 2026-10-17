@@ -1,0 +1,81 @@
+{
+  "comparison": "single Adaptive rough (ours, plain fallback) vs Fusion OVERALL ROUGHING section of reference/1001.nc",
+  "common": {
+    "tool": {
+      "type": "bull",
+      "dia_mm": 12.7,
+      "corner_mm": 0.127
+    },
+    "part_heightfield": "/Users/James/ai-sandbox/stevecam/out/core_front_setup_hf.npy",
+    "cell_mm": 0.5,
+    "stock_box": [
+      -128.651,
+      128.651,
+      -82.55,
+      82.55,
+      0.0,
+      60.96
+    ]
+  },
+  "ours": {
+    "gcode": "/Users/James/ai-sandbox/stevecam/out/core_front_roughD.ngc",
+    "op": "AdaptiveRoughFusion (FreeCAD/VibeCAD Path Adaptive, plain: ModelAwareExperiment failed to the floor with 'TypeError: undefined curve type' from degenerate BSpline edges, see out/run_cam_D.log)",
+    "params": {
+      "stepdown_mm": 1.9,
+      "start_depth_mm": 60.96,
+      "final_depth_mm": 25.1,
+      "stepover_percent": 15.0,
+      "stock_to_leave_mm": 0.3,
+      "cut_feed_mm_min": 3429.0,
+      "plunge_feed_mm_min": 1270.0
+    },
+    "gouges": {
+      "count": 50592,
+      "max_depth": 21.743516277335033,
+      "worst_xy": [
+        -55.11500000000001,
+        29.400000000000006
+      ]
+    },
+    "rapid_collisions": 152,
+    "rapid_collision_first_line": 77070,
+    "leftover_mm": {
+      "mean": -5.673,
+      "p95": 5.415,
+      "max": 18.733
+    },
+    "within_0p5mm_fraction": 0.5787,
+    "cutting_length_mm": 434277.7,
+    "cycle_time_s": 8203.9
+  },
+  "fusion": {
+    "gcode": "/Users/James/ai-sandbox/stevecam/out/fusion_rough.ngc",
+    "op": "OVERALL ROUGHING, T3 D=0.5in CR=0.005in bullnose, S7500 (lines 1-40321 of reference/1001.nc, G20)",
+    "params_measured": {
+      "stepdown_mm": 1.9,
+      "cut_feed_mm_min": 3429.0,
+      "ramp_feed_mm_min": 1270.0,
+      "stepover_mm_median": 2.0
+    },
+    "gouges": {
+      "count": 0,
+      "max_depth": 0.0,
+      "worst_xy": null
+    },
+    "rapid_collisions": 41,
+    "rapid_collision_first_line": 5082,
+    "leftover_mm": {
+      "mean": 1.084,
+      "p95": 5.268,
+      "max": 37.448
+    },
+    "within_0p5mm_fraction": 0.5722,
+    "cutting_length_mm": 48538.9,
+    "cycle_time_s": 1050.6
+  },
+  "notes": [
+    "Ours is a purely-2D plain Adaptive bounded by the stock outline (the model-aware mode that would respect walls errors on this STEP's degenerate edges), so it cuts through every feature above Z 25.1: the gouge/leftover deltas vs Fusion reflect that mandated fallback, not a tool-shape mismatch.",
+    "Fusion roughing section carries no G41/G42 (comp starts at INSERT CONTOUR), so the wear-model sim is exact for this split.",
+    "Cycle times: feed moves at their F words, rapids assumed 15000 mm/min."
+  ]
+}
