@@ -1,4 +1,32 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "omlx/Qwen3.8-Flash-Next-oQ4e-mtp"
+  "model": "omlx/Qwen3.8-Flash-Next-oQ4e-mtp",
+  "mcp": {
+    "servers": {
+      "pcb-creator": {
+        "enabled": false
+      },
+      "fusion360": {
+        "enabled": false
+      },
+      "vibecad": {
+        "enabled": false
+      },
+      "firecrawl": {
+        "enabled": false
+      },
+      "steve": {
+        "enabled": false
+      },
+      "rmfg": {
+        "enabled": false
+      },
+      "obscura": {
+        "enabled": false
+      },
+      "brave-search": {
+        "enabled": false
+      }
+    }
+  }
 }
