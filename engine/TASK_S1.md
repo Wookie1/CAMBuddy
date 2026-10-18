@@ -87,3 +87,45 @@ ball CL is ~36.85 (e.g. line 209170, x 119.655 y 50.785). The floor level coinci
    contains the worst gouge) with --floor 24.765, then zmap that window output at 0.1 mm against
    out/core_front_setup_hf01.npy starting from out/stock_roughG_01.npy, and report gouges.
 Short outputs.
+6. (Added) When the one-sided check removes points, SPLIT the run there; rejoin the pieces only through the checked
+   link logic (retract or a short lift verified clear by drop-cutter along the link). Never bridge a gap at cutting
+   depth. Raising a point up to its CL is also acceptable; never lower one. Add a test where removal creates a gap and
+   assert the resulting link is verified clear (no sample below CL).
+7. (Supervisor, IMPORTANT) The floor level is NOT the main problem. An exact OCL check of the whole S1c output
+   (engine/probe_clcheck.py: every cutting move sampled at 0.25 mm, BallCutter(6) drop-cutter, one-sided) found
+   76,543 points below CL by > 0.005 mm: only 1,281 at Z 24.765; 75,262 elsewhere, max 11.9 mm, depth histogram
+   [0.005-0.02: 19485, -0.1: 3588, -0.5: 9002, -2: 15612, >2: 27575]. Most common Zs of bad points: 31.92 (9290),
+   43.84 (5909), 31.84, 31.24, 30.04, 30.34, 30.94, 27.64 (~1630 each) - i.e. STEEP WATERLINE LOOPS at many levels
+   pass where the ball does not fit (worst x=+-94.975 y=50.761 z=24.944, lines 207636/91349). Find why before
+   relying on item 1 alone: e.g. AdaptiveWaterline sampling/min_sampling too coarse for narrow features, a cutter
+   mismatch between waterline and drop-cutter (diameter/length/BallCutter vs CylCutter), loops of the wrong
+   side/nesting, or simplification bridging loop points. Run probe_clcheck.py on your outputs as the acceptance
+   check (it must report 0 points below CL by > 0.005 mm), in addition to zmap.
+8. (Supervisor, ROOT CAUSE) Stage 1 is the culprit: RAW OCL waterline loops already violate the CL. At Z 31.92 on
+   core_front_setup.stl with BallCutter(6.0, 50): AdaptiveWaterline -> 9 loops, 11,962 pts, 666 below drop-cutter CL
+   by > 0.005 (max 7.625); plain ocl.Waterline -> 655 (max 7.625). Many sit exactly ~3.07 mm under (about the ball
+   radius). Cutter object and Z-as-tip are correct. OCL waterline traces where the cutter at height z touches the mesh
+   from ANY side (incl. material above the cutter / overhangs), which 3-axis-from-above cannot use. Fix: after
+   computing loops, drop-cutter every loop point (batched) and keep only points with CL - z <= 0.005 mm; split loops
+   at removed points; relink pieces through the verified link logic. This is item 1 applied at the source; then the
+   final probe_clcheck must report 0.
+
+## Round S2 (supervisor): PLAN B - steep passes from a drop-cutter CL grid (replaces OCL waterline). Supersedes S1d.
+Root cause (S1d items 7-8): raw OCL Waterline/AdaptiveWaterline loops with BallCutter(6) are wrong by ~r in places
+(Z 31.92: ~660 loop points below drop-cutter CL, max 7.6 mm; same after re-meshing). Filtering would leave walls
+uncut, so do not use OCL waterline for steep passes.
+1. ONE batched drop-cutter CL grid (batch_drop, BallCutter same as everywhere) over the steep-region mask dilated by
+   the ball radius: 0.1 mm pitch in steep regions, coarser elsewhere is fine. Computed once per run, not per level.
+2. Per Z level (keep 0.3 mm stepdown, shift levels within 0.05 mm of a flat-face Z up by 0.05 mm, keep the slope
+   split): marching squares on that grid for the iso-contour CL = Z, with {CL >= Z} as material side.
+3. Refine each contour point by batched bisection along the grid gradient to |CL - Z| <= 0.002 mm (one batch_drop per
+   bisection round for all points of all levels).
+4. Final safety net: one-sided check of every emitted cutting point and segment sample (CL - z <= 0.005 mm); remove
+   violators, SPLIT runs there, rejoin only through verified links (retract or short lift checked clear). Never bridge
+   at cutting depth; raising to CL is ok, never lower.
+5. Tests (engine/test_finish.py): hemisphere and 60-degree cone contours vs analytic circles (CL radius for a ball on
+   a hemisphere/cone at height Z), slot-boss and a plate-at-floor case 0 gouges at zmap 0.1 mm, a gap-split test whose
+   link is verified clear, and engine/probe_clcheck.py == 0 on every synthetic output.
+6. Smoke: --window 96.8 136.8 30.8 70.8 on core_front_setup with --floor 24.765; probe_clcheck on it must report 0.
+   Report timings. Do NOT run the full part (supervisor does). Report per level: contour points, removed points.
+Keep outputs short. Long jobs in the foreground of your shell command.
