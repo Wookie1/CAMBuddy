@@ -44,7 +44,8 @@ from engine.finish import (finish, finish_to_gcode, surf_bounds,  # noqa: E402
                            batch_drop, make_cutter, cl_grid, march_level,
                            refine_contours, steep_runs_grid, segment_net,
                            link_plan, compute_rest_mask, CHORD_TOL,
-                           RAPID_MARGIN)
+                           RAPID_MARGIN, RAPID_STOCK_ALLOW, box_max,
+                           load_heightfield)
 import zmap  # noqa: E402
 from engine import post_lnc  # noqa: E402
 
@@ -910,6 +911,137 @@ def test_rest_mask_units():
               % int(m.sum()))
 
 
+# ---------------------------------------------------------------------------
+# S3b: rapids must clear the ROUGHING STOCK, not just the part
+# ---------------------------------------------------------------------------
+
+def test_stock_out_roundtrip():
+    """S3b item 1 unit: save_stock_npy writes the StockField top surface as
+    .npy (+ x0/y0/cell sidecar, NaN outside the tracked box), readable by
+    finish.load_heightfield with identical geometry and values."""
+    from engine.stock import StockField, save_stock_npy
+    box = (-10.0, 10.0, -8.0, 8.0, 0.0, 12.0)
+    sf = StockField(box, cell=0.5)
+    sf.mill_path([(0.0, 0.0), (4.0, 0.0)], 5.0, 3.0)
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "stock_final.npy")
+        save_stock_npy(sf, p)
+        A, x0, y0, cell = load_heightfield(p)
+        assert A.shape == sf.top.shape and cell == sf.cell
+        assert abs(x0 - sf.x0) < 1e-9 and abs(y0 - sf.y0) < 1e-9
+        fin = np.isfinite(sf.top)
+        assert np.array_equal(np.isfinite(A), fin), "NaN pattern mismatch"
+        assert np.allclose(A[fin], sf.top[fin]), "stock values changed"
+        assert float(np.nanmax(A)) == 12.0
+    print("stock-out roundtrip: shape/values/sidecar OK")
+
+
+def test_link_plan_stock_ridge():
+    """S3b item 2 unit: link over a boss; an artificial stock ridge 2 mm
+    above CL across the path. Without stock: rapid at CL + margin + allow.
+    With the stock model: z_r >= ridge_top + margin (stock, not CL+allow,
+    governs); feed-lift heights must clear the ridge the same way."""
+    q, top, bx, cx, bh = 15.0, 10.0, 2.5, 5.0, 20.0
+    hy, cell = 10.0, 0.5
+    ridge_top = bh + 2.0
+    with tempfile.TemporaryDirectory() as td:
+        stl = two_boss_stl(os.path.join(td, "2boss.stl"))
+        surf = model.load_surf(stl)
+        cutter = make_cutter("ball", BALL_DIA, 0.0)
+        links = [((cx, 0.0, bh), (0.0, 0.0, top))]
+        mode, zr, mx = link_plan(surf, cutter, links, threads=4)[0]
+        assert mode == "rapid", "boss link should be rapid, got %s" % mode
+        assert abs(zr - (bh + RAPID_MARGIN + RAPID_STOCK_ALLOW)) < 1e-6, \
+            "no-stock rapid %.3f != CL+margin+allow %.3f" % (
+                zr, bh + RAPID_MARGIN + RAPID_STOCK_ALLOW)
+        xs = -q + (np.arange(int(2 * q / cell)) + 0.5) * cell
+        ys = -hy + (np.arange(int(2 * hy / cell)) + 0.5) * cell
+        X, Y = np.meshgrid(xs, ys)
+        stock = hf_two_boss(X, Y, top=top, bx=bx, cx=cx, bh=bh) + 0.381
+        ridge = (np.abs(X - cx) <= bx + 1.0) & (np.abs(Y) <= bx + 1.0)
+        stock = np.where(ridge, ridge_top, stock)
+        k = int(math.ceil(0.5 * BALL_DIA / cell))
+        st = (box_max(stock, k), -q, -hy, cell)
+        mode2, zr2, _ = link_plan(surf, cutter, links, threads=4, stock=st)[0]
+        assert mode2 == "rapid" and zr2 >= ridge_top + RAPID_MARGIN - 1e-6, \
+            "rapid z=%.3f does not clear stock ridge %.1f + margin" % (
+                zr2, ridge_top)
+        mode3, lift3, _ = link_plan(surf, cutter, links, threads=4,
+                                   use_rapids=False, stock=st)[0]
+        assert mode3 == "lift" and lift3 >= ridge_top + RAPID_MARGIN - 1e-6, \
+            "feed lift z=%.3f does not clear stock ridge %.1f + margin" % (
+                lift3, ridge_top)
+        print("link-plan stock ridge: no-stock %.3f | rapid %.3f | lift %.3f"
+              " (ridge %.1f + margin)" % (zr, zr2, lift3, ridge_top))
+
+
+def test_stock_from_ridge_rapids():
+    """S3b item 3: two-boss part + artificial stock ridge 2 mm above the
+    boss CL across the link paths; finish(stock_from=...) rapids must lift
+    over the ridge (z >= ridge + margin) and zmap (stock_init = the ridge
+    field) reports 0 rapid collisions and 0 gouges."""
+    q, top, bx, cx, bh = 15.0, 10.0, 2.5, 5.0, 20.0
+    hy = 10.0
+    ridge_top = bh + 2.0
+    with tempfile.TemporaryDirectory() as td:
+        stl = two_boss_stl(os.path.join(td, "2boss.stl"))
+        surf = model.load_surf(stl)
+        Xc, Yc, nx, ny = _grid((-q, q, -hy, hy))
+        stock = hf_two_boss(Xc, Yc, top=top, bx=bx, cx=cx, bh=bh) + 0.381
+        ridge = (np.abs(Xc - cx) <= bx + 1.0) & (np.abs(Yc) <= bx + 1.0)
+        stock = np.where(ridge, ridge_top, stock)
+        np.save(os.path.join(td, "stock.npy"), stock)
+        with open(os.path.join(td, "stock.json"), "w") as fh:
+            json.dump({"x0": -q, "y0": -hy, "cell": CELL}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", BALL_DIA, 0.0),
+                             floor_z=top, threads=4,
+                             stock_from=os.path.join(td, "stock.npy"))
+        assert moves and stats.get("stock_from"), "stock_from not recorded"
+        assert stats["n_rapid_links"] >= 1, "no rapid links emitted"
+        # footprint-max stock grid (same transform finish applies to links)
+        k = int(math.ceil(0.5 * BALL_DIA / CELL))
+        bm = box_max(stock, k)
+
+        def stock_along(px, py):
+            ii = np.clip(((px + q) / CELL).astype(int), 0, bm.shape[1] - 1)
+            jj = np.clip(((py + hy) / CELL).astype(int), 0, bm.shape[0] - 1)
+            v = bm[jj, ii]
+            v = v[np.isfinite(v)]
+            return float(v.max()) if v.size else float("-inf")
+
+        crossed = 0
+        for (x0, y0, x1, y1, z) in _rapids(moves):
+            m = max(2, int(math.ceil(math.hypot(x1 - x0, y1 - y0) / 0.25))) + 1
+            t = np.arange(m) / (m - 1.0)
+            px, py = x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
+            smax = stock_along(px, py)
+            if smax >= ridge_top - 1e-9:
+                crossed += 1
+            if smax > -np.inf:
+                assert z >= smax + RAPID_MARGIN - 1e-6, \
+                    "rapid at %.3f not clear of stock %.3f along path + margin" \
+                    % (z, smax)
+        assert crossed >= 1, "no rapid crosses the stock ridge"
+        text = finish_to_gcode(moves)
+        gmv = zmap.parse_gcode(text)
+        part = hf_two_boss(Xc, Yc, top=top, bx=bx, cx=cx, bh=bh)
+        res = zmap.simulate(gmv, part, CELL, -q, -hy,
+                            (-q, q, -hy, hy, 0.0, ridge_top),
+                            tool="ball", dia=BALL_DIA, stock_init=stock)
+        assert res["rapid_collisions"]["count"] == 0, \
+            "stock-ridge rapid collisions at line %s" % \
+            res["rapid_collisions"]["first_line"]
+        assert res["gouges"]["count"] == 0, \
+            "stock-ridge case gouged: %d (max %.3f)" % (
+                res["gouges"]["count"], res["gouges"]["max_depth"])
+        n_ck, n_bad, mx = clcheck_moves(surf, moves)
+        assert n_bad == 0, "stock-ridge clcheck: %d below CL, max %.3f" % (
+            n_bad, mx)
+        print("stock-ridge: %d/%d rapids cross the ridge (all z>=%.1f), "
+              "zmap rapid collisions 0, gouges 0, clcheck 0" % (
+                  crossed, stats["n_rapid_links"], ridge_top + RAPID_MARGIN))
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -920,7 +1052,10 @@ if __name__ == "__main__":
                test_flat_plate_length_and_links,
                test_two_boss_rapid_over_boss,
                test_rest_mask_units,
-               test_rest_pass_placeholder):
+               test_rest_pass_placeholder,
+               test_stock_out_roundtrip,
+               test_link_plan_stock_ridge,
+               test_stock_from_ridge_rapids):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))

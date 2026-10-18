@@ -143,7 +143,11 @@ def finish_main(a):
         clearance=a.clearance, workers=workers, window=a.window,
         rapid_margin=(finishmod.RAPID_MARGIN if a.rapid_margin is None
                      else a.rapid_margin),
-        use_rapids=not a.no_rapids, progress=prog, **rest_kw)
+        use_rapids=not a.no_rapids, progress=prog,
+        stock_from=a.stock_from,
+        stock_allow=(finishmod.RAPID_STOCK_ALLOW if a.stock_allow is None
+                    else a.stock_allow),
+        **rest_kw)
     if rest_kw:
         tool_comment = ("PLACEHOLDER %s D=%.3f CR=%.3f (not in "
                         "tools/x7_tools.json - LNC post must refuse)"
@@ -239,6 +243,10 @@ def main(argv=None):
     r.add_argument("--wl-sampling", dest="wl_sampling", type=float, default=0.1,
                   help="waterline sampling mm")
     r.add_argument("--stats-json", dest="stats_json", default=None)
+    r.add_argument("--stock-out", dest="stock_out", default=None,
+                   help="write the engine's final stock heightfield to this "
+                        ".npy (+ x0/y0/cell .json sidecar) for finish "
+                        "--stock-from rapid verification (S3b)")
     r.add_argument("--post", choices=("neutral", "lnc"), default="neutral",
                    help="writer: neutral G21 (default) or SyilCNC LNCv2")
     r.add_argument("--program", type=int, default=1001,
@@ -330,6 +338,16 @@ def main(argv=None):
                         "roughing-stock allowance)")
     f.add_argument("--no-rapids", dest="no_rapids", action="store_true",
                    help="disable verified G0 links (feed lift links only)")
+    f.add_argument("--stock-from", dest="stock_from", default=None,
+                   help="post-roughing stock heightfield .npy (+ x0/y0/cell "
+                        ".json sidecar, engine.cli rough --stock-out): "
+                        "rapid/lift heights must clear max(CL, stock within "
+                        "the tool radius) + margin along the swept path (S3b)")
+    f.add_argument("--stock-allow", dest="stock_allow", type=float,
+                   default=None,
+                   help="stock allowance mm added on top of max CL + margin "
+                        "for rapids when no --stock-from model is given "
+                        "(default 1.0)")
     f.add_argument("--rest-from", dest="rest_from", default=None,
                    help="stock/zmap heightfield .npy (+ x0/y0/cell .json "
                         "sidecar): corner rest pass - cut only where the 6 mm "
@@ -407,7 +425,7 @@ def main(argv=None):
                                   part_hf=part_hf, stock_cell=a.stock_cell,
                                   stepup=a.stepup, min_rest=a.min_rest,
                                   min_level_area=a.min_level_area,
-                                  progress=prog)
+                                   progress=prog, stock_out=a.stock_out)
     if a.post == "lnc":
         from engine import post_lnc
         text = post_lnc.post(moves, metric=a.metric, program=a.program,

@@ -38,7 +38,9 @@ otherwise, where drop-cutter along the swept XY path (sampled <= 0.25 mm)
 verifies max CL + margin (default 1 mm) + roughing-stock allowance (1 mm)
 fits under the retract height, retract to that minimum verified-clear height,
 G0 across, plunge at ramp feed (S3 item 1); else retract to local max CL +
-1 mm and traverse at feed.
+1 mm and traverse at feed. With --stock-from (post-roughing stock heightfield,
+S3b) the required height additionally includes the stock top within the tool
+radius along the swept path.
 
 moves are the neutral dicts of engine/gcode.py: {g:0|1, x, y, z, f}.
 """
@@ -1048,24 +1050,27 @@ def box_max(A, k):
 
 def link_plan(surf, cutter, links, sampling=0.1, threads=None,
               rapid_margin=RAPID_MARGIN, clearance=None, use_rapids=True,
-              stock=None):
+              stock=None, stock_allow=RAPID_STOCK_ALLOW):
     """For each ((x0,y0,z0), (x1,y1,z1)) decide 'down', 'rapid' or 'lift'.
     - 'down': stay at cutting height - drop-cutter CL along the link stays
       below the link line (one-sided, no tolerance).
     - 'rapid' (S3 item 1): retract to the MINIMUM verified-clear height
-      z_r = max(CL along path) + rapid_margin + RAPID_STOCK_ALLOW (clamped
-      to `clearance`), G0 across, plunge at ramp feed. Verified by
-      drop-cutter along the swept XY path (sampled <= RAPID_LINK_SS mm,
-      batched): z_r >= CL + rapid_margin for the whole path; the extra
-      RAPID_STOCK_ALLOW covers the roughing leftover stock above the part
-      (the CL is computed on the part, not a stock model). The ball's full
-      footprint is covered by drop-cutter: at tip z > CL(x, y) the ball
-      touches nothing at that xy. If `stock` = (A, x0, y0, cell) heightfield
-      is given (rest pass - where leftover stands far above the part), the
-      rapid must additionally clear it: z_r >= max(stock within a ball-
-      radius box around the path) + rapid_margin.
-    - 'lift': the existing verified feed link (retract to local max CL +
-      LINK_LIFT, traverse at ramp feed) - used when use_rapids is off.
+      z_r = max(CL along path) + rapid_margin + stock_allow (G0 across,
+      plunge at ramp feed). Verified by drop-cutter along the swept XY path
+      (sampled <= RAPID_LINK_SS mm, batched): z_r >= CL + rapid_margin for
+      the whole path; the extra stock_allow covers the roughing leftover
+      stock above the part when NO stock model is given (the CL is computed
+      on the part, not a stock model). The ball's full footprint is covered
+      by drop-cutter: at tip z > CL(x, y) the ball touches nothing at that
+      xy. If `stock` = (A, x0, y0, cell) heightfield is given (post-roughing
+      stock via --stock-from, or the rest pass leftover), the rapid must
+      additionally clear it: z_r >= max(stock within a ball-radius box
+      around the path) + rapid_margin (S3b: rapids clear the ROUGHING
+      STOCK, not just the part; the height is never clamped below this
+      requirement - `clearance` only caps heights that stay above it).
+    - 'lift': the verified feed link (retract to local max CL + LINK_LIFT,
+      traverse at ramp feed) - used when use_rapids is off; with a stock
+      model the lift height must clear the stock the same way (S3b).
     Returns [(mode, height_or_None, local_max_cl_or_None), ...]."""
     if not links:
         return []
@@ -1100,10 +1105,9 @@ def link_plan(surf, cutter, links, sampling=0.1, threads=None,
                 hi = float(np.max(svl))  # stock within ball reach of path
         if not fin.any():
             if hi > -np.inf and use_rapids:
-                zr = hi + rapid_margin
-                if clearance is not None:
-                    zr = min(zr, clearance)
-                out.append(("rapid", zr, None))
+                # all part-air but stock stands under the path: S3b - the
+                # rapid must clear it; never clamp below that requirement
+                out.append(("rapid", hi + rapid_margin, None))
             else:
                 out.append(("down", None, None))  # all air along the path
             continue
@@ -1113,12 +1117,13 @@ def link_plan(surf, cutter, links, sampling=0.1, threads=None,
         if float(np.max(cz[fin] - link_z[fin])) <= 1e-9:
             out.append(("down", None, None))
         elif use_rapids:
-            zr = max(mx + rapid_margin + RAPID_STOCK_ALLOW, hi + rapid_margin)
-            if clearance is not None:
-                zr = min(zr, clearance)
+            # S3b: z_r >= max(CL along path, stock within tool radius along
+            # path) + margin; `clearance` only caps heights already above it
+            zr = max(mx + rapid_margin + stock_allow, hi + rapid_margin)
             out.append(("rapid", zr, mx))
         else:
-            out.append(("lift", mx + LINK_LIFT, mx))
+            # feed lift: with a stock model the traverse must clear it too
+            out.append(("lift", max(mx + LINK_LIFT, hi + rapid_margin), mx))
     return out
 
 
@@ -1175,7 +1180,7 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
            ramp_feed=1270.0, clearance=None, workers=None, threads=8,
            window=None, progress=None, rapid_margin=RAPID_MARGIN,
            use_rapids=True, rest_from=None, big_tool=("ball", 6.0, 0.0),
-           min_rest=0.5):
+           min_rest=0.5, stock_from=None, stock_allow=RAPID_STOCK_ALLOW):
     """Slope-split finishing toolpath (action: slope_split_finish).
     Returns (moves, stats).
 
@@ -1192,6 +1197,12 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     corner rest pass (S3 item 3) - cut only where the big_tool's CL surface
     exceeds the small-ball reach by > min_rest (see compute_rest_mask); the
     tool in `tool` is then a PLACEHOLDER until it joins tools/x7_tools.json.
+    stock_from: path to the roughing stock heightfield .npy (+ sidecar,
+    engine.cli rough --stock-out): verified rapid/lift heights must clear
+    max(CL along the swept path, stock within the tool radius) + margin
+    (S3b). Conservative: the INITIAL stock is used for every link (cuts
+    only lower it). Without stock_from, rapids add `stock_allow` (default
+    1.0 mm) on top of CL + margin to cover the roughing leftover.
     """
     t_start = time.time()
     reset_drop_calls()
@@ -1377,11 +1388,18 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     links = []
     for a, b in zip(ordered, ordered[1:]):
         links.append((a[-1], b[0]))
-    # rest pass: leftover ridges stand far above the part, so verified
-    # rapids must clear the STOCK too (ball-radius box max along the path)
+    # rapids must clear the STOCK too (ball-radius box max along the path):
+    # S3b --stock-from = post-roughing stock heightfield, or the rest pass
+    # leftover map (leftover ridges stand far above the part). Conservative:
+    # the INITIAL stock is used for every link (finishing cuts only lower it).
     stock_arg = None
-    if rest_stock is not None:
-        A, sx0, sy0, cell = rest_stock
+    link_stock = None
+    if stock_from is not None:
+        link_stock = load_heightfield(stock_from)
+    elif rest_stock is not None:
+        link_stock = rest_stock
+    if link_stock is not None:
+        A, sx0, sy0, cell = link_stock
         r_px = int(math.ceil(0.5 * tool[1] / cell))
         i0 = max(0, int((xs[0] - sx0) / cell) - r_px)
         i1 = min(A.shape[1], int((xs[-1] - sx0) / cell) + r_px + 1)
@@ -1393,7 +1411,7 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     lplan = link_plan(surf, cutter, links, sampling=sampling,
                       threads=threads, rapid_margin=rapid_margin,
                       clearance=clearance, use_rapids=use_rapids,
-                      stock=stock_arg)
+                      stock=stock_arg, stock_allow=stock_allow)
     t_link = time.time() - t0
 
     # -- emit -------------------------------------------------------------
@@ -1427,6 +1445,10 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
         stats["big_tool"] = "ball:%.1f" % big_tool[1]
         stats["min_rest_mm"] = min_rest
         stats["n_rest_cells"] = n_rest_cells
+    if stock_from is not None:
+        # S3b: rapids/lifts verified against this post-roughing stock model
+        stats["stock_from"] = str(stock_from)
+        stats["stock_allow_mm"] = stock_allow
     prev = None
 
     def emit(g, x, y, z, f=None, stat=None):
