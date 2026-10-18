@@ -32,8 +32,9 @@ except ImportError:
         pass
     HAVE_AREA = False
 
-from engine.rough import (plan_levels, rect_loop, decimate,  # noqa: E402
-                          allowance_violation)
+from engine.rough import (plan_levels, plan_stepup_levels, rect_loop,  # noqa: E402
+                          decimate, allowance_violation)
+from engine.stock import StockField  # noqa: E402
 from engine.gcode import moves_to_gcode  # noqa: E402
 
 
@@ -196,11 +197,128 @@ def test_gcode_emit():
     print("PASS gcode_emit")
 
 
+# ----------------------------------------------------- engine/stock.py tests
+SB = (-20.0, 20.0, -10.0, 30.0, 0.0, 10.0)  # xmin xmax ymin ymax zmin zmax
+SR = 3.0
+
+
+def test_stock_mill_and_region():
+    """Milling a level lowers the stock top under the footprint only; the
+    region mask then excludes cleared cells and keeps the rest."""
+    sf = StockField(SB, cell=0.5)
+    assert sf.top_at(0.0, 10.0) == 10.0          # stock top everywhere
+    assert sf.top_at(-25.0, 10.0) == -float("inf")  # outside the box
+    sf.mill_path([(-19.0, 5.0), (-1.0, 5.0)], 8.0, SR)
+    assert sf.top_at(-10.0, 5.0) <= 8.0 + 1e-9   # under the path: cut to z
+    assert sf.top_at(-10.0, 5.0 + SR - 0.05) <= 8.0 + 1e-9  # inside radius
+    assert sf.top_at(-10.0, 5.0 + SR + 0.3) > 9.9  # outside: untouched
+    # level 6.0: cleared to 8.0 still leaves stock above 6.0 + leave
+    m = sf.region_mask(6.0, axial_leave=0.5)
+    # level 8.0: nothing left above 8.0 + leave there -> excluded
+    m2 = sf.region_mask(8.0, axial_leave=0.5)
+    i, j = sf._ci(-10.0), sf._cj(5.0)
+    assert m[j, i] and not m2[j, i]
+    assert m[int(sf.ny / 2) + 30, int(sf.nx / 2)]  # far corner still stock
+    print("PASS stock mill/region")
+
+
+def test_stock_bull_footprint():
+    """Bull corner band: cells between r-cr and r are left up to cr high."""
+    sf = StockField(SB, cell=0.5)
+    cx, cy = 0.25, 9.75  # exact cell centres of this grid
+    sf.mill_segment(cx, cy, cx, cy, 5.0, SR, corner_r=0.5)  # plunge disk
+    assert abs(sf.top_at(cx, cy) - 5.0) < 1e-9  # flat centre
+    dx, dy = 2.5, 1.5  # diagonal cell-centre offset, d ~ 2.915 in the band
+    d = math.hypot(dx, dy)
+    expect = 5.0 + 0.5 - math.sqrt(0.25 - (d - 2.5) ** 2)
+    assert abs(sf.top_at(cx + dx, cy + dy) - expect) < 0.01
+    assert abs(sf.top_at(cx, cy + SR) - 5.5) < 0.01  # at r: full cr high
+    assert sf.top_at(cx, cy + SR + 0.25) > 9.9        # outside the disk
+    print("PASS stock bull footprint")
+
+
+def test_stock_contours():
+    """Marching squares: solid box -> one CCW outer at the box edge; donut
+    -> outer + CW hole (classification by containment, not stitch order)."""
+    sf = StockField(SB, cell=0.5)
+    m = sf.inb.copy()
+    outers, holes = sf.contours(m)
+    assert len(outers) == 1 and len(holes) == 0
+    xs = [p[0] for p in outers[0]]
+    ys = [p[1] for p in outers[0]]
+    assert abs(min(xs) - SB[0]) < 0.01 and abs(max(xs) - SB[1]) < 0.01
+    assert abs(min(ys) - SB[2]) < 0.01 and abs(max(ys) - SB[3]) < 0.01
+    area2 = sum(outers[0][i][0] * outers[0][(i + 1) % len(outers[0])][1] -
+                outers[0][(i + 1) % len(outers[0])][0] * outers[0][i][1]
+                for i in range(len(outers[0])))
+    assert area2 > 0, "outer loop must be CCW"
+    # donut: clear a disk at (0, 10) r=4
+    import numpy as np
+    ys2 = sf.y0 + (np.arange(sf.ny) + 0.5) * sf.cell
+    xs2 = sf.x0 + (np.arange(sf.nx) + 0.5) * sf.cell
+    X, Y = np.meshgrid(xs2, ys2)
+    m2 = sf.inb & ~((X - 0.0) ** 2 + (Y - 10.0) ** 2 <= 4.0 ** 2)
+    outers, holes = sf.contours(m2)
+    assert len(outers) == 1 and len(holes) == 1
+    area2 = sum(holes[0][i][0] * holes[0][(i + 1) % len(holes[0])][1] -
+                holes[0][(i + 1) % len(holes[0])][0] * holes[0][i][1]
+                for i in range(len(holes[0])))
+    assert area2 < 0, "hole loop must be CW"
+    print("PASS stock contours")
+
+
+def test_stock_links_and_stepups():
+    """Link clearance follows the model; step-up level plan matches the
+    Fusion pattern (big level, climb grid, floor, climb grid)."""
+    sf = StockField(SB, cell=0.5)
+    sf.set_tool(SR)
+    assert not sf.link_clear([(-10.0, 5.0), (10.0, 5.0)], 8.0)  # solid stock
+    sf.mill_path([(-19.0, 5.0), (19.0, 5.0)], 8.0, SR)
+    sf.refresh_tool()
+    assert sf.link_clear([(-15.0, 5.0), (15.0, 5.0)], 8.0)
+    assert not sf.link_clear([(-15.0, 5.0), (15.0, 5.0)], 7.9)
+    assert sf.rise_clear(-15.0, 5.0, 8.0, 9.9)
+    assert not sf.rise_clear(-15.0, -5.0, 8.0, 9.9)  # unmilled cell
+    zs = plan_stepup_levels(60.96, 24.95, stepdown=19.05, stepup=1.905)
+    assert zs[0] == 41.91 and 24.95 in zs
+    i_floor = zs.index(24.95)
+    assert abs(zs[i_floor + 1] - 26.855) < 1e-9   # climb after the floor
+    for want in (43.815, 45.72, 47.625):
+        assert any(abs(z - want) < 1e-9 for z in zs[:i_floor]), \
+            "step-up %.3f must execute before the floor level" % want
+    climb_after_floor = zs[i_floor + 1:]
+    assert any(abs(z - 36.38) < 1e-9 for z in climb_after_floor)
+    assert any(abs(z - 40.19) < 1e-9 for z in climb_after_floor)
+    # candidates within min_level_gap of an earlier level are dropped
+    assert not any(abs(z - 42.095) < 1e-9 for z in zs)
+    assert all(z <= 60.96 - 0.381 + 1e-9 for z in zs)
+    print("PASS stock links/step-ups: %d candidates" % len(zs))
+
+
+def test_island_clear_fn():
+    """island_clear_fn must return a per-point bool LIST (truthiness of the
+    list itself once hid a clearance bug: `not isl_ok([p])` is always False).
+    Points within `req` of the loop fail, points farther away pass."""
+    from engine.rough import island_clear_fn
+    sq = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]
+    f = island_clear_fn([sq], 2.0)
+    out = f([(5.0, 5.0), (12.05, 5.0), (11.0, 5.0), (5.0, -1.9)])
+    assert isinstance(out, list) and len(out) == 4
+    assert out == [True, True, False, False], out
+    # empty island set -> everything clear
+    g = island_clear_fn([], 2.0)
+    assert all(g([(0.0, 0.0), (99.0, 99.0)]))
+    print("PASS island_clear_fn list semantics")
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
                test_plan_levels_fusion_settings, test_allowance_violation,
-               test_decimate, test_gcode_emit):
+               test_decimate, test_gcode_emit,
+               test_stock_mill_and_region, test_stock_bull_footprint,
+               test_stock_contours, test_stock_links_and_stepups,
+               test_island_clear_fn):
         try:
             fn()
         except AssertionError as e:
