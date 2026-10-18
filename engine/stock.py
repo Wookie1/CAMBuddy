@@ -240,6 +240,40 @@ class StockField:
             return True
         return self.top_at(x, y) <= z_from + eps
 
+    def link_top_max(self, pts, r):
+        """Highest tracked material Z - max(stock top, part surface) - at
+        cell centres within r of the polyline (list of (x, y)). -inf when no
+        material is under the path. Used by roughing to verify rapids/lifts
+        against the LIVE stock model (Task R5)."""
+        top = self.top
+        if self.part is not None:
+            top = np.maximum(top, self.part)
+        c = self.cell
+        k = int(math.ceil(r / c)) + 1
+        mx = -np.inf
+        for (xa, ya), (xb, yb) in zip(pts[:-1], pts[1:]):
+            i0 = max(self._ci(min(xa, xb)) - k, 0)
+            i1 = min(self._ci(max(xa, xb)) + k + 1, self.nx)
+            j0 = max(self._cj(min(ya, yb)) - k, 0)
+            j1 = min(self._cj(max(ya, yb)) + k + 1, self.ny)
+            if i0 >= i1 or j0 >= j1:
+                continue  # segment outside the tracked grid: nothing to see
+            xs = self.x0 + (np.arange(i0, i1) + 0.5) * c
+            ys = self.y0 + (np.arange(j0, j1) + 0.5) * c
+            X, Y = np.meshgrid(xs, ys)
+            abx, aby = xb - xa, yb - ya
+            L2 = abx * abx + aby * aby
+            if L2 < 1e-12:
+                t = np.zeros_like(X)
+            else:
+                t = np.clip(((X - xa) * abx + (Y - ya) * aby) / L2, 0.0, 1.0)
+            dx = X - (xa + t * abx)
+            dy = Y - (ya + t * aby)
+            near = (dx * dx + dy * dy) <= r * r
+            if near.any():
+                mx = max(mx, float(top[j0:j1, i0:i1][near].max()))
+        return mx
+
     # ------------------------------------------------------------- contours
     def contours(self, mask, min_perimeter=4.0, simplify_eps=0.25):
         """Marching squares on the cell-centre grid -> closed loops in world

@@ -748,7 +748,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           tolerance=0.05, keep_tool_down=3.0, stl_path=None, workers=None,
           axial_leave=None, final_zmin=None, allowance_check=True,
           corner_r=0.127, part_hf=None, stock_cell=0.5, stepup=1.905,
-          min_rest=1.0, min_level_area=20.0, progress=None, stock_out=None):
+          min_rest=1.0, min_level_area=20.0, rapid_margin=1.0,
+          progress=None, stock_out=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -768,6 +769,12 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     Links: stay tool-down within/between levels when the stock heightfield
       says the straight link at cutting Z (or Z + lift) is clear; otherwise
       retract to clearance and helix/plunge.
+    rapid_margin: Task R5 - every G0 (retracts, lifts, traverses) is checked
+      against the engine's LIVE stock model (StockField as cut so far, plus
+      the part heightfield): the rapid height must be >= max(stock top, part)
+      within the tool radius along the swept path + rapid_margin (default
+      1.0 mm); emit() raises the height to that verified level when needed
+      (or to the clearance plane), so no rapid can pass through uncut stock.
     allowance_check: HARD post-check per level that no cutter centre at the
       level's Z entered or came within 0.005 mm of that level's forbidden
       island loops, plus the part-heightfield backstop; at the very end an
@@ -811,7 +818,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     order = insert_levels(order, mand)
 
     stats = {"levels": [], "n_regions": 0, "cut_len": 0.0, "plunge_len": 0.0,
-             "rapid_len": 0.0, "t_islands": 0.0, "t_adaptive": 0.0,
+             "rapid_len": 0.0, "n_rapid_bumps": 0,
+             "t_islands": 0.0, "t_adaptive": 0.0,
              "n_retracts": 0, "n_lifts": 0, "n_notclear_links": 0,
              "n_clip_breaks": 0,
              "n_tooldown_links": 0, "levels_planned": [round(z, 3) for z in order],
@@ -849,6 +857,19 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         x0 = mv["x"] if x0 is None else x0
         y0 = mv["y"] if y0 is None else y0
         z0 = mv["z"] if z0 is None else z0
+        if mv["g"] == 0:
+            # R5: every rapid (retract, lift, traverse) is verified against
+            # the LIVE stock model + part: the height must clear max(stock
+            # top, part) within tool_r + rapid_margin along the swept path
+            # by rapid_margin (the radial pad covers heightfield
+            # quantisation - a wall sliver whose cell centres sit just
+            # beyond the tool radius can still stand under the flank);
+            # otherwise lift to that verified height.
+            req = stock.link_top_max([(x0, y0), (mv["x"], mv["y"])],
+                                    tool_r + rapid_margin)
+            if req > -1e8 and mv["z"] < req + rapid_margin:
+                mv = dict(mv, z=round(max(mv["z"], req + rapid_margin), 4))
+                stats["n_rapid_bumps"] += 1
         if (mv.get("x") is not None and mv.get("y") is not None
                 and mv.get("z") is not None
                 and abs(mv["x"] - x0) < 1e-9 and abs(mv["y"] - y0) < 1e-9

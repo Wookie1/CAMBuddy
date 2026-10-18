@@ -740,8 +740,140 @@ def test_rough_synth_pocket_repro():
             "at (%.2f, %.2f) Z=%.3f" % (len(bad), bad[0][0], bad[0][1],
                                         bad[0][2], bad[0][3])
         assert stats.get("clcheck_violations", 0) == 0
-    print("PASS rough synth_pocket repro: %d moves, backstop + clcheck 0"
-          % len(moves))
+        # R5: no rapid may pass through uncut stock (engine's own model)
+        n_bad, worst = _rapids_clear_stock(moves, os.path.join(td, "stock.npy"),
+                                           3.0, 1.0)
+        assert n_bad == 0, "synth_pocket rapids through stock: %d, worst %s" \
+            % (n_bad, worst)
+        assert stats.get("n_rapid_bumps", 0) > 0, \
+            "no rapid heights were lifted by the live-stock check - the " \
+            "R5 verification never engaged"
+    print("PASS rough synth_pocket repro: %d moves, backstop + clcheck 0, "
+          "rapids clear live stock (%d lifted)" % (len(moves), stats.get(
+              "n_rapid_bumps", 0)))
+
+
+def _rapids_clear_stock(moves, stock_npy, tool_r, margin=1.0, pad=1.0):
+    """R5 check with the ENGINE's own stock model (verify/zmap.py is NOT
+    used): every G0 must sit >= margin above max(stock top within
+    tool_r + pad of the swept path) in the final stock heightfield that
+    rough() exported (--stock-out). The final model is a LOWER bound on the
+    live model at emit time (stock only shrinks), so a violation here means
+    the rapid definitely passed through material that was never cut.
+    Returns (n_violations, worst_desc)."""
+    import json
+    import numpy as np
+    A = np.load(stock_npy)
+    with open(os.path.splitext(stock_npy)[0] + ".json") as fh:
+        meta = json.load(fh)
+    x0, y0, cell = meta["x0"], meta["y0"], meta["cell"]
+    ny, nx = A.shape
+    xs = x0 + (np.arange(nx) + 0.5) * cell
+    ys = y0 + (np.arange(ny) + 0.5) * cell
+    R = tool_r + pad
+    k = int(math.ceil(R / cell))
+    prev = (moves[0]["x"], moves[0]["y"], moves[0]["z"])
+    n_bad = 0
+    worst = None
+    for mv in moves:
+        cur = (mv.get("x", prev[0]), mv.get("y", prev[1]), mv.get("z", prev[2]))
+        if mv["g"] == 0:
+            L = math.hypot(cur[0] - prev[0], cur[1] - prev[1])
+            n = max(1, int(L / (0.5 * cell)) + 1)
+            for t in range(1, n + 1):          # skip start: validated before
+                sx = prev[0] + (cur[0] - prev[0]) * t / n
+                sy = prev[1] + (cur[1] - prev[1]) * t / n
+                i0 = int(math.floor((sx - x0) / cell))
+                j0 = int(math.floor((sy - y0) / cell))
+                ilo, ihi = max(0, i0 - k), min(nx, i0 + k + 1)
+                jlo, jhi = max(0, j0 - k), min(ny, j0 + k + 1)
+                if ilo >= ihi or jlo >= jhi:
+                    continue                   # outside tracked grid
+                win = A[jlo:jhi, ilo:ihi]
+                d = np.hypot(xs[ilo:ihi][None, :] - sx,
+                            ys[jlo:jhi][:, None] - sy)
+                m = (d <= R) & np.isfinite(win)
+                if not m.any():
+                    continue
+                mx = float(win[m].max())
+                if cur[2] < mx + margin - 1e-3:
+                    n_bad += 1
+                    desc = ("(%s) (%.3f, %.3f) Z%.3f over stock %.3f"
+                          % (mv.get("line", "?"), sx, sy, cur[2], mx))
+                    if worst is None or (mx + margin - cur[2]) > worst[1]:
+                        worst = (desc, mx + margin - cur[2])
+        prev = cur
+    return n_bad, (worst[0] if worst else None)
+
+
+def _two_level_stl(path, half=14.0, z_hi=8.0, z_lo=5.0):
+    """ASCII STL: block +-half x, +-half y, 0..z_hi with the half y<0 milled
+    down to a shelf at z_lo (single step wall at y=0) - two machining
+    levels, so roughing links must climb over the step."""
+    h, t, s = half, z_hi, z_lo
+
+    def quad(a, b, c, d):
+        return [(a, b, c), (a, c, d)]
+
+    tris = []
+    tris += quad((-h, -h, 0), (-h, h, 0), (h, h, 0), (h, -h, 0))   # bottom
+    tris += quad((h, -h, 0), (h, h, 0), (h, h, t), (h, -h, t))     # +X wall
+    tris += quad((-h, -h, 0), (-h, -h, t), (-h, h, t), (-h, h, 0))  # -X wall
+    tris += quad((-h, h, 0), (-h, h, t), (h, h, t), (h, h, 0))     # +Y wall
+    tris += quad((-h, -h, 0), (-h, -h, s), (h, -h, s), (h, -h, 0))  # -Y wall
+    tris += quad((-h, -h, s), (-h, 0, s), (h, 0, s), (h, -h, s))   # shelf
+    tris += quad((-h, 0, s), (-h, h, t), (h, h, t), (h, 0, s))      # top
+    tris += quad((-h, 0, s), (-h, 0, t), (-h, h, t), (-h, h, s))    # -X step
+    tris += quad((h, 0, s), (h, 0, t), (h, h, t), (h, h, s))        # +X step
+    tris += quad((-h, 0, s), (-h, 0, t), (h, 0, t), (h, 0, s))      # step
+    with open(path, "w") as fh:
+        fh.write("solid two_level\n")
+        for a, b, c in tris:
+            fh.write(" facet normal 0 0 0\n  outer loop\n")
+            for p in (a, b, c):
+                fh.write("   vertex %.4f %.4f %.4f\n" % p)
+            fh.write("  endloop\n endfacet\n")
+        fh.write("endsolid two_level\n")
+    return path
+
+
+def test_rough_rapids_clear_stock():
+    """R5: roughing rapids must clear the LIVE stock. Two-level synthetic
+    part (shelf 5 / top 8): the step stands above the lower level's lift
+    plane, so straight-over-it traverses must be lifted to a verified
+    height; no G0 may sit within margin of uncut stock (engine's own
+    --stock-out heightfield as the check, no verify/zmap import)."""
+    if not HAVE_AREA:
+        print("SKIP rough_rapids_clear_stock (no area)")
+        return
+    import tempfile
+    from opencamlib import ocl
+    from engine.rough import rough, actual_cutter
+    from engine.probe_rough_clcheck import clcheck_moves
+    with tempfile.TemporaryDirectory() as td:
+        stl = _two_level_stl(os.path.join(td, "two_level.stl"))
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        moves, stats = rough(surf, (-14.2, 14.2, -14.2, 14.2, -1.0, 8.0),
+                            3.0, 5.0, leave=0.381, axial_leave=0.381,
+                            stepdown=4.0, stepup=1.905, stepover=2.0 / 6.0,
+                            tolerance=0.05, threads=4, stock_cell=0.5,
+                            min_rest=0.5, corner_r=0.0, stl_path=stl,
+                            stock_out=os.path.join(td, "stock.npy"))
+        assert moves, "no moves"
+        bad = clcheck_moves(surf, actual_cutter(3.0), moves, 0.381, ss=0.1,
+                           tol=0.005)
+        assert not bad, "two-level clcheck: %d violations, worst move %d" % (
+            len(bad), bad[0][0] if bad else -1)
+        assert stats.get("n_rapid_bumps", 0) > 0, \
+            "step-up/lift rapids never verified against the step - no " \
+            "height was lifted"
+        n_bad, worst = _rapids_clear_stock(moves, os.path.join(td, "stock.npy"),
+                                           3.0, 1.0)
+        assert n_bad == 0, "two-level rapids through stock: %d, worst %s" \
+            % (n_bad, worst)
+    print("PASS rough rapids clear stock: two-level %d moves, %d rapids "
+          "lifted to verified heights" % (len(moves), stats["n_rapid_bumps"]))
 
 
 def _main():
@@ -754,7 +886,7 @@ def _main():
                test_island_clear_fn, test_allowance_violation_containment,
                test_rough_without_hf_safe, test_rough_testblock_r2,
                test_islands_grid_edge_parity, test_rough_pocket_in_block,
-               test_rough_synth_pocket_repro):
+               test_rough_synth_pocket_repro, test_rough_rapids_clear_stock):
         try:
             fn()
         except AssertionError as e:
