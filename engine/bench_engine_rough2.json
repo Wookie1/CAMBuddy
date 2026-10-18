@@ -1,0 +1,184 @@
+{
+  "comparison": "engine mesh roughing round 6 (ours, Task F: Fusion-matched adaptive settings + flat-area levels + hard allowance check) vs Fusion OVERALL ROUGHING",
+  "common": {
+    "tool": {
+      "type": "bull",
+      "dia_mm": 12.7,
+      "corner_mm": 0.127,
+      "flute_mm": 25.4
+    },
+    "part_heightfield": "out/core_front_setup_hf.npy",
+    "cell_mm": 0.5,
+    "stock_box": [
+      -128.651,
+      128.651,
+      -82.55,
+      82.55,
+      0.0,
+      60.96
+    ],
+    "zmap": "verify/zmap.py two-pass prefix-stock chunking (--jobs 8), --flute 25.4 (over-flute moves: tip > flute below the material surface at that XY before the move)"
+  },
+  "ours": {
+    "gcode": "out/core_front_roughF.ngc",
+    "gouges": {
+      "count": 0,
+      "max_depth": 0.0,
+      "worst_xy": null
+    },
+    "rapid_collisions": 0,
+    "rapid_collision_first_line": null,
+    "over_flute_moves": {
+      "count": 0,
+      "flute_mm": 25.4,
+      "first_line": null
+    },
+    "leftover_mm": {
+      "mean": 2.786,
+      "p95": 14.116,
+      "max": 35.462
+    },
+    "within_0p5mm_fraction": 0.7654,
+    "cutting_length_mm": 135908.6,
+    "cutting_length_by_5mm_zband_mm": {
+      "20-25": 19133.0,
+      "25-30": 952.4,
+      "30-35": 29.0,
+      "35-40": 42669.0,
+      "40-45": 71725.7,
+      "45-50": 423.0,
+      "50-55": 501.2,
+      "55-60": 367.2,
+      "60-65": 108.3
+    },
+    "air_fraction_vs_stock_sim": 0.1837,
+    "cycle_time_s": 2967.1,
+    "op": "engine.cli rough (ocl AdaptiveWaterline islands per Z level + area.Adaptive2d clearing, levels parallel in fork pool, hard radial-allowance post-check)",
+    "params": {
+      "stepdown_mm": 19.05,
+      "start_depth_mm": 60.96,
+      "final_depth_mm": 24.95,
+      "optimal_load_mm": 2.03,
+      "stepover_factor": 0.15984,
+      "radial_stock_to_leave_mm": 0.381,
+      "axial_leave_mm_flat_levels": 0.381,
+      "final_floor_choice": "matched Fusion ZMIN 24.95 (0.185 mm above the 24.765 floor) instead of floor + 0.381 axial leave (25.146): ZMIN 24.95 is closer to what Fusion actually cuts",
+      "levels_planned": [
+        42.841,
+        41.91,
+        40.291,
+        39.601,
+        35.301,
+        24.95
+      ],
+      "cut_feed_mm_min": 3429.0,
+      "plunge_feed_mm_min": 1270.0,
+      "adaptive_tolerance_mm": 0.05,
+      "waterline_sampling_mm": 0.1,
+      "keepToolDownDistRatio": 3.0
+    },
+    "plunge_length_mm": 8266.2,
+    "rapid_length_mm": 86221.3,
+    "n_levels_planned": 6,
+    "n_regions_total": 16,
+    "n_retracts_to_clearance": 19,
+    "n_linkclear_lifts": 3365,
+    "n_notclear_links": 3,
+    "plan_time_s": 116.4,
+    "outside_part_footprint_cutting": {
+      "cutting_length_mm": 135908.6,
+      "outside_part_footprint_mm": 18547.4,
+      "outside_part_footprint_percent": 13.6
+    }
+  },
+  "fusion": {
+    "gcode": "out/fusion_rough.ngc",
+    "gouges": {
+      "count": 0,
+      "max_depth": 0.0,
+      "worst_xy": null
+    },
+    "rapid_collisions": 0,
+    "rapid_collision_first_line": null,
+    "over_flute_moves": {
+      "count": 0,
+      "flute_mm": 25.4,
+      "first_line": null
+    },
+    "leftover_mm": {
+      "mean": 1.084,
+      "p95": 5.268,
+      "max": 37.448
+    },
+    "within_0p5mm_fraction": 0.5722,
+    "cutting_length_mm": 48543.2,
+    "cutting_length_by_5mm_zband_mm": {
+      "20-25": 15876.5,
+      "25-30": 194.5,
+      "30-35": 44.3,
+      "35-40": 2637.4,
+      "40-45": 25502.7,
+      "45-50": 3507.2,
+      "50-55": 297.3,
+      "55-60": 297.3,
+      "60-65": 185.8
+    },
+    "air_fraction_vs_stock_sim": 0.0994,
+    "cycle_time_s": 1050.7,
+    "op": "OVERALL ROUGHING, T3 D=0.5in CR=0.005in bullnose, S7500 (lines 1-40321 of reference/1001.nc, G20)",
+    "params_settings": {
+      "max_stepdown_mm": 19.05,
+      "optimal_load_mm": 2.03,
+      "stock_to_leave_mm": 0.381,
+      "zmin_mm": 24.95
+    },
+    "levels_measured_from_gcode": [
+      47.62,
+      45.72,
+      43.81,
+      41.91,
+      40.0,
+      38.1,
+      36.2,
+      24.95
+    ],
+    "outside_part_footprint_cutting": {
+      "cutting_length_mm": 47865.2,
+      "outside_part_footprint_mm": 6725.5,
+      "outside_part_footprint_percent": 14.1
+    }
+  },
+  "time_gap_analysis": {
+    "ours_cycle_s": 2967.1,
+    "fusion_cycle_s": 1050.7,
+    "ratio": 2.82,
+    "top3_reasons_from_data": [
+      {
+        "rank": 1,
+        "reason": "intermediate levels re-machine the whole open box: 4 extra full-area levels between stock top and the floor",
+        "data": "ours cuts 135909 mm vs Fusion 48543 mm (2.8x). The floor band tells the story: 20-25 mm ours 19133 vs Fusion 15876 mm (comparable - one full-area drop to the floor does the job), but bands 35-40 + 40-45: ours 114395 mm vs Fusion 28140 mm - our levels 41.91/40.291/39.601/35.301 each re-traverse the whole stock rectangle (~42481 mm^2/level) that is already open; with MAX stepdown 19.05 the floor could be dropped in one step from ~44. zmap stock-sim air cutting 18.4% vs Fusion 9.9%. (Cutting outside the final-part footprint is NOT the issue: ours 13.6% vs Fusion 14.1%.)"
+      },
+      {
+        "rank": 2,
+        "reason": "retract/link moves between regions and levels",
+        "data": "ours: 19 retracts to clearance (Z62.96) + 3365 lift-links (z+1.9 with re-plunge at ramp feed) + 3 notclear links; rapid path 86221 mm vs Fusion 20416 mm (345 s at 15000 mm/min vs 82 s)."
+      },
+      {
+        "rank": 3,
+        "reason": "region order: every region entered via full retract + XY traverse + helix/plunge at ramp feed",
+        "data": "ours 16 regions across 6 levels ([42.841, 41.91, 40.291, 39.601, 35.301, 24.95]); every region entry = retract to Z62.96, XY rapid, then helix/plunge at ramp feed (8266 mm plunge length = 391 s at 1270 mm/min, 244 s more). Fusion's measured program (8 major levels, [47.62, 45.72, 43.81, 41.91, 40.0, 38.1, 36.2, 24.95]) keeps far more passes tool-down between levels."
+      }
+    ]
+  },
+  "allowance_check_note": {
+    "round5_failure": "0.3 mm radial allowance lost near (26.2, 6.65) at Z 41.96 (centre 6.277 mm vs intended 6.65)",
+    "fix": "waterline sampling 0.5->0.1 mm (min 0.02), loop decimate 0.1->0.05, Adaptive2d tolerance 0.1->0.05, plus HARD post-check in engine/rough.py: every CL point at a level's Z must stay >= tool_r + radial_leave - 0.02 from that level's island loops (run aborted with location otherwise; also covered by engine/test_engine.py)",
+    "result": "this run passed the hard check at all 6 levels"
+  },
+  "notes": [
+    "Ours leaves ~0.381 mm on walls by design (radial leave) plus a 0.05 mm waterline cutter-radius margin; floor left = 0.185 mm (final level matched to Fusion ZMIN 24.95).",
+    "Fusion's op settings say MAX stepdown 19.05 mm, but its posted program machines a ~1.905 mm level grid from 47.62 down to ~32.4 plus flat-area drops and one big step to ZMIN 24.95 - see fusion.levels_measured_from_gcode.",
+    "Cycle times: feed moves at their F words, rapids assumed 15000 mm/min.",
+    "Fusion roughing section carries no G41/G42; wear-model sim is exact for this split."
+  ]
+}

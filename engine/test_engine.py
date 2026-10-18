@@ -32,7 +32,8 @@ except ImportError:
         pass
     HAVE_AREA = False
 
-from engine.rough import plan_levels, rect_loop, decimate  # noqa: E402
+from engine.rough import (plan_levels, rect_loop, decimate,  # noqa: E402
+                          allowance_violation)
 from engine.gcode import moves_to_gcode  # noqa: E402
 
 
@@ -111,6 +112,12 @@ def test_adaptive2d_offset_convention():
     # the ring between boss+clearance and stock edge is actually cleared:
     # outermost pass hugs the edge, innermost hugs the boss
     assert max(boss_d) >= off + 1.0, "ring not cleared outward"
+    # HARD allowance post-check (the same one engine/rough.py runs per level):
+    # every cutting centre must stay >= tool_r + leave - 0.02 from the island
+    viol = allowance_violation(cut, [island], r, leave)
+    assert viol is None, \
+        "allowance post-check: centre (%.3f, %.3f) is %.4f mm from the boss "\
+        "loop, need >= %.4f" % (viol[0], viol[1], viol[2], off - 0.02)
     print("PASS adaptive2d convention: boss clearance %.4f == tool_r+leave "
           "%.2f, stock edge reach %.4f" % (min(boss_d), off, min(edge_d)))
 
@@ -122,6 +129,49 @@ def test_plan_levels():
     assert all(zs[i] - zs[i + 1] <= 1.9 + 1e-9 for i in range(len(zs) - 1))
     assert zs[0] < 60.96  # level flush with stock top removed (cuts nothing)
     print("PASS plan_levels: %d levels %.3f..%.3f" % (len(zs), zs[0], zs[-1]))
+
+
+def test_plan_levels_fusion_settings():
+    """Task F: stepdown 19.05, axial leave, explicit final ZMIN matching
+    Fusion, flat-area levels at floor + axial leave."""
+    floors = [42.463, 42.545, 39.908, 39.224, 34.925, 24.765]
+    zs = plan_levels(60.96, 24.765, 0.381, 19.05, flat_floors=floors,
+                    axial_leave=0.381, final_zmin=24.95)
+    assert abs(zs[-1] - 24.95) < 1e-9, "final level must match Fusion ZMIN"
+    assert all(zs[i] > zs[i + 1] for i in range(len(zs) - 1))
+    assert all(zs[i] - zs[i + 1] <= 19.05 + 1e-9 for i in range(len(zs) - 1))
+    assert zs[0] < 60.96
+    # flat floors add levels at floor + axial leave
+    for want in (42.926, 40.289, 39.605, 35.306):
+        assert any(abs(z - want) < 1e-9 for z in zs), \
+            "flat-area level %.3f missing: %r" % (want, zs)
+    # redundant candidates dropped: main-floor 25.146 within min gap of the
+    # final level, and 42.545+0.381 within min gap of 42.926
+    assert not any(abs(z - 25.146) < 1e-9 for z in zs)
+    assert not any(abs(z - 42.545 + 0.381) < 1e-9 and
+                   abs(z - 42.926) > 1e-9 for z in zs)
+    assert all(zs[i] - zs[i + 1] >= 0.5 - 1e-9 for i in range(len(zs) - 1))
+    print("PASS plan_levels fusion settings: levels %r" % (zs,))
+
+
+def test_allowance_violation():
+    """Hard post-check: flag CL centres closer than tool_r + leave - 0.02 to
+    an island loop (the round-5 failure lost 0.37 mm near a tall feature)."""
+    tool_r, leave = 3.0, 0.5
+    island = [[10.0, 10.0], [20.0, 10.0], [20.0, 20.0], [10.0, 20.0]]
+    ok = [(6.5, 15.0), (23.5, 15.0), (15.0, 6.5), (15.0, 23.5),
+          (0.0, 0.0), (30.0, 30.0), (6.52, 10.0)]
+    assert allowance_violation(ok, [island], tool_r, leave) is None
+    bad = [(23.4, 15.0)]  # 0.1 mm inside the required 3.48 mm envelope
+    v = allowance_violation(bad, [island], tool_r, leave)
+    assert v is not None and abs(v[2] - 3.4) < 1e-9, "missed violation: %r" % (v,)
+    assert abs(v[0] - 23.4) < 1e-9 and abs(v[1] - 15.0) < 1e-9
+    # round-5 style: centre 6.277 from material vs intended 6.65
+    big = [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]]
+    v2 = allowance_violation([(6.277, 50.0)], [big], 6.35, 0.3)
+    assert v2 is not None and abs(v2[2] - 6.277) < 1e-9
+    assert allowance_violation([(6.63, 50.0)], [big], 6.35, 0.3) is None
+    print("PASS allowance_violation")
 
 
 def test_decimate():
@@ -149,6 +199,7 @@ def test_gcode_emit():
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
+               test_plan_levels_fusion_settings, test_allowance_violation,
                test_decimate, test_gcode_emit):
         try:
             fn()

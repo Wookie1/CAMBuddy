@@ -1,5 +1,5 @@
 """CLI: python -m engine.cli rough --step S --stock xmin xmax ymin ymax zmin zmax
-          --tool bull:12.7:0.127 --out F [--floor 24.8] [--leave 0.3]
+          --tool bull:12.7:0.127 --out F [--floor 24.765] [--leave 0.381]
 
 Runs with VibeCAD python (opencamlib + area)."""
 import argparse
@@ -30,27 +30,78 @@ def main(argv=None):
     r.add_argument("--tool", required=True,
                    help="bull:DIA:CORNER | flat:DIA | ball:DIA")
     r.add_argument("--out", required=True, help="output .ngc file")
-    r.add_argument("--floor", type=float, default=24.8,
-                   help="main floor Z; last level = floor + leave")
-    r.add_argument("--leave", type=float, default=0.3)
-    r.add_argument("--stepdown", type=float, default=1.9)
-    r.add_argument("--stepover", type=float, default=15.0,
-                   help="percent of tool diameter")
+    r.add_argument("--floor", type=float, default=24.765,
+                   help="main floor Z; last level = floor + axial leave")
+    r.add_argument("--leave", type=float, default=0.381,
+                   help="radial stock to leave mm")
+    r.add_argument("--axial-leave", dest="axial_leave", type=float, default=None,
+                   help="axial leave mm (default: --leave); used for the final "
+                        "level and flat-area levels")
+    r.add_argument("--final-zmin", dest="final_zmin", type=float, default=None,
+                   help="explicit final level tip Z (overrides floor+axial "
+                        "leave; e.g. 24.95 to match Fusion's ZMIN)")
+    r.add_argument("--stepdown", type=float, default=19.05)
+    r.add_argument("--stepover", type=float, default=None,
+                   help="percent of tool diameter (ignored if "
+                        "--optimal-load-mm given)")
+    r.add_argument("--optimal-load-mm", dest="optimal_load_mm", type=float,
+                   default=2.03,
+                   help="adaptive optimal load mm -> stepover = load / dia")
+    r.add_argument("--hf", default=None,
+                   help="part heightfield .npy (+ .json sidecar) for flat-area "
+                        "level detection")
+    r.add_argument("--flat-min-area", dest="flat_min_area", type=float,
+                   default=200.0,
+                   help="min flat-floor area mm^2 for a flat-area level")
+    r.add_argument("--no-flat-levels", dest="flat_levels", action="store_false",
+                   default=True, help="disable flat-area levels")
     r.add_argument("--cut-feed", dest="cut_feed", type=float, default=3429.0)
     r.add_argument("--ramp-feed", dest="ramp_feed", type=float, default=1270.0)
     r.add_argument("--spindle", type=int, default=7500)
     r.add_argument("--workers", type=int, default=None,
                    help="parallel level workers (default os.cpu_count()-2)")
-    r.add_argument("--tolerance", type=float, default=0.1,
+    r.add_argument("--tolerance", type=float, default=0.05,
                    help="Adaptive2d path tolerance mm")
+    r.add_argument("--wl-sampling", dest="wl_sampling", type=float, default=0.1,
+                   help="waterline sampling mm")
     r.add_argument("--stats-json", dest="stats_json", default=None)
     a = p.parse_args(argv)
 
     kind, dia, corner = parse_tool(a.tool)
+    if a.optimal_load_mm is not None:
+        stepover = a.optimal_load_mm / dia
+    else:
+        stepover = (a.stepover if a.stepover is not None else 15.0) / 100.0
+    axial_leave = a.axial_leave if a.axial_leave is not None else a.leave
     t0 = time.time()
     stl = model.step_to_stl(a.step)
     surf = model.load_surf(stl)
     print("STL %s: %d triangles" % (stl, surf.size()), flush=True)
+
+    flat_floors = []
+    if a.hf and a.flat_levels:
+        import numpy as np
+        part = np.load(a.hf)
+        sidecar = (a.hf[:-4] if a.hf.endswith(".npy") else a.hf) + ".json"
+        with open(sidecar) as fh:
+            meta = json.load(fh)
+        cell = float(meta["cell"])
+        z_lo = (a.final_zmin if a.final_zmin is not None
+                else a.floor + axial_leave)
+        z_hi = float(np.nanmax(part))
+        flat_floors = roughmod.find_flat_floors(part, cell,
+                                                float(meta["x0"]),
+                                                float(meta["y0"]),
+                                                tuple(a.stock), z_lo, z_hi,
+                                                min_area_mm2=a.flat_min_area)
+        print("flat floors (%.0f mm^2 min, %.3f < Z < %.3f): %s"
+              % (a.flat_min_area, z_lo, z_hi, flat_floors), flush=True)
+
+    levels = roughmod.plan_levels(a.stock[5], a.floor, a.leave, a.stepdown,
+                                 flat_floors=flat_floors,
+                                 axial_leave=axial_leave,
+                                 final_zmin=a.final_zmin)
+    print("levels (%d): %s" % (len(levels), levels), flush=True)
 
     def prog(zi, z, islands, nreg, stats):
         print("level %2d Z=%7.3f islands=%2d regions=%d (wl %.1fs a2d %.1fs)"
@@ -60,10 +111,13 @@ def main(argv=None):
     workers = a.workers if a.workers is not None else max(1, os.cpu_count() - 2)
     moves, stats = roughmod.rough(surf, tuple(a.stock), dia / 2.0, a.floor,
                                   leave=a.leave, stepdown=a.stepdown,
-                                  stepover=a.stepover / 100.0,
+                                  stepover=stepover,
                                   cut_feed=a.cut_feed, ramp_feed=a.ramp_feed,
-                                  tolerance=a.tolerance, stl_path=stl,
-                                  workers=workers, progress=prog)
+                                  tolerance=a.tolerance,
+                                  wl_sampling=a.wl_sampling, stl_path=stl,
+                                  workers=workers, axial_leave=axial_leave,
+                                  flat_floors=flat_floors,
+                                  final_zmin=a.final_zmin, progress=prog)
     text = moves_to_gcode(moves, spindle_rpm=a.spindle,
                           tool_comment="T1 %s D=%.3f CR=%.3f" % (kind, dia, corner))
     with open(a.out, "w") as fh:

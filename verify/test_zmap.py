@@ -409,6 +409,55 @@ G0 Z5.
     assert np.array_equal(par["stock"], seq["stock"])
 
 
+def test_over_flute_flag_and_zband_lengths():
+    """--flute: cutting moves whose tip is deeper than flute below the local
+    stock surface (at that XY) are counted with the first line; default off.
+    cutting_length_by_zband splits cutting length into 5 mm tip-Z bands."""
+    part = np.full((N, N), 0.0)  # no part: isolates the flute/band metrics
+    sb = (-25.0, 25.0, -25.0, 25.0, 0.0, 40.0)
+    gcode = """
+G21 G90 F500
+G0 X-10. Y0. Z50.
+G1 Z10. F100.
+G1 X10. F500.
+G0 Z50.
+G1 X-10. Y5. Z8. F100.
+G1 X10. Y5. F500.
+"""
+    moves = zmap.parse_gcode(gcode)
+    res = zmap.simulate(moves, part, CELL, X0, Y0, sb, tool="flat", dia=6.0,
+                       flute=25.0)
+    # line 4 plunge 50->10 into surface 40 (depth 30 > 25), line 5 traverse
+    # at Z10 through still-40 material (30), the diagonal plunge ending at
+    # Z8 and the y=5 traverse at Z8 (32): all over-flute = 4 moves
+    assert res["over_flute"]["count"] == 4
+    assert res["over_flute"]["first_line"] == 4
+    assert res["over_flute"]["flute_mm"] == 25.0
+    off = zmap.simulate(moves, part, CELL, X0, Y0, sb, tool="flat", dia=6.0)
+    assert off["over_flute"] is None
+    # a floor cut riding its own groove is NOT over-flute: the y=0 strip was
+    # cut to Z10 above, so a Z9 re-pass there sees surface 10 (depth 1)
+    res2 = zmap.simulate(zmap.parse_gcode(gcode + """
+G0 Z50.
+G1 X-10. Y0. Z9. F100.
+G1 X10. Y0. F500.
+"""), part, CELL, X0, Y0, sb, tool="flat", dia=6.0, flute=25.0)
+    assert res2["over_flute"]["count"] == 4  # no new flags: depth 1 < 25
+
+    zb = res["cutting_length_by_zband"]
+    assert abs(sum(zb.values()) - res["cutting_length_mm"]) < 0.5
+    assert zb.get("30-35", 0.0) >= 39.0  # the 40 mm plunge, mid-Z 30
+    assert zb.get("10-15", 0.0) >= 19.0  # traverse at Z10
+    assert zb.get("5-10", 0.0) >= 19.0   # traverse at Z8
+
+    par = zmap.simulate_parallel(moves, part, CELL, X0, Y0, sb, 2,
+                                tool="flat", dia=6.0, flute=25.0)
+    assert par["over_flute"]["count"] == 4
+    assert par["over_flute"]["first_line"] == 4
+    assert abs(sum(par["cutting_length_by_zband"].values())
+               - sum(zb.values())) < 0.5
+
+
 def test_cutter_comp_reporting():
     """G41/G42 moves are counted and reported; G40 line is not comp-active."""
     part = np.full((N, N), 10.0)

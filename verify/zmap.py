@@ -558,7 +558,7 @@ def apply_cutter_comp(moves, radius):
 
 def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
              corner=0.0, stock_init=None, window=None, rapid_feed=RAPID_FEED,
-             start=None):
+             start=None, flute=None):
     """Run the toolpath over a stock heightfield.
 
     part      : (ny, nx) array of part top-Z heights
@@ -575,6 +575,11 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     start     : optional (x, y, z) machine position before the first move;
                 used by chunked parallel sims so a chunk's first move starts
                 from the previous chunk's end instead of its own target.
+    flute     : optional flute length mm; when set, count cutting moves whose
+                tip goes more than this below the material surface under the
+                move's start/end XY before the move (plunges/ramps/traverses
+                into material deeper than the flutes: reach/evacuation
+                problem). Reported as count + first line.
     Returns dict with 'stock' array and report fields.
     """
     sxmin, sxmax, symin, symax, szmin, szmax = stock_box
@@ -642,6 +647,9 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     rapid_length = 0.0
     air_length = 0.0
     cycle_s = 0.0
+    over_flute = 0
+    first_over_flute_line = None
+    zbands = {}
     comp_moves = 0
     comp_first_line = None
     comp_last_line = None
@@ -665,6 +673,19 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         samples, length = _move_samples(m, cur, cell)
         cutting = mv["motion"] in ("G1", "G2", "G3")
         move_collided = False
+        move_over_flute = False
+        if cutting and flute is not None:
+            # material surface under the move's start/end XY as it stands
+            # BEFORE this move cuts (the footprint leads the centre by R, so
+            # mid-move readings would hide true plunge/ramp engagement)
+            zmin_m = min(cur[2], z1)
+            for (px, py) in ((cur[0], cur[1]), (x1, y1)):
+                pi = int(math.floor((px - x0) / cell))
+                pj = int(math.floor((py - y0) / cell))
+                if 0 <= pi < nx and 0 <= pj < ny:
+                    s0 = float(stock[pj, pi])
+                    if np.isfinite(s0) and s0 - zmin_m > flute + 1e-9:
+                        move_over_flute = True
         seg_len = length / max(1, len(samples))
         for (sx, sy, sz) in samples:
             if near is not None:
@@ -718,6 +739,13 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     move_collided = True
         if cutting:
             cut_length += length
+            lo = int(math.floor(0.5 * (cur[2] + z1) / 5.0)) * 5
+            lbl = "%d-%d" % (lo, lo + 5)
+            zbands[lbl] = zbands.get(lbl, 0.0) + length
+            if flute is not None and move_over_flute:
+                over_flute += 1
+                if first_over_flute_line is None:
+                    first_over_flute_line = mv["line"]
             feed = mv.get("f")
             cycle_s += length / (feed if feed and feed > 0 else rapid_feed) * 60.0
         else:  # rapid
@@ -733,8 +761,13 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         "stock": stock,
         "rapid_collisions": {"count": rapid_collisions,
                             "first_line": first_rapid_line},
+        "over_flute": ({"count": over_flute, "flute_mm": flute,
+                        "first_line": first_over_flute_line}
+                       if flute is not None else None),
         "air_fraction": (air_length / cut_length) if cut_length > 0 else 0.0,
         "cutting_length_mm": cut_length,
+        "cutting_length_by_zband": {k: round(v, 1)
+                                    for k, v in sorted(zbands.items())},
         "rapid_length_mm": rapid_length,
         "cycle_time_s": cycle_s,
         "cutter_comp": {"active_moves": comp_moves,
@@ -774,12 +807,12 @@ def _chunk_worker(idx):
                     corner=g["corner"],
                     stock_init=g["stock_init_per"][idx],
                     window=g["window"], rapid_feed=g["rapid_feed"],
-                    start=g["start_per"][idx])
+                    start=g["start_per"][idx], flute=g["flute"])
 
 
 def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                       dia=6.0, corner=0.0, stock_init=None, window=None,
-                      rapid_feed=RAPID_FEED):
+                      rapid_feed=RAPID_FEED, flute=None):
     import multiprocessing as mp
     moves = resolve_moves(moves)
     spans, n = [], len(moves)
@@ -789,7 +822,7 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
     _CHUNK.update(moves=moves, spans=spans, part=part, cell=cell, x0=x0,
                   y0=y0,
                   stock_box=stock_box, tool=tool, dia=dia, corner=corner,
-                  window=window, rapid_feed=rapid_feed)
+                  window=window, rapid_feed=rapid_feed, flute=flute)
     # true machine position at each chunk start = end of the previous chunk's
     # last move (chunks must not simulate their first move from its own target)
     start_per = []
@@ -826,11 +859,24 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                              default=None),
             "note": "exact under --jobs (two-pass prefix stock + chunk starts)",
         },
+        "over_flute": (
+            {"count": sum(r["over_flute"]["count"] for r in results),
+             "flute_mm": flute,
+             "first_line": min((r["over_flute"]["first_line"]
+                               for r in results
+                               if r["over_flute"]["first_line"]), default=None)}
+            if flute is not None else None),
         "air_fraction": 0.0,
         "cutting_length_mm": sum(r["cutting_length_mm"] for r in results),
         "rapid_length_mm": sum(r["rapid_length_mm"] for r in results),
         "cycle_time_s": sum(r["cycle_time_s"] for r in results),
     }
+    zbands = {}
+    for r in results:
+        for k, v in r["cutting_length_by_zband"].items():
+            zbands[k] = zbands.get(k, 0.0) + v
+    combined["cutting_length_by_zband"] = {k: round(v, 1)
+                                           for k, v in sorted(zbands.items())}
     cut = sum(r["cutting_length_mm"] for r in results)
     # recompute air from chunk air fractions (air = fraction * chunk cut len)
     air = sum(r["air_fraction"] * r["cutting_length_mm"] for r in results)
@@ -958,6 +1004,10 @@ def main(argv=None):
     p.add_argument("--jobs", type=int, default=1,
                    help="parallel worker processes (results identical to "
                         "serial: prefix stock + chunk start states)")
+    p.add_argument("--flute", type=float, default=None,
+                  help="flute length mm: when set, report cutting moves whose "
+                       "tip is more than this deep below the local stock "
+                       "surface at that XY (count + first line). Default off.")
     args = p.parse_args(argv)
 
     if args.stock is None and not args.stock_in:
@@ -993,12 +1043,13 @@ def main(argv=None):
         res = simulate_parallel(moves, part, cell, x0, y0, stock_box,
                                args.jobs, tool=args.tool, dia=args.dia,
                                corner=args.corner, stock_init=stock_init,
-                               window=window, rapid_feed=args.rapid_feed)
+                               window=window, rapid_feed=args.rapid_feed,
+                               flute=args.flute)
     else:
         res = simulate(moves, part, cell, x0, y0, stock_box,
                        tool=args.tool, dia=args.dia, corner=args.corner,
                        stock_init=stock_init, window=window,
-                       rapid_feed=args.rapid_feed)
+                       rapid_feed=args.rapid_feed, flute=args.flute)
 
     report = {
         "gcode": os.path.abspath(args.gcode),
@@ -1012,10 +1063,12 @@ def main(argv=None):
         "leftover": res["leftover"],
         "within_0p5mm_fraction": res["within_0p5mm_fraction"],
         "rapid_collisions": res["rapid_collisions"],
+        "over_flute": res["over_flute"],
         "cutter_comp": res["cutter_comp"],
         "comp_radius_mm": args.comp_radius,
         "air_fraction": res["air_fraction"],
         "cutting_length_mm": round(res["cutting_length_mm"], 1),
+        "cutting_length_by_zband_mm": res["cutting_length_by_zband"],
         "rapid_length_mm": round(res["rapid_length_mm"], 1),
         "cycle_time_s": round(res["cycle_time_s"], 1),
         "cycle_time_note": ("feed moves at their F words; rapids assumed at "

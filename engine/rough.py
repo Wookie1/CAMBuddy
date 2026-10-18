@@ -40,7 +40,7 @@ def decimate(pts, min_d):
     return out
 
 
-def waterline_islands(surf, z, radius, sampling=0.5, min_sampling=0.05,
+def waterline_islands(surf, z, radius, sampling=0.1, min_sampling=0.02,
                      threads=None, min_perimeter=20.0):
     """Cutter-centre forbidden loops (islands) for a cylinder of `radius`
     with its bottom at Z = z, against the part surface."""
@@ -56,7 +56,7 @@ def waterline_islands(surf, z, radius, sampling=0.5, min_sampling=0.05,
     wl.run()
     loops = []
     for loop in wl.getLoops():
-        pts = decimate([(p.x, p.y) for p in loop], 0.1)
+        pts = decimate([(p.x, p.y) for p in loop], 0.05)
         if len(pts) < 3:
             continue
         per = sum(math.dist(pts[i], pts[(i + 1) % len(pts)])
@@ -67,9 +67,20 @@ def waterline_islands(surf, z, radius, sampling=0.5, min_sampling=0.05,
     return loops
 
 
-def plan_levels(stock_zmax, floor_z, leave, stepdown):
-    """Z levels (tip depths) top-down; last level = floor_z + leave."""
-    final = floor_z + leave
+def plan_levels(stock_zmax, floor_z, leave, stepdown, flat_floors=None,
+               axial_leave=None, final_zmin=None, min_level_gap=0.5):
+    """Z levels (tip depths) top-down.
+
+    Last level = final_zmin when given, else floor_z + axial_leave (axial
+    leave defaults to the radial `leave`). Flat-area detection (Fusion-like):
+    each flat floor F of the part adds a level at F + axial_leave, kept only
+    when it sits at least `min_level_gap` below every other level (so it is
+    neither redundant with the final level nor a duplicate of a neighbouring
+    flat) and stays below the stock top (a level at/above the stock top cuts
+    nothing).
+    """
+    axl = leave if axial_leave is None else axial_leave
+    final = final_zmin if final_zmin is not None else floor_z + axl
     zs = []
     z = stock_zmax
     while z > final + 1e-9:
@@ -79,7 +90,104 @@ def plan_levels(stock_zmax, floor_z, leave, stepdown):
     # first level at stock top removes nothing (tip flush with stock surface)
     if len(zs) > 1 and zs[0] >= stock_zmax - 1e-9:
         zs = zs[1:]
-    return zs
+    flat_lvls = []
+    for f in sorted(flat_floors or [], reverse=True):
+        lvl = round(f + axl, 4)
+        if lvl <= final + min_level_gap or lvl >= stock_zmax - 1e-9:
+            continue
+        if all(abs(lvl - k) >= min_level_gap for k in zs + flat_lvls):
+            flat_lvls.append(lvl)
+    return sorted(set(zs) | set(flat_lvls), reverse=True)
+
+
+def find_flat_floors(part, cell, x0, y0, stock_box, z_lo, z_hi,
+                     min_area_mm2=200.0):
+    """Z heights of large flat floors in the part heightfield within
+    (z_lo, z_hi): connected cell areas (0.01 mm Z bins, 4-connected, inside
+    the stock box) of at least min_area_mm2. Like Fusion's flat-area
+    detection for adaptive roughing."""
+    import numpy as np
+    from collections import deque
+    ny, nx = part.shape
+    sxmin, sxmax, symin, symax, _, _ = stock_box
+    xs = x0 + (np.arange(nx) + 0.5) * cell
+    ys = y0 + (np.arange(ny) + 0.5) * cell
+    inb = ((xs >= sxmin) & (xs <= sxmax))[None, :] & \
+          ((ys >= symin) & (ys <= symax))[:, None]
+    fin = np.isfinite(part)
+    q = np.where(fin, np.round(part * 100.0), -10 ** 9).astype(np.int64)
+    min_cells = int(math.ceil(min_area_mm2 / (cell * cell)))
+    lo_q, hi_q = int(round(z_lo * 100)), int(round(z_hi * 100))
+    counts = np.bincount(q[inb & fin].ravel())
+    vals = np.nonzero(counts >= min_cells)[0]
+    vals = vals[(vals > lo_q) & (vals < hi_q)]
+    floors = []
+    for v in vals:
+        mask = (q == v) & inb
+        cells = {tuple(c) for c in np.argwhere(mask)}
+        found = False
+        while cells and not found:
+            seed = cells.pop()
+            n_comp = 1
+            dq = deque([seed])
+            while dq:
+                j, i = dq.popleft()
+                for nb in ((j + 1, i), (j - 1, i), (j, i + 1), (j, i - 1)):
+                    if nb in cells:
+                        cells.discard(nb)
+                        n_comp += 1
+                        dq.append(nb)
+            if n_comp >= min_cells:
+                found = True
+        if found:
+            floors.append(v / 100.0)
+    return sorted(floors, reverse=True)
+
+
+def _pt_seg_dist_np(P, A, B):
+    """(N,2) points vs (M,2) segment ends A,B -> (N,M) point-segment dist."""
+    import numpy as np
+    AB = B - A
+    AP = P[:, None, :] - A[None, :, :]
+    L2 = np.maximum((AB * AB).sum(axis=1)[None, :], 1e-12)
+    t = np.clip((AP * AB[None, :, :]).sum(axis=2) / L2, 0.0, 1.0)
+    d = AP - t[:, :, None] * AB[None, :, :]
+    return np.sqrt((d * d).sum(axis=2))
+
+
+def allowance_violation(points, islands, tool_r, leave, tol=0.02):
+    """HARD post-check for one level: every cutter centre cutting at this
+    level's Z must stay >= tool_r + leave - tol from that level's island
+    loops (the round-5 failure lost 0.37 mm of radial allowance). Returns
+    (x, y, dist) of the closest-to-material offender, else None."""
+    import numpy as np
+    req = tool_r + leave - tol
+    if not points or not islands:
+        return None
+    P = np.asarray(points, dtype=float)
+    worst = None
+    for lp in islands:
+        L = np.asarray(lp, dtype=float)
+        if len(L) < 3:
+            continue
+        A = L
+        B = np.roll(L, -1, axis=0)
+        dbox = np.maximum.reduce([
+            L[:, 0].min() - P[:, 0], P[:, 0] - L[:, 0].max(),
+            L[:, 1].min() - P[:, 1], P[:, 1] - L[:, 1].max(),
+            np.zeros(len(P))])
+        cand = np.nonzero(dbox < req)[0]
+        if cand.size == 0:
+            continue
+        for s in range(0, cand.size, 512):
+            blk = P[cand[s:s + 512]]
+            d = _pt_seg_dist_np(blk, A, B).min(axis=1)
+            k = int(np.argmin(d))
+            if worst is None or d[k] < worst[2]:
+                worst = (float(blk[k, 0]), float(blk[k, 1]), float(d[k]))
+    if worst is not None and worst[2] < req - 1e-9:
+        return worst
+    return None
 
 
 def _helix_moves(cx, cy, sx, sy, z_top, z_bot, feed):
@@ -174,17 +282,23 @@ def _level_worker(idx):
             "t_wl": t_wl, "t_a2d": time.time() - t0}
 
 
-def rough(surf, stock_box, tool_r, floor_z, leave=0.3, stepdown=1.9,
-          stepover=0.15, cut_feed=3429.0, ramp_feed=1270.0,
-          clearance_z=None, lift=1.9, wl_sampling=0.5, threads=8,
-          tolerance=0.1, keep_tool_down=3.0, stl_path=None, workers=None,
-          progress=None):
+def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
+          stepover=0.16, cut_feed=3429.0, ramp_feed=1270.0,
+          clearance_z=None, lift=1.9, wl_sampling=0.1, threads=8,
+          tolerance=0.05, keep_tool_down=3.0, stl_path=None, workers=None,
+          axial_leave=None, flat_floors=None, final_zmin=None,
+          allowance_check=True, progress=None):
     """Plan the roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
     stock_box: (xmin,xmax,ymin,ymax,zmin,zmax) of the raw stock.
+    flat_floors: flat floor Z heights (Fusion-style flat-area detection) that
+    add intermediate levels; final_zmin overrides the final level depth.
     workers>1 with stl_path: run waterline+Adaptive2d per level in a fork
     pool (levels are independent); output levels stay ordered top-down.
+    allowance_check: HARD post-check per level that no cutter centre at the
+    level's Z came closer than tool_r + leave - 0.02 to that level's island
+    loops; raises RuntimeError with the location on violation.
     """
     sxmin, sxmax, symin, symax, szmin, szmax = stock_box
     if clearance_z is None:
@@ -194,9 +308,13 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.3, stepdown=1.9,
                       sxmax + a2d_offset, symax + a2d_offset)
     wl_rho = 0.05                       # near-zero cutter radius: silhouette
 
-    levels = plan_levels(szmax, floor_z, leave, stepdown)
+    levels = plan_levels(szmax, floor_z, leave, stepdown,
+                        flat_floors=flat_floors, axial_leave=axial_leave,
+                        final_zmin=final_zmin)
     stats = {"levels": [], "n_regions": 0, "cut_len": 0.0, "plunge_len": 0.0,
-             "rapid_len": 0.0, "t_waterline": 0.0, "t_adaptive": 0.0}
+             "rapid_len": 0.0, "t_waterline": 0.0, "t_adaptive": 0.0,
+             "n_retracts": 0, "n_lifts": 0, "n_notclear_links": 0,
+             "levels_planned": [round(z, 3) for z in levels]}
 
     if workers and workers > 1 and stl_path:
         if workers is True:
@@ -240,6 +358,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.3, stepdown=1.9,
         length = math.dist((x0, y0, z0), (mv["x"], mv["y"], mv["z"]))
         if mv["g"] == 0:
             stats["rapid_len"] += length
+            if abs(mv["z"] - clearance_z) < 1e-9 and abs(z0 - mv["z"]) > 1e-6:
+                stats["n_retracts"] += 1
         elif abs(mv["z"] - z0) > 1e-6:
             stats["plunge_len"] += length
         else:
@@ -251,6 +371,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.3, stepdown=1.9,
         stats["t_waterline"] += t_wl
         stats["t_adaptive"] += t_a2d
         nreg = 0
+        level_pts = []  # cutter centres cutting at this level's Z
         for res in regions:
             nreg += 1
             sp = res["start"]
@@ -271,16 +392,21 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.3, stepdown=1.9,
                 for hv in _helix_moves(hc[0], hc[1], sp[0], sp[1], z_top, z,
                                        ramp_feed):
                     emit(hv)
+                    if abs(hv["z"] - z) < 1e-6:
+                        level_pts.append((hv["x"], hv["y"]))
             else:
                 emit({"g": 1, "x": sp[0], "y": sp[1], "z": z,
                       "f": ramp_feed})
+                level_pts.append((sp[0], sp[1]))
             # paths
             for (kind, pts) in res["paths"]:
                 if kind == "cutting":
                     for (x, y) in pts:
                         emit({"g": 1, "x": round(x, 4), "y": round(y, 4),
                               "z": z, "f": cut_feed})
+                        level_pts.append((round(x, 4), round(y, 4)))
                 elif kind == "linkclear":
+                    stats["n_lifts"] += 1
                     emit({"g": 0, "x": prev[0], "y": prev[1], "z": z + lift})
                     for (x, y) in pts[:-1]:
                         emit({"g": 0, "x": round(x, 4), "y": round(y, 4),
@@ -289,15 +415,27 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.3, stepdown=1.9,
                           "y": round(pts[-1][1], 4), "z": z + lift})
                     emit({"g": 1, "x": round(pts[-1][0], 4),
                           "y": round(pts[-1][1], 4), "z": z, "f": ramp_feed})
+                    level_pts.append((round(pts[-1][0], 4),
+                                     round(pts[-1][1], 4)))
                 else:  # notclear -> clear of everything, re-plunge at end
+                    stats["n_notclear_links"] += 1
                     emit({"g": 0, "x": prev[0], "y": prev[1],
                           "z": clearance_z})
                     for (x, y) in pts:
                         emit({"g": 0, "x": round(x, 4), "y": round(y, 4),
                               "z": clearance_z})
+        if allowance_check:
+            viol = allowance_violation(level_pts, islands, tool_r, leave)
+            if viol:
+                raise RuntimeError(
+                    "lost allowance at level Z=%.3f: CL point (%.3f, %.3f) is "
+                    "%.3f mm from an island loop, need >= %.3f "
+                    "(tool_r %.3f + leave %.3f - 0.02)"
+                    % (z, viol[0], viol[1], viol[2],
+                     tool_r + leave - 0.02, tool_r, leave))
         emit({"g": 0, "x": prev[0], "y": prev[1], "z": clearance_z})
         stats["levels"].append({"z": round(z, 3), "n_islands": len(islands),
-                                 "n_regions": nreg,
+                                 "n_regions": nreg, "n_cl_pts": len(level_pts),
                                  "t_waterline_s": round(t_wl, 1),
                                  "t_adaptive_s": round(t_a2d, 1)})
         stats["n_regions"] += nreg
