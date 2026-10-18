@@ -307,12 +307,29 @@ def level_islands(surf, cutter_big, Zg, xs, ys, z, axl, threads=None):
     # touching NaN must stay valid for marching - unlike finish's dilated
     # cl_grid, this grid is not pre-grown past the contour of interest.
     mlvl = lvl + 1e-6
-    circuits = [(P, K, c) for (P, K, c) in
-                _contour_circuits(Zg, xs, ys, mlvl,
-                                 comp=np.ones_like(Zg, dtype=bool))
-                if c and len(P) > 2]
+    allc = _contour_circuits(Zg, xs, ys, mlvl,
+                             comp=np.ones_like(Zg, dtype=bool))
+    circuits = [(P, K, c) for (P, K, c) in allc if c and len(P) > 2]
+    Fm = np.isfinite(Zg) & (Zg > lvl)
+    # R3: if F reaches the CL grid boundary (open circuits, or forbidden cells
+    # on the outermost rows/cols) its outer boundary cannot close inside the
+    # grid. Silently dropping those open circuits flips the even-odd parity of
+    # the island test and ADMITS cutter centres next to pocket walls (the synth
+    # pocket failure: centres at 0.39 mm from the wall instead of >= R +
+    # leave). Close F with a fence rectangle at the grid bounds so parity stays
+    # correct; centres are confined to the stock territory strictly inside the
+    # grid anyway, so the fence never rejects a legitimate centre.
+    edge = bool(Fm[0, :].any() or Fm[-1, :].any() or
+               Fm[:, 0].any() or Fm[:, -1].any())
+    fence = edge or any((not c) and len(P) > 1 for (P, _K, c) in allc)
     if not circuits:
-        return [], np.zeros_like(Zg, dtype=bool)
+        if not fence:
+            return [], Fm
+        # F covers the whole grid (tool too big for the gap): fence alone.
+        rect = [[round(gx, 4), round(gy, 4)] for gx, gy in
+                ((xs[0], ys[0]), (xs[-1], ys[0]),
+                 (xs[-1], ys[-1]), (xs[0], ys[-1]))]
+        return [rect], Fm
     tagged = [(mlvl, np.asarray(P, dtype=float), K, True)
               for (P, K, _c) in circuits]
     pitch = float(xs[1] - xs[0])
@@ -331,7 +348,11 @@ def level_islands(surf, cutter_big, Zg, xs, ys, z, axl, threads=None):
             continue
         forbidden.append([[round(x, 4), round(y, 4)] for (x, y) in pts])
     forbidden = _ccw(forbidden)
-    Fm = np.isfinite(Zg) & (Zg > lvl)
+    if fence:
+        rect = [[round(gx, 4), round(gy, 4)] for gx, gy in
+                ((xs[0], ys[0]), (xs[-1], ys[0]),
+                 (xs[-1], ys[-1]), (xs[0], ys[-1]))]
+        forbidden.append(rect)   # CCW, encloses every refined loop
     return forbidden, Fm
 
 

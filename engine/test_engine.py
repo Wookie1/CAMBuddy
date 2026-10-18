@@ -555,6 +555,195 @@ def test_rough_testblock_r2():
               % (len(moves), med - 27.0, len(pts_near), worst))
 
 
+def _pocket_block_stl(path, half=14.0, ztop=8.0, pk_half=8.0, pk_floor=4.0):
+    """ASCII STL: block +-half x, +-half y, 0..ztop with an open-top square
+    pocket +-pk_half down to pk_floor (28 triangles, synth_pocket shape)."""
+    h, t, w, f = half, ztop, pk_half, pk_floor
+
+    def quad(a, b, c, d):
+        return [(a, b, c), (a, c, d)]
+
+    tris = []
+    tris += quad((-h, -h, 0), (-h, h, 0), (h, h, 0), (h, -h, 0))       # bottom
+    tris += quad((h, -h, 0), (h, h, 0), (h, h, t), (h, -h, t))         # +X wall
+    tris += quad((-h, -h, 0), (-h, -h, t), (-h, h, t), (-h, h, 0))     # -X wall
+    tris += quad((-h, h, 0), (-h, h, t), (h, h, t), (h, h, 0))         # +Y wall
+    tris += quad((-h, -h, 0), (-h, -h, t), (h, -h, t), (h, -h, 0))     # -Y wall
+    # top ring z=t between +-h and +-w, split into four trapezoids
+    tris += quad((-h, -h, t), (h, -h, t), (w, -w, t), (-w, -w, t))
+    tris += quad((h, -h, t), (h, h, t), (w, w, t), (w, -w, t))
+    tris += quad((h, h, t), (-h, h, t), (-w, w, t), (w, w, t))
+    tris += quad((-h, h, t), (-h, -h, t), (-w, -w, t), (-w, w, t))
+    tris += quad((-w, -w, f), (w, -w, f), (w, w, f), (-w, w, f))       # floor
+    # pocket walls
+    tris += quad((w, -w, f), (w, w, f), (w, w, t), (w, -w, t))
+    tris += quad((-w, -w, f), (-w, -w, t), (-w, w, t), (-w, w, f))
+    tris += quad((-w, w, f), (w, w, f), (w, w, t), (-w, w, t))
+    tris += quad((-w, -w, f), (-w, -w, t), (w, -w, t), (w, -w, f))
+    with open(path, "w") as fh:
+        fh.write("solid pocket_block\n")
+        for a, b, c in tris:
+            fh.write(" facet normal 0 0 0\n  outer loop\n")
+            for p in (a, b, c):
+                fh.write("   vertex %.4f %.4f %.4f\n" % p)
+            fh.write("  endloop\n endfacet\n")
+        fh.write("endsolid pocket_block\n")
+    return path
+
+
+def test_islands_grid_edge_parity():
+    """R3 regression: when the forbidden region F reaches the CL grid border
+    (grid does not cover the outer CL jump), level_islands must still EXCLUDE
+    cutter centres next to the pocket walls - silently dropping the open
+    circuit flipped even-odd parity and admitted them (synth_pocket failure:
+    centre at (-6.4, 23.508), 0.39 mm from the wall, at Z=4.381)."""
+    if not HAVE_AREA:
+        print("SKIP islands_grid_edge_parity (no area)")
+        return
+    import tempfile
+    import numpy as np
+    from opencamlib import ocl
+    from engine.rough import big_cutter, cl_island_grid, level_islands, \
+        _inside_loops
+    with tempfile.TemporaryDirectory() as td:
+        stl = _pocket_block_stl(os.path.join(td, "pb.stl"),
+                                half=14.0, ztop=8.0, pk_half=8.0, pk_floor=4.0)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        assert surf.size() >= 24, "pocket-block STL too small: %d" \
+            % surf.size()
+        cbig = big_cutter(3.0, 0.381)
+        # clipped grid: F's outer border (pk_half + R = 11.381) is outside
+        gxs, gys, Zg = cl_island_grid(surf, cbig, -10.0, -10.0, 10.0, 10.0,
+                                      0.5)
+        isl, Fm = level_islands(surf, cbig, Zg, gxs, gys, 4.381, 0.381)
+        assert isl, "no islands although F touches the clipped grid border"
+        P = np.array([[0.0, 0.0], [0.0, 6.0], [-6.4, 7.5]])
+        ins = _inside_loops(P, isl)
+        assert not ins[0], "pocket centre wrongly forbidden (parity inverted)"
+        assert ins[1:].all(), \
+            "centres 2 mm from the pocket wall admitted at clipped-grid edge"
+        # unclipped grid: F closes inside (outer jump at 14 + R = 17.381),
+        # no fence, parity unchanged
+        gxs, gys, Zg = cl_island_grid(surf, cbig, -18.0, -18.0, 18.0, 18.0,
+                                      0.5)
+        isl2, Fm2 = level_islands(surf, cbig, Zg, gxs, gys, 4.381, 0.381)
+        assert len(isl2) == 2, "unclipped islands: %d loops" % len(isl2)
+        ins = _inside_loops(P, isl2)
+        assert (not ins[0]) and ins[1:].all(), "unclipped parity wrong"
+        print("PASS islands grid-edge parity: clipped %d loops, unclipped "
+              "%d loops" % (len(isl), len(isl2)))
+
+
+def _check_pocket_block(pkl, label):
+    """rough() end-to-end on a pocket-in-block: no backstop/clcheck violation
+    (rough raises on any) and every horizontal cutting centre below the block
+    top sits >= tool_r + leave - 0.02 from the pocket walls."""
+    import numpy as np
+    import tempfile
+    from opencamlib import ocl
+    from engine.rough import rough, actual_cutter
+    from engine.probe_rough_clcheck import clcheck_moves
+    tool_r, leave = 3.0, 0.381
+    req = tool_r + leave - 0.02
+    with tempfile.TemporaryDirectory() as td:
+        stl = _pocket_block_stl(os.path.join(td, "pb.stl"), half=14.0,
+                                ztop=8.0, pk_half=pkl, pk_floor=4.0)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        box = (-14.2, 14.2, -14.2, 14.2, -1.0, 8.4)
+        moves, stats = rough(surf, box, tool_r, 4.0, leave=leave,
+                            axial_leave=leave, stepdown=4.0, stepup=1.905,
+                            stepover=2.0 / 6.0, tolerance=0.05, threads=4,
+                            stock_cell=0.5, min_rest=0.5, corner_r=0.0)
+        assert moves or label == "narrow", "no moves (%s)" % label
+        if not moves:
+            return 0, stats
+        bad = clcheck_moves(surf, actual_cutter(tool_r), moves, leave,
+                            ss=0.1, tol=0.005)
+        assert not bad, "%s clcheck: %d violations, worst move %d at " \
+            "(%.2f, %.2f) Z=%.3f" % (label, len(bad), bad[0][0], bad[0][1],
+                                     bad[0][2], bad[0][3])
+        prev = None
+        n_below = 0
+        for mv in moves:
+            cur = (mv["x"], mv["y"], mv["z"])
+            if prev is not None and mv["g"] == 1 and \
+                    abs(cur[2] - prev[2]) < 1e-9 and cur[2] < 8.0 - 0.02:
+                L = math.dist(prev[:2], cur[:2])
+                k = max(1, int(L / 0.1) + 1)
+                for t in range(1, k + 1):
+                    f = t / k
+                    px = prev[0] + (cur[0] - prev[0]) * f
+                    py = prev[1] + (cur[1] - prev[1]) * f
+                    n_below += 1
+                    assert pkl - max(abs(px), abs(py)) >= req, \
+                        "%s: centre (%.3f, %.3f) at Z=%.3f is %.3f mm from " \
+                        "the pocket wall, need >= %.3f" % (
+                            label, px, py, cur[2],
+                            pkl - max(abs(px), abs(py)), req)
+            prev = cur
+        return n_below, stats
+
+
+def test_rough_pocket_in_block():
+    """R3: synthetic pocket-in-block, wide and narrow pocket.
+    Wide (16 mm): the floor level runs and every cutter centre below the
+    block top keeps >= tool_r + leave from the pocket walls.
+    Narrow (5 mm < tool + 2x leave): the tool can never enter - no cutting
+    centres below the block top at all, and nothing raises the backstop."""
+    if not HAVE_AREA:
+        print("SKIP rough_pocket_in_block (no area)")
+        return
+    n_wide, stats_w = _check_pocket_block(8.0, "wide")
+    assert n_wide > 0, "wide pocket: no cutting below the block top"
+    floor_lvl = [l for l in stats_w["levels"] if l["z"] == 4.381]
+    assert floor_lvl and not floor_lvl[0].get("skipped"), \
+        "wide pocket floor level 4.381 skipped: %s" % stats_w["levels"]
+    n_narrow, _ = _check_pocket_block(2.5, "narrow")
+    assert n_narrow == 0, \
+        "narrow pocket admitted %d centres below the block top" % n_narrow
+    print("PASS rough pocket-in-block: wide %d sub-top centre samples, "
+          "narrow 0 (tool never enters)" % n_wide)
+
+
+def test_rough_synth_pocket_repro():
+    """R3 supervisor repro: connector/testdata/synth_pocket.step with James's
+    data must produce a program with 0 hf-backstop / clcheck violations (the
+    R2 islands admitted (-6.400, 23.508) at Z=4.381, 7.619 mm below the
+    part hf)."""
+    step = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "connector", "testdata",
+        "synth_pocket.step")
+    if not (HAVE_AREA and os.path.exists(step)):
+        print("SKIP rough_synth_pocket_repro (no area or synth_pocket.step)")
+        return
+    import tempfile
+    from opencamlib import ocl
+    from engine import model
+    from engine.rough import rough, actual_cutter
+    from engine.probe_rough_clcheck import clcheck_moves
+    stl = model.step_to_stl(step)
+    surf = ocl.STLSurf()
+    ocl.STLReader(stl, surf)
+    with tempfile.TemporaryDirectory() as td:
+        moves, stats = rough(surf, (-31.0, 31.0, -31.0, 31.0, -1.0, 12.4),
+                            3.0, 3.0, leave=0.381, axial_leave=0.381,
+                            stepdown=4.0, stepup=1.905, stepover=2.0 / 6.0,
+                            tolerance=0.05, threads=4, stock_cell=0.5,
+                            min_rest=0.5, corner_r=0.0, stl_path=stl,
+                            stock_out=os.path.join(td, "stock.npy"))
+        assert moves, "no moves"
+        bad = clcheck_moves(surf, actual_cutter(3.0), moves, 0.381, ss=0.1,
+                           tol=0.005)
+        assert not bad, "synth_pocket clcheck: %d violations, worst move %d " \
+            "at (%.2f, %.2f) Z=%.3f" % (len(bad), bad[0][0], bad[0][1],
+                                        bad[0][2], bad[0][3])
+        assert stats.get("clcheck_violations", 0) == 0
+    print("PASS rough synth_pocket repro: %d moves, backstop + clcheck 0"
+          % len(moves))
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -563,7 +752,9 @@ def _main():
                test_stock_mill_and_region, test_stock_bull_footprint,
                test_stock_contours, test_stock_links_and_stepups,
                test_island_clear_fn, test_allowance_violation_containment,
-               test_rough_without_hf_safe, test_rough_testblock_r2):
+               test_rough_without_hf_safe, test_rough_testblock_r2,
+               test_islands_grid_edge_parity, test_rough_pocket_in_block,
+               test_rough_synth_pocket_repro):
         try:
             fn()
         except AssertionError as e:
