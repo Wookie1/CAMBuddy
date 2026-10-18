@@ -219,7 +219,8 @@ def main(argv=None):
     r.add_argument("--hf", default=None,
                   help="part heightfield .npy (+ .json sidecar): clips step-up "
                        "levels to where remaining stock above the part is "
-                       "> --min-rest mm")
+                       "> --min-rest mm. When omitted the engine rasterises it "
+                       "itself from the STEP (same clips always apply).")
     r.add_argument("--min-rest", dest="min_rest", type=float, default=1.0,
                   help="min remaining stock above the part mm for a cell to "
                        "stay in a level's region")
@@ -240,7 +241,8 @@ def main(argv=None):
     r.add_argument("--tolerance", type=float, default=0.05,
                   help="Adaptive2d path tolerance mm")
     r.add_argument("--wl-sampling", dest="wl_sampling", type=float, default=0.1,
-                  help="waterline sampling mm")
+                  help="(legacy, unused: R2 islands come from a drop-cutter "
+                       "CL grid, no waterlines)")
     r.add_argument("--stats-json", dest="stats_json", default=None)
     r.add_argument("--stock-out", dest="stock_out", default=None,
                    help="write the engine's final stock heightfield to this "
@@ -404,9 +406,9 @@ def main(argv=None):
     def prog(zi, z, islands, nreg, stats):
         lvl = next(l for l in reversed(stats["levels"]) if l["z"] == round(z, 3))
         print("level %2d Z=%7.3f area=%8.1f mm^2 islands=%2d regions=%d"
-              " (wl %.1fs a2d %.1fs)"
+              " (isl %.1fs a2d %.1fs)"
               % (zi, z, lvl.get("region_mm2", 0.0), len(islands), nreg,
-                 stats["t_waterline"], stats["t_adaptive"]), flush=True)
+                 stats["t_islands"], stats["t_adaptive"]), flush=True)
         if a.json_progress:
             print(json.dumps({
                 "progress": round(0.05 + 0.9 * zi / max(1, len(order)), 3),

@@ -168,10 +168,12 @@ def test_allowance_violation():
     assert v is not None and abs(v[2] - 3.4) < 1e-9, "missed violation: %r" % (v,)
     assert abs(v[0] - 23.4) < 1e-9 and abs(v[1] - 15.0) < 1e-9
     # round-5 style: centre 6.277 from material vs intended 6.65
+    # (R1: points must be OUTSIDE the loop - inside is a containment
+    # violation, covered by test_allowance_violation_containment)
     big = [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]]
-    v2 = allowance_violation([(6.277, 50.0)], [big], 6.35, 0.3)
+    v2 = allowance_violation([(-6.277, 50.0)], [big], 6.35, 0.3)
     assert v2 is not None and abs(v2[2] - 6.277) < 1e-9
-    assert allowance_violation([(6.63, 50.0)], [big], 6.35, 0.3) is None
+    assert allowance_violation([(-6.63, 50.0)], [big], 6.35, 0.3) is None
     print("PASS allowance_violation")
 
 
@@ -298,17 +300,259 @@ def test_stock_links_and_stepups():
 def test_island_clear_fn():
     """island_clear_fn must return a per-point bool LIST (truthiness of the
     list itself once hid a clearance bug: `not isl_ok([p])` is always False).
-    Points within `req` of the loop fail, points farther away pass."""
+    Points within `req` of the loop fail, points farther away pass, and
+    points INSIDE an island loop always fail (R1: distance-only checks let
+    centres deep inside a loop through - the no-hf gouge)."""
     from engine.rough import island_clear_fn
     sq = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]
     f = island_clear_fn([sq], 2.0)
     out = f([(5.0, 5.0), (12.05, 5.0), (11.0, 5.0), (5.0, -1.9)])
     assert isinstance(out, list) and len(out) == 4
-    assert out == [True, True, False, False], out
+    assert out == [False, True, False, False], out   # (5,5) is inside: fail
+    # far outside passes
+    assert f([(20.0, 5.0)]) == [True]
     # empty island set -> everything clear
     g = island_clear_fn([], 2.0)
     assert all(g([(0.0, 0.0), (99.0, 99.0)]))
-    print("PASS island_clear_fn list semantics")
+    print("PASS island_clear_fn list semantics + containment")
+
+
+def test_allowance_violation_containment():
+    """R1: allowance_violation must flag centres INSIDE an island loop even
+    when they are far from the loop line (the original blind spot)."""
+    big = [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]]
+    v = allowance_violation([(50.0, 50.0)], [big], 3.0, 0.5)
+    assert v is not None and v[2] == 0.0, \
+        "centre inside island loop not flagged: %r" % (v,)
+    assert allowance_violation([(105.0, 50.0)], [big], 3.0, 0.5) is None
+    print("PASS allowance_violation containment")
+
+
+# ------------------------------------------- R1: rough without --hf is safe
+def _box_tris(x0, x1, y0, y1, z0, z1):
+    v = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+         (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
+    f = [(0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7),
+         (0, 1, 5), (0, 5, 4), (1, 2, 6), (1, 6, 5),
+         (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7)]
+    return [(v[a], v[b], v[c]) for a, b, c in f]
+
+
+def _write_stl(path, tris):
+    with open(path, "w") as fh:
+        fh.write("solid s\n")
+        for (p, q, r) in tris:
+            fh.write(" facet normal 0 0 0\n  outer loop\n")
+            for v in (p, q, r):
+                fh.write("   vertex %.4f %.4f %.4f\n" % v)
+            fh.write("  endloop\n endfacet\n")
+        fh.write("endsolid s\n")
+
+
+def test_rough_without_hf_safe():
+    """R1 supervisor bug: `rough` WITHOUT --hf gouged the part (no part
+    heightfield -> stock.part None -> every pz/min_rest clip and the
+    island punch-out silently degraded, and with the small feature's
+    waterline loop below min_perimeter the island post-check was blind).
+    Synthetic slab + small tall boss (loop perimeter < 20 mm): roughing
+    without hf must produce ZERO gouges under the engine's own drop-cutter
+    and output identical to passing --hf explicitly."""
+    if not HAVE_AREA:
+        print("SKIP test_rough_without_hf_safe (no area module)")
+        return
+    import tempfile
+    from opencamlib import ocl
+    from engine.rough import rough, build_part_hf
+    tris = _box_tris(-15.0, 15.0, -10.0, 10.0, 0.0, 8.0)
+    tris += _box_tris(-2.0, 2.0, -2.0, 2.0, 8.0, 20.0)
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "slab_boss.stl")
+        _write_stl(stl, tris)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        assert surf.size() == 24
+        stock_box = (-16.0, 16.0, -11.0, 11.0, 0.0, 21.0)
+        kw = dict(leave=0.381, axial_leave=0.381, stepdown=8.0, stepup=1.5,
+                  stl_path=stl, workers=None, threads=1, stock_cell=0.5)
+        moves_no, _ = rough(surf, stock_box, 3.175, 0.0, **kw)
+        sf = StockField(stock_box, cell=0.5)
+        hf = build_part_hf(surf, sf.x0, sf.y0, sf.cell, sf.nx, sf.ny,
+                           threads=1, drop_z=-1.0)
+        moves_hf, _ = rough(surf, stock_box, 3.175, 0.0,
+                            part_hf=(hf, sf.x0, sf.y0, sf.cell), **kw)
+        assert moves_no and len(moves_no) == len(moves_hf), \
+            "no-hf output differs in length from --hf output"
+        assert moves_no == moves_hf, "no-hf output differs from --hf output"
+        # gouge check with the engine's own drop-cutter (ocl), not verify/zmap
+        xs, ys, zs = [], [], []
+        prev = None
+        for mv in moves_no:
+            cur = (mv["x"], mv["y"], mv["z"])
+            if prev is not None and mv["g"] == 1:
+                n = max(1, int(math.dist(prev[:2], cur[:2]) / 0.5) + 1)
+                for t in range(1, n + 1):
+                    f = t / n
+                    xs.append(prev[0] + (cur[0] - prev[0]) * f)
+                    ys.append(prev[1] + (cur[1] - prev[1]) * f)
+                    zs.append(prev[2] + (cur[2] - prev[2]) * f)
+            prev = cur
+        cl = [None] * len(xs)
+        CH = 4000
+        for a in range(0, len(xs), CH):
+            bd = ocl.BatchDropCutter()
+            bd.setSTL(surf)
+            bd.setCutter(ocl.CylCutter(3.175, 50.0))
+            for i in range(a, min(a + CH, len(xs))):
+                bd.appendPoint(ocl.CLPoint(float(xs[i]), float(ys[i]), -50.0))
+            bd.run()
+            cl[a:a + CH] = [p.z for p in bd.getCLPoints()]
+        worst = max(c - z for c, z in zip(cl, zs))
+        assert worst <= 0.05, \
+            "no-hf roughing gouges %.3f mm below the part" % worst
+        print("PASS rough without hf: %d moves identical to --hf, "
+              "drop-cutter worst %.3f mm (no gouge)" % (len(moves_no), worst))
+
+
+# ------------------------------------------- R2: drop-cutter islands, clcheck
+TB_STL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      "out", "test_block.stl")
+TB_HF = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "out", "test_block_hf_0.5.npy")
+
+
+def test_rough_testblock_r2():
+    """R2 (safety-critical) on samples/test_block with James's cutting data:
+    * rough CLCHECK gate: actual-cutter drop-cutter on every cutting move
+      (sampled <= 0.1 mm) -> tip must stay >= CL + axial_leave - 0.005
+      (this also proves 0 gouges, axl 0 being the weaker check);
+    * the mandatory flat-floor level Z27 + leave = 27.381 is present and
+      runs, and the engine stock model shows that pocket floor ending
+      0.381 +- 0.02 mm high;
+    * regression for the fillet-meets-vertical-corner point (-17.56, 13.87)
+      where the old OCL-waterline islands let the level-29.906 path run
+      3.72 mm below CL: leave must be honoured there too."""
+    if not (HAVE_AREA and os.path.exists(TB_STL) and os.path.exists(TB_HF)):
+        print("SKIP test_rough_testblock_r2 (no area or out/test_block.*)")
+        return
+    import tempfile
+    import json as _json
+    import numpy as np
+    from opencamlib import ocl
+    from engine.rough import rough, actual_cutter
+    from engine.probe_rough_clcheck import clcheck_moves
+    surf = ocl.STLSurf()
+    ocl.STLReader(TB_STL, surf)
+    part = np.load(TB_HF)
+    with open(TB_HF[:-4] + ".json") as fh:
+        meta = _json.load(fh)
+    hx0, hy0, hcell = float(meta["x0"]), float(meta["y0"]), float(meta["cell"])
+    stock_box = (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0)
+    kw = dict(leave=0.381, axial_leave=0.381, stepdown=19.05, stepover=0.16,
+              stl_path=TB_STL, workers=None, threads=4, stock_cell=0.5,
+              final_zmin=20.381, part_hf=(part, hx0, hy0, hcell))
+    with tempfile.TemporaryDirectory() as td:
+        stock_out = os.path.join(td, "stock.npy")
+        moves, stats = rough(surf, stock_box, 6.343, 20.0,
+                            stock_out=stock_out, **kw)
+        assert moves, "no moves"
+        # 1. independent CLCHECK gate: 0 violations with leave, and the
+        # weaker axl=0 check proves zero gouges.
+        cutter = actual_cutter(6.343)
+        viol = clcheck_moves(surf, cutter, moves, 0.381, ss=0.1, tol=0.005)
+        assert not viol, "rough clcheck: %d violations, worst move %d at " \
+            "(%.2f, %.2f) Z=%.3f, %.3f mm below CL + axl" % (
+                len(viol), viol[0][0], viol[0][1], viol[0][2], viol[0][3],
+                viol[0][4])
+        gouge = clcheck_moves(surf, cutter, moves, 0.0, ss=0.1, tol=0.005)
+        assert not gouge, "gouges: %d samples below CL, worst move %d at " \
+            "(%.2f, %.2f) Z=%.3f, %.3f mm below CL" % (
+                len(gouge), gouge[0][0], gouge[0][1], gouge[0][2],
+                gouge[0][3], gouge[0][4])
+        # 2. mandatory Z27 pocket level present, ran, and floor ends 0.381
+        lvl27 = [l for l in stats["levels"] if l["z"] == 27.381]
+        assert lvl27 and not lvl27[0].get("skipped"), \
+            "Z27 pocket level 27.381 missing or skipped: %s" % stats["levels"]
+        assert 27.381 in [round(z, 3) for z in stats.get(
+            "mandatory_levels", [])], "27.381 not flagged mandatory"
+        st = np.load(stock_out)
+        with open(stock_out[:-4] + ".json") as fh:
+            sm = _json.load(fh)
+        sx0, sy0, scell = float(sm["x0"]), float(sm["y0"]), float(sm["cell"])
+        pj, pi = np.nonzero(np.abs(part - 27.0) < 0.01)
+        # plateau-27 cells the tool can actually reach at 27.381: no taller
+        # part (frame/boss > 27.01) within tool_r + leave + one cell, and
+        # >= tool_r + leave from the stock walls - there the floor must be
+        # flat at level Z; nearer the walls the corner band is rest material.
+        tall = (part > 27.01) & np.isfinite(part)
+        reach = int(math.ceil((6.343 + 0.381 + 0.5) / hcell))
+        offs = [(dj, di) for dj in range(-reach, reach + 1)
+                for di in range(-reach, reach + 1)
+                if (dj * dj + di * di) * hcell * hcell
+                <= (6.343 + 0.381 + 0.5) ** 2]
+        near_tall = np.zeros_like(tall)
+        for dj, di in offs:
+            js0, js1 = max(0, dj), min(part.shape[0], part.shape[0] + dj)
+            is0, is1 = max(0, di), min(part.shape[1], part.shape[1] + di)
+            near_tall[js0:js1, is0:is1] |= \
+                tall[js0 - dj:js1 - dj, is0 - di:is1 - di]
+        ok = []
+        for j, i in zip(pj, pi):
+            if near_tall[j, i]:
+                continue
+            x = hx0 + i * hcell
+            y = hy0 + j * hcell
+            if not (sx0 + 6.724 <= x <= sx0 + st.shape[1] * scell - 6.724
+                    and sy0 + 6.724 <= y <= sy0 + st.shape[0] * scell - 6.724):
+                continue
+            si = int(round((x - sx0) / scell))
+            sj = int(round((y - sy0) / scell))
+            if 0 <= si < st.shape[1] and 0 <= sj < st.shape[0]:
+                ok.append(st[sj, si])
+        assert ok, "no plateau-27 interior cells found"
+        med = float(np.median(ok))
+        assert abs(med - 27.381) <= 0.02, \
+            "Z27 pocket floor ends %.3f high (want 0.381 +- 0.02)" % (med - 27.0)
+        assert min(ok) >= 27.381 - 0.02, \
+            "Z27 pocket floor cut %.3f mm BELOW leave" % (27.381 - min(ok))
+        # 3. fillet-meets-vertical-corner regression at (-17.56, 13.87):
+        # the OLD waterline islands let the level-29.906 path put a cutter
+        # CENTRE there (G-code line 20741), tip 3.72 mm below the true CL
+        # (33.626). Now every horizontal cutting centre within 0.5 mm of
+        # that XY must have its tip >= CL(centre) + axial_leave - 0.005
+        # (and with CL ~33.6 here, that means no centre at all below 34.0).
+        rx, ry = -17.56, 13.87
+        pts_near = []
+        prev = None
+        for mv in moves:
+            cur = (mv["x"], mv["y"], mv["z"])
+            if prev is not None and mv["g"] == 1 and \
+                    abs(cur[2] - prev[2]) < 1e-9:   # horizontal cutting only
+                L = math.dist(prev[:2], cur[:2])
+                k = max(1, int(L / 0.1) + 1)
+                for t in range(1, k + 1):
+                    f = t / k
+                    px = prev[0] + (cur[0] - prev[0]) * f
+                    py = prev[1] + (cur[1] - prev[1]) * f
+                    if math.dist((px, py), (rx, ry)) <= 0.5:
+                        pts_near.append((px, py, cur[2]))
+            prev = cur
+        worst = -1e9
+        if pts_near:
+            bd = ocl.BatchDropCutter()
+            bd.setSTL(surf)
+            bd.setCutter(cutter)
+            for px, py, _z in pts_near:
+                bd.appendPoint(ocl.CLPoint(px, py, -50.0))
+            bd.run()
+            for p, (_px, _py, z) in zip(bd.getCLPoints(), pts_near):
+                worst = max(worst, float(p.z) + 0.381 - z)
+        assert worst <= 0.005, \
+            "leave violated near (-17.56, 13.87): %.3f mm below CL + axl " \
+            "(%d centres nearby)" % (worst, len(pts_near))
+        print("PASS rough test-block R2: %d moves, clcheck 0, floor Z27 "
+              "ends %.3f high, corner regression: %d centres near "
+              "(-17.56, 13.87), worst %.3f mm vs CL + axl"
+              % (len(moves), med - 27.0, len(pts_near), worst))
 
 
 def _main():
@@ -318,7 +562,8 @@ def _main():
                test_decimate, test_gcode_emit,
                test_stock_mill_and_region, test_stock_bull_footprint,
                test_stock_contours, test_stock_links_and_stepups,
-               test_island_clear_fn):
+               test_island_clear_fn, test_allowance_violation_containment,
+               test_rough_without_hf_safe, test_rough_testblock_r2):
         try:
             fn()
         except AssertionError as e:
