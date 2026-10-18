@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Finish tests (task S1). Pure OCL on generated STLs, no FreeCAD. Run with
-VibeCAD python:
+"""Finish tests (tasks S1 + S2 PLAN B). Pure OCL on generated STLs, no
+FreeCAD. Run with VibeCAD python:
     /Applications/VibeCAD.app/Contents/Resources/bin/python engine/test_finish.py
 (also pytest-compatible).
 
-Three synthetic parts, each finished with a 6 mm ball (shallow raster
-stepover 0.3 / steep waterline stepdown 0.3, threshold 40 deg) and verified
-with zmap at a 0.1 mm heightfield:
+Synthetic parts, each finished with a 6 mm ball (shallow raster stepover
+0.3 / steep stepdown 0.3, threshold 40 deg) and verified with zmap at a
+0.1 mm heightfield:
   1. hemisphere on a plate        - shallow dome cap + steep sides
   2. 60-degree cone on a plate    - all wall is steep, apex shallow-free
   3. vertical-walled boss with a slot narrower than the ball (4 mm < 6 mm)
      - the case that made VibeCAD's SteepShallow gouge (DIAG_steepshallow):
        the ball must ride the slot edges, never below the true CL.
-Gouges MUST be 0 on all three; % of surface left > 0.05 mm per slope zone
-is reported (and asserted for the shallow zones of cases 1-2).
+  4. plate-at-floor: boss whose plate top equals the requested floor Z
+     (S1d item 3) - the degenerate coplanar waterline case.
+Gouges MUST be 0 on all four; % of surface left > 0.05 mm per slope zone
+is reported (and asserted for the shallow zones of cases 1-2). Every output
+additionally gets the exact one-sided CL check of engine/probe_clcheck.py
+(every cutting move sampled at 0.25 mm, BallCutter(6) drop-cutter): MUST
+report 0 points below CL by > 0.005 mm. PLAN B unit checks: refined
+marching-squares contours vs analytic CL radii (hemisphere, cone), and a
+gap-split whose link is verified clear.
 """
 import math
 import os
@@ -31,7 +38,9 @@ import numpy as np  # noqa: E402
 from opencamlib import ocl  # noqa: E402
 from engine import model  # noqa: E402
 from engine.finish import (finish, finish_to_gcode, surf_bounds,  # noqa: E402
-                           batch_drop, make_cutter)
+                           batch_drop, make_cutter, cl_grid, march_level,
+                           refine_contours, steep_runs_grid, segment_net,
+                           link_plan, CHORD_TOL)
 import zmap  # noqa: E402
 
 CELL = 0.1
@@ -211,6 +220,54 @@ def hf_slot_boss(X, Y, top=10.0, slot_half=2.0, slot_floor=4.0):
     return np.where(np.abs(X) < slot_half, slot_floor, top)
 
 
+def boss_plate_stl(path, q=15.0, top=10.0, bx=4.0, bh=20.0):
+    """Plate [-q,q]^2 with top face at z=top (== the requested floor Z)
+    and a raised square boss [-bx,bx]^2 up to z=bh (S1d item 3: the floor
+    level is coplanar with the plate's main flat face)."""
+    tris = _box(-q, q, -q, q, 0.0, top)
+    tris += _box(-bx, bx, -bx, bx, top, bh)
+    return write_stl(path, tris)
+
+
+def hf_boss_plate(X, Y, top=10.0, bx=4.0, bh=20.0):
+    return np.where((np.abs(X) < bx) & (np.abs(Y) < bx), bh, top)
+
+
+# ---------------------------------------------------------------------------
+# exact one-sided CL check (same criterion as engine/probe_clcheck.py):
+# every cutting move sampled at 0.25 mm, BallCutter(6) drop-cutter,
+# CL - z <= 0.005 mm at every sample.
+# ---------------------------------------------------------------------------
+
+def clcheck_moves(surf, moves, step=0.25, threads=4):
+    """(n_points, n_below, max_depth) for all G1 moves of `moves`."""
+    cutter = make_cutter("ball", BALL_DIA, 0.0)
+    xs, ys, zs = [], [], []
+    prev = None
+    for mv in moves:
+        cur = (mv.get("x"), mv.get("y"), mv.get("z"))
+        if None in cur:
+            continue
+        if prev is not None and mv["g"] == 1:
+            m = max(1, int(math.ceil(math.hypot(cur[0] - prev[0],
+                                               cur[1] - prev[1]) / step)))
+            t = np.arange(1, m + 1) / m
+            xs.append(prev[0] + (cur[0] - prev[0]) * t)
+            ys.append(prev[1] + (cur[1] - prev[1]) * t)
+            zs.append(prev[2] + (cur[2] - prev[2]) * t)
+        prev = cur
+    if not xs:
+        return 0, 0, 0.0
+    x = np.concatenate(xs)
+    y = np.concatenate(ys)
+    z = np.concatenate(zs)
+    cl = batch_drop(surf, cutter, list(zip(x.tolist(), y.tolist())),
+                   threads=threads)
+    d = cl - z
+    bad = d > CHORD_TOL
+    return len(x), int(bad.sum()), float(np.nanmax(d)) if len(d) else 0.0
+
+
 # ---------------------------------------------------------------------------
 # drive one case
 # ---------------------------------------------------------------------------
@@ -233,17 +290,19 @@ def run_case(name, stl_path, hf_fn, box, floor_z, assert_shallow_lt=None):
                         tool="ball", dia=BALL_DIA)
     gouges = res["gouges"]
     print("%-14s moves=%6d cut=%.0fmm plunge=%.0fmm lifts=%d "
-          "steep_runs=%d shallow_runs=%d gouges=%d drop_calls=%d "
-          "(rounds=%d chords=%d)" %
+          "steep_runs=%d shallow_runs=%d gouges=%d removed=%d splits=%d "
+          "drop_calls=%d (rounds=%d chords=%d)" %
           (name, len(moves), stats["cut_len"], stats["plunge_len"],
            stats["n_lifts"], stats["n_steep_runs"], stats["n_shallow_runs"],
-           gouges["count"], stats["n_drop_calls"],
+           gouges["count"], stats["n_steep_removed"], stats["n_seg_splits"],
+           stats["n_drop_calls"],
            stats["n_simplify_rounds"], stats["n_chords_checked"]))
     # S1c: the gouge-safe simplification must verify its chords in O(rounds)
     # batched drop-cutter calls (one per round), not one call per chord -
     # every call re-indexes the whole STL (setSTL). Fixed overhead: raster
-    # row batches, steep-slope stencil chunks, CL validation, extras, links.
-    assert stats["n_drop_calls"] <= 16 + 2 * stats["n_simplify_rounds"], \
+    # row batches, window probe, CL grid, refine rounds (<=5), segment net,
+    # curve-sample extras, links.
+    assert stats["n_drop_calls"] <= 26 + 2 * stats["n_simplify_rounds"], \
         "%s: %d drop-cutter calls vs rounds=%d (expected O(rounds))" % (
             name, stats["n_drop_calls"], stats["n_simplify_rounds"])
     # leftover > 0.05 mm per slope zone (of the part surface). Cells where
@@ -281,6 +340,12 @@ def run_case(name, stl_path, hf_fn, box, floor_z, assert_shallow_lt=None):
     assert res["rapid_collisions"]["count"] == 0, \
         "%s: rapid collisions at line %s" % (
             name, res["rapid_collisions"]["first_line"])
+    # S2 acceptance (engine/probe_clcheck.py criterion): 0 points below CL
+    n_ck, n_bad, mx = clcheck_moves(surf, moves)
+    print("  clcheck: %d samples, below CL by >%.3f mm: %d (max %.4f)"
+          % (n_ck, CHORD_TOL, n_bad, mx))
+    assert n_bad == 0, "%s: clcheck %d points below CL, max %.3f" % (
+        name, n_bad, mx)
     return stats
 
 
@@ -307,9 +372,147 @@ def test_slot_narrower_than_ball():
                  (-15.0, 15.0, -10.0, 10.0), floor_z=0.0)
 
 
+def test_plate_at_floor():
+    """Plate top == requested floor Z (coplanar-flat degenerate level):
+    zmap 0.1 mm must show 0 gouges, clcheck 0."""
+    with tempfile.TemporaryDirectory() as td:
+        stl = boss_plate_stl(os.path.join(td, "bossfloor.stl"))
+        run_case("plate-floor", stl, hf_boss_plate,
+                 (-15.0, 15.0, -15.0, 15.0), floor_z=10.0)
+
+
+# ---------------------------------------------------------------------------
+# PLAN B unit checks: grid contours vs analytic CL radii, gap split + link
+# ---------------------------------------------------------------------------
+
+def _cl_grid_full(surf, sp=0.1):
+    b = surf_bounds(surf)
+    xs = np.arange(b[0], b[1] + 0.5 * sp, sp)
+    ys = np.arange(b[2], b[3] + 0.5 * sp, sp)
+    cutter = make_cutter("ball", BALL_DIA, 0.0)
+    Zg = cl_grid(surf, cutter, xs, ys,
+                 np.ones((len(ys), len(xs)), dtype=bool), threads=4)
+    with np.errstate(invalid="ignore"):
+        gyA, gxA = np.gradient(Zg, sp, sp)
+    return xs, ys, Zg, gxA, gyA
+
+
+def _contour_radii(stl_path, zs, rho_fn):
+    """Refined contours at `zs` vs the analytic CL radius rho_fn(z);
+    returns (n_pts, worst radial err, worst |CL - Z|)."""
+    surf = model.load_surf(stl_path)
+    cutter = make_cutter("ball", BALL_DIA, 0.0)
+    xs, ys, Zg, gxA, gyA = _cl_grid_full(surf)
+    loops = []
+    for z in zs:
+        for (P, closed) in march_level(Zg, xs, ys, z):
+            if len(P) >= 2:
+                loops.append((z, P, closed))
+    assert loops, "%s: no contours" % stl_path
+    refined = refine_contours(surf, cutter, loops, gxA, gyA, xs[0], ys[0],
+                              0.1, threads=4)
+    n = 0
+    wr = 0.0
+    wc = 0.0
+    for (z, pos, cl, ok, closed) in refined:
+        assert ok.all(), "%s: refine left points below CL" % stl_path
+        rho = np.hypot(pos[:, 0], pos[:, 1])
+        wr = max(wr, float(np.max(np.abs(rho - rho_fn(z)))))
+        fin = np.isfinite(cl)
+        assert fin.all(), "%s: refine lost contact" % stl_path
+        wc = max(wc, float(np.max(np.abs(cl - z))))
+        n += len(pos)
+    return n, wr, wc
+
+
+def test_contour_vs_analytic_hemisphere():
+    """Ball r=3 on hemisphere R=10: CL circle at tip height z has radius
+    sqrt((R+r)^2 - (z+r)^2)."""
+    with tempfile.TemporaryDirectory() as td:
+        stl = hemisphere_plate_stl(os.path.join(td, "hemi.stl"))
+        R, r = 10.0, 0.5 * BALL_DIA
+        rho_fn = lambda z: math.sqrt((R + r) ** 2 - (z + r) ** 2)
+        n, wr, wc = _contour_radii(stl, [2.0, 4.0, 6.0, 8.0], rho_fn)
+        print("hemi contours: pts=%d radial_err<=%.4f cl_err<=%.4f"
+              % (n, wr, wc))
+        assert wr <= 0.01 and wc <= 0.003
+
+
+def test_contour_vs_analytic_cone():
+    """Ball r on a 60-deg cone: contact at z_s = z + r(1-cos a), radius
+    (h - z_s)/tan a + r sin a."""
+    with tempfile.TemporaryDirectory() as td:
+        stl = cone_plate_stl(os.path.join(td, "cone.stl"))
+        h, r = 15.0, 0.5 * BALL_DIA
+        a = math.radians(60.0)
+
+        def rho_fn(z):
+            return (h - z - r * (1.0 - math.cos(a))) / math.tan(a) \
+                + r * math.sin(a)
+
+        n, wr, wc = _contour_radii(stl, [2.0, 4.0, 6.0, 8.0], rho_fn)
+        print("cone contours: pts=%d radial_err<=%.4f cl_err<=%.4f"
+              % (n, wr, wc))
+        assert wr <= 0.01 and wc <= 0.003
+
+
+def test_gap_split_and_verified_link():
+    """A closed contour with two arcs pushed below CL: removal SPLITS it;
+    links across the gaps must be verified clear (lift, never bridged at
+    cutting depth), and every surviving segment interior passes the
+    one-sided check."""
+    with tempfile.TemporaryDirectory() as td:
+        stl = hemisphere_plate_stl(os.path.join(td, "hemi.stl"))
+        surf = model.load_surf(stl)
+        cutter = make_cutter("ball", BALL_DIA, 0.0)
+        z = 5.0
+        rho = math.sqrt(13.0 ** 2 - (z + 3.0) ** 2)
+        th = np.linspace(0.0, 2.0 * math.pi, 96, endpoint=False)
+        P = np.stack([rho * np.cos(th), rho * np.sin(th)], axis=1)
+        for (i0, i1) in ((24, 40), (64, 80)):
+            P[i0:i1] *= (rho - 0.6) / rho  # below CL by ~0.8 mm
+        cl = batch_drop(surf, cutter, [tuple(p) for p in P], threads=4)
+        ok = np.where(np.isfinite(cl), cl - z <= CHORD_TOL, True)
+        assert int(ok[24:40].sum()) == 0 and int(ok[64:80].sum()) == 0
+        xs, ys, Zg, gxA, gyA = _cl_grid_full(surf)
+        slopeA = np.degrees(np.arctan(np.hypot(gxA, gyA)))
+        runs, n_removed = steep_runs_grid([(z, P, cl, ok, True)], slopeA,
+                                          xs[0], ys[0], 0.1)
+        print("gap-split: removed=%d runs=%d" % (n_removed, len(runs)))
+        assert n_removed == 32 and len(runs) == 2
+        # links across the gaps: must be LIFT (chord cuts dome interior)
+        for (a, b) in ((runs[0][1][-1], runs[1][1][0]),
+                      (runs[1][1][-1], runs[0][1][0])):
+            plan = link_plan(surf, cutter,
+                            [((float(a[0]), float(a[1]), z),
+                              (float(b[0]), float(b[1]), z))], threads=4)[0]
+            mode, lift_z, mx = plan
+            assert mode == "lift" and lift_z >= mx + 0.99, \
+                "gap link not lifted clear: %s" % (plan,)
+        # segment net: after its splits, every surviving segment interior is
+        # verified clear (no sample below CL)
+        runs2, n_split = segment_net(surf, cutter, runs, ss=0.1, threads=4)
+        xy = []
+        for (_, R2) in runs2:
+            for k in range(len(R2) - 1):
+                m = max(1, int(math.ceil(math.hypot(
+                    R2[k + 1, 0] - R2[k, 0], R2[k + 1, 1] - R2[k, 1]) / 0.1)))
+                t = np.arange(1, m + 1) / (m + 1)
+                xy.extend(zip(R2[k, 0] + (R2[k + 1, 0] - R2[k, 0]) * t,
+                             R2[k, 1] + (R2[k + 1, 1] - R2[k, 1]) * t))
+        cz = batch_drop(surf, cutter, xy, threads=4)
+        assert float(np.nanmax(cz)) <= z + CHORD_TOL, \
+            "segment_net left a segment below CL"
+        print("gap-split: seg_net splits=%d -> runs=%d, all clear"
+              % (n_split, len(runs2)))
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
-               test_slot_narrower_than_ball):
+               test_slot_narrower_than_ball, test_plate_at_floor,
+               test_contour_vs_analytic_hemisphere,
+               test_contour_vs_analytic_cone,
+               test_gap_split_and_verified_link):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))
