@@ -44,6 +44,7 @@ class Connector:
         self.running = None          # active EngineRun (for cancel)
         self.current_run = None
         self._last_event = None
+        self._last_keys_refresh = 0.0
         self._stop = False
 
     # ------------------------------------------------------------ persist --
@@ -76,19 +77,30 @@ class Connector:
     def enroll(self):
         st = self.state
         if st.get("enrolled"):
-            self.client.token = st.get("token")
-            self.client.token_exp = st.get("token_exp", 0)
-            return
+            return  # token is memory-only: get_token_blocking() re-fetches
         pub = crypto.b64(crypto.public_raw(self.sk))
         out = self.client.enroll(self.cfg["pairing_code"], pub,
                                 self.cfg["connector_name"], VERSION,
                                 catalog_mod.CATALOG)
+        signed = out.get("steve_keys") or {}
+        keys = {}
+        try:
+            for k in signed["list"]["keys"]:
+                keys[k["kid"]] = k["public_key"]
+        except (KeyError, TypeError):
+            keys = {}
+        if not keys:
+            raise SteveError("keys_untrusted",
+                            "enroll response carries no usable steve_keys")
+        # self-consistency: the enroll keys list must carry at least one
+        # valid signature by a key in that same list
+        if not crypto.verify_signed_list(keys, signed):
+            raise SteveError("keys_untrusted",
+                            "enroll steve_keys list is not signed by a key "
+                            "in the list itself")
         st["enrolled"] = True
         st["fingerprint"] = out["fingerprint"]
         st["cursor"] = 0
-        keys = {}
-        for k in out["steve_keys"]["list"]["keys"]:
-            keys[k["kid"]] = k["public_key"]
         st["steve_keys"] = keys
         self._save()
 
@@ -99,23 +111,20 @@ class Connector:
         except SteveError:
             return
         trusted = self.state.get("steve_keys", {})
-        for kid, pub_b64 in trusted.items():
-            if crypto.verify_signed_list(crypto.unb64(pub_b64), listing):
-                keys = {k["kid"]: k["public_key"]
-                       for k in listing["list"]["keys"]}
-                if keys != trusted:
-                    self.state["steve_keys"] = keys
-                    self._save()
-                return
+        if not trusted or not crypto.verify_signed_list(trusted, listing):
+            return
+        try:
+            keys = {k["kid"]: k["public_key"] for k in listing["list"]["keys"]}
+        except (KeyError, TypeError):
+            return
+        if keys and keys != trusted:
+            self.state["steve_keys"] = keys
+            self._save()
 
     def get_token_blocking(self):
         while not self._stop:
             try:
-                out = self.client.get_token()
-                self.state["token"] = self.client.token
-                self.state["token_exp"] = self.client.token_exp
-                self._save()
-                return out
+                return self.client.get_token()  # token stays in memory only
             except SteveError as e:
                 if e.code != "pending_confirmation":
                     raise
@@ -163,8 +172,11 @@ class Connector:
             return False, "envelope_sig_invalid"
         if env.get("connector") != self.fingerprint:
             return False, "connector_mismatch"
-        if not isinstance(env.get("expires_at"), (int, float)) or \
-                env["expires_at"] <= time.time():
+        issued = crypto.parse_time(env.get("issued_at"))
+        expires = crypto.parse_time(env.get("expires_at"))
+        if issued is None or expires is None:
+            return False, "envelope_bad_time"
+        if expires <= time.time():
             return False, "envelope_expired"
         if env.get("nonce") in self.ledger["nonces"]:
             return False, "nonce_replayed"
@@ -309,6 +321,9 @@ class Connector:
         self.publish_catalog_and_panel()
         self.emit_state("idle")
         while not self._stop:
+            if time.time() - self._last_keys_refresh >= 60:
+                self.refresh_steve_keys()
+                self._last_keys_refresh = time.time()
             try:
                 out = self.client.messages(self.state.get("cursor", 0),
                                          int(self.cfg["poll_wait"]))

@@ -7,6 +7,7 @@ RFC 9421 HTTP message signatures with Content-Digest (RFC 9530).
 Never logs tokens, keys or signatures.
 """
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -161,22 +162,61 @@ def verify_envelope(raw_pub: bytes, envelope: dict, sig_b64: str) -> bool:
     return verify_signature(raw_pub, canonical_json(envelope), sig_b64)
 
 
-def verify_signed_list(raw_pub: bytes, signed: dict) -> bool:
-    """Verify a {"list": {...}, "signatures": [...]} structure (keys lists):
-    at least one signature by `raw_pub` over the canonical form of `list`."""
+def verify_signed_list(trusted: dict, signed: dict) -> bool:
+    """Verify a {"list": ..., "signatures": [{"kid", "sig"}]} structure.
+
+    Accept iff some signature entry's `kid` is in `trusted`
+    ({kid: public_key_b64}) and the Ed25519 signature over the canonical
+    JSON of signed["list"] verifies with that kid's key. STEVE's kids are
+    its own key ids (any string), NOT our fingerprint format.
+    """
     if not isinstance(signed, dict) or "list" not in signed:
         return False
-    want = fingerprint(raw_pub)
+    if not isinstance(trusted, dict):
+        return False
+    message = canonical_json(signed["list"])
     for entry in signed.get("signatures", []):
-        if entry.get("kid") == want and verify_signature(
-                raw_pub, canonical_json(signed["list"]), entry.get("sig", "")):
+        pub_b64 = trusted.get(entry.get("kid"))
+        if not pub_b64:
+            continue
+        try:
+            raw_pub = unb64(pub_b64)
+        except Exception:
+            continue
+        if verify_signature(raw_pub, message, entry.get("sig", "")):
             return True
     return False
 
 
-def sign_keys_list(sk: Ed25519PrivateKey, keys: list) -> dict:
+def sign_keys_list(sk: Ed25519PrivateKey, keys: list, kid: str = None) -> dict:
     """Build {"list": {"keys": [...]}, "signatures": [...]} for our mock."""
     listing = {"keys": keys}
     return {"list": listing,
-            "signatures": [{"kid": fingerprint(public_raw(sk)),
+            "signatures": [{"kid": kid or fingerprint(public_raw(sk)),
                            "sig": b64(sk.sign(canonical_json(listing)))}]}
+
+
+# ---------------------------------------------------------- timestamps ----
+
+def parse_time(value):
+    """Envelope timestamp -> Unix seconds (float), or None if invalid.
+
+    Accepts numeric Unix seconds (int or float) or an ISO 8601 string with
+    a trailing "Z" or an explicit offset. Rejects naive times (no zone),
+    unparseable strings and anything else."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z") or text.endswith("z"):
+            text = text[:-1] + "+00:00"
+        try:
+            dt = datetime.datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            return None  # naive time without a zone
+        return dt.timestamp()
+    return None

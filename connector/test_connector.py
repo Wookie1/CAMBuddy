@@ -4,6 +4,7 @@ Run: /opt/homebrew/bin/python3 -m pytest connector -q
 NEVER contacts stevecad.studio: everything runs against connector/mock_steve.py.
 """
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -19,6 +20,8 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import crypto  # noqa: E402
+import connector as connector_mod  # noqa: E402
+from client import SteveError  # noqa: E402
 from mock_steve import MockSteve  # noqa: E402
 
 PY = "/opt/homebrew/bin/python3"
@@ -123,11 +126,61 @@ class TestCryptoUnit:
         assert crypto.verify_envelope(pub, env, sig)
         tampered = dict(env, action="cycle_start")
         assert not crypto.verify_envelope(pub, tampered, sig)
-        listing = crypto.sign_keys_list(sk, [{"kid": kid,
-                                             "public_key": crypto.b64(pub)}])
-        assert crypto.verify_signed_list(pub, listing)
-        other = crypto.new_key()
-        assert not crypto.verify_signed_list(crypto.public_raw(other), listing)
+
+    def test_verify_signed_list_uses_trusted_kids(self):
+        """STEVE kids are its own key ids (any string), not fingerprints."""
+        sk = crypto.new_key()
+        pub = crypto.b64(crypto.public_raw(sk))
+        keys = [{"kid": "steve-2026-a", "public_key": pub}]
+        listing = crypto.sign_keys_list(sk, keys, kid="steve-2026-a")
+        # signed by a kid present in the trusted map -> accepted
+        assert crypto.verify_signed_list({"steve-2026-a": pub}, listing)
+        # same key but kid not in trusted -> rejected
+        assert not crypto.verify_signed_list(
+            {crypto.fingerprint(crypto.public_raw(sk)): pub}, listing)
+        # kid trusted but the key does not verify the sig -> rejected
+        assert not crypto.verify_signed_list(
+            {"steve-2026-a": crypto.b64(crypto.public_raw(crypto.new_key()))},
+            listing)
+        # tampered list -> rejected
+        listing["list"]["keys"].append(
+            {"kid": "evil", "public_key": crypto.b64(
+                crypto.public_raw(crypto.new_key()))})
+        assert not crypto.verify_signed_list({"steve-2026-a": pub}, listing)
+        # malformed inputs -> rejected, no crash
+        assert not crypto.verify_signed_list({}, listing)
+        assert not crypto.verify_signed_list({"a": "b"}, {"list": {}})
+
+
+class TestTimestamps:
+    def test_numeric_unix_seconds(self):
+        assert crypto.parse_time(1760000000) == 1760000000.0
+        assert crypto.parse_time(1760000000.5) == 1760000000.5
+
+    def test_iso_with_z(self):
+        got = crypto.parse_time("2026-10-17T12:00:00Z")
+        want = datetime.datetime(2026, 10, 17, 12, 0, 0,
+                                tzinfo=datetime.timezone.utc).timestamp()
+        assert got == want
+
+    def test_iso_with_offset(self):
+        z = crypto.parse_time("2026-10-17T12:00:00Z")
+        off = crypto.parse_time("2026-10-17T14:00:00+02:00")
+        assert off == z  # same instant
+
+    def test_naive_rejected(self):
+        assert crypto.parse_time("2026-10-17T12:00:00") is None
+        assert crypto.parse_time("2026-10-17 12:00:00") is None
+
+    def test_garbage_rejected(self):
+        for bad in ("soon", "", "1760000000.5x", None, True, [], {}):
+            assert crypto.parse_time(bad) is None
+
+    def test_expired_iso_detected(self):
+        past = (datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(seconds=60))
+        assert crypto.parse_time(
+            past.strftime("%Y-%m-%dT%H:%M:%SZ")) <= time.time()
 
 
 # =========================================================== fixtures =====
@@ -329,6 +382,201 @@ class TestNegatives:
             assert False, "unsigned request was accepted"
         except urllib.error.HTTPError as e:
             assert e.code == 401
+
+
+# ================================================ (d) timestamps end-to-end ==
+
+def _wait_rejected(mock, run_id, code):
+    assert mock.wait_state(run_id, "rejected", 30), \
+        "run %s not rejected: %s" % (run_id, mock.states_for(run_id))
+    rep = [r["body"] for r in mock.reports
+           if str(r["run_id"]) == str(run_id)][-1]
+    assert rep["state"] == "rejected"
+    assert rep.get("error", {}).get("code") == code, rep
+    assert "running" not in mock.states_for(run_id)
+
+
+def _iso(seconds_ahead):
+    dt = datetime.datetime.now(datetime.timezone.utc) + \
+        datetime.timedelta(seconds=seconds_ahead)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class TestTimestampsE2E:
+    """issued_at/expires_at: numeric or ISO with Z/offset accepted;
+    naive, garbage or expired rejected."""
+
+    def test_iso_z_and_offset_accepted(self, live):
+        mock, _, _ = live
+        # out-of-range input => rejection with input_out_of_range, which can
+        # only happen if the ISO timestamps passed validation
+        mock.enqueue_run(701, inputs=dict(GOOD_INPUTS, model=model_input(mock),
+                                         tool_diameter=100.0),
+                         envelope_over={"issued_at": _iso(-5),
+                                      "expires_at": _iso(600)})
+        _wait_rejected(mock, 701, "input_out_of_range")
+        mock.enqueue_run(702, inputs=dict(GOOD_INPUTS, model=model_input(mock),
+                                         tool_diameter=100.0),
+                         envelope_over={
+                             "issued_at": "2026-01-01T00:00:00+02:00",
+                             "expires_at": "2999-01-01T00:00:00+05:45"})
+        _wait_rejected(mock, 702, "input_out_of_range")
+
+    def test_naive_iso_rejected(self, live):
+        mock, _, _ = live
+        mock.enqueue_run(703, inputs=dict(GOOD_INPUTS, model=model_input(mock)),
+                         envelope_over={"issued_at": "2026-10-17T12:00:00",
+                                      "expires_at": "2999-01-01T00:00:00"})
+        _wait_rejected(mock, 703, "envelope_bad_time")
+        mock.enqueue_run(704, inputs=dict(GOOD_INPUTS, model=model_input(mock)),
+                         envelope_over={"issued_at": int(time.time()),
+                                      "expires_at": "2999-01-01T00:00:00"})
+        _wait_rejected(mock, 704, "envelope_bad_time")
+
+    def test_garbage_time_rejected(self, live):
+        mock, _, _ = live
+        mock.enqueue_run(705, inputs=dict(GOOD_INPUTS, model=model_input(mock)),
+                         envelope_over={"issued_at": "soon",
+                                      "expires_at": "2999-01-01T00:00:00Z"})
+        _wait_rejected(mock, 705, "envelope_bad_time")
+
+    def test_expired_iso_rejected(self, live):
+        mock, _, _ = live
+        mock.enqueue_run(706, inputs=dict(GOOD_INPUTS, model=model_input(mock)),
+                         envelope_over={"issued_at": _iso(-700),
+                                      "expires_at": _iso(-10)})
+        _wait_rejected(mock, 706, "envelope_expired")
+
+
+# ================================================= (e) STEVE key trust ====
+
+def _inproc_connector(tmp_path, mock, code="PAIR-1234"):
+    home = tmp_path / "home"
+    os.makedirs(home, exist_ok=True)
+    with open(home / "config.toml", "w") as fh:
+        fh.write('base_url = "%s"\npairing_code = "%s"\npoll_wait = 1\n'
+                 'token_retry = 1\nprograms_dir = "%s"\nrepo_root = "%s"\n'
+                 % (mock.base_url, code, home / "programs", REPO))
+    return connector_mod.Connector(str(home))
+
+
+class TestSteveKeys:
+    def test_enroll_requires_self_consistent_keys(self, tmp_path):
+        """Enroll list signed only by a key NOT in the list -> fail."""
+        mock = MockSteve(code="PAIR-K1")
+        base = mock.serve_forever()
+        try:
+            keys = [{"kid": "steve-2026-a",
+                     "public_key": crypto.b64(crypto.public_raw(mock.key))}]
+            evil = crypto.new_key()
+            mock.enroll_keys_override = {
+                "list": {"keys": keys},
+                "signatures": [{"kid": "evil-kid",
+                              "sig": crypto.b64(evil.sign(
+                                  crypto.canonical_json({"keys": keys})))}]}
+            c = _inproc_connector(tmp_path, mock, "PAIR-K1")
+            with pytest.raises(SteveError) as ei:
+                c.enroll()
+            assert ei.value.code == "keys_untrusted"
+            assert not c.state.get("enrolled")
+        finally:
+            mock.stop()
+
+    def test_rotation_signed_by_trusted_kid_accepted(self, tmp_path):
+        mock = MockSteve(code="PAIR-K2")
+        base = mock.serve_forever()
+        try:
+            mock.confirm()
+            c = _inproc_connector(tmp_path, mock, "PAIR-K2")
+            c.enroll()
+            assert set(c.state["steve_keys"]) == {"steve-2026-a"}
+            # rotate to a new key, signed by the trusted kid "steve-2026-a"
+            k2 = crypto.new_key()
+            new_keys = [{"kid": "steve-2026-b",
+                        "public_key": crypto.b64(crypto.public_raw(k2))}]
+            mock.keys_override = crypto.sign_keys_list(mock.key, new_keys,
+                                                      kid="steve-2026-a")
+            c.refresh_steve_keys()
+            assert set(c.state["steve_keys"]) == {"steve-2026-b"}
+            # envelopes signed by the new key under the new kid verify now
+            env = {"id": 801, "action": "adaptive_rough", "inputs": {},
+                   "connector": c.fingerprint, "issued_at": int(time.time()),
+                   "expires_at": int(time.time()) + 600, "nonce": "rot-1"}
+            msg = {"kind": "run", "envelope": env, "kid": "steve-2026-b",
+                   "sig": crypto.b64(k2.sign(crypto.canonical_json(env)))}
+            ok, code = c.verify_envelope(msg)
+            assert ok, code
+        finally:
+            mock.stop()
+
+    def test_rotation_by_untrusted_key_rejected_keeps_old(self, tmp_path):
+        mock = MockSteve(code="PAIR-K3")
+        base = mock.serve_forever()
+        try:
+            mock.confirm()
+            c = _inproc_connector(tmp_path, mock, "PAIR-K3")
+            c.enroll()
+            k3 = crypto.new_key()
+            new_keys = [{"kid": "steve-2026-c",
+                        "public_key": crypto.b64(crypto.public_raw(k3))}]
+            # signed by the NEW key itself, which is not trusted yet
+            mock.keys_override = crypto.sign_keys_list(k3, new_keys,
+                                                      kid="steve-2026-c")
+            c.refresh_steve_keys()
+            assert set(c.state["steve_keys"]) == {"steve-2026-a"}
+        finally:
+            mock.stop()
+
+    def test_tampered_keys_list_rejected(self, tmp_path):
+        mock = MockSteve(code="PAIR-K4")
+        base = mock.serve_forever()
+        try:
+            mock.confirm()
+            c = _inproc_connector(tmp_path, mock, "PAIR-K4")
+            c.enroll()
+            new_keys = [{"kid": "steve-2026-b",
+                        "public_key": crypto.b64(
+                            crypto.public_raw(crypto.new_key()))}]
+            listing = crypto.sign_keys_list(mock.key, new_keys,
+                                           kid="steve-2026-a")
+            # tamper after signing: inject an extra key
+            listing["list"]["keys"].append(
+                {"kid": "evil", "public_key": crypto.b64(
+                    crypto.public_raw(crypto.new_key()))})
+            mock.keys_override = listing
+            c.refresh_steve_keys()
+            assert set(c.state["steve_keys"]) == {"steve-2026-a"}
+        finally:
+            mock.stop()
+
+
+# ============================================ (f) token not persisted ======
+
+class TestTokenNotPersisted:
+    def test_no_token_key_or_signature_in_state_dir(self, live):
+        mock, home, _ = live
+        assert mock.token, "mock never issued a token"
+        with open(home / "identity.key") as fh:
+            seed = fh.read().strip()
+        blob = {}
+        for root, _dirs, files in os.walk(home):
+            for name in files:
+                if name == "identity.key":  # the key file itself is allowed
+                    continue
+                with open(os.path.join(root, name), "rb") as fh:
+                    blob[name] = fh.read().decode("utf-8", errors="ignore")
+        all_text = "\n".join(blob.values())
+        # the bearer token and the private seed appear nowhere in the state dir
+        assert mock.token not in all_text
+        assert seed not in all_text
+        # and the JSON state files carry no token/signature fields at all
+        st = json.loads(blob["state.json"])
+        assert "token" not in st and "token_exp" not in st
+        led = json.loads(blob["ledger.json"])
+        assert not any("sig" in k for k in led)
+        for name, text in blob.items():
+            if name.endswith(".json"):
+                assert '"signatures"' not in text, name
 
 
 # ======================================================== final printout ==

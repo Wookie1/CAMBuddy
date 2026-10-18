@@ -34,7 +34,8 @@ SIG_INPUT_RE = re.compile(
 class MockSteve:
     def __init__(self, code="PAIR-1234", serve_dir=None, strict_files=True):
         self.key = crypto.new_key()
-        self.kid = crypto.fingerprint(crypto.public_raw(self.key))
+        # STEVE's kid is its own key id (any string), NOT our fingerprint
+        self.kid = "steve-2026-a"
         self.code = code
         self.serve_dir = serve_dir or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "testdata")
@@ -54,11 +55,17 @@ class MockSteve:
         self.catalog = None
         self.rejected_requests = []  # (path, code)
         self._seen_nonces = set()
+        self.keys_override = None    # GET /keys response (rotation tests)
+        self.enroll_keys_override = None  # enroll steve_keys (tests)
 
     # ----------------------------------------------------------- helpers --
     def keys_list(self):
+        if self.keys_override is not None:
+            return self.keys_override
         return crypto.sign_keys_list(self.key, [{
-            "kid": self.kid, "public_key": crypto.b64(crypto.public_raw(self.key))}])
+            "kid": self.kid,
+            "public_key": crypto.b64(crypto.public_raw(self.key))}],
+            kid=self.kid)
 
     def enqueue_run(self, run_id, action="adaptive_rough", inputs=None,
                    note="", ttl=900, expires_at=None, requested_by=None,
@@ -326,7 +333,8 @@ class MockSteve:
         return h._send(200, {"connector": req.get("name"),
                              "fingerprint": self.enrolled["fingerprint"],
                              "status": "pending",
-                             "steve_keys": self.keys_list()})
+                             "steve_keys": (self.enroll_keys_override
+                                          or self.keys_list())})
 
     def _token(self, h):
         if not self.confirmed:
