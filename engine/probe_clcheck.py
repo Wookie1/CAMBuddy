@@ -7,7 +7,7 @@ Old CLI (backward compatible):  probe_clcheck.py <ngc> <step_mm>
 New CLI:  probe_clcheck.py <ngc> <stl> <tool_diameter>
   Outputs JSON on stdout, text diagnostics on stderr.
 """
-import json, math, re, sys, time
+import json, math, os, re, sys, time
 import numpy as np
 from opencamlib import ocl
 
@@ -18,7 +18,11 @@ if len(sys.argv) == 3:
     # Old CLI: probe_clcheck.py <ngc> <step_mm>
     gcode_path = sys.argv[1]
     step = float(sys.argv[2])
-    stl_path = "out/core_front_setup.stl"
+    # never a name-keyed cache: tessellate samples/core_front_setup.step fresh (content-keyed cache)
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from engine import model as _model
+    stl_path = _model.step_to_stl(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                               "samples", "core_front_setup.step"))
     tool_dia = 6.0
     old_cli = True
 elif len(sys.argv) == 4:
