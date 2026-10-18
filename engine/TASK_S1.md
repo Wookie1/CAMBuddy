@@ -32,3 +32,14 @@ artifact (prove with a finer sample). Keep messages short and avoid printing lar
 - Relaunch 3 (now on a different model): the previous session got the hemisphere test clean and changed
   test_finish.py to assert on tool-reachable cells (reporting raw and reachable fractions). Next: run the full
   finish suite, then item 5 on core_front_setup.
+
+## Round S1b (supervisor)
+The full core_front finishing run took > 70 min single-process and OpenCode ended your session for inactivity.
+1. Add an ENGINE_WORKERS-capped pool (default 4) to engine/finish.py the way engine/cli.py/rough.py do it:
+   split shallow raster rows and steep waterline Z levels across workers; keep output order deterministic.
+2. Keep engine/test_finish.py passing (3 shapes, 0 gouges). Time it before/after.
+3. Smoke test on core_front_setup: a 60 x 40 mm window around (-114.6, 56.9) only (add --window xmin xmax ymin ymax
+   to the finish CLI), and report its runtime. Do NOT run the full part; the supervisor runs it.
+4. Note in the report: plunge length exceeds cut length on slot-boss (9854 vs 7358 mm) - check that link/retract
+   logic does not plunge at every row; reduce it if it's simple and safe.
+Short outputs. Print timings and the smoke stats at the end.
