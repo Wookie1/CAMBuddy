@@ -23,9 +23,12 @@ grid at `sampling` pitch over the steep-region mask dilated by the ball
 radius, computed once per run; per Z level (stepdown default 0.3 mm, levels
 within 0.05 mm of a flat-face Z shifted up) marching squares extracts the
 contour CL = Z with {CL >= Z} as material side; every contour point is
-refined by batched Newton bisection against the true drop-cutter CL to
-|CL - Z| <= 0.002 mm; a one-sided net (CL - z <= CHORD_TOL) removes any
-remaining violator and splits runs there. Points are never lowered.
+refined by batched bisection on its grid edge against the true drop-cutter
+CL until the bracket's XY width <= 0.002 mm, emitting the low-side endpoint
+(CL <= Z + 0.005 mm: at CL jumps this is the jump line at offset r, the
+correct waterline next to a vertical wall); a one-sided net (CL - z <=
+CHORD_TOL) removes any remaining violator and splits runs there. Points are
+never lowered.
 Links: stay down only if drop-cutter along the link stays below the link;
 otherwise retract to local max CL + 1 mm.
 
@@ -381,20 +384,29 @@ def steep_runs(level_slopes, threshold=40.0, overlap_deg=5.0, min_len=0.3):
 # (S1d items 7-8). Instead: ONE batched drop-cutter CL grid over the steep
 # region (dilated by the ball radius), computed once per run; per Z level the
 # contour CL(x,y) = Z is extracted by marching squares with {CL >= Z} as the
-# material side; every contour point is refined by batched Newton bisection
-# against the TRUE drop-cutter CL to |CL - Z| <= REFINE_TOL; then a one-sided
-# safety net removes any remaining point below CL - CHORD_TOL and splits runs
-# there. Gaps are rejoined only through link_plan (verified clear or retract).
+# material side; every contour point is refined by batched bisection on its
+# grid edge (true drop-cutter) until the bracket's XY width <= REFINE_W, and
+# the LOW-side endpoint (CL <= Z + KEEP_TOL) is emitted - at CL jumps (real
+# walls) that is the jump line at offset r, gouge-safe and touching the wall;
+# then a one-sided safety net removes any remaining point below CL - CHORD_TOL
+# and splits runs there. Gaps are rejoined only through link_plan (verified
+# clear or retract).
 # ---------------------------------------------------------------------------
 
-REFINE_TOL = 0.002    # mm, |CL - Z| target for refined contour points
-KEEP_TOL = 0.01       # mm, |CL - Z| to keep a contour point: CL must pass
-                      # through Z here. At CL jumps (ball-catch boundary at
-                      # convex vertical corners) the level has no solution;
-                      # marching squares still draws a ring microns from the
-                      # jump, and its air-side points would graze it.
+REFINE_W = 0.002      # mm, bisection converges on the bracket's XY width
+KEEP_TOL = 0.005      # mm, one-sided keep rule: emit the LOW-side endpoint of
+                      # a bracket (CL <= Z + KEEP_TOL). At CL jumps (vertical
+                      # walls) the level has no |CL - Z| solution; the jump
+                      # line at offset r IS the correct waterline for every
+                      # level between floor and top - r, so converging onto the
+                      # jump and emitting its safe (air/floor) side is both
+                      # gouge-safe and touching the wall. Reject only when no
+                      # sign change can be bracketed on the crossing's edge.
 FLAT_GAP = 0.05       # mm, min distance of a level from a flat-face Z
 FLAT_NZ = 0.995       # normal-z threshold for horizontal (flat) triangles
+JUMP_SPAN = 0.1       # mm, CL gap across a converged bracket = discontinuity
+JUMP_MARGIN = 0.005   # mm, outward nudge of jump-line points so chords and
+                      # check samples between neighbours stay clear side
 
 
 def flat_face_zs(surf):
@@ -466,16 +478,23 @@ def cl_grid(surf, cutter, xs, ys, mask, threads=None):
     return Zg
 
 
-def march_level(Zg, xs, ys, z):
+def march_level(Zg, xs, ys, z, comp=None):
     """Marching-squares iso-contour of Zg at level z; material side is
-    {CL >= z}. Returns list of (P(n, 2), closed); closed loops repeat no
-    endpoint (cyclic in contour order)."""
-    v00 = Zg[:-1, :-1]
-    v10 = Zg[:-1, 1:]   # bottom-right
-    v01 = Zg[1:, :-1]    # top-left
-    v11 = Zg[1:, 1:]
-    valid = np.isfinite(v00) & np.isfinite(v10) & np.isfinite(v01) \
-        & np.isfinite(v11)
+    {CL >= z}. Computed-but-no-contact nodes (nan in Zg) count as -inf: air
+    is below every level, so contours exist at CL jumps into air (outer
+    walls, slot edges) - the jump line at offset r, which is the correct
+    waterline for every level between floor and top - r. Nodes not in comp
+    (not computed) make their cells invalid. Returns list of (P(n, 2),
+    closed); closed loops repeat no endpoint (cyclic in contour order)."""
+    ninf = -1e30
+    Zc = np.where(np.isfinite(Zg), Zg, ninf)
+    if comp is None:
+        comp = np.isfinite(Zg)
+    v00 = Zc[:-1, :-1]
+    v10 = Zc[:-1, 1:]   # bottom-right
+    v01 = Zc[1:, :-1]    # top-left
+    v11 = Zc[1:, 1:]
+    valid = comp[:-1, :-1] & comp[:-1, 1:] & comp[1:, :-1] & comp[1:, 1:]
     case = ((v00 >= z).astype(np.int8) + (v10 >= z).astype(np.int8) * 2
             + (v01 >= z).astype(np.int8) * 4 + (v11 >= z).astype(np.int8) * 8)
     cells = np.argwhere(valid & (case > 0) & (case < 15))
@@ -536,10 +555,10 @@ def march_level(Zg, xs, ys, z):
             s, e = cand[0]
             seen[s] = True
             if e == 0:
-                back.append((segs[s][2], segs[s][3]))
+                back.append((segs[s][0], segs[s][2], segs[s][3]))
                 k = segs[s][1]
             else:
-                back.append((segs[s][4], segs[s][5]))
+                back.append((segs[s][1], segs[s][4], segs[s][5]))
                 k = segs[s][0]
         fwd = []
         k = kb
@@ -550,82 +569,116 @@ def march_level(Zg, xs, ys, z):
             s, e = cand[0]
             seen[s] = True
             if e == 0:
-                fwd.append((segs[s][2], segs[s][3]))
+                fwd.append((segs[s][0], segs[s][2], segs[s][3]))
                 k = segs[s][1]
             else:
-                fwd.append((segs[s][4], segs[s][5]))
+                fwd.append((segs[s][1], segs[s][4], segs[s][5]))
                 k = segs[s][0]
-        pts = back[::-1] + [(xa, ya), (xb, yb)] + fwd
-        P = np.asarray(pts, dtype=float)
+        pts = back[::-1] + [(ka, xa, ya), (kb, xb, yb)] + fwd
+        K = [p[0] for p in pts]
+        P = np.asarray([(p[1], p[2]) for p in pts], dtype=float)
         closed = len(P) > 2 and float(np.hypot(*(P[0] - P[-1]))) < 1e-9
         if closed:
             P = P[:-1]
-        out.append((P, closed))
+            K = K[:-1]
+        out.append((P, closed, K))
     return out
 
 
-def refine_contours(surf, cutter, loops, gx, gy, x0, y0, sp,
-                    tol=REFINE_TOL, rounds=5, threads=None):
-    """Refine every contour point by batched Newton bisection along the CL
-    grid gradient to |CL - Z| <= tol: one batch_drop per round for all
-    points of all levels (only points not yet converged). Invariant: when a
-    point is done, cl is the true drop-cutter CL AT pos. Points that leave
-    contact (nan) or sit on a flat gradient are frozen at their last valid
-    position. Returns [(z, pos(n,2), cl(n), ok(n), closed)] where
-    ok = |CL - z| <= KEEP_TOL: the level must actually pass through Z at the
-    point. Points on the air side of a CL jump (|CL - z| large, CL < z) are
-    spurious marching-squares rings around ball-catch boundaries and are
-    removed; points below CL (CL - z > 0) are removed by the same test.
+def refine_contours(surf, cutter, loops, Zg, x0, y0, sp,
+                    width_tol=REFINE_W, rounds=8, threads=None):
+    """Refine every contour point by batched bisection on its marching-
+    squares grid edge (loops = [(z, P(n,2), keys(n), closed)], keys are the
+    march_level crossing edge ids): the two nodes bracketing the crossing
+    (one CL >= Z,
+    the other < Z) form a bracket; each round halves it with ONE batch_drop
+    over all still-active points of all levels, moving the material-side
+    endpoint to the midpoint when CL(mid) >= Z and the low-side endpoint
+    otherwise. Convergence is on the bracket's XY WIDTH <= width_tol, NOT on
+    |CL - Z|: at a CL jump (vertical wall) the level has no |CL - Z|
+    solution, yet bisection converges onto the jump line at offset r, which
+    is the correct waterline for every level between floor and top - r. The
+    LOW-side endpoint is emitted (its CL <= Z + KEEP_TOL): gouge-safe and
+    touching the wall. A point is rejected (ok == False) only when no sign
+    change can be bracketed on its edge (both nodes >= Z, or contact lost).
+    Returns [(z, pos(n,2), cl(n), ok(n), closed)]; cl is the true
+    drop-cutter CL at pos for every emitted point.
     """
     if not loops:
         return []
-    Zall = np.concatenate([np.full(len(P), z) for (z, P, _) in loops])
-    XY = np.concatenate([P for (z, P, _) in loops])
+    Zall = np.concatenate([np.full(len(P), z) for (z, P, _K, _) in loops])
+    XY = np.concatenate([P for (z, P, _K, _) in loops])
+    KEYS = [k for (_z, _P, K, _c) in loops for k in K]
     n = len(XY)
-    pos = XY.copy()
-    prev = pos.copy()
-    cl = np.full(n, np.nan)
-    done = np.zeros(n, dtype=bool)
+    # each crossing's grid edge key gives its two node indices directly:
+    # ('h', i, j) = horizontal edge between nodes (j, i) and (j, i + 1);
+    # ('v', i, j) = vertical edge between nodes (j, i) and (j + 1, i).
+    typ = np.array([k[0] for k in KEYS])
+    i = np.array([k[1] for k in KEYS], dtype=int)
+    j = np.array([k[2] for k in KEYS], dtype=int)
+    horiz = typ == 'h'
+    i2 = np.where(horiz, i + 1, i)
+    j2 = np.where(horiz, j, j + 1)
+    # nodes of valid crossing cells are computed; nan there = air (-inf)
+    Zf = np.where(np.isfinite(Zg), Zg, -1e30)
+    va = Zf[j, i]
+    vb = Zf[j2, i2]
+    axy = np.stack([x0 + i * sp + np.zeros(n),
+                   y0 + j * sp + np.zeros(n)], axis=1)
+    bxy = np.stack([x0 + i2 * sp + np.zeros(n),
+                   y0 + j2 * sp + np.zeros(n)], axis=1)
+    # lo = air/floor-side endpoint (CL < Z), hi = material-side (CL >= Z)
+    a_low = va < Zall                      # b is the low side when va >= Z
+    lo = np.where(a_low[:, None], axy, bxy)
+    hi = np.where(a_low[:, None], bxy, axy)
+    lo_cl = np.where(a_low, va, vb)
+    hi_ok = np.where(a_low, vb, va)   # material-side node value (may be nan)
+    fin_hi = np.isfinite(hi_ok)
+    # lo_cl may be -inf (no contact = air: nothing to gouge, never >= Z)
+    bracketed = fin_hi & (hi_ok >= Zall) & (lo_cl < Zall)
+    # unbracketed: keep the crossing position; the one-sided ok test below
+    # removes it unless its own CL is already safe (both nodes < Z case)
+    cl = np.where(np.isfinite(lo_cl), lo_cl, np.nan)  # -inf (air) -> nan
+    active = bracketed & (np.hypot(hi[:, 0] - lo[:, 0],
+                                   hi[:, 1] - lo[:, 1]) > width_tol)
     for r in range(rounds):
-        ai = np.where(~done)[0]
+        ai = np.where(active)[0]
         if len(ai) == 0:
             break
-        zc = batch_drop(surf, cutter, [tuple(p) for p in pos[ai]],
+        mid = 0.5 * (lo[ai] + hi[ai])
+        zc = batch_drop(surf, cutter, [tuple(p) for p in mid],
                         threads=threads)
-        cl[ai] = zc
-        bad = ~np.isfinite(zc)
-        conv = np.abs(zc - Zall[ai]) <= tol
-        frz = bad | conv
-        done[ai[frz]] = True
-        rest = ai[~frz]
-        if len(rest) == 0:
-            break
-        if r == rounds - 1:
-            done[rest] = True  # stay at pos; cl was just evaluated AT pos
-            break
-        gv_x = grid_sample(gx, x0, y0, sp, pos[rest, 0], pos[rest, 1])
-        gv_y = grid_sample(gy, x0, y0, sp, pos[rest, 0], pos[rest, 1])
-        g2 = gv_x * gv_x + gv_y * gv_y
-        flatg = ~np.isfinite(g2) | (g2 < 1e-4)
-        done[rest[flatg]] = True
-        mrel = np.where(~flatg)[0]
-        if len(mrel) == 0:
-            continue
-        g = rest[mrel]  # global indices of points to move
-        err = cl[g] - Zall[g]
-        sx = -err * gv_x[mrel] / g2[mrel]
-        sy = -err * gv_y[mrel] / g2[mrel]
-        L = np.hypot(sx, sy)
-        over = L > sp
-        sx[over] *= sp / L[over]
-        sy[over] *= sp / L[over]
-        prev[g] = pos[g]
-        pos[g, 0] += sx
-        pos[g, 1] += sy
-    ok = np.isfinite(cl) & (np.abs(cl - Zall) <= KEEP_TOL)
+        up = np.isfinite(zc) & (zc >= Zall[ai])   # midpoint on material side
+        hi[ai[up]] = mid[up]
+        lo[ai[~up]] = mid[~up]                    # air/floor side (nan -> air)
+        lo_cl[ai[~up]] = zc[~up]
+        w = np.hypot(hi[ai, 0] - lo[ai, 0], hi[ai, 1] - lo[ai, 1])
+        active[ai[w <= width_tol]] = False
+    # jump detection: after convergence the bracket is <= width_tol wide; a
+    # CL difference > JUMP_SPAN across it means a CL discontinuity (wall).
+    # Nudge such points outward (air/floor side) by JUMP_MARGIN so chords and
+    # check samples between neighbours cannot dip across the jump into CL > Z.
+    bi = np.where(bracketed)[0]
+    if len(bi):
+        zh = batch_drop(surf, cutter, [tuple(p) for p in hi[bi]],
+                        threads=threads)
+        jump = (np.isfinite(zh) & (zh - lo_cl[bi] > JUMP_SPAN)) \
+            | ~np.isfinite(lo_cl[bi])
+        sel = bi[jump]
+        if len(sel):
+            dxu = lo[sel, 0] - hi[sel, 0]
+            dyu = lo[sel, 1] - hi[sel, 1]
+            Lw = np.hypot(dxu, dyu)
+            Lw[Lw < 1e-9] = 1.0
+            lo[sel, 0] += dxu / Lw * JUMP_MARGIN
+            lo[sel, 1] += dyu / Lw * JUMP_MARGIN
+    pos = np.where(bracketed[:, None], lo, XY)  # emit low-side endpoint
+    cl = np.where(bracketed, lo_cl, cl)
+    # nan cl = no contact = air: nothing to gouge at any Z
+    ok = ~np.isfinite(cl) | (cl <= Zall + KEEP_TOL)
     out = []
     off = 0
-    for (z, P, closed) in loops:
+    for (z, P, _K, closed) in loops:
         m = len(P)
         out.append((z, pos[off:off + m].copy(), cl[off:off + m],
                     ok[off:off + m], closed))
@@ -808,8 +861,8 @@ class Chords:
                 dx = P[b, 0] - P[a, 0]
                 dy = P[b, 1] - P[a, 1]
                 L2 = dx * dx + dy * dy
-                if math.sqrt(L2) > max_chord:
-                    break
+                if math.sqrt(L2) > max_chord or L2 <= 1e-12:
+                    break  # too long, or zero-length chord (duplicate xy)
                 # samples strictly between a and b: vertices a+1..b-1
                 ok = True
                 if b > a + 1:
@@ -825,10 +878,12 @@ class Chords:
                         sy = self.ex_y[msk, 1] - P[a, 1]
                         t = (sx * dx + sy * dy) / L2
                         zc = P[a, 2] + (P[b, 2] - P[a, 2]) * t
-                        with np.errstate(invalid="ignore"):
-                            bad = float(np.nanmax(np.abs(zc - self.ex_z[msk])))
-                        if bad > tol:
-                            ok = False
+                        dz = zc - self.ex_z[msk]
+                        if np.isfinite(dz).any():
+                            bad = float(np.nanmax(np.abs(dz)))
+                            if bad > tol:
+                                ok = False
+                        # all-air samples (nan CL): nothing to cut, no constraint
                 if not ok:
                     break
                 last_ok = b
@@ -1045,19 +1100,27 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     zs = shift_levels(zs, flat_face_zs(surf))
 
     sp = sampling  # square CL grid pitch in steep regions (0.1 mm)
-    gxs = np.arange(rxmin, rxmax + 0.5 * sp, sp)
-    gys = np.arange(rymin, rymax + 0.5 * sp, sp)
+    r_mm = 0.5 * tool[1] + 1.0
+    # extend past the region bbox by the ball radius so CL DESCENTS exist at
+    # outer walls (walls at the stock edge drop into air: without the pad the
+    # CL stays >= every level on the grid and no contour can be bracketed).
+    gxs = np.arange(rxmin - r_mm, rxmax + r_mm + 0.5 * sp, sp)
+    gys = np.arange(rymin - r_mm, rymax + r_mm + 0.5 * sp, sp)
     # steep mask: raster CL-surface slope >= lim, dilated by ball radius
     # + 1 mm so contours of every kept wall lie inside the dropped region.
     lim = slope_threshold - overlap_deg
     core = np.isfinite(Z) & (slope >= lim)
-    r_mm = 0.5 * tool[1] + 1.0
     gmask = dilate(core, int(math.ceil(r_mm / sampling)),
                    int(math.ceil(r_mm / stepover)))[np.ix_(
         np.clip(np.round((gys - ys[0]) / stepover).astype(int), 0,
                 len(ys) - 1),
         np.clip(np.round((gxs - xs[0]) / sampling).astype(int), 0,
                 len(xs) - 1))]
+    # the pad frame outside the region bbox must be COMPUTED (its nan then
+    # means true air, giving real contact boundaries at outer walls; leaving
+    # it uncomputed would put fake jumps at the mask edge)
+    gmask[:, (gxs > rxmax) | (gxs < rxmin)] = True
+    gmask[(gys > rymax) | (gys < rymin), :] = True
     Zg = cl_grid(surf, cutter, gxs, gys, gmask, threads=threads)
     with np.errstate(invalid="ignore"):
         gyA, gxA = np.gradient(Zg, sp, sp)
@@ -1065,11 +1128,12 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
 
     contours = []
     for z in zs:
-        for (P, closed) in march_level(Zg, gxs, gys, z):
+        for (P, closed, K) in march_level(Zg, gxs, gys, z, comp=gmask):
             if len(P) >= 2:
-                contours.append((z, P, closed))
-    # batched Newton bisection to |CL - Z| <= REFINE_TOL (true drop-cutter)
-    refined = refine_contours(surf, cutter, contours, gxA, gyA, gxs[0],
+                contours.append((z, P, K, closed))
+    # batched bracket bisection on the grid edges (true drop-cutter), width
+    # <= REFINE_W; low-side endpoint emitted at CL jumps
+    refined = refine_contours(surf, cutter, contours, Zg, gxs[0],
                               gys[0], sp, threads=threads)
     lvl_stat = {}
     for (z, P, cl, ok, closed) in refined:

@@ -129,3 +129,17 @@ uncut, so do not use OCL waterline for steep passes.
 6. Smoke: --window 96.8 136.8 30.8 70.8 on core_front_setup with --floor 24.765; probe_clcheck on it must report 0.
    Report timings. Do NOT run the full part (supervisor does). Report per level: contour points, removed points.
 Keep outputs short. Long jobs in the foreground of your shell command.
+
+## Round S2b (supervisor): keep the wall contours at CL jumps
+The "spurious rings" are the REAL wall contours. Next to a vertical wall (top T, floor F) the ball CL jumps from F
+to T - r at distance r from the wall, so every level between F and T - r lies exactly on that jump: the correct
+waterline is the jump line at offset r. Bisection can never reach |CL - Z| <= 0.002 across a jump, so those points
+were wrongly rejected (slot-boss steep runs 35 -> 2, window removed 32,759 / 50,741).
+1. Bisection converges on the bracket's XY width (<= 0.002 mm), not on |CL - Z|. Emit the LOW-side endpoint
+   (CL <= Z + 0.005): gouge-safe and touching the wall. Reject a point only if no sign change can be bracketed.
+2. Keep the one-sided nets (vertex + segment + rounded coords) unchanged; they must still pass.
+3. New test: vertical cylinder boss (radius R, height H > r + several stepdowns) on a floor: expect one circle of
+   radius R + r (+-0.01) at every level from floor up to H - r; probe_clcheck == 0; zmap 0 gouges at 0.1 mm.
+4. Assert slot-boss steep run count and wall leftover are back near S1b's (S1b: steep_runs=35, cut ~7.6 m).
+5. Re-run the window smoke (--window 96.8 136.8 30.8 70.8 --floor 24.765): report removed points per level,
+   probe_clcheck (must be 0) and timing. Do NOT run the full part. Do not commit (the supervisor commits).

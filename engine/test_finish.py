@@ -14,7 +14,9 @@ Synthetic parts, each finished with a 6 mm ball (shallow raster stepover
        the ball must ride the slot edges, never below the true CL.
   4. plate-at-floor: boss whose plate top equals the requested floor Z
      (S1d item 3) - the degenerate coplanar waterline case.
-Gouges MUST be 0 on all four; % of surface left > 0.05 mm per slope zone
+Gouges MUST be 0 on all five (incl. the S2b cylinder boss: one circle of
+radius R + r at every level from floor up to H - r, the CL jump line);
+% of surface left > 0.05 mm per slope zone
 is reported (and asserted for the shallow zones of cases 1-2). Every output
 additionally gets the exact one-sided CL check of engine/probe_clcheck.py
 (every cutting move sampled at 0.25 mm, BallCutter(6) drop-cutter): MUST
@@ -233,6 +235,32 @@ def hf_boss_plate(X, Y, top=10.0, bx=4.0, bh=20.0):
     return np.where((np.abs(X) < bx) & (np.abs(Y) < bx), bh, top)
 
 
+def cylinder_boss_stl(path, q=15.0, R=5.0, H=12.0, n=96):
+    """Vertical cylinder boss (radius R, height H > r + several stepdowns)
+    on a flat plate top z=0 (S2b item 3: CL jumps from floor to H - r at
+    distance r from the wall)."""
+    tris = _box(-q, q, -q, q, -2.0, 0.0)
+
+    def ring(k, z):
+        th = 2.0 * math.pi * k / n
+        return (R * math.cos(th), R * math.sin(th), z)
+
+    for k in range(n):
+        a, b = ring(k, 0.0), ring((k + 1) % n, 0.0)
+        a2, b2 = ring(k, H), ring((k + 1) % n, H)
+        ref = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0, H / 2.0)
+        tris.append((a, b, b2, ref))
+        tris.append((a, b2, a2, ref))
+    for k in range(n):
+        tris.append(((0.0, 0.0, H), ring(k, H), ring((k + 1) % n, H),
+                     (0.0, 0.0, 1.0)))
+    return write_stl(path, tris)
+
+
+def hf_cyl(X, Y, R=5.0, H=12.0):
+    return np.where(np.hypot(X, Y) <= R, H, 0.0)
+
+
 # ---------------------------------------------------------------------------
 # exact one-sided CL check (same criterion as engine/probe_clcheck.py):
 # every cutting move sampled at 0.25 mm, BallCutter(6) drop-cutter,
@@ -300,8 +328,8 @@ def run_case(name, stl_path, hf_fn, box, floor_z, assert_shallow_lt=None):
     # S1c: the gouge-safe simplification must verify its chords in O(rounds)
     # batched drop-cutter calls (one per round), not one call per chord -
     # every call re-indexes the whole STL (setSTL). Fixed overhead: raster
-    # row batches, window probe, CL grid, refine rounds (<=5), segment net,
-    # curve-sample extras, links.
+    # row batches, window probe, CL grid, refine rounds (<=6) + jump check,
+    # segment net, curve-sample extras, links.
     assert stats["n_drop_calls"] <= 26 + 2 * stats["n_simplify_rounds"], \
         "%s: %d drop-cutter calls vs rounds=%d (expected O(rounds))" % (
             name, stats["n_drop_calls"], stats["n_simplify_rounds"])
@@ -368,8 +396,47 @@ def test_slot_narrower_than_ball():
         stl = slot_boss_stl(os.path.join(td, "slot.stl"))
         # slot floor (4 mm) is unreachable by the 6 mm ball - leftover there
         # is expected and only reported; gouges must still be 0.
-        run_case("slot-boss", stl, hf_slot_boss,
-                 (-15.0, 15.0, -10.0, 10.0), floor_z=0.0)
+        stats = run_case("slot-boss", stl, hf_slot_boss,
+                         (-15.0, 15.0, -10.0, 10.0), floor_z=0.0)
+        # S2b item 4: wall contours at CL jumps are back - near the S1b
+        # waterline baseline (steep_runs=35, cut ~7.6 m).
+        assert stats["n_steep_runs"] >= 30, \
+            "slot-boss steep runs %d < 30 (S1b: 35)" % stats["n_steep_runs"]
+        assert stats["cut_len"] >= 6500.0, \
+            "slot-boss cut %.0f mm < 6500 (S1b ~7600)" % stats["cut_len"]
+
+
+def test_cylinder_boss_wall():
+    """S2b item 3: vertical cylinder boss R on a floor - the CL jumps from
+    floor to H - r at distance r, so every level from the floor up to
+    H - r must produce ONE circle of radius R + r (+-0.01); zmap 0.1 mm
+    0 gouges and probe_clcheck criterion 0."""
+    R, H = 5.0, 12.0
+    r = 0.5 * BALL_DIA
+    with tempfile.TemporaryDirectory() as td:
+        stl = cylinder_boss_stl(os.path.join(td, "cyl.stl"))
+        surf = model.load_surf(stl)
+        cutter = make_cutter("ball", BALL_DIA, 0.0)
+        xs, ys, Zg, gxA, gyA = _cl_grid_full(surf)
+        zs = [0.3, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0]
+        for z in zs:
+            loops = [(P, K) for (P, c, K) in march_level(Zg, xs, ys, z)
+                     if len(P) >= 2]
+            assert len(loops) == 1, "z=%.1f: %d loops (want 1)" % (
+                z, len(loops))
+            ref = refine_contours(surf, cutter, [(z, loops[0][0], loops[0][1],
+                                                 True)], Zg, xs[0], ys[0],
+                                 0.1, threads=4)
+            (_z, pos, cl, ok, _c) = ref[0]
+            assert ok.all(), "z=%.1f: points below CL" % z
+            rho = np.hypot(pos[:, 0], pos[:, 1])
+            err = float(np.max(np.abs(rho - (R + r))))
+            assert err <= 0.01, "z=%.1f: radius err %.4f mm" % (z, err)
+        print("cyl contours: 1 circle of radius R+r at %d levels" % len(zs))
+        stats = run_case("cyl-boss", stl, hf_cyl,
+                         (-15.0, 15.0, -15.0, 15.0), floor_z=0.0)
+        assert stats["n_steep_runs"] >= len(zs), \
+            "cyl-boss steep runs %d < %d" % (stats["n_steep_runs"], len(zs))
 
 
 def test_plate_at_floor():
@@ -397,30 +464,42 @@ def _cl_grid_full(surf, sp=0.1):
     return xs, ys, Zg, gxA, gyA
 
 
-def _contour_radii(stl_path, zs, rho_fn):
+def _contour_radii(stl_path, zs, rho_fn, cl_rule="smooth"):
     """Refined contours at `zs` vs the analytic CL radius rho_fn(z);
-    returns (n_pts, worst radial err, worst |CL - Z|)."""
+    returns (n_pts, worst radial err, worst cl-rule violation). cl_rule
+    "smooth": |CL - Z| (no CL jumps on the shape); "low": CL <= Z + 0.005
+    (jump shapes: the low-side endpoint sits at floor CL below Z)."""
     surf = model.load_surf(stl_path)
     cutter = make_cutter("ball", BALL_DIA, 0.0)
     xs, ys, Zg, gxA, gyA = _cl_grid_full(surf)
     loops = []
     for z in zs:
-        for (P, closed) in march_level(Zg, xs, ys, z):
+        for (P, closed, K) in march_level(Zg, xs, ys, z):
             if len(P) >= 2:
-                loops.append((z, P, closed))
+                loops.append((z, P, K, closed))
     assert loops, "%s: no contours" % stl_path
-    refined = refine_contours(surf, cutter, loops, gxA, gyA, xs[0], ys[0],
+    refined = refine_contours(surf, cutter, loops, Zg, xs[0], ys[0],
                               0.1, threads=4)
     n = 0
     wr = 0.0
-    wc = 0.0
-    for (z, pos, cl, ok, closed) in refined:
-        assert ok.all(), "%s: refine left points below CL" % stl_path
+    wc = -1e9
+    by_z = {}
+    for item in refined:
+        by_z.setdefault(item[0], []).append(item)
+    for z, items in by_z.items():
+        # the loop nearest the analytic radius is the dome/wall contour; other
+        # loops (CL-jump rings at tangencies) are separate and not checked
+        items.sort(key=lambda it: abs(float(np.mean(np.hypot(
+            it[1][:, 0], it[1][:, 1]))) - rho_fn(z)))
+        (_z, pos, cl, ok, _c) = items[0]
+        assert ok.all(), "%s z=%.2f: refine left points below CL" % (
+            stl_path, z)
         rho = np.hypot(pos[:, 0], pos[:, 1])
         wr = max(wr, float(np.max(np.abs(rho - rho_fn(z)))))
         fin = np.isfinite(cl)
         assert fin.all(), "%s: refine lost contact" % stl_path
-        wc = max(wc, float(np.max(np.abs(cl - z))))
+        e = cl - z if cl_rule == "low" else np.abs(cl - z)
+        wc = max(wc, float(np.max(e)))
         n += len(pos)
     return n, wr, wc
 
@@ -435,7 +514,8 @@ def test_contour_vs_analytic_hemisphere():
         n, wr, wc = _contour_radii(stl, [2.0, 4.0, 6.0, 8.0], rho_fn)
         print("hemi contours: pts=%d radial_err<=%.4f cl_err<=%.4f"
               % (n, wr, wc))
-        assert wr <= 0.01 and wc <= 0.003
+        # width-converged bisection: |CL - Z| <= REFINE_W * |grad CL|
+        assert wr <= 0.01 and wc <= 0.008
 
 
 def test_contour_vs_analytic_cone():
@@ -453,7 +533,8 @@ def test_contour_vs_analytic_cone():
         n, wr, wc = _contour_radii(stl, [2.0, 4.0, 6.0, 8.0], rho_fn)
         print("cone contours: pts=%d radial_err<=%.4f cl_err<=%.4f"
               % (n, wr, wc))
-        assert wr <= 0.01 and wc <= 0.003
+        # width-converged bisection: |CL - Z| <= REFINE_W * |grad CL|
+        assert wr <= 0.01 and wc <= 0.008
 
 
 def test_gap_split_and_verified_link():
@@ -510,6 +591,7 @@ def test_gap_split_and_verified_link():
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
+               test_cylinder_boss_wall,
                test_contour_vs_analytic_hemisphere,
                test_contour_vs_analytic_cone,
                test_gap_split_and_verified_link):

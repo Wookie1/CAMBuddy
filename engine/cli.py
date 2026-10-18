@@ -39,9 +39,9 @@ def finish_main(a):
     def prog(stats):
         print("raster %.1fs steep %.1fs (wl %.1fs) simplify %.1fs links %.1fs"
               " drop_calls=%d rounds=%d chords=%d"
-              % (stats["t_raster_s"], stats["t_steep_s"],
-                 stats["t_waterline_s"], stats["t_simplify_s"],
-                 stats["t_link_s"], stats["n_drop_calls"],
+              % (stats.get("t_raster_s", 0.0), stats.get("t_steep_s", 0.0),
+                 stats.get("t_waterline_s", 0.0), stats.get("t_simplify_s", 0.0),
+                 stats.get("t_link_s", 0.0), stats["n_drop_calls"],
                  stats["n_simplify_rounds"], stats["n_chords_checked"]),
               flush=True)
 
@@ -63,7 +63,7 @@ def finish_main(a):
     stats["n_moves"] = len(moves)
     stats["t_total_s"] = round(time.time() - t0, 1)
     print("wrote %s (%d moves) in %.1f s" % (a.out, len(moves),
-                                               stats["t_total_s"]), flush=True)
+                                               stats.get("t_total_s", 0.0)), flush=True)
     if a.stats_json:
         with open(a.stats_json, "w") as fh:
             json.dump(stats, fh, indent=2)
@@ -201,8 +201,8 @@ def main(argv=None):
 
     def prog(zi, z, islands, nreg, stats):
         print("level %2d Z=%7.3f islands=%2d regions=%d (wl %.1fs a2d %.1fs)"
-              % (zi, z, len(islands), nreg, stats["t_waterline"],
-                 stats["t_adaptive"]), flush=True)
+              % (zi, z, len(islands), nreg, stats.get("t_waterline", 0.0),
+                 stats.get("t_adaptive", 0.0)), flush=True)
 
     workers = a.workers if a.workers is not None else max(1, os.cpu_count() - 2)
     moves, stats = roughmod.rough(surf, tuple(a.stock), dia / 2.0, a.floor,
@@ -222,7 +222,7 @@ def main(argv=None):
     stats["n_moves"] = len(moves)
     stats["t_total"] = time.time() - t0
     print("wrote %s (%d moves) in %.1f s" % (a.out, len(moves),
-                                               stats["t_total"]), flush=True)
+                                               stats.get("t_total", 0.0)), flush=True)
     if a.stats_json:
         with open(a.stats_json, "w") as fh:
             json.dump(stats, fh, indent=2)
