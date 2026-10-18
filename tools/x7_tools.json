@@ -1,6 +1,6 @@
 {
   "machine": "SyilCNC X7 (LNCv2)",
-  "comment": "James's X7 tool table: maps a tool spec (type + diameter + corner radius, mm) to the machine's T/H/D numbers. Seeded with James's cutting data: 0.5 in bull nose, CR 0.005 in -> T3 / H03 / D03. Used by engine/post_lnc.py; an explicit --tool-number overrides the lookup.",
+  "comment": "James's X7 tool table: maps a tool spec (type + diameter + corner radius, mm) to the machine's T/H/D numbers. Used by engine/post_lnc.py; an explicit --tool-number overrides the lookup. Entries with number null are known tools without an assigned T/H/D: the LNC post refuses them.",
   "tolerance_mm": 0.001,
   "tools": [
     {
@@ -10,7 +10,109 @@
       "corner_radius_mm": 0.127,
       "length_offset": "H03",
       "diameter_offset": "D03",
-      "description": "12.7mm BULLNOSE END MILL"
+      "description": "12.7mm BULLNOSE END MILL",
+      "flute_mm": 31.75,
+      "flute_note": "assumed 2.5xD",
+      "shank_diameter_mm": 12.7,
+      "shank_note": "assumed = D (not necked)"
+    },
+    {
+      "number": null,
+      "type": "ball",
+      "diameter_mm": 6.0,
+      "corner_radius_mm": 3.0,
+      "length_offset": null,
+      "diameter_offset": null,
+      "flute_mm": 15.0,
+      "flute_note": "2.5xD (James: normal flute length)",
+      "shank_diameter_mm": 6.0,
+      "shank_note": "assumed = D (not necked)",
+      "description": "6mm BALL END MILL",
+      "source": "James 2026-10-18"
+    },
+    {
+      "number": null,
+      "type": "ball",
+      "diameter_mm": 9.525,
+      "corner_radius_mm": 4.7625,
+      "length_offset": null,
+      "diameter_offset": null,
+      "flute_mm": 23.8125,
+      "flute_note": "2.5xD (James: normal flute length)",
+      "shank_diameter_mm": 9.525,
+      "shank_note": "assumed = D (not necked)",
+      "description": "3/8in BALL END MILL",
+      "source": "James 2026-10-18"
+    },
+    {
+      "number": null,
+      "type": "ball",
+      "diameter_mm": 19.05,
+      "corner_radius_mm": 9.525,
+      "length_offset": null,
+      "diameter_offset": null,
+      "flute_mm": 47.625,
+      "flute_note": "2.5xD (James: normal flute length)",
+      "shank_diameter_mm": 19.05,
+      "shank_note": "assumed = D (not necked)",
+      "description": "3/4in BALL END MILL",
+      "source": "James 2026-10-18"
+    },
+    {
+      "number": null,
+      "type": "ball",
+      "diameter_mm": 12.7,
+      "corner_radius_mm": 6.35,
+      "length_offset": null,
+      "diameter_offset": null,
+      "flute_mm": 31.75,
+      "flute_note": "2.5xD (James: normal flute length)",
+      "shank_diameter_mm": 12.7,
+      "shank_note": "assumed = D (not necked)",
+      "description": "1/2in BALL END MILL",
+      "source": "James 2026-10-18"
+    },
+    {
+      "number": null,
+      "type": "ball",
+      "diameter_mm": 3.175,
+      "corner_radius_mm": 1.5875,
+      "length_offset": null,
+      "diameter_offset": null,
+      "flute_mm": 7.9375,
+      "flute_note": "2.5xD (James: normal flute length)",
+      "shank_diameter_mm": 3.175,
+      "shank_note": "assumed = D (not necked)",
+      "description": "1/8in BALL END MILL",
+      "source": "James 2026-10-18"
+    },
+    {
+      "number": null,
+      "type": "ball",
+      "diameter_mm": 1.5875,
+      "corner_radius_mm": 0.79375,
+      "length_offset": null,
+      "diameter_offset": null,
+      "flute_mm": 3.9688,
+      "flute_note": "2.5xD (James: normal flute length)",
+      "shank_diameter_mm": 1.5875,
+      "shank_note": "assumed = D (not necked)",
+      "description": "1/16in BALL END MILL",
+      "source": "James 2026-10-18"
+    },
+    {
+      "number": null,
+      "type": "ball",
+      "diameter_mm": 0.79375,
+      "corner_radius_mm": 0.396875,
+      "length_offset": null,
+      "diameter_offset": null,
+      "flute_mm": 1.9844,
+      "flute_note": "2.5xD (James: normal flute length)",
+      "shank_diameter_mm": 0.79375,
+      "shank_note": "assumed = D (not necked)",
+      "description": "1/32in BALL END MILL",
+      "source": "James 2026-10-18"
     }
   ]
 }

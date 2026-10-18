@@ -104,6 +104,14 @@ def finish_main(a):
     slope_split_finish), engine/finish.py."""
     from engine import finish as finishmod, model
     kind, dia, corner = parse_tool(a.tool)
+    rest_kw = {}
+    if getattr(a, "rest_from", None):
+        # S3 item 3: corner rest pass with a PLACEHOLDER small ball; the
+        # leftover map is computed by the engine itself from its own
+        # drop-cutter CL (6 mm vs 3 mm) - see finish.compute_rest_mask.
+        kind, dia, corner = parse_tool(a.rest_tool)
+        rest_kw = dict(rest_from=a.rest_from, big_tool=("ball", 6.0, 0.0),
+                       min_rest=a.min_rest)
     t0 = time.time()
     if a.stl:
         stl = a.stl
@@ -132,10 +140,22 @@ def finish_main(a):
         wl_sampling=a.wl_sampling, wl_min_sampling=a.wl_min_sampling,
         max_chord=a.max_chord, cut_feed=a.cut_feed, ramp_feed=a.ramp_feed,
         clearance=a.clearance, workers=workers, window=a.window,
-        progress=prog)
+        rapid_margin=(finishmod.RAPID_MARGIN if a.rapid_margin is None
+                     else a.rapid_margin),
+        use_rapids=not a.no_rapids, progress=prog,
+        stock_from=a.stock_from,
+        stock_allow=(finishmod.RAPID_STOCK_ALLOW if a.stock_allow is None
+                    else a.stock_allow),
+        **rest_kw)
+    if rest_kw:
+        tool_comment = ("PLACEHOLDER %s D=%.3f CR=%.3f (not in "
+                        "tools/x7_tools.json - LNC post must refuse)"
+                        % (a.rest_tool, dia, corner))
+        stats["tool"] = "PLACEHOLDER %s" % a.rest_tool
+    else:
+        tool_comment = "T1 %s D=%.3f CR=%.3f" % (kind, dia, corner)
     text = finishmod.finish_to_gcode(
-        moves, spindle_rpm=a.spindle,
-        tool_comment="T1 %s D=%.3f CR=%.3f" % (kind, dia, corner))
+        moves, spindle_rpm=a.spindle, tool_comment=tool_comment)
     with open(a.out, "w") as fh:
         fh.write(text)
     stats["out"] = a.out
@@ -222,6 +242,10 @@ def main(argv=None):
     r.add_argument("--wl-sampling", dest="wl_sampling", type=float, default=0.1,
                   help="waterline sampling mm")
     r.add_argument("--stats-json", dest="stats_json", default=None)
+    r.add_argument("--stock-out", dest="stock_out", default=None,
+                   help="write the engine's final stock heightfield to this "
+                        ".npy (+ x0/y0/cell .json sidecar) for finish "
+                        "--stock-from rapid verification (S3b)")
     r.add_argument("--post", choices=("neutral", "lnc"), default="neutral",
                    help="writer: neutral G21 (default) or SyilCNC LNCv2")
     r.add_argument("--program", type=int, default=1001,
@@ -306,6 +330,33 @@ def main(argv=None):
     f.add_argument("--workers", type=int, default=None,
                    help="parallel waterline level workers (default cpu-2)")
     f.add_argument("--stats-json", dest="stats_json", default=None)
+    f.add_argument("--rapid-margin", dest="rapid_margin", type=float,
+                   default=None,
+                   help="safety margin mm above max CL along a link path for "
+                        "a verified G0 rapid link (default 1.0; + 1.0 mm "
+                        "roughing-stock allowance)")
+    f.add_argument("--no-rapids", dest="no_rapids", action="store_true",
+                   help="disable verified G0 links (feed lift links only)")
+    f.add_argument("--stock-from", dest="stock_from", default=None,
+                   help="post-roughing stock heightfield .npy (+ x0/y0/cell "
+                        ".json sidecar, engine.cli rough --stock-out): "
+                        "rapid/lift heights must clear max(CL, stock within "
+                        "the tool radius) + margin along the swept path (S3b)")
+    f.add_argument("--stock-allow", dest="stock_allow", type=float,
+                   default=None,
+                   help="stock allowance mm added on top of max CL + margin "
+                        "for rapids when no --stock-from model is given "
+                        "(default 1.0)")
+    f.add_argument("--rest-from", dest="rest_from", default=None,
+                   help="stock/zmap heightfield .npy (+ x0/y0/cell .json "
+                        "sidecar): corner rest pass - cut only where the 6 mm "
+                        "ball CL surface exceeds the 3 mm ball reach by "
+                        "> --min-rest mm (PLACEHOLDER tool)")
+    f.add_argument("--rest-tool", dest="rest_tool", default="ball:3",
+                   help="tool spec for --rest-from passes (default ball:3; "
+                        "marked PLACEHOLDER, LNC post refuses it)")
+    f.add_argument("--min-rest", dest="min_rest", type=float, default=0.5,
+                   help="rest-pass threshold mm (default 0.5)")
 
     a = p.parse_args(argv)
 
@@ -373,7 +424,7 @@ def main(argv=None):
                                   part_hf=part_hf, stock_cell=a.stock_cell,
                                   stepup=a.stepup, min_rest=a.min_rest,
                                   min_level_area=a.min_level_area,
-                                  progress=prog)
+                                   progress=prog, stock_out=a.stock_out)
     if a.post == "lnc":
         from engine import post_lnc
         text = post_lnc.post(moves, metric=a.metric, program=a.program,

@@ -31,7 +31,7 @@ import time
 from opencamlib import ocl
 import area
 
-from engine.stock import StockField
+from engine.stock import StockField, save_stock_npy
 
 
 def rect_loop(xmin, ymin, xmax, ymax):
@@ -355,7 +355,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           tolerance=0.05, keep_tool_down=3.0, stl_path=None, workers=None,
           axial_leave=None, final_zmin=None, allowance_check=True,
           corner_r=0.127, part_hf=None, stock_cell=0.5, stepup=1.905,
-          min_rest=1.0, min_level_area=20.0, progress=None):
+          min_rest=1.0, min_level_area=20.0, progress=None, stock_out=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -371,6 +371,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     allowance_check: HARD post-check per level that no cutter centre at the
       level's Z came closer than tool_r + leave - 0.02 to that level's island
       loops; raises RuntimeError with the location on violation.
+    stock_out: optional .npy path: write the engine's OWN final stock
+      heightfield (engine/stock.py model after all levels, NaN outside the
+      tracked box) with a .json sidecar {x0,y0,cell} so finishing can verify
+      rapids against it (finish --stock-from, S3b).
     """
     sxmin, sxmax, symin, symax, szmin, szmax = stock_box
     if clearance_z is None:
@@ -696,4 +700,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         if progress:
             progress(zi, z, islands, nreg, stats)
     emit({"g": 0, "x": prev[0], "y": prev[1], "z": clearance_z})
+    if stock_out:
+        # S3b: the engine's own final stock heightfield (after all levels),
+        # for finish --stock-from rapid verification
+        save_stock_npy(stock, stock_out)
     return moves, stats

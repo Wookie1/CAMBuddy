@@ -34,10 +34,17 @@ correct waterline next to a vertical wall); a one-sided net (CL - z <=
 CHORD_TOL) removes any remaining violator and splits runs there. Points are
 never lowered.
 Links: stay down only if drop-cutter along the link stays below the link;
-otherwise retract to local max CL + 1 mm.
+otherwise, where drop-cutter along the swept XY path (sampled <= 0.25 mm)
+verifies max CL + margin (default 1 mm) + roughing-stock allowance (1 mm)
+fits under the retract height, retract to that minimum verified-clear height,
+G0 across, plunge at ramp feed (S3 item 1); else retract to local max CL +
+1 mm and traverse at feed. With --stock-from (post-roughing stock heightfield,
+S3b) the required height additionally includes the stock top within the tool
+radius along the swept path.
 
 moves are the neutral dicts of engine/gcode.py: {g:0|1, x, y, z, f}.
 """
+import json
 import math
 import multiprocessing as mp
 import os
@@ -50,6 +57,14 @@ CHORD_TOL = 0.005     # mm, one-sided gouge-safe chord tolerance
 NET_TOL = 0.004       # mm, internal check tol: leaves margin under
                       # CHORD_TOL for between-sample CL bulge (kappa*L^2/8)
 LINK_LIFT = 1.0       # mm above local max CL when a link is blocked
+RAPID_MARGIN = 1.0    # mm, safety margin above max CL along a link path for
+                      # a G0 rapid traverse (S3: verified-clear rapid links)
+RAPID_STOCK_ALLOW = 1.0  # mm, extra clearance over the part for the roughing
+                         # leftover stock above it (allowance + steps bound);
+                         # drop-cutter CL is computed on the PART, so a rapid
+                         # must sit above part + allowance + steps unless a
+                         # stock model is checked directly (S3 item 1)
+RAPID_LINK_SS = 0.25  # mm, max drop-cutter sample spacing along a rapid link
 NO_CONTACT = -1e30    # ocl keeps the initial Z when nothing is touched
 DROP_CHUNK = 250_000  # CLPoints per BatchDropCutter call
 BALL_HEIGHT = 50.0
@@ -743,6 +758,11 @@ def segment_net(surf, cutter, runs, ss=0.1, tol=CHORD_TOL, threads=None):
         for k in range(len(P) - 1):
             L = math.hypot(P[k + 1, 0] - P[k, 0], P[k + 1, 1] - P[k, 1])
             m = int(math.ceil(L / ss))
+            # even m -> the k/(m+1) grid includes t = 0.5: the worst chord
+            # point against a ball-corner tangent circle is the midpoint, and
+            # micron-scale tangent slivers must not depend on sample phase
+            if m % 2:
+                m += 1
             s0 = len(xy)
             if m > 0:
                 t = np.arange(1, m + 1) / (m + 1)
@@ -845,6 +865,10 @@ class Chords:
         if dev <= 1e-6:
             return None
         m = int(math.ceil(L / self.line_ss)) + 1
+        # odd m -> interior samples j/(m-1) include t = 0.5 (worst point of
+        # a chord against a ball-corner tangent circle; see segment_net)
+        if m % 2 == 0:
+            m += 1
         tl = np.linspace(0.0, 1.0, m)[1:-1]
         return [(P[a, 0] + dx * s, P[a, 1] + dy * s) for s in tl], tl
 
@@ -1012,35 +1036,94 @@ def vertex_net(surf, cutter, paths, tol=NET_TOL, threads=None):
     return out, src, n
 
 
-def link_plan(surf, cutter, links, sampling=0.1, threads=None):
-    """For each ((x0,y0,z0), (x1,y1,z1)) decide 'down' or 'lift'.
-    Stay down only if drop-cutter CL along the link stays below the link
-    (one-sided, no tolerance); else lift to local max CL + LINK_LIFT.
-    Returns [(mode, lift_z_or_None, local_max_cl_or_None), ...]."""
+def box_max(A, k):
+    """Max filter over a (2k+1) square window per axis (nan = -inf);
+    conservative superset of a ball-radius footprint max."""
+    m = np.where(np.isfinite(A), A, -np.inf).astype(float)
+    for _ in range(k):
+        m[1:, :] = np.maximum(m[1:, :], m[:-1, :])
+        m[:-1, :] = np.maximum(m[:-1, :], m[1:, :])
+        m[:, 1:] = np.maximum(m[:, 1:], m[:, :-1])
+        m[:, :-1] = np.maximum(m[:, :-1], m[:, 1:])
+    return m
+
+
+def link_plan(surf, cutter, links, sampling=0.1, threads=None,
+              rapid_margin=RAPID_MARGIN, clearance=None, use_rapids=True,
+              stock=None, stock_allow=RAPID_STOCK_ALLOW):
+    """For each ((x0,y0,z0), (x1,y1,z1)) decide 'down', 'rapid' or 'lift'.
+    - 'down': stay at cutting height - drop-cutter CL along the link stays
+      below the link line (one-sided, no tolerance).
+    - 'rapid' (S3 item 1): retract to the MINIMUM verified-clear height
+      z_r = max(CL along path) + rapid_margin + stock_allow (G0 across,
+      plunge at ramp feed). Verified by drop-cutter along the swept XY path
+      (sampled <= RAPID_LINK_SS mm, batched): z_r >= CL + rapid_margin for
+      the whole path; the extra stock_allow covers the roughing leftover
+      stock above the part when NO stock model is given (the CL is computed
+      on the part, not a stock model). The ball's full footprint is covered
+      by drop-cutter: at tip z > CL(x, y) the ball touches nothing at that
+      xy. If `stock` = (A, x0, y0, cell) heightfield is given (post-roughing
+      stock via --stock-from, or the rest pass leftover), the rapid must
+      additionally clear it: z_r >= max(stock within a ball-radius box
+      around the path) + rapid_margin (S3b: rapids clear the ROUGHING
+      STOCK, not just the part; the height is never clamped below this
+      requirement - `clearance` only caps heights that stay above it).
+    - 'lift': the verified feed link (retract to local max CL + LINK_LIFT,
+      traverse at ramp feed) - used when use_rapids is off; with a stock
+      model the lift height must clear the stock the same way (S3b).
+    Returns [(mode, height_or_None, local_max_cl_or_None), ...]."""
     if not links:
         return []
+    ss = min(sampling, RAPID_LINK_SS)
     xy, spans = [], []
     for (a, b) in links:
         L = math.hypot(b[0] - a[0], b[1] - a[1])
-        m = max(2, int(math.ceil(L / sampling))) + 1
+        m = max(2, int(math.ceil(L / ss))) + 1
+        # odd m -> linspace includes t = 0.5 (tangent-sliver phase safety)
+        if m % 2 == 0:
+            m += 1
         s0 = len(xy)
         for t in np.linspace(0.0, 1.0, m):
             xy.append((a[0] + (b[0] - a[0]) * t,
                        a[1] + (b[1] - a[1]) * t))
         spans.append((s0, len(xy)))
     z = batch_drop(surf, cutter, xy, threads=threads)
+    smax = None
+    if stock is not None:
+        A, sx0, sy0, cell = stock
+        sv = grid_sample(A, sx0, sy0, cell,
+                        np.array([p[0] for p in xy]),
+                        np.array([p[1] for p in xy]))
     out = []
-    for (a, b), (s0, s1) in zip(links, spans):
-        L = math.hypot(b[0] - a[0], b[1] - a[1])
-        ts = np.linspace(0.0, 1.0, s1 - s0)
-        link_z = a[2] + (b[2] - a[2]) * ts
+    for li, ((a, b), (s0, s1)) in enumerate(zip(links, spans)):
         cz = z[s0:s1]
         fin = np.isfinite(cz)
-        if not fin.any() or float(np.max(cz[fin] - link_z[fin])) <= 1e-9:
+        hi = -np.inf
+        if stock is not None:
+            svl = sv[s0:s1]
+            if np.isfinite(svl).any():
+                hi = float(np.max(svl))  # stock within ball reach of path
+        if not fin.any():
+            if hi > -np.inf and use_rapids:
+                # all part-air but stock stands under the path: S3b - the
+                # rapid must clear it; never clamp below that requirement
+                out.append(("rapid", hi + rapid_margin, None))
+            else:
+                out.append(("down", None, None))  # all air along the path
+            continue
+        mx = float(np.max(cz[fin]))
+        ts = np.linspace(0.0, 1.0, s1 - s0)
+        link_z = a[2] + (b[2] - a[2]) * ts
+        if float(np.max(cz[fin] - link_z[fin])) <= 1e-9:
             out.append(("down", None, None))
+        elif use_rapids:
+            # S3b: z_r >= max(CL along path, stock within tool radius along
+            # path) + margin; `clearance` only caps heights already above it
+            zr = max(mx + rapid_margin + stock_allow, hi + rapid_margin)
+            out.append(("rapid", zr, mx))
         else:
-            out.append(("lift", float(np.max(cz[fin])) + LINK_LIFT,
-                        float(np.max(cz[fin]))))
+            # feed lift: with a stock model the traverse must clear it too
+            out.append(("lift", max(mx + LINK_LIFT, hi + rapid_margin), mx))
     return out
 
 
@@ -1048,12 +1131,56 @@ def link_plan(surf, cutter, links, sampling=0.1, threads=None):
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def load_heightfield(path):
+    """Load a heightfield .npy (+ sidecar .json with x0/y0/cell, the
+    engine/zmap convention) -> (A, x0, y0, cell)."""
+    stem = path[:-4] if path.endswith(".npy") else path
+    A = np.load(stem + ".npy")
+    with open(stem + ".json") as fh:
+        meta = json.load(fh)
+    return A, float(meta["x0"]), float(meta["y0"]), float(meta["cell"])
+
+
+def compute_rest_mask(surf, xs, ys, big_tool=("ball", 6.0, 0.0),
+                     small_tool=("ball", 3.0, 0.0), min_rest=0.5,
+                     stock=None, threads=None):
+    """Leftover map for the corner rest pass (S3 item 3), computed from the
+    engine's OWN drop-cutter CL only (no verify/zmap import): a cell is rest
+    material where the 6 mm ball's machined surface (its CL tip height, the
+    surface point directly under the centre) sits more than `min_rest` above
+    what the 3 mm ball reaches:
+
+        CL_big - CL_small > min_rest
+
+    The part lies at or below CL_small wherever the small ball has contact,
+    so this implies CL_big - part > min_rest (the 6 mm ball left more than
+    min_rest above the part). If `stock` = (A, x0, y0, cell) is given (the
+    post-roughing stock .npy or a previous op's zmap heightfield), cells must
+    additionally have stock - CL_small > min_rest, i.e. real material left to
+    remove down to the small ball's cut. Returns a bool array (len(ys),
+    len(xs))."""
+    X, Y = np.meshgrid(xs, ys)
+    xy = list(zip(X.ravel().tolist(), Y.ravel().tolist()))
+    clb = batch_drop(surf, make_cutter(*big_tool), xy,
+                    threads=threads).reshape(X.shape)
+    cls = batch_drop(surf, make_cutter(*small_tool), xy,
+                    threads=threads).reshape(X.shape)
+    mask = np.isfinite(clb) & np.isfinite(cls) & (clb - cls > min_rest)
+    if stock is not None:
+        A, sx0, sy0, cell = stock
+        s = grid_sample(A, sx0, sy0, cell, X, Y)
+        mask &= np.isfinite(s) & (s - cls > min_rest)
+    return mask
+
+
 def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
            sampling=0.1, slope_threshold=40.0, overlap_mm=1.0,
            stepdown=0.3, overlap_deg=5.0, floor_z=None, wl_sampling=0.2,
            wl_min_sampling=0.1, max_chord=5.0, cut_feed=3429.0,
            ramp_feed=1270.0, clearance=None, workers=None, threads=8,
-           window=None, progress=None):
+           window=None, progress=None, rapid_margin=RAPID_MARGIN,
+           use_rapids=True, rest_from=None, big_tool=("ball", 6.0, 0.0),
+           min_rest=0.5, stock_from=None, stock_allow=RAPID_STOCK_ALLOW):
     """Slope-split finishing toolpath (action: slope_split_finish).
     Returns (moves, stats).
 
@@ -1064,7 +1191,19 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     overlap_mm: legacy (S1 overlap band); unused since S2c - the band
     duplicated cutting of the steep transition zone.
     window: (xmin, xmax, ymin, ymax) - restrict the raster and the steep CL
-    grid (smoke tests)."""
+    grid (smoke tests).
+    rapid_margin / use_rapids: verified-clear G0 links (S3 item 1).
+    rest_from: path to a stock/zmap heightfield .npy (+ .json sidecar):
+    corner rest pass (S3 item 3) - cut only where the big_tool's CL surface
+    exceeds the small-ball reach by > min_rest (see compute_rest_mask); the
+    tool in `tool` is then a PLACEHOLDER until it joins tools/x7_tools.json.
+    stock_from: path to the roughing stock heightfield .npy (+ sidecar,
+    engine.cli rough --stock-out): verified rapid/lift heights must clear
+    max(CL along the swept path, stock within the tool radius) + margin
+    (S3b). Conservative: the INITIAL stock is used for every link (cuts
+    only lower it). Without stock_from, rapids add `stock_allow` (default
+    1.0 mm) on top of CL + margin to cover the roughing leftover.
+    """
     t_start = time.time()
     reset_drop_calls()
     cutter = make_cutter(*tool)
@@ -1089,6 +1228,20 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                           tool=tool)
     t_raster = time.time() - t0
     slope = slope_deg(Z, xs[1] - xs[0], ys[1] - ys[0])
+    # rest pass (S3 item 3): restrict the CL grid to leftover cells before
+    # the slope split - shallow rows and the steep core then exist only
+    # where the big ball left > min_rest above the small-ball reach.
+    rest_mask = None
+    rest_stock = None
+    n_rest_cells = 0
+    if rest_from is not None:
+        stock = load_heightfield(rest_from)
+        rest_stock = stock
+        rest_mask = compute_rest_mask(surf, xs, ys, big_tool=big_tool,
+                                     small_tool=tool, min_rest=min_rest,
+                                     stock=stock, threads=threads)
+        n_rest_cells = int(rest_mask.sum())
+        Z = np.where(rest_mask, Z, np.nan)
     s_runs = shallow_runs(xs, ys, Z, slope, threshold=slope_threshold,
                           overlap_mm=overlap_mm, sampling=sampling,
                           stepover=stepover)
@@ -1235,8 +1388,30 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     links = []
     for a, b in zip(ordered, ordered[1:]):
         links.append((a[-1], b[0]))
+    # rapids must clear the STOCK too (ball-radius box max along the path):
+    # S3b --stock-from = post-roughing stock heightfield, or the rest pass
+    # leftover map (leftover ridges stand far above the part). Conservative:
+    # the INITIAL stock is used for every link (finishing cuts only lower it).
+    stock_arg = None
+    link_stock = None
+    if stock_from is not None:
+        link_stock = load_heightfield(stock_from)
+    elif rest_stock is not None:
+        link_stock = rest_stock
+    if link_stock is not None:
+        A, sx0, sy0, cell = link_stock
+        r_px = int(math.ceil(0.5 * tool[1] / cell))
+        i0 = max(0, int((xs[0] - sx0) / cell) - r_px)
+        i1 = min(A.shape[1], int((xs[-1] - sx0) / cell) + r_px + 1)
+        j0 = max(0, int((ys[0] - sy0) / cell) - r_px)
+        j1 = min(A.shape[0], int((ys[-1] - sy0) / cell) + r_px + 1)
+        if i1 > i0 and j1 > j0:
+            stock_arg = (box_max(A[j0:j1, i0:i1], r_px),
+                        sx0 + i0 * cell, sy0 + j0 * cell, cell)
     lplan = link_plan(surf, cutter, links, sampling=sampling,
-                      threads=threads)
+                      threads=threads, rapid_margin=rapid_margin,
+                      clearance=clearance, use_rapids=use_rapids,
+                      stock=stock_arg, stock_allow=stock_allow)
     t_link = time.time() - t0
 
     # -- emit -------------------------------------------------------------
@@ -1251,6 +1426,9 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
              "t_link_s": round(t_link, 1),
              "n_lifts": 0, "cut_len": 0.0, "plunge_len": 0.0,
              "rapid_len": 0.0,
+             # S3 item 1: rapid vs feed link counts and lengths
+             "n_rapid_links": 0, "n_feed_links": 0, "n_lift_links": 0,
+             "rapid_link_len": 0.0, "feed_link_len": 0.0,
              "levels": sorted((round(z, 3) for z in lvl_stat), reverse=True),
              "levels_detail": [[round(z, 3), v[0], v[1]]
                               for z, v in sorted(lvl_stat.items(),
@@ -1258,6 +1436,19 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     stats["n_drop_calls"] = drop_calls()
     stats["n_simplify_rounds"] = n_rounds_steep + n_rounds_shallow
     stats["n_chords_checked"] = n_chords + n_chords_sh
+    if rest_from is not None:
+        # S3 item 3: placeholder tool - the LNC post must refuse this tool
+        # (not in tools/x7_tools.json); never add it to the table.
+        stats["rest_pass"] = True
+        stats["placeholder_tool"] = True
+        stats["rest_from"] = str(rest_from)
+        stats["big_tool"] = "ball:%.1f" % big_tool[1]
+        stats["min_rest_mm"] = min_rest
+        stats["n_rest_cells"] = n_rest_cells
+    if stock_from is not None:
+        # S3b: rapids/lifts verified against this post-roughing stock model
+        stats["stock_from"] = str(stock_from)
+        stats["stock_allow_mm"] = stock_allow
     prev = None
 
     def emit(g, x, y, z, f=None, stat=None):
@@ -1297,14 +1488,30 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                 # plunge_len = real Z travel instead of the whole diagonal.
                 px, py, pz = prev
                 bx, by, bz = path[0][0], path[0][1], path[0][2]
+                stats["n_feed_links"] += 1
+                stats["feed_link_len"] += math.hypot(bx - px, by - py)
                 if bz <= pz:
                     emit(1, bx, by, pz, cut_feed)
                     emit(1, bx, by, bz, cut_feed)
                 else:
                     emit(1, px, py, bz, cut_feed)
                     emit(1, bx, by, bz, cut_feed)
+            elif mode == "rapid":
+                # S3 item 1: retract to the minimum verified-clear height,
+                # G0 across, plunge at ramp feed.
+                stats["n_lifts"] += 1
+                stats["n_rapid_links"] += 1
+                stats["rapid_link_len"] += math.hypot(path[0][0] - prev[0],
+                                                     path[0][1] - prev[1])
+                if abs(lift_z - prev[2]) > 1e-9:
+                    emit(1, prev[0], prev[1], lift_z, ramp_feed)
+                emit(0, path[0][0], path[0][1], lift_z)
+                emit(1, path[0][0], path[0][1], path[0][2], ramp_feed)
             else:
                 stats["n_lifts"] += 1
+                stats["n_lift_links"] += 1
+                stats["feed_link_len"] += math.hypot(path[0][0] - prev[0],
+                                                    path[0][1] - prev[1])
                 emit(1, prev[0], prev[1], lift_z, ramp_feed)
                 emit(1, path[0][0], path[0][1], lift_z, ramp_feed,
                      stat="rapid")
@@ -1317,6 +1524,8 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     stats["cut_len"] = round(stats["cut_len"], 1)
     stats["plunge_len"] = round(stats["plunge_len"], 1)
     stats["rapid_len"] = round(stats["rapid_len"], 1)
+    stats["rapid_link_len"] = round(stats["rapid_link_len"], 1)
+    stats["feed_link_len"] = round(stats["feed_link_len"], 1)
     stats["t_total_s"] = round(time.time() - t_start, 1)
     if progress:
         progress(stats)

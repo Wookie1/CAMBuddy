@@ -15,9 +15,21 @@ tip Z + corner-profile height h(d) (h = 0 inside r - cr). The part
 heightfield (resampled onto this grid) is only used for the "remaining
 stock above the part" clip; gouge checking stays in verify/zmap.py.
 """
+import json
 import math
 
 import numpy as np
+
+
+def save_stock_npy(stock, path):
+    """Write a StockField's final top surface to <path>.npy (+ .json sidecar
+    with x0/y0/cell, the engine/zmap heightfield convention; cells outside
+    the tracked stock box are NaN). Consumed by finish --stock-from."""
+    stem = path[:-4] if path.endswith(".npy") else path
+    A = np.where(np.isfinite(stock.top), stock.top, np.nan)
+    np.save(stem + ".npy", A)
+    with open(stem + ".json", "w") as fh:
+        json.dump({"x0": stock.x0, "y0": stock.y0, "cell": stock.cell}, fh)
 
 
 class StockField:
