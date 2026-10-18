@@ -66,3 +66,24 @@ Short outputs.
    reused across batches without re-running old points. Therefore: make every phase gather its points and call
    batch_drop once per round; add a module-level counter of setSTL calls and a test that asserts the count per
    finish() run is bounded by a small constant times the number of verify rounds (print it).
+
+## Round S1d (supervisor): full Core Front run gouges - fix first
+Full run (S1c code, ball 6, --floor 24.765, after round-7 roughing) at zmap 0.1 mm: 10,815 gouge cells, max 12.08 mm
+at (116.8, 50.8); rapids 0, leftover p95 0.44 mm. Supervisor diagnosis with OCL drop-cutter: the worst moves are steep
+waterline moves at exactly Z 24.765 (the --floor value; 15,502 such lines, G-code lines ~183k-305k), where the true
+ball CL is ~36.85 (e.g. line 209170, x 119.655 y 50.785). The floor level coincides with the part's main flat floor
+(~24.76-24.8), so the waterline at that Z is degenerate (coplanar with flat faces) and runs across raised areas.
+1. Gouge-safe by construction: before emitting, run a ONE-SIDED CL check on EVERY cutting point and every segment's
+   interior samples (line_ss) of the steep pass too (batched, one or a few batch_drop calls): any point whose Z is
+   below the drop-cutter CL by > 0.005 mm is dropped/split out of its run (never moved down). Count and log removals.
+2. Never place a waterline level within 0.05 mm of a flat face Z (detect flat-face Zs from the STL, triangles with
+   normal z ~ 1); shift that level up by 0.05 mm or skip it (the shallow raster covers flats).
+3. Synthetic regression test: plate with a raised boss whose plate top equals the requested floor; zmap 0.1 mm must
+   show 0 gouges; also assert the check in 1 removes the bad points if item 2 is disabled.
+4. Then (only after 1-3 pass): clipped waterline per level - pass only triangles whose z-range overlaps
+   [level - margin, level + ball radius + margin], clipped to the region; test clipped vs unclipped loops equal on
+   a synthetic shape. Do NOT change the 0.3 mm wall stepdown.
+5. Do not run the full part; run the 3+1 synthetic tests and the window smoke (--window 96.8 136.8 30.8 70.8, which
+   contains the worst gouge) with --floor 24.765, then zmap that window output at 0.1 mm against
+   out/core_front_setup_hf01.npy starting from out/stock_roughG_01.npy, and report gouges.
+Short outputs.
