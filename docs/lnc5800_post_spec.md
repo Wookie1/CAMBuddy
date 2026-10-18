@@ -6,6 +6,10 @@ output. Rules marked **VERIFY** depend on a machine parameter or setting that Ja
 Before anything new runs on the machine, he does a graphics check or a dry run above the part.
 
 ## Sources
+- **[LNC-PM]** Advantech-LNC, *A-LNC Milling Machine Series Programming Manual*, 2016/05 V01.02.000
+  (James's copy, docs/LNC-Programming Manual.pdf, kept out of git).
+- **[LNC-OM]** Advantech-LNC, *A-LNC Milling Machine Series Operation Manual*, V01.00.003 (James's copy,
+  docs/LNC-Operation Manual.pdf, kept out of git).
 - **[LNC]** LNC Technology, *LNC Milling Series Software Manual*, 2020/07 V01.00 (parameters, alarms):
   https://abmarketotomasyon.com/wp-content/uploads/2025/08/LNC-Milling-Series_Software_Application_Manual_V01.004408210139_ENG.pdf
 - **[LNC-OP]** Advantech-LNC M5800 Series Operation Manual (ManualsLib):
@@ -23,12 +27,12 @@ Before anything new runs on the machine, he does a graphics check or a dry run a
 |---|------|--------|
 | P1 | The file starts and ends with a `%` line (tape start and end). | [LCNC-O] (`%` demarcation) |
 | P2 | The second line is `O<n>` with an integer program number and no decimal point. | [LNC] INT 3010 (no decimal point on integer addresses); Fanuc O-number convention |
-| P3 | Comments are `( … )`, in upper case, with no nested parentheses. **VERIFY: LNC parameter 42 (COMMENT TYPE) must be 1.** With the default 0, comments are `/*…*/` and `(…)` is a *functional* format. | [LNC] p.147 (param 42), p.59 (param list) |
+| P3 | Comments are `( … )`, in upper case, with no nested parentheses. **CONFIRMED on James's X7, 2026-10-18** (`( )` comments run, so parameter 42 = 1). With parameter 42 = 0, comments are `/*…*/` and `(…)` is a *functional* format; `--comment-style slashstar` covers that case. | [LNC] p.147 (param 42), p.59 (param list); [LNC-PM] p.29 (`/* */` comments in examples) |
 | P4 | Safety line: `G90 G94 G17 G40 G49 G80` sets absolute mode, feed per minute, the XY plane, comp off, length comp off and canned cycles off. | [LCNC-G] G90/G94/G17/G40/G49/G80; [LNC] p.156 (G94 = mm/min or in/min) |
 | P5 | Units: `G21` (mm) or `G20` (inch) as its own line before any motion. | [LNC] p.151 (power-on unit; G20/G21 switch) |
 | P6 | `G53 G00 Z0.` retracts in machine coordinates to Z home before a tool change and at the end. G53 is non-modal. | [LCNC-G] G53; [LNC] param list (G53 motion) |
 | P7 | Tool change: `T<n> M06`, with n from 0 to 99 and no decimal point. | [LNC] INT 3135 (T range 0~99); [LCNC-M] M6 |
-| P8 | Spindle: `S<rpm> M03` (integer S), then a warm-up dwell `G04`. **VERIFY the dwell unit: Fanuc-style `P` is ms with no decimal point, `X` is seconds.** We emit `G04 X<s>.` unless James confirms `P` ms on the X7. | [LCNC-G] G4; [LNC] p.206-210 (`G04 P_` in the rigid-tap example, unit not stated) |
+| P8 | Spindle: `S<rpm> M03` (integer S), then a warm-up dwell `G04 P<ms>`: whole milliseconds, no decimal point (default; **CONFIRMED on James's X7, 2026-10-18**). `G04 X<s>.` (seconds, with a point) is the `--dwell-x-s` option. | [LNC-PM] p.13 (G04: `G04 X100.` = 100 s, `G04 P100` = 0.1 s, P in ms without a decimal point) |
 | P9 | Work offset: `G54` (or G55…G59, or G54 P1…P100) on its own line. | [LNC-OP] (6 + 100 extended work coordinate systems) |
 | P10 | Coolant: `M08` on before cutting, `M09` off at the end. | [LCNC-M] M7/M8/M9 |
 | P11 | Tool length offset: `G43 Z<clear> H<n>`, with H from 0 to 99 and H = T by default. It is applied on the first Z move at clearance height, after an XY rapid at the current Z. | [LCNC-G] G43; [LNC] INT 3136 (H/D range 0~99) |
@@ -47,7 +51,7 @@ Before anything new runs on the machine, he does a graphics check or a dry run a
 | N7 | Line endings: CRLF (accepted by DOS-based LNC controls over disk/RS232). | [LNC] p.1-2 (DOS update page, disk/RS232 transfer) |
 
 ## Open points for James (VERIFY)
-1. LNC parameter 42 is 1, so `( )` comments are comments (P3).
-2. The `G04` dwell unit: whether he wants `X<s>.` or `P<ms>` (P8).
+1. ~~Parameter 42 / `( )` comments (P3)~~: confirmed 2026-10-18.
+2. ~~`G04` dwell unit (P8)~~: confirmed `P<ms>` 2026-10-18.
 3. That `M05` before `M30` is wanted. It's harmless, since M30 also stops the spindle (P13).
 4. The tool and H/D numbers come from tools/x7_tools.json, his own tool table.

@@ -24,7 +24,7 @@ python -m engine.cli post --in out/core_front_roughG.ngc \
   machine-Z home before the tool change and in the footer.
 * **P7-P11** per op: `T<n> M06` / tool description / `S<rpm> M03` / warm-up
   dwell / `G54` / `M08` / first XY rapid at the current Z / `G43 Z<clear> H<n>`.
-* **P8** dwell default `G04 X<seconds>.`; `--dwell-p-ms` emits `G04 P<milliseconds>`
+* **P8** dwell default `G04 P<milliseconds>` (confirmed on James's X7 2026-10-18); `--dwell-x-s` emits `G04 X<seconds>.`
   (the P unit is a VERIFY item on the X7).
 * **P12** cutter radius comp off — paths are tool centre, stated in a header
   comment; arcs (`G02/G03`, N5) only if the input path contains them.
@@ -63,8 +63,7 @@ overrides the table; a spec that is not listed with no number given is
 
 ## VERIFY items for James (from the spec)
 
-1. LNC parameter 42 = 1 so `( )` are comments (P3).
-2. The `G04` dwell unit: default is `X<seconds>`; use `--dwell-p-ms` for
-   `P<milliseconds>` once confirmed (P8).
+1. CONFIRMED 2026-10-18 on James's X7: `( )` comments run (LNC parameter 42 = 1) (P3).
+2. CONFIRMED 2026-10-18 on James's X7: dwell `G04 P<milliseconds>` (P8); `--dwell-x-s` remains.
 3. `M05` before `M30` is emitted per P13 (spindle stop; M30 also stops).
 4. Tool/H/D numbers come from `tools/x7_tools.json`, James's own tool table.

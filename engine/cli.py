@@ -26,7 +26,7 @@ def _run_post(a):
     with open(a.inp, newline="") as fh:
         text = fh.read()
     kw = dict(metric=a.metric, program=a.program, op_name=a.op_name,
-              wcs=a.wcs, dwell_ms=a.dwell_ms, dwell_p_ms=a.dwell_p_ms,
+              wcs=a.wcs, dwell_ms=a.dwell_ms, dwell_p_ms=not getattr(a, "dwell_x_s", False),
               comment_style=getattr(a, "comment_style", "paren"),
               tool_desc=a.tool_desc, crlf=not a.lf)
     if a.tool_number is not None:
@@ -210,9 +210,9 @@ def main(argv=None):
     pp.add_argument("--comment-style", choices=("paren", "slashstar"), default="paren",
                    help="P3: ( ) comments need LNC parameter 42 = 1; slashstar emits /*...*/")
     pp.add_argument("--dwell-ms", dest="dwell_ms", type=int, default=3000)
-    pp.add_argument("--dwell-p-ms", dest="dwell_p_ms", action="store_true",
-                   help="emit the P8 dwell as G04 P<milliseconds> instead of "
-                        "the default G04 X<seconds>")
+    pp.add_argument("--dwell-x-s", dest="dwell_x_s", action="store_true",
+                   help="emit the P8 dwell as G04 X<seconds>. instead of "
+                        "the default G04 P<milliseconds> (James's X7)")
     pp.add_argument("--tool-desc", dest="tool_desc", default=None)
     pp.add_argument("--lf", action="store_true", help="use LF instead of CRLF")
     a = p.parse_args(argv)

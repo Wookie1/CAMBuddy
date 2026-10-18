@@ -9,3 +9,6 @@ samples/core_check.step
 spike/probe_*.py
 engine/probe_*.py
 connector/probe_*.py
+docs/*.pdf
+.DS_Store
+samples/*.nc

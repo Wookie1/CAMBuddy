@@ -11,8 +11,8 @@ numbers).
   ``G90 G94 G17 G49 G40 G80`` (P4) / ``G20`` (or ``G21``, P5) /
   ``G53 G00 Z0.`` (P6).
 * Per op (P7-P12): ``(OP NAME)`` / ``T<n> M06`` / tool description comment /
-  ``S<rpm> M03`` + warm-up dwell (P8: ``G04 X<s>.`` in seconds by default;
-  ``dwell_p_ms=True`` emits ``G04 P<ms>``) / work offset ``G54`` (P9) /
+  ``S<rpm> M03`` + warm-up dwell (P8: ``G04 P<ms>`` by default, confirmed on James's X7;
+  ``dwell_p_ms=False`` emits ``G04 X<s>.``) / work offset ``G54`` (P9) /
   ``M08`` (P10) / first XY rapid at the current Z / ``G43 Z<clear> H<n>``
   (P11) / motion. Cutter radius comp is off, paths are tool centre (P12); a
   header comment states this. Arcs (``G02``/``G03`` with I/J in G17, N5) are
@@ -290,7 +290,7 @@ def post_moves(moves, metric=False, units_in=1.0, start=None):
 def post(moves, *, metric=False, units_in=1.0, program=1001,
          op_name="ENGINE ROUGH", tool_number=None, rpm=7500,
          dia_mm=12.7, corner_mm=0.127, tool_kind="bull",
-         clear_mm=None, wcs=54, dwell_ms=3000, dwell_p_ms=False,
+         clear_mm=None, wcs=54, dwell_ms=3000, dwell_p_ms=True,
          tool_desc=None, comp_note=True, crlf=True,
          comment_style="paren"):
     """Build a full LNC program (single string) from neutral ``moves``.
@@ -301,7 +301,7 @@ def post(moves, *, metric=False, units_in=1.0, program=1001,
     input units if they are not mm. Output is inch unless ``metric=True``.
 
     ``dwell_ms`` is the P8 warm-up dwell; by default it is emitted as
-    ``G04 X<seconds>.`` (P8, X = seconds). With ``dwell_p_ms=True`` it is
+    ``G04 P<milliseconds>`` (P8, whole ms, no point). With ``dwell_p_ms=False`` it is
     emitted as ``G04 P<milliseconds>`` (P8, VERIFY: P unit on the X7).
 
     ``tool_number`` (T and H) must either be given explicitly or be found in
@@ -357,7 +357,7 @@ def post(moves, *, metric=False, units_in=1.0, program=1001,
     out.append("(%s)" % desc.upper())            # P3 comment form
     out.append("S%d M03" % rpm)                 # P8 (integer S: N2)
     if dwell_p_ms:
-        out.append("G04 P%d" % int(round(dwell_ms)))   # P8 (VERIFY: P = ms)
+        out.append("G04 P%d" % int(round(dwell_ms)))   # P8: P = ms (LNC programming manual p.13)
     else:
         out.append("G04 X%s" % fmt_num(dwell_ms / 1000.0, 3))  # P8: X = sec
     out.append("G%d" % wcs)                     # P9

@@ -7,7 +7,7 @@ Runnable two ways:
 
 (a) spec conformance: post a small synthetic program and check every rule of
     docs/lnc5800_post_spec.md -- header order (P1-P6), comment form (P3),
-    dwell default `G04 X<s>.` and `--dwell-p-ms` variant (P8), footer order
+    dwell default `G04 P<ms>` and `--dwell-x-s` variant (P8), footer order
     incl. M05 (P13), integer addresses without points (N2), decimals on
     coordinates/feeds (N1/N3/N4), modal suppression (N6), CRLF (N7).
 (b) zmap the posted inch file and confirm gouges / leftover / cutting length are
@@ -97,7 +97,7 @@ def test_spec_header_and_footer_order():
     assert lines.count("G53 G00 Z0.") == 2, "P6: home before op and in footer"
 
     # P7-P11 op block order
-    seq = ["T2 M06", "S7500 M03", "G04 X3.", "G54", "M08"]
+    seq = ["T2 M06", "S7500 M03", "G04 P3000", "G54", "M08"]
     idx = [lines.index(s) for s in seq]
     assert idx == sorted(idx), "P7-P10 order wrong: %r" % lines[i_tool:i_tool + 8]
     i_g43 = next(i for i, l in enumerate(lines) if l.startswith("G43"))
@@ -128,14 +128,14 @@ def test_spec_comment_form():
 
 
 def test_spec_dwell_variants():
-    """P8: default dwell is G04 X<seconds>.; dwell_p_ms emits G04 P<milliseconds>."""
-    assert "G04 X3." in _synthetic(), "P8 default must be G04 X<seconds>."
-    txt_p = _synthetic(dwell_p_ms=True)
-    assert "G04 P3000" in txt_p, "P8 dwell_p_ms must emit G04 P<ms>"
-    assert "G04 X" not in txt_p
-    txt_half = _synthetic(dwell_ms=1500)
-    assert "G04 X1.5" in txt_half, "P8: 1500 ms -> G04 X1.5: %r" % txt_half
-    print("PASS spec P8: dwell X<s>. default, P<ms> with dwell_p_ms")
+    """P8: default dwell is G04 P<whole ms> (James's X7); dwell_p_ms=False emits G04 X<s>."""
+    txt_p = _synthetic()
+    assert "G04 P3000" in txt_p, "P8 default must be G04 P<ms>"
+    assert "G04 X" not in txt_p and "G04 P3000." not in txt_p
+    assert "G04 P1500" in _synthetic(dwell_ms=1500.4), "P8: whole milliseconds"
+    assert "G04 X3." in _synthetic(dwell_p_ms=False), "P8 option must be G04 X<seconds>."
+    assert "G04 X1.5" in _synthetic(dwell_ms=1500, dwell_p_ms=False)
+    print("PASS spec P8: dwell P<ms> default, X<s>. with dwell_p_ms=False")
 
 
 def test_spec_number_rules():
