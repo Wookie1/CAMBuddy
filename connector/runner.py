@@ -20,6 +20,26 @@ class EngineError(Exception):
     pass
 
 
+def _check_zmap_gates(check):
+    """Raise EngineError if any zmap gate fails: gouges, rapid collisions,
+    or shank/over-flute hits > 0."""
+    gouges = check.get("gouges", {})
+    if isinstance(gouges, dict) and gouges.get("count", 0) > 0:
+        raise EngineError(
+            "zmap gate: %d gouges (max %.3f mm)"
+            % (gouges["count"], gouges.get("max_depth", 0.0)))
+    rapids = check.get("rapid_collisions", {})
+    if isinstance(rapids, dict) and rapids.get("count", 0) > 0:
+        raise EngineError(
+            "zmap gate: %d rapid collisions (first line %s)"
+            % (rapids["count"], rapids.get("first_line", "?")))
+    of = check.get("over_flute")
+    if isinstance(of, dict) and of.get("count", 0) > 0:
+        raise EngineError(
+            "zmap gate: %d over-flute/shank hits (max %.3f mm)"
+            % (of["count"], of.get("max_depth", 0.0)))
+
+
 def _tool_number(cfg, values):
     if values.get("tool_number"):
         return int(values["tool_number"])
@@ -170,6 +190,7 @@ class EngineRun:
                    0.88, 0.95, on_progress)
         with open(check_path) as fh:
             check = json.load(fh)
+        _check_zmap_gates(check)
 
         result = {
             "units": "mm",
@@ -325,8 +346,7 @@ class EngineRun:
 
         # 7) probe_clcheck on the posted finish output (must be 0)
         cl_lines = []
-        self._spawn([py, os.path.join(os.path.dirname(
-            os.path.abspath(__file__)), "probe_clcheck.py"),
+        self._spawn([py, os.path.join(repo, "engine", "probe_clcheck.py"),
                     fin, stl, "%.4f" % values["tool_diameter"]],
                    0.76, 0.80, on_progress, json_out=cl_lines)
         cl = cl_lines[-1] if cl_lines else {}
@@ -363,6 +383,8 @@ class EngineRun:
             check_r = json.load(fh)
         with open(check_finish) as fh:
             check_f = json.load(fh)
+        _check_zmap_gates(check_r)
+        _check_zmap_gates(check_f)
 
         # 9) combined check.json + result
         check = {
