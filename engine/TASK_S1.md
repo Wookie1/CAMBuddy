@@ -21,3 +21,14 @@ steep contours misplace the tool next to slots narrower than the ball (spike/DIA
    rough with bull 12.7/0.127, finish with ball 6). Report zmap gouges (0.1 mm heightfield out/core_front_setup_hf01
    near walls), leftover after finishing by slope zone, length and time. Write out/bench_finish_s1.json.
 Run /opt/homebrew/bin/python3 -m pytest verify -q and the finish tests before finishing.
+
+## Supervisor note (relaunch)
+The previous session was aborted by the local oMLX memory guard (context too long), not by your code. Your
+work is in the tree (engine/finish.py, engine/test_finish.py, cli.py changes): check git diff first. You were
+investigating 10 tiny over-cuts (0.02-0.07 mm, ball surface 9.93-9.98 vs wall top 10.0) on the slot-boss test
+around (-15, 12) at Z 7.6-9.4 - steep waterline points within the ball radius of the slot edge. Decide if they are
+real (fix: the waterline must come from ocl with the same 6 mm ball, sampling fine enough) or a zmap sampling
+artifact (prove with a finer sample). Keep messages short and avoid printing large outputs, to keep context small.
+- Relaunch 3 (now on a different model): the previous session got the hemisphere test clean and changed
+  test_finish.py to assert on tool-reachable cells (reporting raw and reachable fractions). Next: run the full
+  finish suite, then item 5 on core_front_setup.

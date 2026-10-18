@@ -20,6 +20,52 @@ def parse_tool(spec):
     return kind, dia, corner
 
 
+def finish_main(a):
+    """`engine.cli finish`: steep & shallow finishing (engine/finish.py)."""
+    from engine import finish as finishmod
+    kind, dia, corner = parse_tool(a.tool)
+    t0 = time.time()
+    if a.stl:
+        stl = a.stl
+    elif a.step:
+        stl = model.step_to_stl(a.step)
+    else:
+        raise SystemExit("finish needs --stl or --step")
+    surf = model.load_surf(stl)
+    print("STL %s: %d triangles" % (stl, surf.size()), flush=True)
+    workers = a.workers if a.workers is not None else max(1, os.cpu_count() - 2)
+
+    def prog(stats):
+        print("raster %.1fs steep %.1fs (wl %.1fs) simplify %.1fs links %.1fs"
+              % (stats["t_raster_s"], stats["t_steep_s"],
+                 stats["t_waterline_s"], stats["t_simplify_s"],
+                 stats["t_link_s"]), flush=True)
+
+    moves, stats = finishmod.finish(
+        surf, stl_path=stl, tool=(kind, dia, corner), stepover=a.stepover,
+        sampling=a.sampling, slope_threshold=a.slope_threshold,
+        overlap_mm=a.overlap_mm, stepdown=a.stepdown,
+        overlap_deg=a.overlap_deg, floor_z=a.floor,
+        wl_sampling=a.wl_sampling, wl_min_sampling=a.wl_min_sampling,
+        max_chord=a.max_chord, cut_feed=a.cut_feed, ramp_feed=a.ramp_feed,
+        clearance=a.clearance, workers=workers,
+        progress=prog)
+    text = finishmod.finish_to_gcode(
+        moves, spindle_rpm=a.spindle,
+        tool_comment="T1 %s D=%.3f CR=%.3f" % (kind, dia, corner))
+    with open(a.out, "w") as fh:
+        fh.write(text)
+    stats["out"] = a.out
+    stats["n_moves"] = len(moves)
+    stats["t_total_s"] = round(time.time() - t0, 1)
+    print("wrote %s (%d moves) in %.1f s" % (a.out, len(moves),
+                                               stats["t_total_s"]), flush=True)
+    if a.stats_json:
+        with open(a.stats_json, "w") as fh:
+            json.dump(stats, fh, indent=2)
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="engine.cli")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -65,7 +111,48 @@ def main(argv=None):
     r.add_argument("--wl-sampling", dest="wl_sampling", type=float, default=0.1,
                    help="waterline sampling mm")
     r.add_argument("--stats-json", dest="stats_json", default=None)
+
+    f = sub.add_parser("finish",
+                       help="steep & shallow finishing from ocl CL points only")
+    f.add_argument("--stl", default=None,
+                   help="part STL (e.g. cached out/core_front_setup.stl)")
+    f.add_argument("--step", default=None,
+                   help="STEP to tessellate via engine.model if --stl is absent")
+    f.add_argument("--tool", default="ball:6",
+                   help="ball:DIA | bull:DIA:CORNER | flat:DIA (default ball:6)")
+    f.add_argument("--out", required=True, help="output .ngc file")
+    f.add_argument("--stepover", type=float, default=0.3,
+                   help="shallow raster stepover mm")
+    f.add_argument("--sampling", type=float, default=0.1,
+                   help="CL sampling / raster X pitch mm")
+    f.add_argument("--slope-threshold", dest="slope_threshold", type=float,
+                   default=40.0, help="steep/shallow slope threshold deg")
+    f.add_argument("--overlap-mm", dest="overlap_mm", type=float, default=1.0,
+                   help="shallow overlap band into the steep zone mm")
+    f.add_argument("--stepdown", type=float, default=0.3,
+                   help="steep waterline Z stepdown mm")
+    f.add_argument("--overlap-deg", dest="overlap_deg", type=float, default=5.0,
+                   help="steep keeps slope >= threshold - overlap_deg")
+    f.add_argument("--floor", type=float, default=None,
+                   help="lowest steep waterline Z (default: part zmin)")
+    f.add_argument("--wl-sampling", dest="wl_sampling", type=float, default=0.2)
+    f.add_argument("--wl-min-sampling", dest="wl_min_sampling", type=float,
+                   default=0.1)
+    f.add_argument("--max-chord", dest="max_chord", type=float, default=5.0,
+                   help="max gouge-safe simplification chord mm")
+    f.add_argument("--cut-feed", dest="cut_feed", type=float, default=3429.0)
+    f.add_argument("--ramp-feed", dest="ramp_feed", type=float, default=1270.0)
+    f.add_argument("--clearance", type=float, default=None,
+                   help="retract plane Z (default part top + 2)")
+    f.add_argument("--spindle", type=int, default=7500)
+    f.add_argument("--workers", type=int, default=None,
+                   help="parallel waterline level workers (default cpu-2)")
+    f.add_argument("--stats-json", dest="stats_json", default=None)
+
     a = p.parse_args(argv)
+
+    if a.cmd == "finish":
+        return finish_main(a)
 
     kind, dia, corner = parse_tool(a.tool)
     if a.optimal_load_mm is not None:
