@@ -199,16 +199,47 @@ def _pt_seg_dist_np(P, A, B):
     return np.sqrt((d * d).sum(axis=2))
 
 
+def _inside_loops(P, loops, chunk=512):
+    """Even-odd point-in-polygon for closed loops: (N,2) array -> bool array,
+    True where the point is strictly INSIDE any loop. Distance-to-loop alone
+    cannot see centres deep inside an island loop (R1: those gouge the part
+    while every distance check stays green)."""
+    import numpy as np
+    inside = np.zeros(len(P), dtype=bool)
+    for lp in loops:
+        L = np.asarray(lp, dtype=float)
+        if len(L) < 3:
+            continue
+        x, y = L[:, 0], L[:, 1]
+        xn, yn = np.roll(x, -1), np.roll(y, -1)
+        for s in range(0, len(P), chunk):
+            blk = P[s:s + chunk]
+            py = blk[:, 1][:, None]
+            cross = (y[None, :] > py) != (yn[None, :] > py)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                xint = x[None, :] + (py - y[None, :]) * (xn[None, :] - x[None, :]) \
+                       / (yn[None, :] - y[None, :])
+            hit = cross & (blk[:, 0][:, None] < xint)
+            inside[s:s + chunk] |= (hit.sum(axis=1) % 2 == 1)
+    return inside
+
+
 def allowance_violation(points, islands, tool_r, leave, tol=0.02):
     """HARD post-check for one level: every cutter centre cutting at this
     level's Z must stay >= tool_r + leave - tol from that level's island
-    loops (the round-5 failure lost 0.37 mm of radial allowance). Returns
-    (x, y, dist) of the closest-to-material offender, else None."""
+    loops (the round-5 failure lost 0.37 mm of radial allowance), and must
+    never be INSIDE an island loop (R1: distance alone missed centres deep
+    inside a loop - the no-hf gouge). Returns (x, y, dist) of the
+    closest-to-material offender, else None."""
     import numpy as np
     req = tool_r + leave - tol
     if not points or not islands:
         return None
     P = np.asarray(points, dtype=float)
+    ins = _inside_loops(P, islands)
+    if ins.any():
+        k = int(np.nonzero(ins)[0][0])
+        return (float(P[k, 0]), float(P[k, 1]), 0.0)
     worst = None
     for lp in islands:
         L = np.asarray(lp, dtype=float)
@@ -236,8 +267,10 @@ def allowance_violation(points, islands, tool_r, leave, tol=0.02):
 
 def island_clear_fn(islands, req):
     """Return f(pts) -> bool list: True where a cutter centre is >= `req`
-    away from every island loop (exact waterline geometry - the ground truth
-    the emitted CL must obey, independent of the stock heightfield model)."""
+    away from every island loop AND not inside one (exact waterline geometry -
+    the ground truth the emitted CL must obey, independent of the stock
+    heightfield model; R1: the inside test closes the distance-only blind
+    spot that let centres deep inside an island pass)."""
     import numpy as np
     segs = []
     for lp in islands:
@@ -258,8 +291,76 @@ def island_clear_fn(islands, req):
             blk = P[s:s + 512]
             d = _pt_seg_dist_np(blk, A, AB[:, 1, :])
             out[s:s + 512] = d.min(axis=1)
-        return [bool(v >= req) for v in out]
+        ins = _inside_loops(P, [lp for lp in islands if len(lp) >= 3])
+        return [bool(v >= req) and not i for v, i in zip(out, ins)]
     return f
+
+
+def build_part_hf(surf, x0, y0, cell, nx, ny, threads=None, drop_z=0.0):
+    """Rasterise the part heightfield on a grid (x0/y0 = lower-left corner,
+    cell mm, row j = +Y) by dropping a small cylinder (r 0.05 mm, the same
+    convention as the waterline islands) with ocl's batch drop-cutter:
+    part[j, i] = highest part surface at the cell centre, NaN where the
+    column is empty. R1: rough() builds this itself when no --hf is given,
+    so the rest/step-up clips and the part-footprint guards always have the
+    part model (the no-hf gouge on core_front_setup came from running with
+    stock.part = None: every part clip silently degraded)."""
+    import numpy as np
+    total = nx * ny
+    z = np.empty(total)
+    CH = 200000
+    for a in range(0, total, CH):
+        n = min(CH, total - a)
+        idx = np.arange(a, a + n)
+        jj, ii = np.divmod(idx, nx)
+        bd = ocl.BatchDropCutter()   # fresh batch per chunk (reuse crashes)
+        bd.setSTL(surf)
+        bd.setCutter(ocl.CylCutter(0.05, 50.0))
+        if threads:
+            bd.setThreads(min(8, threads))
+        for k in range(n):
+            bd.appendPoint(ocl.CLPoint(x0 + (int(ii[k]) + 0.5) * cell,
+                                      y0 + (int(jj[k]) + 0.5) * cell, drop_z))
+        bd.run()
+        z[a:a + n] = [p.z for p in bd.getCLPoints()]
+    z[z < -1e29] = np.nan
+    return z.reshape(ny, nx)
+
+
+def hf_gouge_violation(points, stock, tool_r, tol=0.02):
+    """Backstop for the island post-check: no part-heightfield cell within
+    (tool_r - cell) of a cutting centre may stand above that point's own Z
+    + tol. Catches levels whose waterline islands came out empty/missing
+    (features below min_perimeter, adaptive-waterline misses) - exactly where
+    the island-loop check is blind. The disk shrinks by one cell because the
+    hf raster quantises walls by up to one cell, so a centre honouring
+    tool_r + leave at a wall keeps a >= leave - tol margin against this
+    check at any stock_cell."""
+    import numpy as np
+    if stock.part is None or not points:
+        return None
+    c = stock.cell
+    rad = tool_r - c
+    if rad <= 0:
+        return None
+    k = int(math.floor(rad / c))
+    offs = [(dj, di) for dj in range(-k, k + 1)
+            for di in range(-k, k + 1)
+            if (dj * dj + di * di) * c * c <= rad * rad]
+    P = np.asarray([(p[0], p[1]) for p in points], dtype=float)
+    Z = np.asarray([p[2] for p in points], dtype=float)
+    ii = np.floor((P[:, 0] - stock.x0) / c).astype(np.int64)
+    jj = np.floor((P[:, 1] - stock.y0) / c).astype(np.int64)
+    mx = np.full(len(P), -np.inf)
+    for dj, di in offs:
+        a = np.clip(ii + di, 0, stock.nx - 1)
+        b = np.clip(jj + dj, 0, stock.ny - 1)
+        np.maximum(mx, stock.part[b, a], out=mx)
+    d = mx - Z
+    k2 = int(np.argmax(d))
+    if d[k2] > tol:
+        return (float(P[k2, 0]), float(P[k2, 1]), float(Z[k2]), float(mx[k2]))
+    return None
 
 
 def _helix_moves(cx, cy, sx, sy, z_top, z_bot, feed):
@@ -362,6 +463,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     stock_box: (xmin,xmax,ymin,ymax,zmin,zmax) of the raw stock.
     part_hf: (part, x0, y0, cell) final-part heightfield for the
       "remaining stock above the part > min_rest" clip on level regions.
+      When None it is built from `surf` itself (build_part_hf, R1) so the
+      part clips are never silently skipped.
     Levels: big stepdowns + stock-clipped step-up climb grids (Task G);
       `stepup` = climb grid pitch, levels whose clipped region is smaller
       than min_level_area mm^2 are skipped.
@@ -386,6 +489,16 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     if part_hf is not None:
         part, px0, py0, pcell = part_hf
         stock.set_part_from_other_grid(part, px0, py0, pcell, fill=-1e9)
+    else:
+        # R1: the part model is mandatory - without it region_mask's
+        # pz/min_rest clips and the grown-mask island punch-out silently
+        # degrade, and levels whose waterline islands are missing cut
+        # straight through the part. Build it from the STL we already load.
+        part = build_part_hf(surf, stock.x0, stock.y0, stock.cell,
+                             stock.nx, stock.ny, threads=threads,
+                             drop_z=szmin - 1.0)
+        stock.set_part_from_other_grid(part, stock.x0, stock.y0, stock.cell,
+                                      fill=-1e9)
     stock.set_tool(tool_r)
 
     order = plan_stepup_levels(szmax, final, stepdown=stepdown, stepup=stepup,
@@ -417,6 +530,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
 
     moves = []
     prev = [None, None, clearance_z]
+    hf_pts = []  # cutting (G1) points with their own Z, per level (backstop)
 
     def emit(mv):
         x0, y0, z0 = prev
@@ -428,6 +542,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 and abs(mv["x"] - x0) < 1e-9 and abs(mv["y"] - y0) < 1e-9
                 and abs(mv["z"] - z0) < 1e-9):
             return  # zero-length move
+        if mv["g"] == 1:
+            hf_pts.append((mv["x"], mv["y"], mv["z"]))
         length = math.dist((x0, y0, z0), (mv["x"], mv["y"], mv["z"]))
         if mv["g"] == 0:
             stats["rapid_len"] += length
@@ -499,6 +615,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
 
     zi = 0
     for z in order:
+        del hf_pts[:]
         mask = stock.region_mask(z, axl, min_rest, leave_margin=leave + 0.4)
         area_mm2 = stock.region_area(mask)
         if area_mm2 < min_level_area:
@@ -557,11 +674,26 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # keep only genuine cleared-pocket holes: a hole whose interior still
         # has stock above the level is a part footprint (excluded cells with
         # part > Z) - passing it next to the coincident waterline island loop
-        # breaks Adaptive2d (probe_g_duploop: centres end up inside the hole)
-        holes = [hp for hp in holes
-                 if stock.top_at(sum(p[0] for p in hp) / len(hp),
-                                sum(p[1] for p in hp) / len(hp))
-                 <= z + axl + 0.05]
+        # breaks Adaptive2d (probe_g_duploop: centres end up inside the hole).
+        # R1: when THIS level has no islands, that footprint hole is the only
+        # guard for the feature - convert it into a pseudo-island (geometry
+        # loop, offset by tool_r+leave) instead of passing it as a hole.
+        import numpy as np
+        keep_holes, foot_iso = [], []
+        for hp in holes:
+            cx = sum(p[0] for p in hp) / len(hp)
+            cy = sum(p[1] for p in hp) / len(hp)
+            if stock.top_at(cx, cy) <= z + axl + 0.05:
+                keep_holes.append(hp)
+            else:
+                foot_iso.append(hp)
+        holes = keep_holes
+        if foot_iso and not islands:
+            islands = [lp if sum(lp[i][0] * lp[(i + 1) % len(lp)][1]
+                                - lp[(i + 1) % len(lp)][0] * lp[i][1]
+                                for i in range(len(lp))) > 0
+                       else lp[::-1] for lp in foot_iso]  # CCW like islands
+            isl_ok = island_clear_fn(islands, tool_r + leave - 0.015)
         if not outers:
             stats["levels"].append({"z": round(z, 3), "skipped": True,
                                    "region_mm2": round(area_mm2, 1)})
@@ -685,6 +817,15 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     "(tool_r %.3f + leave %.3f - 0.02)"
                     % (z, viol[0], viol[1], viol[2],
                      tool_r + leave - 0.02, tool_r, leave))
+            # R1 backstop: the island loops above can be empty/stale for a
+            # level (small features drop below min_perimeter, waterline can
+            # miss); the part heightfield check never depends on islands.
+            hv = hf_gouge_violation(hf_pts, stock, tool_r)
+            if hv:
+                raise RuntimeError(
+                    "hf backstop at level Z=%.3f: CL point (%.3f, %.3f) at "
+                    "Z=%.3f cuts to %.3f mm below the part heightfield"
+                    % (z, hv[0], hv[1], hv[2], hv[3] - hv[2]))
 
         stock.refresh_tool()   # per-level tool-kernel refresh (cuts milled live)
 
@@ -699,7 +840,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         zi += 1
         if progress:
             progress(zi, z, islands, nreg, stats)
-    emit({"g": 0, "x": prev[0], "y": prev[1], "z": clearance_z})
+    if prev[0] is not None:
+        emit({"g": 0, "x": prev[0], "y": prev[1], "z": clearance_z})
     if stock_out:
         # S3b: the engine's own final stock heightfield (after all levels),
         # for finish --stock-from rapid verification

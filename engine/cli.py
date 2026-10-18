@@ -220,7 +220,8 @@ def main(argv=None):
     r.add_argument("--hf", default=None,
                   help="part heightfield .npy (+ .json sidecar): clips step-up "
                        "levels to where remaining stock above the part is "
-                       "> --min-rest mm")
+                       "> --min-rest mm. When omitted the engine rasterises it "
+                       "itself from the STEP (same clips always apply).")
     r.add_argument("--min-rest", dest="min_rest", type=float, default=1.0,
                   help="min remaining stock above the part mm for a cell to "
                        "stay in a level's region")
