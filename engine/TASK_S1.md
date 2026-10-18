@@ -43,3 +43,21 @@ The full core_front finishing run took > 70 min single-process and OpenCode ende
 4. Note in the report: plunge length exceeds cut length on slot-boss (9854 vs 7358 mm) - check that link/retract
    logic does not plunge at every row; reduce it if it's simple and safe.
 Short outputs. Print timings and the smoke stats at the end.
+
+## Round S1c (supervisor): fix the finishing bottleneck
+Diagnosis (stack sample of the full core_front run, 80+ min single-core): almost all time is in
+ocl::BatchDropCutter::setSTL -> Bbox::addTriangle. engine/finish.py batch_drop() builds a NEW BatchDropCutter and
+calls setSTL (re-indexes all 248k triangles) on every call, and the gouge-safe simplification calls it once per
+candidate chord (finish.py ~line 439), i.e. thousands of times.
+Fix (keep it gouge-safe, same 0.005 mm one-sided chord rule):
+1. Simplify in verify-and-split rounds instead of per-chord calls: propose a simplification (e.g. Douglas-Peucker
+   on the CL polyline at the chord tolerance), then check ALL resulting chords' interior samples (line_ss spacing)
+   in ONE batch_drop call; for each failing chord re-insert the original point(s) it skipped (e.g. the one with max
+   deviation) and re-check only the failing ones in the next single call; repeat until none fail (cap rounds,
+   fall back to keeping all points). Same for link checks: batch every link's samples into one call.
+2. Count batch_drop calls (log them) and assert in the tests that a run makes O(rounds) calls, not O(chords).
+3. Keep engine/test_finish.py passing (0 gouges on hemisphere, cone60, slot-boss) and time it before/after.
+4. Rename user-facing "steep & shallow" wording to "slope-split finishing" / action name slope_split_finish in
+   finish.py docstrings, CLI help and logs (keep internal function names if you like).
+5. Then run the window smoke test (--window -144.6 -84.6 36.9 76.9) and report its runtime. Do NOT run the full part.
+Short outputs.
