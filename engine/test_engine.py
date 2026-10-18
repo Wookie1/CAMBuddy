@@ -886,7 +886,8 @@ def _main():
                test_island_clear_fn, test_allowance_violation_containment,
                test_rough_without_hf_safe, test_rough_testblock_r2,
                test_islands_grid_edge_parity, test_rough_pocket_in_block,
-               test_rough_synth_pocket_repro, test_rough_rapids_clear_stock):
+               test_rough_synth_pocket_repro, test_rough_rapids_clear_stock,
+               test_stl_cache_keyed_by_content):
         try:
             fn()
         except AssertionError as e:
@@ -894,6 +895,30 @@ def _main():
             print("FAIL %s: %s" % (fn.__name__, e))
     print("%d failure(s)" % fails)
     return 1 if fails else 0
+
+
+
+def test_stl_cache_keyed_by_content():
+    """Two different STEP files with the same name must never share a cached STL
+    (connector runs all name their part model.step)."""
+    import tempfile, shutil
+    from engine import model
+    here = os.path.dirname(os.path.abspath(__file__))
+    a = os.path.join(here, "testdata_synth_pocket.step")
+    b = os.path.join(os.path.dirname(here), "samples", "test_block.step")
+    if not (os.path.exists(a) and os.path.exists(b)):
+        print("SKIP stl cache test (sample STEPs missing)")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "out")
+        for src, sub in ((a, "r1"), (b, "r2")):
+            os.makedirs(os.path.join(td, sub))
+            shutil.copy(src, os.path.join(td, sub, "model.step"))
+        s1 = model.step_to_stl(os.path.join(td, "r1", "model.step"), out_dir=out)
+        s2 = model.step_to_stl(os.path.join(td, "r2", "model.step"), out_dir=out)
+        assert s1 != s2, "same-name different-content STEPs shared a cached STL"
+        assert model.step_to_stl(os.path.join(td, "r1", "model.step"), out_dir=out) == s1
+    print("PASS stl cache keyed by content")
 
 
 if __name__ == "__main__":

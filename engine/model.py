@@ -25,8 +25,13 @@ def python311():
 
 def step_to_stl(step, out_dir="out", tol=0.01):
     """Tessellate `step` to <out_dir>/<stem>.stl at deflection `tol` (cached)."""
+    # Cache key = file CONTENT + tolerance, never the file name: every connector
+    # run's part is "model.step", so a name-keyed cache served a stale, different part.
+    import hashlib
+    with open(step, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()[:16]
     stem = os.path.splitext(os.path.basename(step))[0]
-    stl = os.path.join(out_dir, stem + ".stl")
+    stl = os.path.join(out_dir, "%s-%s-t%g.stl" % (stem, digest, tol))
     if os.path.exists(stl) and os.path.getsize(stl) > 0:
         return stl
     os.makedirs(out_dir, exist_ok=True)
