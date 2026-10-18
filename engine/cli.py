@@ -106,8 +106,9 @@ def main(argv=None):
                    help="LNC op-name comment (with --post lnc)")
     r.add_argument("--metric", action="store_true",
                    help="emit G21 mm instead of the default G20 inch")
-    r.add_argument("--tool-number", dest="tool_number", type=int, default=1,
-                   help="LNC tool number (T/H) with --post lnc)")
+    r.add_argument("--tool-number", dest="tool_number", type=int, default=None,
+                   help="LNC tool number (T/H) with --post lnc; default: look "
+                        "the tool up in tools/x7_tools.json")
 
     pp = sub.add_parser("post", help="post neutral/engine moves to LNC G-code")
     pp.add_argument("--in", dest="inp", required=True,
@@ -117,7 +118,9 @@ def main(argv=None):
                    help="emit G21 mm instead of the default G20 inch")
     pp.add_argument("--program", type=int, default=1001)
     pp.add_argument("--op-name", dest="op_name", default="ENGINE ROUGH")
-    pp.add_argument("--tool-number", dest="tool_number", type=int, default=None)
+    pp.add_argument("--tool-number", dest="tool_number", type=int, default=None,
+                   help="LNC tool number (T/H); default: look the tool up in "
+                        "tools/x7_tools.json (refuses if not listed)")
     pp.add_argument("--rpm", type=int, default=None)
     pp.add_argument("--dia", type=float, default=None, help="tool dia mm")
     pp.add_argument("--corner", type=float, default=None, help="corner radius mm")

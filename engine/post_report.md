@@ -10,6 +10,13 @@ python -m engine.cli post --in out/core_front_roughG.ngc \
 
 `rough` also takes `--post lnc [--metric] --program N --op-name "..." --tool-number n`.
 
+**Tool number (Task I).** With no `--tool-number`, the post resolves T/H through the
+X7 tool table **`tools/x7_tools.json`** (match on type + diameter + corner radius
+within 0.001 mm; seeded from `reference/1001.nc`: bull Ø12.7 CR0.127 → **T3 / H03 /
+D03**). An explicit `--tool-number` overrides the table; a spec that is not listed
+with no number given is **refused** (no silent T1). The re-posted program therefore
+reads `T3 M06` / `G43 Z.. H03`.
+
 ## (a) Structural diff vs `reference/1001.nc` (non-motion lines)
 
 Every NON-motion control line is classified and value-masked (tool number, rpm,
@@ -25,9 +32,9 @@ matching control lines: 18 / 18        # % O<n> modal-header units G53-home
 Header tool comment — only the allowed fields differ:
 
 ```
-ours = (T1 D=0.5 CR=0.005 - ZMIN=0.9823 - BULLNOSE END MILL)
+ours = (T3 D=0.5 CR=0.005 - ZMIN=0.9823 - BULLNOSE END MILL)
 ref  = (T3 D=0.5 CR=0.005 - ZMIN=0.9824 - BULLNOSE END MILL)
-       -> D, CR and tool type identical; T (tool number) and ZMIN differ (allowed)
+       -> T, D, CR and tool type identical; ZMIN differs (allowed)
 ```
 
 Comment lines: ours = 4, ref = 4 (tool comment, op name, tool description, plus
@@ -84,14 +91,16 @@ length within 1e-3 relative. Residual drift is exactly the G20 output resolution
 3. **No `M05`.** 1001.nc never emits `M05`; it relies on `M30` to stop the spindle.
    The footer reproduces this exactly (`M09 / G53 G00 Z0. / G49 / G28 G91 X0. Y0. /
    G90 / M30 / %`).
-4. **First-move Z default (zmap caveat, not a posting bug).** The op header positions
-   XY with `G00 X.. Y..` (no Z) before `G43 Z<clear> H<n>` — verbatim the vendor
-   structure. `verify/zmap.py`'s `resolve_moves` defaults an unresolved leading Z to
-   machine 0, so a **chunked** (`--jobs>1`) sim of *any* such program — including
-   `reference/1001.nc` itself, whose first resolved move is likewise `z=0.0` —
-   registers a phantom dive. Serial (`--jobs 1`) initialises from the first real Z (the
-   `G43` clear) and matches the neutral run exactly. The test applies the identical
-   first-Z normalisation to both files, then gouges are equal (0/0) under either path.
+4. **First-move Z default (fixed in Task I).** The op header positions XY with
+   `G00 X.. Y..` (no Z) before `G43 Z<clear> H<n>` — verbatim the vendor structure.
+   `verify/zmap.py` now treats a leading Z-less rapid as **Z unknown, above stock**:
+   `resolve_moves` defaults it to the first explicit Z of the program (else the stock
+   top), and `simulate_parallel` passes that explicitly, so chunked (`--jobs>1`) sims
+   of any such program — `reference/1001.nc` included — no longer register the
+   phantom dive. The first-Z normalisation workaround was removed from
+   `engine/test_post.py`; `engine/probe_i_jobs_agree.py` confirms `--jobs 1` and
+   `--jobs 4` agree exactly (identical stock arrays, 0 gouges / 0 rapid collisions /
+   0 over-flute) on the `1001.nc` rough section and on our X7 file.
 5. **Clearance / retract heights.** The reference uses round stock-relative heights
    (`Z3.`, `Z2.6`); the engine bakes its own retract/approach into the moves, so ours
    posts the path's max Z (`62.96 mm → Z2.4787`) as the `G43`/retract height. These
@@ -101,7 +110,11 @@ length within 1e-3 relative. Residual drift is exactly the G20 output resolution
 
 ## Test suites run
 
-* `/opt/homebrew/bin/python3 -m pytest engine/test_post.py -q` → **3 passed**
+* `/opt/homebrew/bin/python3 -m pytest verify -q` → **16 passed** (incl. the new
+  leading-XY-rapid first-Z regression)
+* `/opt/homebrew/bin/python3 -m pytest engine/test_post.py -q` → **7 passed** (incl.
+  tool-table lookup / override / refusal and the T3 check on the posted X7 file)
 * `/Applications/VibeCAD.app/Contents/Resources/bin/python engine/test_post.py` → **0 failures**
-* `/opt/homebrew/bin/python3 -m pytest verify -q` → **15 passed**
 * `/Applications/VibeCAD.app/Contents/Resources/bin/python engine/test_engine.py` → **0 failures**
+* `/opt/homebrew/bin/python3 engine/probe_i_jobs_agree.py` → **AGREE** (`--jobs 1` vs
+  `--jobs 4` on the `1001.nc` rough section and `out/core_front_rough_X7.nc`)

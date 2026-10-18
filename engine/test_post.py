@@ -11,6 +11,8 @@ Runnable two ways:
 (b) zmap the posted inch file and confirm gouges / leftover / cutting length are
     identical (within 1e-3) to the neutral metric run out/core_front_roughG.ngc.
 (c) number-formatting edge cases (0, negatives, 1.0, 0.00005 rounding, -0.0).
+(d) X7 tool table (tools/x7_tools.json): lookup, --tool-number override,
+    refusal for unlisted tools without a number (no silent T1).
 """
 import difflib
 import os
@@ -77,6 +79,64 @@ def test_number_format_edge_cases():
         got = f(val, dec)
         assert got == want, "fmt_num(%r,%d)=%r want %r" % (val, dec, got, want)
     print("PASS number format edge cases (%d)" % len(cases))
+
+
+# ---------------------------------------------------------------------------
+# (d) X7 tool table: lookup / override / refusal
+# ---------------------------------------------------------------------------
+
+def test_tool_table_lookup():
+    entry = post_lnc.lookup_tool("bull", 12.7, 0.127)
+    assert entry is not None, "seed tool bull D12.7 CR0.127 missing from table"
+    assert entry["number"] == 3, "seed tool must be T3, got %r" % entry["number"]
+    # spec within 0.001 mm still matches; type mismatch or beyond tolerance not
+    assert post_lnc.lookup_tool("bull", 12.7005, 0.1272)["number"] == 3
+    assert post_lnc.lookup_tool("bull", 12.7, 0.13) is None
+    assert post_lnc.lookup_tool("flat", 12.7, 0.127) is None
+    # posting with no explicit number resolves through the table -> T3 / H03
+    txt = post_lnc.post_text(_read(NEUTRAL), program=1001,
+                             op_name="OVERALL ROUGHING", crlf=False)
+    assert "T3 M06" in txt, "no T3 toolchange from table lookup: %r" % txt[:80]
+    assert "H03" in txt, "no H03 tool-length offset from table lookup"
+    print("PASS tool table lookup (bull 12.7/0.127 -> T3 / H03)")
+
+
+def test_tool_number_override():
+    txt = post_lnc.post_text(_read(NEUTRAL), program=1001,
+                             op_name="OVERALL ROUGHING", tool_number=5,
+                             crlf=False)
+    assert "T5 M06" in txt and "H05" in txt, "--tool-number must win over table"
+    assert "T3 M06" not in txt
+    print("PASS tool number override (explicit 5 -> T5 / H05)")
+
+
+def test_unknown_tool_refused():
+    moves = [{"g": 1, "x": 0.0, "y": 0.0, "z": 1.0, "f": 100.0}]
+    try:
+        post_lnc.post(moves, tool_kind="flat", dia_mm=6.0, corner_mm=0.0)
+        raise AssertionError("expected refusal: flat D6 not in table and no "
+                           "--tool-number given")
+    except ValueError as e:
+        assert "x7_tools.json" in str(e), "refusal must name the table: %s" % e
+    # with an explicit number an unlisted tool still posts (override path)
+    txt = post_lnc.post(moves, tool_kind="flat", dia_mm=6.0, corner_mm=0.0,
+                        tool_number=2, crlf=False)
+    assert "T2 M06" in txt and "H02" in txt
+    print("PASS unknown-tool refusal (no silent T1)")
+
+
+def test_posted_x7_file_reads_T3():
+    path = os.path.join(ROOT, "out", "core_front_rough_X7.nc")
+    if not os.path.exists(path):
+        print("SKIP X7 file check: %s missing" % path)
+        return
+    txt = _read(path)
+    import re as _r
+    assert "T3 M06" in txt, "out/core_front_rough_X7.nc must read T3 M06"
+    assert _r.search(r"G43 Z\S+ H03", txt), \
+        "out/core_front_rough_X7.nc must carry G43 ... H03"
+    assert txt.splitlines()[2].startswith("(T3 "), "header tool comment T-number"
+    print("PASS posted X7 file reads T3 / H03")
 
 
 # ---------------------------------------------------------------------------
@@ -147,16 +207,10 @@ def test_structural_diff_vs_reference():
 def _zmap_stats(moves, jobs):
     import zmap
     part, cell, x0, y0 = zmap.load_part(PART_HF)
-    # zmap.resolve_moves defaults an unresolved leading Z to machine 0; the real
-    # first Z is the G43 clear height. Lift any leading zero-Z moves to it so
-    # chunked sims do not register a phantom dive (applied to both files).
+    # zmap.resolve_moves resolves a leading Z-less rapid to the first explicit
+    # Z (Z unknown = above stock, not machine 0), so serial and chunked sims
+    # agree without any first-Z normalisation here.
     rm = zmap.resolve_moves(moves)
-    firstz = next((m["z"] for m in rm if m.get("z") not in (None, 0.0)), None)
-    for m in rm:
-        if m.get("z") == 0.0 and firstz is not None:
-            m["z"] = firstz
-        else:
-            break
     if jobs > 1:
         return zmap.simulate_parallel(rm, part, cell, x0, y0, STOCK_BOX, jobs,
                                      **TOOL)
@@ -214,6 +268,10 @@ def test_zmap_matches_neutral():
 def _main():
     fails = 0
     for fn in (test_number_format_edge_cases,
+               test_tool_table_lookup,
+               test_tool_number_override,
+               test_unknown_tool_refused,
+               test_posted_x7_file_reads_T3,
                test_structural_diff_vs_reference,
                test_zmap_matches_neutral):
         try:

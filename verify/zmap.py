@@ -285,14 +285,24 @@ def steep_window(part, cell, radius=2.0, dz_thresh=1.0):
     return win
 
 
-def resolve_moves(moves, x_init=0.0, y_init=0.0, z_init=0.0):
+def resolve_moves(moves, x_init=0.0, y_init=0.0, z_init=None):
     """Resolve modal coordinates and arc geometry for a move list.
 
     Returns dicts with explicit x/y/z (mm), arc tuples where applicable, and
     the move's feed. Do this once on the FULL list before chunking so chunk
     starts inherit the correct position and feed. Moves already carrying
     resolved=True (e.g. output of apply_cutter_comp) keep their arc geometry.
+
+    ``z_init`` is the Z assumed by moves BEFORE the first explicit Z word. The
+    default (None) means "Z unknown, above stock": a leading XY-only rapid
+    (e.g. ``G00 X.. Y..`` then ``G43 Z3. H03``, as in 1001.nc) must resolve
+    to the first explicit Z of the program, NOT machine 0 -- defaulting to 0
+    simulates a phantom dive up/down through the stock. With no Z word at all
+    in the list, 0.0 is used.
     """
+    if z_init is None:
+        z_init = next((mv["z"] for mv in moves if mv.get("z") is not None),
+                     0.0)
     out = []
     cx, cy, cz = x_init, y_init, z_init
     feed = None
@@ -814,7 +824,11 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                       dia=6.0, corner=0.0, stock_init=None, window=None,
                       rapid_feed=RAPID_FEED, flute=None):
     import multiprocessing as mp
-    moves = resolve_moves(moves)
+    # leading moves without a Z word: Z unknown = above stock, not machine 0;
+    # use the first explicit Z (as serial simulate does), else the stock top
+    z_init = next((m["z"] for m in moves if m.get("z") is not None),
+                 float(stock_box[5]))
+    moves = resolve_moves(moves, z_init=z_init)
     spans, n = [], len(moves)
     per = int(math.ceil(n / float(jobs)))
     for c in range(0, n, per):

@@ -31,6 +31,8 @@ the input path actually contains arcs.
 Line endings: the reference file is CRLF, so the posted program uses CRLF by
 default (``crlf=False`` switches to LF for diffing/tests).
 """
+import json
+import os
 
 # Motion G-codes that are "group 1" modal moves in this post.
 _MOTION = {0: "G00", 1: "G01", 2: "G02", 3: "G03"}
@@ -42,6 +44,35 @@ _TYPE = {
     "endmill": "END MILL",
     "ball": "BALL NOSE END MILL",
 }
+
+# X7 tool table: spec (type + diameter + corner radius, mm) -> machine numbers.
+TOOL_TABLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              os.pardir, "tools", "x7_tools.json")
+
+
+def load_tool_table(path=None):
+    """Load the X7 tool table (list of entries); [] if the file is absent."""
+    p = path or TOOL_TABLE_PATH
+    try:
+        with open(p) as fh:
+            return json.load(fh).get("tools", [])
+    except (IOError, OSError, ValueError):
+        return []
+
+
+def lookup_tool(kind, dia_mm, corner_mm, table=None):
+    """Find the table entry matching type + diameter + corner radius within
+    0.001 mm. Returns the entry dict or None."""
+    tol = 0.001
+    for e in (table if table is not None else load_tool_table()):
+        if e.get("type") != kind:
+            continue
+        if abs(float(e.get("diameter_mm", -1.0)) - dia_mm) > tol:
+            continue
+        if abs(float(e.get("corner_radius_mm", 0.0)) - corner_mm) > tol:
+            continue
+        return e
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +288,7 @@ def post_moves(moves, metric=False, units_in=1.0, start=None):
 
 
 def post(moves, *, metric=False, units_in=1.0, program=1001,
-         op_name="ENGINE ROUGH", tool_number=1, rpm=7500,
+         op_name="ENGINE ROUGH", tool_number=None, rpm=7500,
          dia_mm=12.7, corner_mm=0.127, tool_kind="bull",
          clear_mm=None, wcs=54, dwell_ms=3000, tool_desc=None,
          comp_note=True, crlf=True):
@@ -266,7 +297,21 @@ def post(moves, *, metric=False, units_in=1.0, program=1001,
     Distances in ``dia_mm/corner_mm/clear_mm`` and the move coordinates are
     millimetres (the engine's working unit); ``units_in`` tells the post the
     input units if they are not mm. Output is inch unless ``metric=True``.
+
+    ``tool_number`` (T and H) must either be given explicitly or be found in
+    the X7 tool table (``tools/x7_tools.json``, matched on type + diameter +
+    corner radius within 0.001 mm). A spec that is not in the table with no
+    explicit number is refused -- never a silent T1.
     """
+    if tool_number is None:
+        entry = lookup_tool(tool_kind, dia_mm, corner_mm)
+        if entry is None:
+            raise ValueError(
+                "no X7 tool number for %s D=%.3fmm CR=%.3fmm: not in %s and "
+                "no --tool-number given" % (tool_kind, dia_mm, corner_mm,
+                                           TOOL_TABLE_PATH))
+        tool_number = int(entry["number"])
+
     out_to_mm = 1.0 if metric else 25.4
     scale = units_in / out_to_mm
     cdec = _coord_decimals(metric)
@@ -354,7 +399,8 @@ def post_text(text, **kw):
     if parsed.get("spindle") is not None:
         kw.setdefault("rpm", parsed["spindle"])
     if tool:
-        kw.setdefault("tool_number", tool.get("number", 1))
+        # the neutral file's T-number is an engine placeholder, not an X7 one:
+        # the number comes from --tool-number or the tool table, never silently
         kw.setdefault("tool_kind", tool.get("kind", "bull"))
         if tool.get("dia") is not None:
             # engine writes D in mm; keep as mm regardless of input units

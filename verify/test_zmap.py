@@ -409,6 +409,49 @@ G0 Z5.
     assert np.array_equal(par["stock"], seq["stock"])
 
 
+def test_leading_xy_rapid_z_unknown_matches_serial():
+    """A leading XY-only rapid before the first Z word = Z unknown, above
+    stock -- NOT machine 0.
+
+    Regression for the 1001.nc op-header shape (G00 X.. Y.. then G43 Z.. H..):
+    resolving the leading rapid's Z to 0 made chunked (--jobs>1) sims register a
+    phantom dive through the stock that serial (which starts from the first real
+    Z) does not see. resolve_moves now defaults unknown leading Z to the first
+    explicit Z, so jobs must agree with serial exactly.
+    """
+    part = block_part(hi=10.0, half=15.0)
+    gcode = """
+G21 G90
+G53 G00 Z0.
+T3 M06
+S7500 M03
+G04 P3000
+G54
+M08
+G00 X-20. Y0.
+G43 Z20. H03
+G00 Z15.
+G01 Z5. F100.
+G01 X20. F500.
+"""
+    moves = zmap.parse_gcode(gcode)
+    seq = zmap.simulate(moves, part, CELL, X0, Y0, STOCK, tool="flat",
+                       dia=6.0)
+    # the XY rapid precedes any Z word: it is NOT a dive to Z0 inside the
+    # stock, and the rapids that follow stay above the 10 mm stock top
+    assert seq["rapid_collisions"]["count"] == 0
+    for jobs in (2, 4):
+        par = zmap.simulate_parallel(moves, part, CELL, X0, Y0, STOCK, jobs,
+                                     tool="flat", dia=6.0)
+        assert par["rapid_collisions"]["count"] == \
+            seq["rapid_collisions"]["count"], \
+            "jobs=%d: %d rapid collisions != serial %d (phantom dive)" % (
+                jobs, par["rapid_collisions"]["count"],
+                seq["rapid_collisions"]["count"])
+        assert np.array_equal(par["stock"], seq["stock"])
+        assert par["gouges"]["count"] == seq["gouges"]["count"]
+
+
 def test_over_flute_flag_and_zband_lengths():
     """--flute: cutting moves whose tip is deeper than flute below the local
     stock surface (at that XY) are counted with the first line; default off.
