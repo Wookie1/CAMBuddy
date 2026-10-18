@@ -102,7 +102,7 @@ def _run_prepare(a):
 def finish_main(a):
     """`engine.cli finish`: slope-split finishing (action:
     slope_split_finish), engine/finish.py."""
-    from engine import finish as finishmod
+    from engine import finish as finishmod, model
     kind, dia, corner = parse_tool(a.tool)
     t0 = time.time()
     if a.stl:

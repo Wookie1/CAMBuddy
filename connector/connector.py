@@ -201,12 +201,13 @@ class Connector:
         if run_id in self.ledger["runs"]:
             return  # never act twice
         self._remember_nonce(env.get("nonce"))
-        if env.get("action") != catalog_mod.ACTION:
+        action = env.get("action")
+        if action not in catalog_mod.ACTIONS:
             self._remember_run(run_id)
             self._safe_reject(run_id, "action_unknown")
             return
         self._remember_run(run_id)
-        self._run_job(run_id, env)
+        self._run_job(run_id, env, action)
 
     def _safe_reject(self, run_id, code):
         try:
@@ -215,10 +216,10 @@ class Connector:
         except SteveError:
             pass
 
-    def _run_job(self, run_id, env):
+    def _run_job(self, run_id, env, action):
         self.current_run = run_id
         work = os.path.join(self.home, "runs", str(run_id))
-        self.emit_state("busy", catalog_mod.ACTION, 0.0)
+        self.emit_state("busy", action, 0.0)
         try:
             self.client.report_run(run_id, "received")
         except SteveError:
@@ -235,12 +236,12 @@ class Connector:
                                          message=m)
                 except SteveError:
                     pass
-                self.emit_state("busy", catalog_mod.ACTION, round(p, 2))
+                self.emit_state("busy", action, round(p, 2))
 
         try:
             # download + verify inputs
             step_path = None
-            for name, spec in catalog_mod.CATALOG["actions"][0]["inputs"] \
+            for name, spec in catalog_mod.get_action(action)["inputs"] \
                     ["properties"].items():
                 if spec.get("x-steve") != "file":
                     continue
@@ -261,7 +262,7 @@ class Connector:
                 with open(step_path, "wb") as fh:
                     fh.write(data)
             values_in = env.get("inputs", {})
-            ok, code, values = catalog_mod.validate_inputs(values_in)
+            ok, code, values = catalog_mod.validate_inputs(values_in, action)
             if not ok:
                 self.client.report_run(run_id, "rejected",
                                      error={"code": code, "message": values})
@@ -269,12 +270,18 @@ class Connector:
                 return
             values = catalog_mod.to_mm(values)
 
-            result, files = engine.run(step_path, values, on_progress)
+            if action == catalog_mod.ACTION:
+                result, files = engine.run(step_path, values, on_progress)
+            else:
+                result, files = engine.run_slope_split_finish(
+                    step_path, values, on_progress)
             for fname, (path, media) in files.items():
                 with open(path, "rb") as fh:
                     self.client.put_file(run_id, fname, fh.read(), media)
-            self._copy_program(path_nc=files["rough.nc"][0],
-                              program_number=values["program_number"])
+            for fname, (path, _media) in files.items():
+                if fname.endswith(".nc"):
+                    self._copy_program(path, values["program_number"],
+                                       fname[:-3])
             self.client.report_run(run_id, "succeeded", result=result,
                                  message="done")
             self.emit_state("idle")
@@ -297,11 +304,11 @@ class Connector:
             self.running = None
             self.current_run = None
 
-    def _copy_program(self, path_nc, program_number):
+    def _copy_program(self, path_nc, program_number, stem="rough"):
         try:
             os.makedirs(self.cfg["programs_dir"], exist_ok=True)
             dest = os.path.join(self.cfg["programs_dir"],
-                               "O%d_rough.nc" % int(program_number))
+                               "O%d_%s.nc" % (int(program_number), stem))
             with open(path_nc, "rb") as src, open(dest, "wb") as dst:
                 dst.write(src.read())
         except OSError:

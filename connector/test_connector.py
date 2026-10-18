@@ -20,6 +20,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import crypto  # noqa: E402
+import catalog as catalog_mod  # noqa: E402
 import connector as connector_mod  # noqa: E402
 from client import SteveError  # noqa: E402
 from mock_steve import MockSteve  # noqa: E402
@@ -194,6 +195,22 @@ GOOD_INPUTS = {
     "stepdown": 4.0, "optimal_load": 2.0, "stock_to_leave": 0.381,
     "rest_stepup": 1.905, "rpm": 7500, "feed": 3429.0, "ramp_feed": 1270.0,
     "tool_number": 1, "units": "mm", "program_number": 1001,
+}
+
+# slope_split_finish: finishing ball 6 (tool_number given - the X7 table has
+# no ball), roughing with a flat 6 (the engine's bull 12.7 skips every level
+# on this small pocketed block and crashes: engine-track bug, see TASK_M).
+# floor_z 5.0 -> floor = stock zmin (-1.0) + 5.0 = 4.0 = the pocket floor.
+SLOPE_GOOD_INPUTS = {
+    "orientation": "as_modeled", "stock_xy": 1.0, "stock_top": 0.4,
+    "stock_bottom": 1.0, "floor_z": 5.0, "tool_diameter": 6.0,
+    "stepover": 0.3, "stepdown": 0.3, "slope_threshold": 40.0,
+    "rpm": 7500, "feed": 3429.0, "ramp_feed": 1270.0,
+    "tool_number": 5, "units": "mm", "program_number": 1002,
+    "rough_tool_type": "flat", "rough_tool_diameter": 6.0,
+    "rough_corner_radius": 0.0, "rough_flute_length": 30.0,
+    "rough_stepdown": 4.0, "rough_optimal_load": 2.0,
+    "rough_stock_to_leave": 0.381, "rough_rest_stepup": 1.905,
 }
 
 E2E = {}  # captures the end-to-end run for the final printout
@@ -577,6 +594,146 @@ class TestTokenNotPersisted:
         for name, text in blob.items():
             if name.endswith(".json"):
                 assert '"signatures"' not in text, name
+
+
+# ============================================ (g) slope_split_finish ======
+
+class TestSlopeCatalog:
+    """Catalog shape for the new action (no live mock needed)."""
+
+    def test_action_shape(self):
+        a = catalog_mod.get_action(catalog_mod.SLOPE_ACTION)
+        assert a is not None
+        assert a["name"] == "slope_split_finish"
+        assert a["title"] == "Slope-split finishing"
+        assert a["confirm"] is False
+        # name rules: lowercase letters/digits/_, starts with a letter, <= 40
+        assert len(a["name"]) <= 40
+        assert a["name"][0].isalpha() and a["name"] == a["name"].lower()
+        props = a["inputs"]["properties"]
+        assert len(props) <= 30, "more than 30 inputs"
+        assert a["inputs"]["required"] == ["model"]
+        assert props["model"].get("x-steve") == "file"
+        assert props["model"]["format"] == "step"
+        for n in props:
+            assert len(n) <= 40 and n == n.lower()
+
+    def test_limits_and_defaults(self):
+        a = catalog_mod.get_action(catalog_mod.SLOPE_ACTION)
+        p = a["inputs"]["properties"]
+        assert p["tool_diameter"]["minimum"] == 1.0
+        assert p["tool_diameter"]["maximum"] == 25.0
+        assert p["tool_diameter"]["default"] == 6.0
+        for k in ("stepover", "stepdown"):
+            assert p[k]["minimum"] == 0.05 and p[k]["maximum"] == 2.0
+            assert p[k]["default"] == 0.3
+        assert p["slope_threshold"]["minimum"] == 10.0
+        assert p["slope_threshold"]["maximum"] == 80.0
+        assert p["slope_threshold"]["default"] == 40.0
+        assert p["units"]["enum"] == ["inch", "mm"]
+        assert p["units"]["default"] == "inch"
+        # same orientation enum + stock inputs as adaptive_rough
+        r = catalog_mod.get_action(catalog_mod.ACTION)["inputs"]["properties"]
+        assert p["orientation"] == r["orientation"]
+        for k in ("stock_xy", "stock_top", "stock_bottom", "floor_z"):
+            assert p[k] == r[k], k
+
+    def test_roughing_inputs_mirror_adaptive_rough_defaults(self):
+        a = catalog_mod.get_action(catalog_mod.SLOPE_ACTION)
+        p = a["inputs"]["properties"]
+        r = catalog_mod.get_action(catalog_mod.ACTION)["inputs"]["properties"]
+        for k in ("tool_type", "tool_diameter", "corner_radius",
+                  "flute_length", "stepdown", "optimal_load",
+                  "stock_to_leave", "rest_stepup"):
+            assert p["rough_" + k]["default"] == r[k]["default"], k
+        # description says run after roughing
+        assert "run after roughing" in a["description"].lower()
+
+    def test_validate_rejects(self):
+        ok, code, v = catalog_mod.validate_inputs(
+            {"model": "m", "slope_threshold": 90.0},
+            catalog_mod.SLOPE_ACTION)
+        assert not ok and code == "input_out_of_range"
+        ok, code, v = catalog_mod.validate_inputs(
+            {"model": "m", "tool_diameter": 0.5}, catalog_mod.SLOPE_ACTION)
+        assert not ok and code == "input_out_of_range"
+        ok, code, v = catalog_mod.validate_inputs(
+            {"model": "m", "rough_stepdown": 100.0},
+            catalog_mod.SLOPE_ACTION)
+        assert not ok and code == "input_out_of_range"
+        ok, code, v = catalog_mod.validate_inputs(
+            {}, catalog_mod.SLOPE_ACTION)
+        assert not ok and code == "input_missing"
+
+
+class TestSlopeSplitFinish:
+    def test_e2e_chain_rough_then_finish(self, live):
+        mock, home, programs = live
+        mock.enqueue_run(801, action=catalog_mod.SLOPE_ACTION,
+                         inputs=dict(SLOPE_GOOD_INPUTS,
+                                     model=model_input(mock)))
+        assert mock.wait_state(801, "received", 30), \
+            "run never received: %s" % mock.states_for(801)
+        final = mock.wait_terminal(801, timeout=600)
+        assert final == "succeeded", \
+            "run ended %s: %s" % (final, mock.states_for(801))
+
+        reps = {r["body"]["state"]: r["body"] for r in mock.reports
+                if str(r["run_id"]) == "801"}
+        result = reps["succeeded"].get("result") or {}
+        for key in ("estimated_time_min", "cut_length_mm", "probe_clcheck",
+                    "zmap", "programs"):
+            assert key in result, "missing %s in result" % key
+        # clcheck on the posted finish output must be 0
+        assert result["probe_clcheck"]["below_cl"] == 0
+        assert result["probe_clcheck"]["points"] > 0
+        # chained zmap judgement: roughing from full stock, finish with the
+        # roughed stock as stock-in (never a finish judged from raw stock)
+        zmap = result["zmap"]
+        assert zmap["stock_in"] == "roughing"
+        assert zmap["gouges"]["rough"] == 0
+        assert zmap["gouges"]["finish"] == 0
+        assert zmap["rapid_collisions"]["rough"] == 0
+        assert zmap["rapid_collisions"]["finish"] == 0
+        assert result["cut_length_mm"] > 100
+
+        # BOTH programs uploaded (never a finish-only program)
+        names = mock.file_names(801)
+        for f in ("rough.nc", "finish.nc", "check.json", "preview.png"):
+            assert f in names, "missing upload %s: %s" % (f, names)
+        assert mock.file_info(801, "preview.png")["media"] == "image/png"
+
+        # the finish header carries the run-after-roughing comment
+        with open(home / "runs" / "801" / "finish.nc") as fh:
+            head = fh.read(4000).lower()
+        assert "run after roughing" in head
+
+        # both programs copied to the configured programs folder
+        assert (programs / "O1002_rough.nc").exists()
+        assert (programs / "O1002_finish.nc").exists()
+
+    def test_out_of_range_input_rejected(self, live):
+        mock, _, _ = live
+        mock.enqueue_run(802, action=catalog_mod.SLOPE_ACTION,
+                         inputs=dict(SLOPE_GOOD_INPUTS,
+                                     model=model_input(mock),
+                                     slope_threshold=90.0))
+        _wait_rejected(mock, 802, "input_out_of_range")
+
+    def test_missing_tool_fails_with_clear_message(self, live):
+        mock, _, _ = live
+        inputs = dict(SLOPE_GOOD_INPUTS, model=model_input(mock))
+        del inputs["tool_number"]  # a 6 mm ball is not in the X7 table
+        mock.enqueue_run(803, action=catalog_mod.SLOPE_ACTION, inputs=inputs)
+        final = mock.wait_terminal(803, timeout=120)
+        assert final == "failed", mock.states_for(803)
+        rep = [r["body"] for r in mock.reports
+               if str(r["run_id"]) == "803"
+               and r["body"]["state"] == "failed"][-1]
+        msg = rep.get("error", {}).get("message", "")
+        assert "x7_tools" in msg and "tool_number" in msg, msg
+        # nothing was posted: no finish-only (or any) program uploaded
+        assert mock.file_names(803) == []
 
 
 # ======================================================== final printout ==
