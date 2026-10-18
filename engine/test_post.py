@@ -392,3 +392,13 @@ def test_comment_style_slashstar():
     assert any(l.startswith("(") for l in paren)
     assert not any(l.startswith("(") for l in slash)
     assert any(l.startswith("/*") and l.endswith("*/") for l in slash)
+
+
+def test_ball_without_number_refused():
+    """Balls listed in James's table with number null must be refused, not posted as T None/T1."""
+    from engine.post_lnc import post
+    moves = [{"g": 0, "x": 0.0, "y": 0.0, "z": 10.0}, {"g": 1, "x": 5.0, "y": 0.0, "z": 10.0, "f": 1000.0}]
+    import pytest
+    with pytest.raises(ValueError, match="no T/H/D number"):
+        post(moves, tool_kind="ball", dia_mm=6.0, corner_mm=3.0)
+    assert "T7 M06" in post(moves, tool_kind="ball", dia_mm=6.0, corner_mm=3.0, tool_number=7)

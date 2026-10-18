@@ -311,6 +311,10 @@ def post(moves, *, metric=False, units_in=1.0, program=1001,
     """
     if tool_number is None:
         entry = lookup_tool(tool_kind, dia_mm, corner_mm)
+        if entry is not None and entry.get("number") is None:
+            raise ValueError(
+                "X7 tool %s D=%.3fmm is in %s but has no T/H/D number assigned yet "
+                "(ask James); pass --tool-number to override" % (tool_kind, dia_mm, TOOL_TABLE_PATH))
         if entry is None:
             raise ValueError(
                 "no X7 tool number for %s D=%.3fmm CR=%.3fmm: not in %s and "
