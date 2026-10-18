@@ -8,7 +8,6 @@ import os
 import sys
 import time
 
-from engine import model, rough as roughmod
 from engine.gcode import moves_to_gcode
 
 
@@ -18,6 +17,33 @@ def parse_tool(spec):
     dia = float(parts[1])
     corner = float(parts[2]) if len(parts) > 2 else 0.0
     return kind, dia, corner
+
+
+def _run_post(a):
+    """python -m engine.cli post --in <neutral/engine> --out F [options]"""
+    from engine import post_lnc
+    with open(a.inp, newline="") as fh:
+        text = fh.read()
+    kw = dict(metric=a.metric, program=a.program, op_name=a.op_name,
+              wcs=a.wcs, dwell_ms=a.dwell_ms, tool_desc=a.tool_desc,
+              crlf=not a.lf)
+    if a.tool_number is not None:
+        kw["tool_number"] = a.tool_number
+    if a.rpm is not None:
+        kw["rpm"] = a.rpm
+    if a.dia is not None:
+        kw["dia_mm"] = a.dia
+    if a.corner is not None:
+        kw["corner_mm"] = a.corner
+    if a.tool_kind is not None:
+        kw["tool_kind"] = a.tool_kind
+    if a.clear is not None:
+        kw["clear_mm"] = a.clear
+    out = post_lnc.post_text(text, **kw)
+    with open(a.out, "w", newline="") as fh:
+        fh.write(out)
+    print("wrote %s" % a.out, flush=True)
+    return 0
 
 
 def main(argv=None):
@@ -72,8 +98,43 @@ def main(argv=None):
     r.add_argument("--wl-sampling", dest="wl_sampling", type=float, default=0.1,
                   help="waterline sampling mm")
     r.add_argument("--stats-json", dest="stats_json", default=None)
+    r.add_argument("--post", choices=("neutral", "lnc"), default="neutral",
+                   help="writer: neutral G21 (default) or SyilCNC LNCv2")
+    r.add_argument("--program", type=int, default=1001,
+                   help="LNC program number (with --post lnc)")
+    r.add_argument("--op-name", dest="op_name", default="OVERALL ROUGHING",
+                   help="LNC op-name comment (with --post lnc)")
+    r.add_argument("--metric", action="store_true",
+                   help="emit G21 mm instead of the default G20 inch")
+    r.add_argument("--tool-number", dest="tool_number", type=int, default=1,
+                   help="LNC tool number (T/H) with --post lnc)")
+
+    pp = sub.add_parser("post", help="post neutral/engine moves to LNC G-code")
+    pp.add_argument("--in", dest="inp", required=True,
+                   help="neutral or engine-output G-code file")
+    pp.add_argument("--out", required=True, help="output .nc file")
+    pp.add_argument("--metric", action="store_true",
+                   help="emit G21 mm instead of the default G20 inch")
+    pp.add_argument("--program", type=int, default=1001)
+    pp.add_argument("--op-name", dest="op_name", default="ENGINE ROUGH")
+    pp.add_argument("--tool-number", dest="tool_number", type=int, default=None)
+    pp.add_argument("--rpm", type=int, default=None)
+    pp.add_argument("--dia", type=float, default=None, help="tool dia mm")
+    pp.add_argument("--corner", type=float, default=None, help="corner radius mm")
+    pp.add_argument("--tool-kind", dest="tool_kind", default=None,
+                   choices=("bull", "flat", "ball", "endmill"))
+    pp.add_argument("--clear", type=float, default=None,
+                   help="clearance/retract height mm (default: max Z of path)")
+    pp.add_argument("--wcs", type=int, default=54, help="work offset G-code (54)")
+    pp.add_argument("--dwell-ms", dest="dwell_ms", type=int, default=3000)
+    pp.add_argument("--tool-desc", dest="tool_desc", default=None)
+    pp.add_argument("--lf", action="store_true", help="use LF instead of CRLF")
     a = p.parse_args(argv)
 
+    if a.cmd == "post":
+        return _run_post(a)
+
+    from engine import model, rough as roughmod
     kind, dia, corner = parse_tool(a.tool)
     if a.optimal_load_mm is not None:
         stepover = a.optimal_load_mm / dia
@@ -122,9 +183,16 @@ def main(argv=None):
                                   stepup=a.stepup, min_rest=a.min_rest,
                                   min_level_area=a.min_level_area,
                                   progress=prog)
-    text = moves_to_gcode(moves, spindle_rpm=a.spindle,
-                          tool_comment="T1 %s D=%.3f CR=%.3f" % (kind, dia, corner))
-    with open(a.out, "w") as fh:
+    if a.post == "lnc":
+        from engine import post_lnc
+        text = post_lnc.post(moves, metric=a.metric, program=a.program,
+                             op_name=a.op_name, tool_number=a.tool_number,
+                             rpm=a.spindle, dia_mm=dia, corner_mm=corner,
+                             tool_kind=kind)
+    else:
+        text = moves_to_gcode(moves, spindle_rpm=a.spindle,
+                              tool_comment="T1 %s D=%.3f CR=%.3f" % (kind, dia, corner))
+    with open(a.out, "w", newline="") as fh:
         fh.write(text)
     stats["out"] = a.out
     stats["n_moves"] = len(moves)
