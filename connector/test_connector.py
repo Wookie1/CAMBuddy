@@ -668,10 +668,6 @@ class TestSlopeCatalog:
 
 
 class TestSlopeSplitFinish:
-    @pytest.mark.xfail(
-        strict=True,
-        reason="engine rough rapid collision on synth_pocket, see GATES_NOTES.md"
-    )
     def test_e2e_chain_rough_then_finish(self, live):
         mock, home, programs = live
         mock.enqueue_run(801, action=catalog_mod.SLOPE_ACTION,

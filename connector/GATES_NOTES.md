@@ -21,3 +21,7 @@ cd connector && python3 -c "
 # inspect the check.json from a failed run for rapid_collisions details
 "
 ```
+
+## Resolved (2026-10-18)
+After merging the S3/S3b engine work (stock-aware verified rapids) into main, the synth_pocket chain
+has 0 rough rapid collisions: the strict xfail flipped to XPASS and the marker was removed.
