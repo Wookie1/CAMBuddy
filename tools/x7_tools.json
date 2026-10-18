@@ -113,6 +113,21 @@
       "shank_note": "assumed = D (not necked)",
       "description": "1/32in BALL END MILL",
       "source": "James 2026-10-18"
+    },
+    {
+      "number": 13,
+      "type": "flat",
+      "diameter_mm": 12.686,
+      "corner_radius_mm": 0.0,
+      "length_offset": "H13",
+      "diameter_offset": "D13",
+      "flute_mm": 50.8,
+      "shank_diameter_mm": 12.686,
+      "stickout_mm": 71.6,
+      "holder": "ER32 collet chuck",
+      "description": "1/2 in LONG REACH FLAT END MILL",
+      "source": "James's shop T13 via STEVE comparison 2026-10-18",
+      "note": "T/H/D 13 assigned for the STEVE comparison only"
     }
   ]
 }
