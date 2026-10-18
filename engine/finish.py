@@ -1,4 +1,5 @@
-"""Steep & shallow finishing from OpenCAMLib CL points only (task S1, track B).
+"""Slope-split finishing (action: slope_split_finish) from OpenCAMLib CL
+points only (task S1, track B).
 
 Why not VibeCAD's SteepShallow: its steep contours interpolate iso-crossings
 linearly on a CL heightfield, so next to slots narrower than the ball the
@@ -40,6 +41,18 @@ NO_CONTACT = -1e30    # ocl keeps the initial Z when nothing is touched
 DROP_CHUNK = 250_000  # CLPoints per BatchDropCutter call
 BALL_HEIGHT = 50.0
 
+_DROP_CALLS = 0       # BatchDropCutter.setSTL calls (re-indexes the STL)
+
+
+def reset_drop_calls():
+    global _DROP_CALLS
+    _DROP_CALLS = 0
+
+
+def drop_calls():
+    """Number of BatchDropCutter.setSTL calls so far in this process."""
+    return _DROP_CALLS
+
 
 def worker_cap():
     """ENGINE_WORKERS env cap on pool size (default 4)."""
@@ -73,10 +86,13 @@ def make_cutter(kind, dia, corner=0.0):
 
 def batch_drop(surf, cutter, xy, threads=None):
     """Drop-cutter a sequence of (x, y). Returns np.array of tip Z (nan =
-    no contact). Order-preserving, chunked to bound memory."""
+    no contact). Order-preserving, chunked to bound memory; each chunk is
+    one BatchDropCutter.setSTL (counted in drop_calls())."""
+    global _DROP_CALLS
     n = len(xy)
     z = np.full(n, np.nan)
     for i0 in range(0, n, DROP_CHUNK):
+        _DROP_CALLS += 1
         i1 = min(n, i0 + DROP_CHUNK)
         bd = ocl.BatchDropCutter()
         bd.setSTL(surf)
@@ -99,6 +115,8 @@ def batch_drop(surf, cutter, xy, threads=None):
 def _raster_worker(ci):
     """Drop-cutter a contiguous block of raster rows in a fork-pool worker.
     Workers load the STL once and cache it in _POOL (rough.py pattern)."""
+    global _DROP_CALLS
+    _DROP_CALLS = 0  # count locally, report back to the parent
     g = _POOL
     surf = g.get("surf")
     if surf is None:
@@ -112,7 +130,7 @@ def _raster_worker(ci):
         xy = [(x, float(y)) for y in jj for x in g["xrow"]]
         zz = batch_drop(surf, make_cutter(*g["tool"]), xy, threads=g["threads"])
         z[jb - j0:jb - j0 + len(jj)] = zz.reshape(len(jj), -1)
-    return j0, z
+    return j0, z, _DROP_CALLS
 
 
 def raster_cl(surf, cutter, bounds, stepover=0.3, sampling=0.1,
@@ -122,6 +140,7 @@ def raster_cl(surf, cutter, bounds, stepover=0.3, sampling=0.1,
     Returns (xs, ys, Z) with Z (ny, nx), nan where the cutter touches
     nothing. workers>1 with stl_path: rows split across a fork pool in
     contiguous ordered blocks (deterministic output)."""
+    global _DROP_CALLS
     xmin, xmax, ymin, ymax = bounds[:4]
     xs = np.arange(xmin, xmax + 0.5 * sampling, sampling)
     ys = np.arange(ymin, ymax + 0.5 * stepover, stepover)
@@ -137,8 +156,9 @@ def raster_cl(surf, cutter, bounds, stepover=0.3, sampling=0.1,
                                                               edges[1:])])
         ctx = mp.get_context("fork")
         with ctx.Pool(nch) as pool:
-            for j0, zblk in pool.map(_raster_worker, range(nch)):
+            for j0, zblk, ncalls in pool.map(_raster_worker, range(nch)):
                 Z[j0:j0 + zblk.shape[0]] = zblk
+                _DROP_CALLS += ncalls  # account worker-local setSTL calls
         return xs, ys, Z
     for j0 in range(0, len(ys), row_batch):
         jj = ys[j0:j0 + row_batch]
@@ -253,24 +273,39 @@ def waterline_levels(surf, zs, tool, wl_sampling=0.1, wl_min_sampling=0.05,
     return res, t_wl
 
 
-def steep_slopes(surf, cutter, level_loops, d, threads=None):
+def steep_slopes(surf, cutter, level_loops, d, threads=None,
+                 chunk_pts=20_000):
     """CL-surface slope (deg) at every waterline loop point, from a
-    drop-cutter stencil (+-d along x and y). Points where the stencil falls
-    off an edge (nan) or the waterline sits below the resting CL by > tol
-    are at a CL step discontinuity -> treated as steep (kept)."""
-    out = []
-    for z, loops in level_loops:
-        lslopes = []
+    drop-cutter stencil (+-d along x and y). All loops are stencilled in
+    batched drop-cutter calls (one per ~chunk_pts loop points, not one per
+    loop). Points where the stencil falls off an edge (nan) or the
+    waterline sits below the resting CL by > tol are at a CL step
+    discontinuity -> treated as steep (kept)."""
+    flat = []  # (level_index, z, P) per loop
+    for li, (z, loops) in enumerate(level_loops):
         for loop in loops:
-            P = np.asarray(loop, dtype=float)
-            xy = []
+            flat.append((li, z, np.asarray(loop, dtype=float)))
+    sl_of = [None] * len(flat)
+    i = 0
+    while i < len(flat):
+        j = i
+        npts = 0
+        while j < len(flat) and npts + len(flat[j][2]) <= chunk_pts:
+            npts += len(flat[j][2])
+            j += 1
+        all_xy = []
+        spans = []
+        for k in range(i, j):
+            _, _, P = flat[k]
+            s0 = len(all_xy)
             for x, y in P:
-                xy.append((x, y))
-                xy.append((x + d, y))
-                xy.append((x - d, y))
-                xy.append((x, y + d))
-                xy.append((x, y - d))
-            zc = batch_drop(surf, cutter, xy, threads=threads).reshape(-1, 5)
+                all_xy += [(x, y), (x + d, y), (x - d, y),
+                           (x, y + d), (x, y - d)]
+            spans.append((k, s0, len(all_xy)))
+        zc_all = batch_drop(surf, cutter, all_xy, threads=threads)
+        for (k, s0, s1) in spans:
+            _, z, P = flat[k]
+            zc = zc_all[s0:s1].reshape(-1, 5)
             z0, zp_x, zn_x, zp_y, zn_y = zc[:, 0], zc[:, 1], zc[:, 2], \
                 zc[:, 3], zc[:, 4]
             with np.errstate(invalid="ignore"):
@@ -281,7 +316,11 @@ def steep_slopes(surf, cutter, level_loops, d, threads=None):
             # the stencil losing contact (edge/overhang) -> steep
             disc = (z0 > z + CHORD_TOL) | ~np.isfinite(sl)
             sl = np.where(disc, 89.9, sl)
-            lslopes.append((P, sl))
+            sl_of[k] = (P, sl)
+        i = j
+    out = []
+    for li, (z, loops) in enumerate(level_loops):
+        lslopes = [sl_of[k] for k in range(len(flat)) if flat[k][0] == li]
         out.append((z, lslopes))
     return out
 
@@ -328,17 +367,19 @@ class Chords:
     neighbours stays >= CL - tol at every sample under the chord, where the
     samples are (a) the polyline vertices and interior extras every `ss` mm
     along the curve, and (b) - when the curve deviates from the chord by >
-    tol (convex corners: the chord cuts across where CL rises) - drop-cutter
-    points every `line_ss` mm along the chord line ITSELF. (b) matters
-    because gouge-freeness of a cutter position depends on CL at the chord's
-    own xy, which near corners is far above CL on the sampled curve.
-    Chords are capped at `max_chord` mm.
+    1e-6 (convex corners: the chord cuts across where CL rises) -
+    drop-cutter points every `line_ss` mm along the chord line ITSELF.
+    (b) matters because gouge-freeness of a cutter position depends on CL
+    at the chord's own xy, which near corners is far above CL on the
+    sampled curve. Chords are capped at `max_chord` mm; chords between
+    adjacent original vertices are never line-checked (their deviation is
+    second order in the sampling, << tol). Simplification runs in
+    verify-and-split rounds over many polylines: see simplify_rounds.
     """
 
     def __init__(self, P, ss=0.05, line_ss=0.1):
         self.P = np.asarray(P, dtype=float)          # (n, 3) on the CL
         self.line_ss = line_ss
-        self.ex_y = None
         if len(self.P) > 1 and ss > 0:
             ex, seg = [], []
             d = np.diff(self.P[:, :2], axis=0)
@@ -360,23 +401,45 @@ class Chords:
             self.ex_y = np.zeros((0, 2))
             self.ex_seg = np.zeros(0, dtype=int)
         self.ex_z = None
-        self.surf = self.cutter = None
-        self.threads = None
 
-    def drop_extras(self, surf, cutter, threads=None):
-        """True CL Z of the interior extras via drop-cutter (batched)."""
-        self.surf, self.cutter, self.threads = surf, cutter, threads
+    def line_samples(self, a, b):
+        """((x, y) samples every line_ss strictly between P[a] and P[b],
+        their t along the chord) for the chord-line check, or None when the
+        curve is collinear with the chord (straight raster rows: the vertex
+        CL samples already sit on the chord) or the chord is too short."""
+        P = self.P
+        dx = P[b, 0] - P[a, 0]
+        dy = P[b, 1] - P[a, 1]
+        L = math.hypot(dx, dy)
+        if L <= self.line_ss:
+            return None
+        ux, uy = dx / L, dy / L
+        Q = P[a + 1:b, :2]
+        dev = float(np.max(np.abs((Q[:, 0] - P[a, 0]) * uy
+                                  - (Q[:, 1] - P[a, 1]) * ux)))
         if len(self.ex_y):
-            self.ex_z = batch_drop(surf, cutter,
-                                   [tuple(p) for p in self.ex_y],
-                                   threads=threads)
+            msk = (self.ex_seg >= a) & (self.ex_seg < b)
+            if msk.any():
+                E = self.ex_y[msk]
+                dev = max(dev, float(np.max(
+                    np.abs((E[:, 0] - P[a, 0]) * uy
+                           - (E[:, 1] - P[a, 1]) * ux))))
+        if dev <= 1e-6:
+            return None
+        m = int(math.ceil(L / self.line_ss)) + 1
+        tl = np.linspace(0.0, 1.0, m)[1:-1]
+        return [(P[a, 0] + dx * s, P[a, 1] + dy * s) for s in tl], tl
 
-    def simplify(self, tol=CHORD_TOL, max_chord=5.0):
-        """Greedy from the start; returns kept [(x, y, z), ...]."""
+    def propose(self, tol=CHORD_TOL, max_chord=5.0):
+        """Cheap pass (NO drop-cutter): greedy from the start, checks only
+        the vertex and curve samples against the chord. Returns
+        (keep_idx, chords) where chords = [(a, b), ...] pairs of
+        consecutive kept indices that skip >= 1 vertex (those need the
+        batched chord-line check of simplify_rounds)."""
         P = self.P
         n = len(P)
         if n <= 2:
-            return [(float(p[0]), float(p[1]), float(p[2])) for p in P]
+            return list(range(n)), []
         keep_idx = [0]
         a = 0
         while a < n - 1:
@@ -407,50 +470,88 @@ class Chords:
                             bad = float(np.nanmax(np.abs(zc - self.ex_z[msk])))
                         if bad > tol:
                             ok = False
-                if ok and b > a + 1:
-                    # chord-line check: gouge-freeness depends on CL at the
-                    # chord's own xy, which near convex corners or iso-CL arcs
-                    # is higher than anywhere on the sampled curve (the CL
-                    # gradient is invisible from z-values along a level loop)
-                    # -> drop-cutter along the chord line. Skipped only when
-                    # the curve is exactly collinear with the chord (straight
-                    # raster rows): then the vertex CL samples already sit on
-                    # the chord.
-                    L = math.sqrt(L2)
-                    ux, uy = dx / L, dy / L
-                    Q = P[a + 1:b, :2]
-                    dev = float(np.max(np.abs((Q[:, 0] - P[a, 0]) * uy
-                                              - (Q[:, 1] - P[a, 1]) * ux)))
-                    if self.ex_z is not None and len(self.ex_z):
-                        msk = (self.ex_seg >= a) & (self.ex_seg < b)
-                        if msk.any():
-                            E = self.ex_y[msk]
-                            dev = max(dev, float(np.max(
-                                np.abs((E[:, 0] - P[a, 0]) * uy
-                                      - (E[:, 1] - P[a, 1]) * ux))))
-                    if L > self.line_ss and dev > 1e-6:
-                        if self.surf is None:
-                            ok = False
-                        else:
-                            m = int(math.ceil(L / self.line_ss)) + 1
-                            tl = np.linspace(0.0, 1.0, m)
-                            xy = [(P[a, 0] + dx * s, P[a, 1] + dy * s)
-                                 for s in tl[1:-1]]
-                            cz = batch_drop(self.surf, self.cutter, xy,
-                                          threads=self.threads)
-                            zc = P[a, 2] + (P[b, 2] - P[a, 2]) * tl[1:-1]
-                            fin = np.isfinite(cz)
-                            if fin.any() and float(np.max(
-                                    np.abs(cz[fin] - zc[fin]))) > tol:
-                                ok = False
                 if not ok:
                     break
                 last_ok = b
                 b += 1
             keep_idx.append(last_ok if last_ok is not None else a + 1)
             a = keep_idx[-1]
-        return [(float(P[i, 0]), float(P[i, 1]), float(P[i, 2]))
-                for i in keep_idx]
+        chords = [(keep_idx[i], keep_idx[i + 1])
+                  for i in range(len(keep_idx) - 1)
+                  if keep_idx[i + 1] > keep_idx[i] + 1]
+        return keep_idx, chords
+
+
+def simplify_rounds(chords_list, surf, cutter, threads=None, tol=CHORD_TOL,
+                    max_chord=5.0, max_rounds=16):
+    """Gouge-safe simplification of many polylines in verify-and-split
+    rounds (O(rounds) batched drop-cutter calls, not O(chords)): each
+    Chords.propose suggests kept vertices cheaply, then ALL proposed
+    chords' chord-line samples are checked in ONE batch_drop call per
+    round; a failing chord is split by re-inserting the skipped vertex
+    nearest the worst sample, and only the resulting halves are re-checked
+    in the next single call. If the round cap is hit with failures still
+    open, those chords keep every original vertex (safe: the remaining
+    chords are between adjacent vertices and never line-checked). Returns
+    (kept per polyline as [(x, y, z), ...] in input order, n_rounds,
+    n_chords_checked)."""
+    inserted = [set() for _ in chords_list]
+    keep_idxs = []
+    active = []  # [ci, a, b, (samples_xy, ts)]
+    for ci, c in enumerate(chords_list):
+        keep_idx, chs = c.propose(tol=tol, max_chord=max_chord)
+        keep_idxs.append(keep_idx)
+        for (a, b) in chs:
+            ls = c.line_samples(a, b)
+            if ls is not None:
+                active.append([ci, a, b, ls])
+    n_chords = len(active)
+    n_rounds = 0
+    while active and n_rounds < max_rounds:
+        n_rounds += 1
+        xy = []
+        spans = []
+        for _, _, _, (s, _) in active:
+            s0 = len(xy)
+            xy.extend(s)
+            spans.append((s0, len(xy)))
+        z = batch_drop(surf, cutter, xy, threads=threads) if xy \
+            else np.zeros(0)
+        nxt = []
+        for (ci, a, b, (s, ts)), (s0, s1) in zip(active, spans):
+            P = chords_list[ci].P
+            dx = P[b, 0] - P[a, 0]
+            dy = P[b, 1] - P[a, 1]
+            cz = z[s0:s1]
+            zc = P[a, 2] + (P[b, 2] - P[a, 2]) * ts
+            fin = np.isfinite(cz)
+            if not (fin.any() and float(np.max(
+                    np.abs(cz[fin] - zc[fin]))) > tol):
+                continue  # chord verified gouge-safe
+            dev = np.where(fin, np.abs(cz - zc), 0.0)
+            jw = int(np.argmax(dev))
+            wx = P[a, 0] + dx * ts[jw]
+            wy = P[a, 1] + dy * ts[jw]
+            idx = np.arange(a + 1, b)
+            d2 = (P[idx, 0] - wx) ** 2 + (P[idx, 1] - wy) ** 2
+            m = int(idx[int(np.argmin(d2))])
+            inserted[ci].add(m)
+            c = chords_list[ci]
+            for (na, nb) in ((a, m), (m, b)):
+                if nb > na + 1:
+                    ls2 = c.line_samples(na, nb)
+                    if ls2 is not None:
+                        nxt.append([ci, na, nb, ls2])
+        active = nxt
+    if active:  # round cap with failures open -> keep all original vertices
+        for ci, a, b, _ in active:
+            inserted[ci].update(range(a + 1, b))
+    out = []
+    for ci, c in enumerate(chords_list):
+        ki = sorted(set(keep_idxs[ci]) | inserted[ci])
+        out.append([(float(c.P[i, 0]), float(c.P[i, 1]), float(c.P[i, 2]))
+                    for i in ki])
+    return out, n_rounds, n_chords
 
 
 def link_plan(surf, cutter, links, sampling=0.1, threads=None):
@@ -495,13 +596,15 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
            wl_min_sampling=0.1, max_chord=5.0, cut_feed=3429.0,
            ramp_feed=1270.0, clearance=None, workers=None, threads=8,
            window=None, progress=None):
-    """Steep & shallow finishing toolpath. Returns (moves, stats).
+    """Slope-split finishing toolpath (action: slope_split_finish).
+    Returns (moves, stats).
 
     workers: pool size for raster rows + waterline levels (capped by the
     ENGINE_WORKERS env, default 4); output order stays deterministic.
     window: (xmin, xmax, ymin, ymax) - restrict the raster and keep only
     waterline loops that touch the window (smoke tests)."""
     t_start = time.time()
+    reset_drop_calls()
     cutter = make_cutter(*tool)
     workers = resolve_workers(workers)
     xmin, xmax, ymin, ymax, zmin, zmax = surf_bounds(surf)
@@ -599,20 +702,24 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
         off = 0
         for c in chords:
             m = len(c.ex_y)
-            c.surf, c.cutter, c.threads = surf, cutter, threads
             if m:
                 c.ex_z = all_z[off:off + m]
                 off += m
-    steep_paths = [c.simplify(max_chord=max_chord) for c in chords]
-    # shallow rows: vertices ARE the 0.1 mm CL samples - no extras needed
-    shallow_paths = []
+    # verify-and-split rounds: ALL chord-line samples per round in ONE
+    # batched drop-cutter call (O(rounds) setSTL calls, not O(chords))
+    steep_paths, n_rounds_steep, n_chords = simplify_rounds(
+        chords, surf, cutter, threads=threads, max_chord=max_chord)
+    # shallow rows: vertices ARE the 0.1 mm CL samples - no extras needed;
+    # rows are collinear so the rounds make zero drop-cutter calls
+    shallow_chords = []
     row_of = []
     for (j, i0, i1) in s_runs:
         P = np.stack([xs[i0:i1], np.full(i1 - i0, ys[j]),
                      Z[j, i0:i1]], axis=1)
-        c = Chords(P, ss=0.0)
-        shallow_paths.append(c.simplify(max_chord=max_chord))
+        shallow_chords.append(Chords(P, ss=0.0))
         row_of.append(j)
+    shallow_paths, n_rounds_shallow, n_chords_sh = simplify_rounds(
+        shallow_chords, surf, cutter, threads=threads, max_chord=max_chord)
     t_simplify = time.time() - t0
 
     # -- order the paths: steep top-down, then shallow rows -----------
@@ -645,6 +752,9 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
              "n_lifts": 0, "cut_len": 0.0, "plunge_len": 0.0,
              "rapid_len": 0.0, "levels": [round(z, 3) for z, lp in levels
                                            if lp]}
+    stats["n_drop_calls"] = drop_calls()
+    stats["n_simplify_rounds"] = n_rounds_steep + n_rounds_shallow
+    stats["n_chords_checked"] = n_chords + n_chords_sh
     prev = None
 
     def emit(g, x, y, z, f=None):
@@ -709,7 +819,7 @@ def finish_to_gcode(moves, spindle_rpm=7500, tool_comment=None):
     out = ["G21", "G90", "G94", "G17"]
     if tool_comment:
         out.append("(%s)" % tool_comment)
-    out.append("(ENGINE FINISH STEEP+SHALLOW)")
+    out.append("(ENGINE FINISH SLOPE-SPLIT)")
     out.append("S%d M3" % spindle_rpm)
     for mv in moves:
         bits = []

@@ -21,7 +21,8 @@ def parse_tool(spec):
 
 
 def finish_main(a):
-    """`engine.cli finish`: steep & shallow finishing (engine/finish.py)."""
+    """`engine.cli finish`: slope-split finishing (action:
+    slope_split_finish), engine/finish.py."""
     from engine import finish as finishmod
     kind, dia, corner = parse_tool(a.tool)
     t0 = time.time()
@@ -37,9 +38,12 @@ def finish_main(a):
 
     def prog(stats):
         print("raster %.1fs steep %.1fs (wl %.1fs) simplify %.1fs links %.1fs"
+              " drop_calls=%d rounds=%d chords=%d"
               % (stats["t_raster_s"], stats["t_steep_s"],
                  stats["t_waterline_s"], stats["t_simplify_s"],
-                 stats["t_link_s"]), flush=True)
+                 stats["t_link_s"], stats["n_drop_calls"],
+                 stats["n_simplify_rounds"], stats["n_chords_checked"]),
+              flush=True)
 
     moves, stats = finishmod.finish(
         surf, stl_path=stl, tool=(kind, dia, corner), stepover=a.stepover,
@@ -113,7 +117,8 @@ def main(argv=None):
     r.add_argument("--stats-json", dest="stats_json", default=None)
 
     f = sub.add_parser("finish",
-                       help="steep & shallow finishing from ocl CL points only")
+                       help="slope-split finishing (action: slope_split_finish) "
+                            "from ocl CL points only")
     f.add_argument("--stl", default=None,
                    help="part STL (e.g. cached out/core_front_setup.stl)")
     f.add_argument("--step", default=None,

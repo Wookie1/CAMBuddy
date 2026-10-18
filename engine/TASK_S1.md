@@ -61,3 +61,8 @@ Fix (keep it gouge-safe, same 0.005 mm one-sided chord rule):
    finish.py docstrings, CLI help and logs (keep internal function names if you like).
 5. Then run the window smoke test (--window -144.6 -84.6 36.9 76.9) and report its runtime. Do NOT run the full part.
 Short outputs.
+6. (Added) Index the STL as few times as possible: OCL's BatchDropCutter has no clear/replace-points method
+   (methods: appendPoint, getCLPoints, run, setSTL, setCutter, setThreads, setBucketSize), so one instance cannot be
+   reused across batches without re-running old points. Therefore: make every phase gather its points and call
+   batch_drop once per round; add a module-level counter of setSTL calls and a test that asserts the count per
+   finish() run is bounded by a small constant times the number of verify rounds (print it).

@@ -233,10 +233,19 @@ def run_case(name, stl_path, hf_fn, box, floor_z, assert_shallow_lt=None):
                         tool="ball", dia=BALL_DIA)
     gouges = res["gouges"]
     print("%-14s moves=%6d cut=%.0fmm plunge=%.0fmm lifts=%d "
-          "steep_runs=%d shallow_runs=%d gouges=%d" %
+          "steep_runs=%d shallow_runs=%d gouges=%d drop_calls=%d "
+          "(rounds=%d chords=%d)" %
           (name, len(moves), stats["cut_len"], stats["plunge_len"],
            stats["n_lifts"], stats["n_steep_runs"], stats["n_shallow_runs"],
-           gouges["count"]))
+           gouges["count"], stats["n_drop_calls"],
+           stats["n_simplify_rounds"], stats["n_chords_checked"]))
+    # S1c: the gouge-safe simplification must verify its chords in O(rounds)
+    # batched drop-cutter calls (one per round), not one call per chord -
+    # every call re-indexes the whole STL (setSTL). Fixed overhead: raster
+    # row batches, steep-slope stencil chunks, CL validation, extras, links.
+    assert stats["n_drop_calls"] <= 16 + 2 * stats["n_simplify_rounds"], \
+        "%s: %d drop-cutter calls vs rounds=%d (expected O(rounds))" % (
+            name, stats["n_drop_calls"], stats["n_simplify_rounds"])
     # leftover > 0.05 mm per slope zone (of the part surface). Cells where
     # the ball physically cannot bring its tip within 0.05 mm of the surface
     # (CL - part > 0.05: fillets at convex/concave tangencies) are reported
