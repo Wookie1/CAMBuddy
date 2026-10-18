@@ -28,6 +28,7 @@ moves are the neutral dicts of engine/gcode.py: {g:0|1, x, y, z, f}.
 """
 import math
 import multiprocessing as mp
+import os
 import time
 
 import numpy as np
@@ -38,6 +39,21 @@ LINK_LIFT = 1.0       # mm above local max CL when a link is blocked
 NO_CONTACT = -1e30    # ocl keeps the initial Z when nothing is touched
 DROP_CHUNK = 250_000  # CLPoints per BatchDropCutter call
 BALL_HEIGHT = 50.0
+
+
+def worker_cap():
+    """ENGINE_WORKERS env cap on pool size (default 4)."""
+    try:
+        return max(1, int(os.environ.get("ENGINE_WORKERS", "4")))
+    except ValueError:
+        return 4
+
+
+def resolve_workers(workers):
+    """workers None/True -> cpu-2; result capped by worker_cap()."""
+    if workers is None or workers is True:
+        workers = max(1, (os.cpu_count() or 2) - 2)
+    return max(1, min(int(workers), worker_cap()))
 
 
 def surf_bounds(surf):
@@ -80,15 +96,50 @@ def batch_drop(surf, cutter, xy, threads=None):
 # Shallow: drop-cutter raster + slope filter
 # ---------------------------------------------------------------------------
 
+def _raster_worker(ci):
+    """Drop-cutter a contiguous block of raster rows in a fork-pool worker.
+    Workers load the STL once and cache it in _POOL (rough.py pattern)."""
+    g = _POOL
+    surf = g.get("surf")
+    if surf is None:
+        surf = ocl.STLSurf()
+        ocl.STLReader(g["stl"], surf)
+        g["surf"] = surf
+    j0, j1 = g["chunks"][ci]
+    z = np.full((j1 - j0, len(g["xrow"])), np.nan)
+    for jb in range(j0, j1, g["row_batch"]):
+        jj = g["ys"][jb:min(j1, jb + g["row_batch"])]
+        xy = [(x, float(y)) for y in jj for x in g["xrow"]]
+        zz = batch_drop(surf, make_cutter(*g["tool"]), xy, threads=g["threads"])
+        z[jb - j0:jb - j0 + len(jj)] = zz.reshape(len(jj), -1)
+    return j0, z
+
+
 def raster_cl(surf, cutter, bounds, stepover=0.3, sampling=0.1,
-              threads=None, row_batch=64):
+              threads=None, row_batch=64, stl_path=None, workers=None,
+              tool=None):
     """CL grid: rows along X spaced `stepover` in Y, sampled at `sampling`.
-    Returns (xs, ys, Z) with Z (ny, nx), nan where the cutter touches nothing."""
+    Returns (xs, ys, Z) with Z (ny, nx), nan where the cutter touches
+    nothing. workers>1 with stl_path: rows split across a fork pool in
+    contiguous ordered blocks (deterministic output)."""
     xmin, xmax, ymin, ymax = bounds[:4]
     xs = np.arange(xmin, xmax + 0.5 * sampling, sampling)
     ys = np.arange(ymin, ymax + 0.5 * stepover, stepover)
     Z = np.full((len(ys), len(xs)), np.nan)
     xrow = [float(x) for x in xs]
+    if workers and workers > 1 and stl_path and tool is not None:
+        nch = min(int(workers), len(ys))
+        edges = np.linspace(0, len(ys), nch + 1).astype(int)
+        _POOL.update(stl=stl_path, tool=tool, ys=list(map(float, ys)),
+                     xrow=xrow, row_batch=row_batch,
+                     threads=max(1, (threads or 8) // nch),
+                     chunks=[(int(a), int(b)) for a, b in zip(edges[:-1],
+                                                              edges[1:])])
+        ctx = mp.get_context("fork")
+        with ctx.Pool(nch) as pool:
+            for j0, zblk in pool.map(_raster_worker, range(nch)):
+                Z[j0:j0 + zblk.shape[0]] = zblk
+        return xs, ys, Z
     for j0 in range(0, len(ys), row_batch):
         jj = ys[j0:j0 + row_batch]
         xy = [(x, float(y)) for y in jj for x in xrow]
@@ -443,21 +494,34 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
            stepdown=0.3, overlap_deg=5.0, floor_z=None, wl_sampling=0.2,
            wl_min_sampling=0.1, max_chord=5.0, cut_feed=3429.0,
            ramp_feed=1270.0, clearance=None, workers=None, threads=8,
-           progress=None):
-    """Steep & shallow finishing toolpath. Returns (moves, stats)."""
+           window=None, progress=None):
+    """Steep & shallow finishing toolpath. Returns (moves, stats).
+
+    workers: pool size for raster rows + waterline levels (capped by the
+    ENGINE_WORKERS env, default 4); output order stays deterministic.
+    window: (xmin, xmax, ymin, ymax) - restrict the raster and keep only
+    waterline loops that touch the window (smoke tests)."""
     t_start = time.time()
     cutter = make_cutter(*tool)
+    workers = resolve_workers(workers)
     xmin, xmax, ymin, ymax, zmin, zmax = surf_bounds(surf)
     if floor_z is None:
         floor_z = zmin
     if clearance is None:
         clearance = zmax + 2.0
+    window = tuple(float(v) for v in window) if window else None
 
     # -- shallow raster (CL grid + slope) --------------------------------
+    rxmin, rxmax = xmin, xmax
+    rymin, rymax = ymin, ymax
+    if window:
+        rxmin, rxmax = max(xmin, window[0]), min(xmax, window[1])
+        rymin, rymax = max(ymin, window[2]), min(ymax, window[3])
     t0 = time.time()
-    xs, ys, Z = raster_cl(surf, cutter, (xmin, xmax, ymin, ymax),
+    xs, ys, Z = raster_cl(surf, cutter, (rxmin, rxmax, rymin, rymax),
                           stepover=stepover, sampling=sampling,
-                          threads=threads)
+                          threads=threads, stl_path=stl_path, workers=workers,
+                          tool=tool)
     t_raster = time.time() - t0
     slope = slope_deg(Z, xs[1] - xs[0], ys[1] - ys[0])
     s_runs = shallow_runs(xs, ys, Z, slope, threshold=slope_threshold,
@@ -465,15 +529,32 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                           stepover=stepover)
 
     # -- steep waterline levels ------------------------------------------
-    zs = np.arange(zmax - stepdown, floor_z - 1e-9, -stepdown)
-    if len(zs) == 0 or abs(zs[-1] - floor_z) > 1e-9:
-        zs = np.append(zs, floor_z)
+    # with a window, only levels where the CL inside the window actually
+    # exists can produce loops touching it: bound the range coarsely.
+    ztop, zbot = zmax, floor_z
+    if window:
+        wxs = np.arange(rxmin + 0.5, rxmax, 0.5)
+        wys = np.arange(rymin + 0.5, rymax, 0.5)
+        wxy = [(float(x), float(y)) for y in wys for x in wxs]
+        wz = batch_drop(surf, cutter, wxy, threads=threads)
+        finw = np.isfinite(wz)
+        ztop = min(zmax, float(np.max(wz[finw])) + 1.0)
+        zbot = max(floor_z, float(np.min(wz[finw])) - 1.0)
+    zs = np.arange(ztop - stepdown, zbot - 1e-9, -stepdown)
+    if len(zs) == 0 or abs(zs[-1] - zbot) > 1e-9:
+        zs = np.append(zs, zbot)
     t0 = time.time()
     levels, t_wl = waterline_levels(surf, zs, tool, wl_sampling=wl_sampling,
                                     wl_min_sampling=wl_min_sampling,
                                     stl_path=stl_path, workers=workers,
                                     threads=threads)
     levels.sort(key=lambda r: -r[0])
+    if window:
+        m = 2.0 * wl_sampling
+        levels = [(z, [lp for lp in loops if any(
+            rxmin - m <= px <= rxmax + m and rymin - m <= py <= rymax + m
+            for px, py in lp)])
+                  for z, loops in levels]
     lslopes = steep_slopes(surf, cutter, levels, stepover, threads=threads)
     st_runs = steep_runs(lslopes, threshold=slope_threshold,
                          overlap_deg=overlap_deg)
@@ -492,10 +573,20 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     cl_all = batch_drop(surf, cutter, all_pts, threads=threads)
     off = 0
     n_wl_lift = 0
+    n_cl_nan = 0
     for (z, run) in st_runs:
         m = len(run)
         cl = cl_all[off:off + m]
         off += m
+        # ocl drop-cutter returns nan at points just off the contact
+        # cylinder (tangency edge) while neighbours land on it; at a
+        # no-contact xy every z is gouge-free, so fill nan with the run's
+        # max CL to keep the run flat (a level-z sawtooth would plunge
+        # 5-7 mm every ~0.2 mm along vertical walls).
+        if not np.isfinite(cl).all():
+            n_cl_nan += int((~np.isfinite(cl)).sum())
+            cl = np.where(np.isfinite(cl), cl,
+                          np.nanmax(cl) if np.isfinite(cl).any() else z)
         need = np.isfinite(cl) & (cl > z + CHORD_TOL)
         n_wl_lift += int(need.sum())
         P = np.stack([run[:, 0], run[:, 1], np.where(need, cl, z)], axis=1)
@@ -546,7 +637,7 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     stats = {"n_steep_runs": len(steep_paths), "n_shallow_runs": len(shallow_paths),
              "n_steep_pts": int(sum(len(p) for p in steep_paths)),
              "n_shallow_pts": int(sum(len(p) for p in shallow_paths)),
-             "n_wl_lifted": n_wl_lift,
+             "n_wl_lifted": n_wl_lift, "n_cl_nan_filled": n_cl_nan,
              "t_raster_s": round(t_raster, 1), "t_steep_s": round(t_steep, 1),
              "t_waterline_s": round(t_wl, 1),
              "t_simplify_s": round(t_simplify, 1),
@@ -580,7 +671,20 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
             mode, lift_z, _ = lplan[k - 1] if k - 1 < len(lplan) else \
                 ("lift", clearance, None)
             if mode == "down":
-                emit(1, path[0][0], path[0][1], path[0][2], cut_feed)
+                # split the diagonal link into horizontal + vertical: safe
+                # both ways (descending: horizontal at the old height is
+                # above the verified diagonal, then a drop to CL at the new
+                # xy; ascending: rise at the old xy above its CL, then
+                # horizontal at the new height, above the diagonal). Keeps
+                # plunge_len = real Z travel instead of the whole diagonal.
+                px, py, pz = prev
+                bx, by, bz = path[0][0], path[0][1], path[0][2]
+                if bz <= pz:
+                    emit(1, bx, by, pz, cut_feed)
+                    emit(1, bx, by, bz, cut_feed)
+                else:
+                    emit(1, px, py, bz, cut_feed)
+                    emit(1, bx, by, bz, cut_feed)
             else:
                 stats["n_lifts"] += 1
                 emit(1, prev[0], prev[1], lift_z, ramp_feed)

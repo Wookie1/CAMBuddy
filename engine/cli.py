@@ -48,7 +48,7 @@ def finish_main(a):
         overlap_deg=a.overlap_deg, floor_z=a.floor,
         wl_sampling=a.wl_sampling, wl_min_sampling=a.wl_min_sampling,
         max_chord=a.max_chord, cut_feed=a.cut_feed, ramp_feed=a.ramp_feed,
-        clearance=a.clearance, workers=workers,
+        clearance=a.clearance, workers=workers, window=a.window,
         progress=prog)
     text = finishmod.finish_to_gcode(
         moves, spindle_rpm=a.spindle,
@@ -144,6 +144,10 @@ def main(argv=None):
     f.add_argument("--ramp-feed", dest="ramp_feed", type=float, default=1270.0)
     f.add_argument("--clearance", type=float, default=None,
                    help="retract plane Z (default part top + 2)")
+    f.add_argument("--window", type=float, nargs=4, default=None,
+                   metavar=("XMIN", "XMAX", "YMIN", "YMAX"),
+                   help="restrict raster + steep loops to this window "
+                        "(smoke test)")
     f.add_argument("--spindle", type=int, default=7500)
     f.add_argument("--workers", type=int, default=None,
                    help="parallel waterline level workers (default cpu-2)")
