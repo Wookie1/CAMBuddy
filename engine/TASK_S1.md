@@ -143,3 +143,13 @@ were wrongly rejected (slot-boss steep runs 35 -> 2, window removed 32,759 / 50,
 4. Assert slot-boss steep run count and wall leftover are back near S1b's (S1b: steep_runs=35, cut ~7.6 m).
 5. Re-run the window smoke (--window 96.8 136.8 30.8 70.8 --floor 24.765): report removed points per level,
    probe_clcheck (must be 0) and timing. Do NOT run the full part. Do not commit (the supervisor commits).
+
+## Round S2c (supervisor): duplicated shallow raster rows (time), plus nothing else
+Full Core Front with S2 code: probe_clcheck 0 below CL (good), but cutting length 2,660 m and est. 32.6 h (S1c was
+565 m). Feed by Z band (m): 15:12, 20:98, 25:94, 30:104, 35:418, 40:798, 45:1136. Long X rows (>50 mm, |dY|<1):
+11,749 rows at only 2,050 distinct Y values; one Y repeats up to 85 times (expected ~550 rows for 165 mm / 0.3).
+So shallow raster rows (or long segments of them) are emitted many times - e.g. once per steep level/region/run,
+or links/runs duplicated. Find the duplication in engine/finish.py and fix it so each shallow raster row segment
+is emitted once. Add a test asserting no two emitted cutting segments overlap (same Y row, overlapping X span,
+same Z within 0.01) on a synthetic shape, and that cut length is within 20% of the S1b synthetic numbers.
+Keep probe_clcheck == 0 and zmap 0 gouges on the synthetic suite. Do NOT run the full part. Do not commit.

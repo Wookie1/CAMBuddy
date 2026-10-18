@@ -17,7 +17,11 @@ along the chord line itself (a cutter position is gouge-free iff its tip z is
 Shallow: drop-cutter raster (BatchDropCutter, ball 6 default) along X at
 `stepover` (default 0.3 mm), sampled at `sampling` (0.1 mm). Slope per CL
 point from the CL-surface gradient of that grid; keep slope < threshold
-(default 40 deg) dilated by a 1 mm overlap band into the steep zone.
+(default 40 deg); rows serpentine (alternate direction) so consecutive rows
+connect with a short stepover link - never a full-width re-traversal of an
+already-cut row (S2c). The transition band into the steep zone is covered by
+the steep pass (segments with slope >= threshold - overlap_deg at every
+level), not by duplicated shallow rows.
 Steep (task S2 PLAN B, replaces OCL waterline): ONE batched drop-cutter CL
 grid at `sampling` pitch over the steep-region mask dilated by the ball
 radius, computed once per run; per Z level (stepdown default 0.3 mm, levels
@@ -213,7 +217,11 @@ def _runs_of_mask(mask):
 def shallow_runs(xs, ys, Z, slope, threshold=40.0, overlap_mm=1.0,
                  sampling=0.1, stepover=0.3, max_dz=0.08):
     """Contiguous (x, y, z) runs of shallow CL points per raster row:
-    slope < threshold plus an overlap_mm band dilated into the steep zone.
+    slope < threshold. (S2c: the former overlap_mm dilation band into the
+    steep zone is gone - it re-cut the same surface strips as the level
+    contours, duplicating shallow rows. The steep pass covers the
+    transition: it keeps segments with slope >= threshold - overlap_deg
+    at every level.)
     Points adjacent to an along-row CL step > max_dz are dropped and the row
     split there: a 0.1 mm chord spanning such a step bulges below the curved
     CL surface (the offset surface's radius of curvature can drop to ~r/2 at
@@ -221,9 +229,7 @@ def shallow_runs(xs, ys, Z, slope, threshold=40.0, overlap_mm=1.0,
     chord-line-checked. Those flanks belong to the steep pass anyway.
     Returns list of (row_index, i0, i1)."""
     valid = np.isfinite(Z)
-    core = valid & (slope < threshold)
-    keep = core | (dilate(core, int(math.ceil(overlap_mm / sampling)),
-                           int(math.ceil(overlap_mm / stepover))) & valid)
+    keep = valid & (slope < threshold)
     dzf = np.abs(np.diff(Z, axis=1)) > max_dz  # nan steps -> False
     if dzf.any():
         bad = np.zeros_like(keep)
@@ -977,19 +983,22 @@ def vertex_net(surf, cutter, paths, tol=NET_TOL, threads=None):
     check must run after rounding, not before. One batched drop-cutter call;
     violators are removed and paths split there (never lowered, never
     bridged - the pieces rejoin only through the verified link logic).
-    Returns (rounded paths, n_removed)."""
+    Returns (rounded paths, src index of the input path each output came
+    from - splits keep input order, n_removed)."""
     if not paths:
-        return [], 0
+        return [], [], 0
     rpth = [[tuple(round(float(v), 4) for v in p) for p in pth]
             for pth in paths if len(pth) >= 2]
+    src_in = [i for i, pth in enumerate(paths) if len(pth) >= 2]
     if not rpth:
-        return [], 0
+        return [], [], 0
     xy = [(p[0], p[1]) for pth in rpth for p in pth]
     cl = batch_drop(surf, cutter, xy, threads=threads)
     out = []
+    src = []
     n = 0
     off = 0
-    for pth in rpth:
+    for si, pth in enumerate(rpth):
         m = len(pth)
         c = cl[off:off + m]
         off += m
@@ -999,7 +1008,8 @@ def vertex_net(surf, cutter, paths, tol=NET_TOL, threads=None):
         for i0, i1 in _runs_of_mask(ok):
             if i1 - i0 >= 2:
                 out.append(pth[i0:i1])
-    return out, n
+                src.append(src_in[si])
+    return out, src, n
 
 
 def link_plan(surf, cutter, links, sampling=0.1, threads=None):
@@ -1051,6 +1061,8 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     default 4); output order stays deterministic.
     wl_sampling / wl_min_sampling: legacy (OCL waterline, task S1); unused by
     the PLAN B grid contours.
+    overlap_mm: legacy (S1 overlap band); unused since S2c - the band
+    duplicated cutting of the steep transition zone.
     window: (xmin, xmax, ymin, ymax) - restrict the raster and the steep CL
     grid (smoke tests)."""
     t_start = time.time()
@@ -1177,22 +1189,27 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     # shallow rows: vertices ARE the 0.1 mm CL samples - no extras needed;
     # rows are collinear so the rounds make zero drop-cutter calls
     shallow_chords = []
-    row_of = []
+    row_of_pre = []
     for (j, i0, i1) in s_runs:
         P = np.stack([xs[i0:i1], np.full(i1 - i0, ys[j]),
                      Z[j, i0:i1]], axis=1)
         shallow_chords.append(Chords(P, ss=0.0))
-        row_of.append(j)
+        row_of_pre.append(j)
     shallow_paths, n_rounds_shallow, n_chords_sh = simplify_rounds(
         shallow_chords, surf, cutter, threads=threads, tol=NET_TOL,
         max_chord=max_chord)
     # final one-sided net at the emitted (4-decimal rounded) coordinates:
     # rounding across a CL discontinuity (ball-catch circle at convex
     # vertical corners) must not leave an unsafe vertex in the output.
-    steep_paths, n_vn_steep = vertex_net(surf, cutter, steep_paths,
-                                         threads=threads)
-    shallow_paths, n_vn_shallow = vertex_net(surf, cutter, shallow_paths,
-                                             threads=threads)
+    steep_paths, _src_steep, n_vn_steep = vertex_net(surf, cutter,
+                                                     steep_paths,
+                                                     threads=threads)
+    shallow_paths, src_shallow, n_vn_shallow = vertex_net(
+        surf, cutter, shallow_paths, threads=threads)
+    # row / run index per EMITTED path (vertex_net splits runs, so the
+    # pre-net row_of / s_runs indices no longer align with k)
+    row_of = [row_of_pre[s] for s in src_shallow]
+    run_i0 = [s_runs[s][1] for s in src_shallow]
     t_simplify = time.time() - t0
 
     # -- order the paths: steep top-down, then shallow rows -----------
@@ -1200,8 +1217,18 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     order.sort(key=lambda k: (-steep_paths[k][0][2], steep_paths[k][0][1],
                               steep_paths[k][0][0]))
     ordered = [steep_paths[k] for k in order]
-    shallow_order = sorted(range(len(shallow_paths)), key=lambda k: row_of[k])
-    ordered += [shallow_paths[k] for k in shallow_order]
+    # serpentine shallow rows: reverse alternate rows so consecutive rows
+    # connect at the SAME X end with a short stepover link. Without this,
+    # every row transition re-traversed the full row length at cutting
+    # height (a "down" link's horizontal component), duplicating shallow
+    # raster rows many times over (S2c: 11,749 long rows for ~550).
+    shallow_order = sorted(range(len(shallow_paths)),
+                          key=lambda k: (row_of[k],
+                                       run_i0[k] if row_of[k] % 2 == 0
+                                       else -run_i0[k]))
+    for k in shallow_order:
+        p = shallow_paths[k]
+        ordered.append(p if row_of[k] % 2 == 0 else p[::-1])
 
     # -- links -----------------------------------------------------------
     t0 = time.time()
@@ -1233,11 +1260,16 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     stats["n_chords_checked"] = n_chords + n_chords_sh
     prev = None
 
-    def emit(g, x, y, z, f=None):
+    def emit(g, x, y, z, f=None, stat=None):
         nonlocal prev
+        if prev is not None and math.dist(prev, (x, y, z)) <= 1e-9:
+            return  # skip zero-length moves (down-link with bz == pz)
         if prev is not None:
             L = math.dist(prev, (x, y, z))
-            if g == 0:
+            if g == 0 or stat == "rapid":
+                # horizontal travel at a verified lift height (>= local max
+                # CL + 1 mm) is repositioning, not cutting (S2c: counting it
+                # as cut inflated cut_len ~40% on the synthetic shapes)
                 stats["rapid_len"] += L
             elif abs(z - prev[2]) > 1e-6:
                 stats["plunge_len"] += L
@@ -1274,7 +1306,8 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
             else:
                 stats["n_lifts"] += 1
                 emit(1, prev[0], prev[1], lift_z, ramp_feed)
-                emit(1, path[0][0], path[0][1], lift_z, ramp_feed)
+                emit(1, path[0][0], path[0][1], lift_z, ramp_feed,
+                     stat="rapid")
                 emit(1, path[0][0], path[0][1], path[0][2], ramp_feed)
         for (x, y, z) in path[1:]:
             emit(1, x, y, z, cut_feed)

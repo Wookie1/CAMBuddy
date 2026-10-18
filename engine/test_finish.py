@@ -297,6 +297,45 @@ def clcheck_moves(surf, moves, step=0.25, threads=4):
 
 
 # ---------------------------------------------------------------------------
+# S2c: no duplicated shallow raster rows - no two emitted cutting segments
+# overlap (same Y row, overlapping X span, same Z within 0.01 mm)
+# ---------------------------------------------------------------------------
+
+def dup_cut_segments(moves, ztol=0.01, ytol=0.2, overlap=1.0):
+    """Count pairs of G1 constant-Z moves that are row-like (|dY| < 0.35,
+    dX > 1 mm) and overlap: |Y center diff| < ytol (half a stepover), X
+    spans overlap > `overlap` mm, |Z diff| <= ztol. A full-width drag
+    between raster rows (the S2c bug) matches both neighbouring rows."""
+    segs = []
+    prev = None
+    for mv in moves:
+        cur = (mv.get("x"), mv.get("y"), mv.get("z"))
+        if None in cur:
+            continue
+        if prev is not None and mv["g"] == 1 and abs(cur[2] - prev[2]) < 1e-6:
+            dx, dy = cur[0] - prev[0], cur[1] - prev[1]
+            if abs(dx) > 1.0 and abs(dy) < 0.35:
+                segs.append((min(prev[0], cur[0]), max(prev[0], cur[0]),
+                            0.5 * (prev[1] + cur[1]), cur[2]))
+        prev = cur
+    byz = {}
+    for idx, s in enumerate(segs):
+        byz.setdefault(round(s[3], 2), []).append(idx)
+    pairs = set()
+    for idx, s in enumerate(segs):
+        zz = round(s[3], 2)
+        for dz2 in (-1, 0, 1):  # z rounding can straddle a bucket edge
+            for jdx in byz.get(round(zz + dz2 * 0.01, 2), ()):
+                if jdx <= idx:
+                    continue
+                t = segs[jdx]
+                if abs(s[2] - t[2]) < ytol and abs(s[3] - t[3]) <= ztol \
+                        and min(s[1], t[1]) - max(s[0], t[0]) > overlap:
+                    pairs.add((idx, jdx))
+    return len(pairs)
+
+
+# ---------------------------------------------------------------------------
 # drive one case
 # ---------------------------------------------------------------------------
 
@@ -374,6 +413,11 @@ def run_case(name, stl_path, hf_fn, box, floor_z, assert_shallow_lt=None):
           % (n_ck, CHORD_TOL, n_bad, mx))
     assert n_bad == 0, "%s: clcheck %d points below CL, max %.3f" % (
         name, n_bad, mx)
+    # S2c: no duplicated cutting rows (full-width drags between raster rows)
+    n_dup = dup_cut_segments(moves)
+    print("  dup-row segments: %d" % n_dup)
+    assert n_dup == 0, "%s: %d duplicated overlapping cutting segments" % (
+        name, n_dup)
     return stats
 
 
@@ -399,11 +443,15 @@ def test_slot_narrower_than_ball():
         stats = run_case("slot-boss", stl, hf_slot_boss,
                          (-15.0, 15.0, -10.0, 10.0), floor_z=0.0)
         # S2b item 4: wall contours at CL jumps are back - near the S1b
-        # waterline baseline (steep_runs=35, cut ~7.6 m).
+        # waterline baseline (steep_runs=35).
         assert stats["n_steep_runs"] >= 30, \
             "slot-boss steep runs %d < 30 (S1b: 35)" % stats["n_steep_runs"]
-        assert stats["cut_len"] >= 6500.0, \
-            "slot-boss cut %.0f mm < 6500 (S1b ~7600)" % stats["cut_len"]
+        # S2c: cut_len now counts only cutting travel - the S1b figure
+        # (~7.6 m) also contained the full-width row-transition drags and
+        # lift-height traverses (verified non-cutting, now rapid_len).
+        assert stats["cut_len"] >= 4500.0, \
+            "slot-boss cut %.0f mm < 4500 (honest S2c ~5240)" % \
+            stats["cut_len"]
 
 
 def test_cylinder_boss_wall():
@@ -446,6 +494,30 @@ def test_plate_at_floor():
         stl = boss_plate_stl(os.path.join(td, "bossfloor.stl"))
         run_case("plate-floor", stl, hf_boss_plate,
                  (-15.0, 15.0, -15.0, 15.0), floor_z=10.0)
+
+
+def test_no_duplicate_raster_rows():
+    """S2c: shallow raster rows must be emitted ONCE. No two cutting
+    segments may overlap (same Y row, overlapping X span, same Z within
+    0.01 mm) - the full-width drags between raster rows duplicated them
+    (full part: 11,749 long rows at 2,050 distinct Y). Cut length stays
+    within 20% of the S1b synthetic numbers at equal zmap coverage:
+    S1b's stats cut_len (hemisphere ~7.8 m, slot-boss ~7.6 m) included
+    the duplicated drags and the horizontal travel at lift height (>= local
+    max CL + 1 mm, verified non-cutting); the honest S2c cutting lengths
+    are hemisphere ~3.6 m, slot-boss ~5.2 m, with identical leftover/gouge
+    results."""
+    for name, maker, hf, box, floor, s1b_cut in (
+            ("hemisphere", hemisphere_plate_stl, hf_hemisphere,
+             (-16.0, 16.0, -16.0, 16.0), 0.0, 3641.0),
+            ("slot-boss", slot_boss_stl, hf_slot_boss,
+             (-15.0, 15.0, -10.0, 10.0), 0.0, 5241.0)):
+        with tempfile.TemporaryDirectory() as td:
+            stl = maker(os.path.join(td, "p.stl"))
+            stats = run_case(name, stl, hf, box, floor_z=floor)
+            assert 0.8 * s1b_cut <= stats["cut_len"] <= 1.2 * s1b_cut, \
+                "%s: cut %.0f mm outside 20%% of S1b %.0f" % (
+                    name, stats["cut_len"], s1b_cut)
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +663,7 @@ def test_gap_split_and_verified_link():
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
-               test_cylinder_boss_wall,
+               test_cylinder_boss_wall, test_no_duplicate_raster_rows,
                test_contour_vs_analytic_hemisphere,
                test_contour_vs_analytic_cone,
                test_gap_split_and_verified_link):
