@@ -980,6 +980,11 @@ def load_part(path):
     sidecar = re.sub(r"\.npy$", "", path) + ".json"
     with open(sidecar) as f:
         meta = json.load(f)
+    tess = meta.get("tess_tol")
+    if tess is None or float(tess) > 0.02:
+        print("warning: part sidecar tess_tol missing or > 0.02 mm "
+              "(vertical walls carry chord error); regenerate the heightfield "
+              "with TESS_TOL=0.01", file=sys.stderr)
     return part, float(meta["cell"]), float(meta["x0"]), float(meta["y0"])
 
 

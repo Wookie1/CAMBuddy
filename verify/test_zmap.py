@@ -563,3 +563,39 @@ G1 G40 X0. Y0.
     assert res["gouges"]["count"] == 0
     # the pocket floor really got cut along the compensated path
     assert res["stock"].min() <= 4.0 + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Synthetic vertical wall (analytic heightfield, 0.1 mm cells)
+# ---------------------------------------------------------------------------
+
+def wall_part(cell=0.1, n=100, x0=-5.0, top=10.0, floor=0.0):
+    """Analytic vertical wall: part = top for x >= 0, floor for x < 0."""
+    xs = (x0 + (np.arange(n) + 0.5) * cell)[None, :]
+    return np.broadcast_to(np.where(xs >= 0.0, top, floor), (n, n)).copy()
+
+
+def test_vertical_wall_ball_gouge():
+    """Ball tangent to a vertical wall face (tip at floor) gouges nothing;
+    the same path shifted 0.05 mm into the wall is flagged with depth > 0."""
+    cell, n, x0 = 0.1, 100, -5.0
+    part = wall_part(cell=cell, n=n, x0=x0)
+    R = 1.0
+    sb = (-5.0, 5.0, -5.0, 5.0, 0.0, 10.0)
+
+    def run_wall(xc):
+        gcode = "G21 G90 F500\nG0 X%.4f Y-3. Z20.\nG1 Z0. F100.\n" \
+                "G1 X%.4f Y3. F500.\n" % (xc, xc)
+        moves = zmap.parse_gcode(gcode)
+        return zmap.simulate(moves, part, cell, x0, -5.0, sb, tool="ball",
+                            dia=2 * R)
+
+    # (a) path exactly R from the wall face (x = -R): ball tangent -> no gouge
+    res_a = run_wall(-R)
+    assert res_a["gouges"]["count"] == 0, \
+        "tangent ball gouged %d cells" % res_a["gouges"]["count"]
+
+    # (b) same path 0.05 mm into the wall: flagged with positive depth
+    res_b = run_wall(-R + 0.05)
+    assert res_b["gouges"]["count"] > 0, "intruding ball not flagged"
+    assert res_b["gouges"]["max_depth"] > 0.0

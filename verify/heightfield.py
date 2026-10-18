@@ -35,7 +35,7 @@ def get_args():
     return step, out, cell, pad
 
 
-def rasterize(shape, cell=0.5, tol=0.05, pad=0.0):
+def rasterize(shape, cell=0.5, tol=0.01, pad=0.0):
     """Tessellate `shape` and rasterize triangles into a max-Z grid.
 
     Returns (hf, meta). Empty cells get the shape's bottom Z.
@@ -78,14 +78,15 @@ def rasterize(shape, cell=0.5, tol=0.05, pad=0.0):
         np.maximum(win, np.where(inside, z, -np.inf), out=win)
 
     meta = {"x0": x0, "y0": y0, "cell": cell, "nx": nx, "ny": ny,
-            "zmin": zmin, "zmax": float(bb.ZMax)}
+            "zmin": zmin, "zmax": float(bb.ZMax), "tess_tol": tol}
     return hf, meta
 
 
 def main():
     step, out, cell, pad = get_args()
     shape = Part.read(step)
-    hf, meta = rasterize(shape, cell=cell, tol=0.05, pad=pad)
+    tol = float(os.environ.get("TESS_TOL", 0.01))  # 0.01 = the engine STL tolerance
+    hf, meta = rasterize(shape, cell=cell, tol=tol, pad=pad)
     outdir = os.path.dirname(os.path.abspath(out))
     if outdir:
         os.makedirs(outdir, exist_ok=True)
