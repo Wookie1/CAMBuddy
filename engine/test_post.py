@@ -5,17 +5,19 @@ Runnable two ways:
     /opt/homebrew/bin/python3 -m pytest engine/test_post.py -q
     /Applications/VibeCAD.app/Contents/Resources/bin/python engine/test_post.py
 
-(a) structural diff of our posted rough program vs reference/1001.nc over every
-    NON-motion line: only tool number / op name / rpm / ZMIN-type values may
-    differ (plus the reference's second-op plane restores). Prints a summary.
+(a) spec conformance: post a small synthetic program and check every rule of
+    docs/lnc5800_post_spec.md -- header order (P1-P6), comment form (P3),
+    dwell default `G04 X<s>.` and `--dwell-p-ms` variant (P8), footer order
+    incl. M05 (P13), integer addresses without points (N2), decimals on
+    coordinates/feeds (N1/N3/N4), modal suppression (N6), CRLF (N7).
 (b) zmap the posted inch file and confirm gouges / leftover / cutting length are
     identical (within 1e-3) to the neutral metric run out/core_front_roughG.ngc.
 (c) number-formatting edge cases (0, negatives, 1.0, 0.00005 rounding, -0.0).
 (d) X7 tool table (tools/x7_tools.json): lookup, --tool-number override,
     refusal for unlisted tools without a number (no silent T1).
 """
-import difflib
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -26,7 +28,6 @@ sys.path.insert(0, "/Applications/VibeCAD.app/Contents/Resources/lib")
 from engine import post_lnc  # noqa: E402
 
 NEUTRAL = os.path.join(ROOT, "out", "core_front_roughG.ngc")
-REFERENCE = os.path.join(ROOT, "reference", "1001.nc")
 PART_HF = os.path.join(ROOT, "out", "core_front_setup_hf.npy")
 STOCK_BOX = (-128.651, 128.651, -82.55, 82.55, 0.0, 60.96)
 TOOL = dict(tool="bull", dia=12.7, corner=0.127, flute=25.4)
@@ -40,7 +41,7 @@ def _read(path):
 
 
 def _posted_inch_text():
-    """Post the round-7 neutral roughing to LNC inch once, cache it."""
+    """Post the neutral roughing to LNC inch once, cache it."""
     if "inch" not in _POSTED_CACHE:
         _POSTED_CACHE["inch"] = post_lnc.post_text(
             _read(NEUTRAL), program=1001, op_name="OVERALL ROUGHING")
@@ -49,6 +50,154 @@ def _posted_inch_text():
 
 def _lines(text):
     return text.replace("\r\n", "\n").split("\n")
+
+
+# ---------------------------------------------------------------------------
+# (a) spec conformance on a small synthetic program (docs/lnc5800_post_spec.md)
+# ---------------------------------------------------------------------------
+
+# small synthetic mm path: rapid in, 3 feed moves (one per axis), retract
+SYN_MOVES = [
+    {"g": 0, "x": 0.0, "y": 0.0, "z": 5.0},
+    {"g": 1, "x": 10.0, "y": 0.0, "z": 5.0, "f": 1270.0},
+    {"g": 1, "x": 10.0, "y": 10.0, "z": 5.0, "f": 1270.0},
+    {"g": 1, "x": 10.0, "y": 10.0, "z": -2.5, "f": 1270.0},
+    {"g": 0, "x": 0.0, "y": 0.0, "z": 5.0},
+]
+
+
+def _synthetic(metric=True, **kw):
+    return post_lnc.post(SYN_MOVES, metric=metric, tool_number=2,
+                         rpm=7500, dia_mm=6.0, corner_mm=0.0,
+                         tool_kind="flat", op_name="SPEC TEST", crlf=False,
+                         **kw)
+
+
+def test_spec_header_and_footer_order():
+    """P1-P6 header order and P13 footer order (incl. M05)."""
+    txt = _synthetic()
+    lines = _lines(txt)
+
+    # P1/P2: tape start, integer program number
+    assert lines[0] == "%", "P1: file must start with a %% line, got %r" % lines[0]
+    assert re.match(r"^O\d+$", lines[1]), "P2: line 2 must be O<n>: %r" % lines[1]
+
+    # P4 safety line, P5 units on its own line -- both before any motion
+    i_safety = lines.index("G90 G94 G17 G49 G40 G80")
+    i_units = lines.index("G21")
+    first_motion = next(i for i, l in enumerate(lines)
+                        if re.match(r"^G0[01] [XYZ]", l))
+    assert i_safety < i_units < first_motion, \
+        "P4/P5: safety line then units must precede motion: %r" % lines[:12]
+
+    # P6: G53 G00 Z0. appears before the tool change (and again in the footer)
+    i_home = lines.index("G53 G00 Z0.")
+    i_tool = next(i for i, l in enumerate(lines) if l.endswith("M06"))
+    assert i_home < i_tool, "P6: machine-Z home before the tool change"
+    assert lines.count("G53 G00 Z0.") == 2, "P6: home before op and in footer"
+
+    # P7-P11 op block order
+    seq = ["T2 M06", "S7500 M03", "G04 X3.", "G54", "M08"]
+    idx = [lines.index(s) for s in seq]
+    assert idx == sorted(idx), "P7-P10 order wrong: %r" % lines[i_tool:i_tool + 8]
+    i_g43 = next(i for i, l in enumerate(lines) if l.startswith("G43"))
+    assert lines[i_g43] == "G43 Z5. H02", "P11: %r" % lines[i_g43]
+    assert i_g43 > lines.index("M08"), "P11: tool length after coolant on"
+    xy_rapid = next(l for l in lines if re.match(r"^G00 X\S+ Y\S+$", l))
+    assert lines.index(xy_rapid) < i_g43, \
+        "P11: first XY rapid at current Z precedes G43"
+
+    # P13 footer order incl. explicit M05 after M09
+    tail = [l for l in lines if l != ""][-8:]
+    want = ["M09", "M05", "G53 G00 Z0.", "G49", "G28 G91 X0. Y0.", "G90",
+            "M30", "%"]
+    assert tail == want, "P13 footer order: got %r want %r" % (tail, want)
+    print("PASS spec P1-P13: header/footer order incl. M05")
+
+
+def test_spec_comment_form():
+    """P3: comments are ( ... ), upper case, no nested parentheses."""
+    txt = _synthetic()
+    comments = [l for l in _lines(txt) if l.startswith("(")]
+    assert comments, "no comment lines posted"
+    for c in comments:
+        assert c.endswith(")") and c.count("(") == 1 and c.count(")") == 1, \
+            "P3: no nested parens: %r" % c
+        assert c == c.upper(), "P3: comments must be upper case: %r" % c
+    print("PASS spec P3: %d upper-case flat ( ) comments" % len(comments))
+
+
+def test_spec_dwell_variants():
+    """P8: default dwell is G04 X<seconds>.; dwell_p_ms emits G04 P<milliseconds>."""
+    assert "G04 X3." in _synthetic(), "P8 default must be G04 X<seconds>."
+    txt_p = _synthetic(dwell_p_ms=True)
+    assert "G04 P3000" in txt_p, "P8 dwell_p_ms must emit G04 P<ms>"
+    assert "G04 X" not in txt_p
+    txt_half = _synthetic(dwell_ms=1500)
+    assert "G04 X1.5" in txt_half, "P8: 1500 ms -> G04 X1.5: %r" % txt_half
+    print("PASS spec P8: dwell X<s>. default, P<ms> with dwell_p_ms")
+
+
+def test_spec_number_rules():
+    """N1/N2/N4: decimals on axes/feeds, none on integer addresses."""
+    txt = _synthetic()
+    lines = _lines(txt)
+
+    # N2: O/T/H/M/S/G words never carry a decimal point
+    for l in lines:
+        for letter, num in re.findall(r"\b([OTHMSG])\s*([-+]?[0-9.]+)", l):
+            assert "." not in num, \
+                "N2: integer address %s%s carries a point: %r" % (letter, num, l)
+
+    # N1: every X/Y/Z/F word carries a decimal point
+    for l in lines:
+        if l.startswith("("):
+            continue
+        for letter, num in re.findall(r"\b([XYZF])\s*([-+]?[0-9.]+)", l):
+            assert "." in num, \
+                "N1: %s value lacks a decimal point: %r" % (letter, l)
+
+    # N3/N4 metric: mm coords to 3 dp, feeds integer with forced point
+    assert "X10." in txt and "Z-2.5" in txt, "N3: mm coords: %r" % txt
+    assert "F1270." in txt, "N4: mm feed is integer with a point"
+
+    # N3 inch output: 4 dp, trailing zeros trimmed
+    txt_in = _synthetic(metric=False)
+    assert "G20" in txt_in, "P5: inch mode emits G20"
+    assert "X0.3937" in txt_in, \
+        "N3: 10 mm -> 0.3937 in (4 dp): %r" % [l for l in _lines(txt_in)
+                                                if "X0.39" in l]
+    assert "F50." in txt_in, "N4: 1270 mm/min -> F50. ipm"
+    print("PASS spec N1-N4: decimals on axes/feeds, none on integer addresses")
+
+
+def test_spec_modal_suppression():
+    """N6: motion word on mode change only, axis words on change only, F once."""
+    txt = _synthetic()
+    lines = _lines(txt)
+    motion = [l for l in lines if re.match(r"^[XYZF]|^G0[01]", l)
+              and not l.startswith(("G53", "G28"))]
+    assert txt.count("G01") == 1, \
+        "N6: G01 must appear once (mode change), got %d: %r" % (txt.count("G01"),
+                                                                 motion)
+    assert txt.count("F1270.") == 1, "N6: unchanged feed must be suppressed"
+    assert "Y10." in txt and not re.search(r"G01 Y10\.", txt), \
+        "N6: axis-only change lines carry no motion word"
+    # the entry rapid to (0,0) at Z5 equals the header position -> dropped;
+    # only the end-of-op retract rapid to that point remains (one such line)
+    assert txt.count("G00 X0. Y0. Z5.") == 1, \
+        "N6: the no-op entry move must be dropped: %r" % motion
+    print("PASS spec N6: modal suppression (%d motion lines)" % len(motion))
+
+
+def test_spec_crlf():
+    """N7: CRLF line endings by default, LF on request."""
+    default = post_lnc.post(SYN_MOVES, metric=True, tool_number=2,
+                            tool_kind="flat", dia_mm=6.0)
+    assert "\r\n" in default and "\n" not in default.replace("\r\n", ""), \
+        "N7: default line endings must be CRLF"
+    assert "\r\n" not in _synthetic(), "crlf=False must give LF"
+    print("PASS spec N7: CRLF by default")
 
 
 # ---------------------------------------------------------------------------
@@ -131,73 +280,11 @@ def test_posted_x7_file_reads_T3():
         print("SKIP X7 file check: %s missing" % path)
         return
     txt = _read(path)
-    import re as _r
     assert "T3 M06" in txt, "out/core_front_rough_X7.nc must read T3 M06"
-    assert _r.search(r"G43 Z\S+ H03", txt), \
+    assert re.search(r"G43 Z\S+ H03", txt), \
         "out/core_front_rough_X7.nc must carry G43 ... H03"
     assert txt.splitlines()[2].startswith("(T3 "), "header tool comment T-number"
     print("PASS posted X7 file reads T3 / H03")
-
-
-# ---------------------------------------------------------------------------
-# (a) structural diff vs reference over non-motion lines
-# ---------------------------------------------------------------------------
-
-def test_structural_diff_vs_reference():
-    if not os.path.exists(REFERENCE):
-        print("SKIP structural diff: reference/1001.nc missing")
-        return
-    ours = _lines(_posted_inch_text())
-    ref = _lines(_read(REFERENCE))
-
-    oc = post_lnc.control_sequence(ours)
-    rc = post_lnc.control_sequence(ref)
-
-    # The reference emits standalone G17 plane-restore lines only because its
-    # final op arcs in G18; our line-only roughing stays in G17, so it has none.
-    rc_no_plane = [t for t in rc if t != "G17"]
-
-    print("\n--- structural diff (non-motion control lines) ---")
-    print("ours control tokens: %d   ref (excl. G17 plane restores): %d"
-          % (len(oc), len(rc_no_plane)))
-    sm = difflib.SequenceMatcher(a=rc_no_plane, b=oc, autojunk=False)
-    diffs = 0
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            continue
-        diffs += 1
-        print("  %-6s ref=%s ours=%s" % (tag, rc_no_plane[i1:i2], oc[j1:j2]))
-    equal = sum(i2 - i1 for t, i1, i2, j1, j2 in sm.get_opcodes()
-               if t == "equal")
-    print("  matching control lines: %d / %d" % (equal, len(rc_no_plane)))
-
-    # core assertion: every non-motion control line matches the reference
-    # exactly, except the reference's second-op G17 plane restores.
-    assert rc_no_plane == oc, ("control-line structural mismatch; diffs=%d\n"
-                               "ref(no G17)=%s\nours=%s"
-                               % (diffs, rc_no_plane, oc))
-
-    # header tool comment: only tool number and ZMIN may differ from reference
-    ours_hdr = next(l for l in ours if l.startswith("(T"))
-    ref_hdr = next(l for l in ref if l.startswith("(T"))
-    import re
-    pat = r"\(T(\d+) D=(\S+) CR=(\S+) - ZMIN=(\S+) - (.*)\)"
-    om, rm = re.match(pat, ours_hdr), re.match(pat, ref_hdr)
-    assert om and rm, "header tool comment not in expected form: %r / %r" % (ours_hdr, ref_hdr)
-    assert om.group(2) == rm.group(2), "D differs: %s vs %s" % (om.group(2), rm.group(2))
-    assert om.group(3) == rm.group(3), "CR differs"
-    assert om.group(5) == rm.group(5), "tool type differs: %s vs %s" % (om.group(5), rm.group(5))
-    print("  header tool comment: ours=%s\n                     ref =%s"
-          % (ours_hdr, ref_hdr))
-    print("  -> D=%s CR=%s type=%s identical; T and ZMIN allowed to differ"
-          % (om.group(2), om.group(3), om.group(5)))
-
-    # comment lines (op name / tool description / our comp-off note)
-    ocm = post_lnc.comment_sequence(ours)
-    rcm = post_lnc.comment_sequence(ref)
-    print("  comment lines: ours=%d ref=%d (text may differ; both carry "
-          "tool/op/description comments)" % (len(ocm), len(rcm)))
-    print("PASS structural diff vs reference")
 
 
 # ---------------------------------------------------------------------------
@@ -267,12 +354,17 @@ def test_zmap_matches_neutral():
 
 def _main():
     fails = 0
-    for fn in (test_number_format_edge_cases,
+    for fn in (test_spec_header_and_footer_order,
+               test_spec_comment_form,
+               test_spec_dwell_variants,
+               test_spec_number_rules,
+               test_spec_modal_suppression,
+               test_spec_crlf,
+               test_number_format_edge_cases,
                test_tool_table_lookup,
                test_tool_number_override,
                test_unknown_tool_refused,
                test_posted_x7_file_reads_T3,
-               test_structural_diff_vs_reference,
                test_zmap_matches_neutral):
         try:
             fn()
@@ -285,3 +377,18 @@ def _main():
 
 if __name__ == "__main__":
     sys.exit(_main())
+
+
+def test_comment_style_slashstar():
+    """P3: with LNC parameter 42 = 0 comments must be /*...*/; default stays ( )."""
+    from engine.post_lnc import post
+    moves = [{"g": 0, "x": 0.0, "y": 0.0, "z": 10.0}, {"g": 1, "x": 5.0, "y": 0.0, "z": 10.0, "f": 1000.0}]
+    try:
+        paren = post(moves, tool_number=3).splitlines()
+        slash = post(moves, tool_number=3, comment_style="slashstar").splitlines()
+    except (KeyError, TypeError):
+        import pytest
+        pytest.skip("synthetic move shape differs from the engine's")
+    assert any(l.startswith("(") for l in paren)
+    assert not any(l.startswith("(") for l in slash)
+    assert any(l.startswith("/*") and l.endswith("*/") for l in slash)

@@ -1,35 +1,35 @@
 """Neutral / engine move list -> James's SyilCNC LNCv2 G-code (post_lnc).
 
 The engine's neutral moves (mm, ``G0``/``G1`` with explicit X/Y/Z/F words as
-written by :func:`engine.gcode.moves_to_gcode`) are re-posted into the shape of
-``reference/1001.nc`` -- the program that runs on James's LNC 5800.
+written by :func:`engine.gcode.moves_to_gcode`) are re-posted into the format
+documented in ``docs/lnc5800_post_spec.md`` for James's LNC 5800 (Syil X7).
+Rule ids below cite that spec (P1..P13 program structure, N1..N7 words and
+numbers).
 
-Conventions learned from ``reference/1001.nc`` (and the vendor ``.cps`` used only
-to understand the number formats; none of its code is copied):
-
-* Header: ``%`` / ``O<prog>`` / tool comment
+* Header (P1-P6): ``%`` / ``O<n>`` / tool comment
   ``(T<n> D=<dia> CR=<cr> - ZMIN=<min z> - <type>)`` /
-  ``G90 G94 G17 G49 G40 G80`` / ``G20`` (or ``G21``) / ``G53 G00 Z0.``.
-* Per op: ``(OP NAME)`` / ``T<n> M06`` / tool description comment /
-  ``S<rpm> M03`` / ``G04 P<dwell>`` / work offset (``G54``) / ``M08`` /
-  first XY rapid / ``G43 Z<clear> H<n>`` / motion.
-* Number format: maximum fraction digits with trailing zeros trimmed and a
-  forced decimal point (``3.`` for integers, ``2.6`` not ``2.6000``, leading
-  zeros kept). Inch = up to 4 decimals, mm = up to 3; feeds inch up to 1,
-  mm integer.
-* Modal suppression exactly like the reference: the motion word (``G00``/``G1``)
-  is emitted only when the motion mode changes, an axis word only when that
-  axis value changes at output precision, and ``F`` only when the feed changes.
-* Footer: exactly what ``1001.nc`` ends with -- a clearance rapid, blank line,
-  ``M09 / G53 G00 Z0. / G49 / G28 G91 X0. Y0. / G90 / M30 / %``. (No ``M05``;
-  the LNC post relies on ``M30`` to stop the spindle.)
+  ``G90 G94 G17 G49 G40 G80`` (P4) / ``G20`` (or ``G21``, P5) /
+  ``G53 G00 Z0.`` (P6).
+* Per op (P7-P12): ``(OP NAME)`` / ``T<n> M06`` / tool description comment /
+  ``S<rpm> M03`` + warm-up dwell (P8: ``G04 X<s>.`` in seconds by default;
+  ``dwell_p_ms=True`` emits ``G04 P<ms>``) / work offset ``G54`` (P9) /
+  ``M08`` (P10) / first XY rapid at the current Z / ``G43 Z<clear> H<n>``
+  (P11) / motion. Cutter radius comp is off, paths are tool centre (P12); a
+  header comment states this. Arcs (``G02``/``G03`` with I/J in G17, N5) are
+  emitted only if the input path actually contains arcs.
+* Number format (N1-N4): every axis/arc-centre/feed value carries a decimal
+  point; maximum fraction digits with trailing zeros trimmed and the point
+  forced (inch coords 4 dp, mm 3 dp; feeds inch up to 1 dp, mm integer).
+  Integer-only addresses (O/N/T/H/D/M/S/G) never carry a point (N2); ``-0.``
+  collapses to ``0.`` (N3).
+* Modal suppression (N6): the motion word (``G00``/``G01``) is emitted only
+  when the motion mode changes, an axis word only when that axis value changes
+  at output precision, and ``F`` only when the feed changes.
+* Footer (P13): a clearance rapid, blank line, then ``M09 / M05 / G53 G00 Z0.
+  / G49 / G28 G91 X0. Y0. / G90 / M30 / %`` (M05 is the explicit spindle
+  stop).
 
-No cutter compensation is emitted (roughing paths are tool centre); a header
-comment states this. Arcs (``G02``/``G03`` with I/J in G17) are emitted only if
-the input path actually contains arcs.
-
-Line endings: the reference file is CRLF, so the posted program uses CRLF by
-default (``crlf=False`` switches to LF for diffing/tests).
+Line endings: CRLF per N7 (``crlf=False`` switches to LF for diffing/tests).
 """
 import json
 import os
@@ -76,19 +76,19 @@ def lookup_tool(kind, dia_mm, corner_mm, table=None):
 
 
 # ---------------------------------------------------------------------------
-# Number formatting (matches the vendor createFormat: max fraction digits,
-# trailing zeros trimmed, decimal point forced)
+# Number formatting (spec N1-N4: max fraction digits, trailing zeros trimmed,
+# decimal point forced on float addresses)
 # ---------------------------------------------------------------------------
 
 def fmt_num(value, decimals):
-    """Format one number the way 1001.nc does.
+    """Format one number per spec N1/N3.
 
     ``decimals`` is the maximum number of fractional digits; trailing zeros are
     trimmed but a decimal point is always kept (``3.`` for integers). ``-0.0``
-    and values that round to zero collapse to a positive ``0.``.
+    and values that round to zero collapse to a positive ``0.`` (N3).
     """
     if decimals <= 0:
-        # integer field; forceDecimal still wants the trailing dot
+        # integer feed field (N4): the forced trailing dot still applies
         n = int(round(value))
         if n == 0:
             n = 0  # collapse -0
@@ -236,7 +236,7 @@ def post_moves(moves, metric=False, units_in=1.0, start=None):
 
     ``start`` is the (x, y, z) position already established by the op header
     (first XY rapid + ``G43`` tool-length), in output units; it lets the first
-    cutting move suppress axes that have not changed, exactly like 1001.nc.
+    cutting move suppress axes that have not changed (modal rule N6).
     """
     out_to_mm = 1.0 if metric else 25.4
     scale = units_in / out_to_mm          # input units -> output units
@@ -290,13 +290,19 @@ def post_moves(moves, metric=False, units_in=1.0, start=None):
 def post(moves, *, metric=False, units_in=1.0, program=1001,
          op_name="ENGINE ROUGH", tool_number=None, rpm=7500,
          dia_mm=12.7, corner_mm=0.127, tool_kind="bull",
-         clear_mm=None, wcs=54, dwell_ms=3000, tool_desc=None,
-         comp_note=True, crlf=True):
-    """Build a full LNC program (list of lines) from neutral ``moves``.
+         clear_mm=None, wcs=54, dwell_ms=3000, dwell_p_ms=False,
+         tool_desc=None, comp_note=True, crlf=True,
+         comment_style="paren"):
+    """Build a full LNC program (single string) from neutral ``moves``.
 
+    Format follows docs/lnc5800_post_spec.md (rule ids P1..P13, N1..N7).
     Distances in ``dia_mm/corner_mm/clear_mm`` and the move coordinates are
     millimetres (the engine's working unit); ``units_in`` tells the post the
     input units if they are not mm. Output is inch unless ``metric=True``.
+
+    ``dwell_ms`` is the P8 warm-up dwell; by default it is emitted as
+    ``G04 X<seconds>.`` (P8, X = seconds). With ``dwell_p_ms=True`` it is
+    emitted as ``G04 P<milliseconds>`` (P8, VERIFY: P unit on the X7).
 
     ``tool_number`` (T and H) must either be given explicitly or be found in
     the X7 tool table (``tools/x7_tools.json``, matched on type + diameter +
@@ -326,10 +332,10 @@ def post(moves, *, metric=False, units_in=1.0, program=1001,
     # round clear to output precision so G43 / retract read cleanly
     clear_out = round(clear_out, cdec)
 
-    # --- header ---
+    # --- header (P1-P6, P12) ---
     out = []
-    out.append("%")
-    out.append("O%d" % program)
+    out.append("%")                                  # P1
+    out.append("O%d" % program)                   # P2 (integer, no point: N2)
     dia_out = dia_mm * units_in / out_to_mm
     cr_out = corner_mm * units_in / out_to_mm
     zmin_out = min_z_mm * units_in / out_to_mm
@@ -337,22 +343,25 @@ def post(moves, *, metric=False, units_in=1.0, program=1001,
     out.append("(T%d D=%s CR=%s - ZMIN=%s - %s)"
                % (tool_number, fmt_num(dia_out, cdec), fmt_num(cr_out, cdec),
                  fmt_num(zmin_out, cdec), type_str))
-    out.append("G90 G94 G17 G49 G40 G80")
-    out.append("G21" if metric else "G20")
+    out.append("G90 G94 G17 G49 G40 G80")      # P4 safety line
+    out.append("G21" if metric else "G20")      # P5 units, own line
     if comp_note:
-        out.append("(CUTTER COMPENSATION OFF - PATHS ARE TOOL CENTRE)")
-    out.append("G53 G00 Z0.")
+        out.append("(CUTTER COMPENSATION OFF - PATHS ARE TOOL CENTRE)")  # P12
+    out.append("G53 G00 Z0.")                  # P6 home before tool change
     out.append("")
 
-    # --- op block ---
-    out.append("(%s)" % op_name.upper())
-    out.append("T%d M06" % tool_number)
+    # --- op block (P7-P11) ---
+    out.append("(%s)" % op_name.upper())          # P3 comment form
+    out.append("T%d M06" % tool_number)          # P7
     desc = tool_desc if tool_desc is not None else type_str
-    out.append("(%s)" % desc.upper())
-    out.append("S%d M03" % rpm)
-    out.append("G04 P%d" % dwell_ms)
-    out.append("G%d" % wcs)
-    out.append("M08")
+    out.append("(%s)" % desc.upper())            # P3 comment form
+    out.append("S%d M03" % rpm)                 # P8 (integer S: N2)
+    if dwell_p_ms:
+        out.append("G04 P%d" % int(round(dwell_ms)))   # P8 (VERIFY: P = ms)
+    else:
+        out.append("G04 X%s" % fmt_num(dwell_ms / 1000.0, 3))  # P8: X = sec
+    out.append("G%d" % wcs)                     # P9
+    out.append("M08")                           # P10
 
     # first XY rapid (at clear height), then tool-length to clear
     first_xy = next(((mv.get("x"), mv.get("y")) for mv in moves
@@ -378,16 +387,23 @@ def post(moves, *, metric=False, units_in=1.0, program=1001,
     if last_z is None or last_z < clear_out:
         out.append("G00 Z%s" % fmt_num(clear_out, cdec))
 
-    # --- footer (exactly what 1001.nc ends with) ---
+    # --- footer (P13) ---
     out.append("")
-    out.append("M09")
-    out.append("G53 G00 Z0.")
+    out.append("M09")                           # P10 coolant off
+    out.append("M05")                          # P13 explicit spindle stop
+    out.append("G53 G00 Z0.")                  # P6 machine-coordinate Z home
     out.append("G49")
     out.append("G28 G91 X0. Y0.")
     out.append("G90")
     out.append("M30")
-    out.append("%")
+    out.append("%")                            # P1
 
+    # CRLF line endings per N7
+    if comment_style == "slashstar":   # P3: LNC parameter 42 = 0 -> /*...*/ comments
+        out = ["/*%s*/" % l[1:-1] if l.startswith("(") and l.endswith(")") else l
+               for l in out]
+    elif comment_style != "paren":
+        raise ValueError("comment_style must be 'paren' or 'slashstar'")
     return ("\r\n" if crlf else "\n").join(out) + ("\r\n" if crlf else "\n")
 
 
@@ -420,24 +436,25 @@ _CONTROL_RES = [
     ("pct", _re.compile(r"%$")),
     ("oprogram", _re.compile(r"O\d+$")),
     ("comment", _re.compile(r"\(.*\)$")),
-    ("modal_header", _re.compile(r"G90 G94 G17 G49 G40 G80$")),
-    ("units", _re.compile(r"G2[01]$")),
-    ("home_rapid", _re.compile(r"G53 G00 Z0\.$")),
-    ("toolchange", _re.compile(r"T\d+ M0?6$")),
-    ("spindle", _re.compile(r"S\d+ M0?3$")),
-    ("dwell", _re.compile(r"G0?4 P\d+$")),
-    ("wcs", _re.compile(r"G5[4-9]$")),
-    ("coolant_on", _re.compile(r"M0?8$")),
-    ("coolant_off", _re.compile(r"M0?9$")),
-    ("tool_len", _re.compile(r"G43 Z\S+ H\d+$")),
-    ("g49", _re.compile(r"G49$")),
-    ("home_g28", _re.compile(r"G28 G91 X0\. Y0\.$")),
+    ("modal_header", _re.compile(r"G90 G94 G17 G49 G40 G80$")),   # P4
+    ("units", _re.compile(r"G2[01]$")),                             # P5
+    ("home_rapid", _re.compile(r"G53 G00 Z0\.$")),                  # P6
+    ("toolchange", _re.compile(r"T\d+ M0?6$")),                     # P7
+    ("spindle", _re.compile(r"S\d+ M0?3$")),                        # P8
+    ("dwell", _re.compile(r"G0?4 [XP]\S+$")),                       # P8
+    ("wcs", _re.compile(r"G5[4-9]$")),                              # P9
+    ("coolant_on", _re.compile(r"M0?8$")),                          # P10
+    ("coolant_off", _re.compile(r"M0?9$")),                         # P10
+    ("spindle_stop", _re.compile(r"M0?5$")),                        # P13
+    ("tool_len", _re.compile(r"G43 Z\S+ H\d+$")),                    # P11
+    ("g49", _re.compile(r"G49$")),                                  # P13
+    ("home_g28", _re.compile(r"G28 G91 X0\. Y0\.$")),               # P13
     ("absolute", _re.compile(r"G9[01]$")),
     ("plane", _re.compile(r"G1[789]$")),
-    ("end", _re.compile(r"M3?0$")),
+    ("end", _re.compile(r"M3?0$")),                                 # P13
 ]
 
-# Categories whose *values* are allowed to differ from the reference (tool
+# Categories whose *values* are allowed to differ between programs (tool
 # number, rpm, dwell, tool-length clear/H, program number) plus comments and the
 # optional plane-restore that only appears when an op used G18/G19.
 MASKS = {
@@ -445,7 +462,7 @@ MASKS = {
     "comment": "(C)",
     "toolchange": "T<#> M06",
     "spindle": "S<#> M03",
-    "dwell": "G04 P<#>",
+    "dwell": "G04 <X/P#>",
     "tool_len": "G43 Z<#> H<#>",
 }
 

@@ -82,7 +82,7 @@ def plan_levels(stock_zmax, floor_z, leave, stepdown, flat_floors=None,
     """Z levels (tip depths) top-down (legacy, round 6).
 
     Last level = final_zmin when given, else floor_z + axial_leave (axial
-    leave defaults to the radial `leave`). Flat-area detection (Fusion-like):
+    leave defaults to the radial `leave`). Flat-area detection:
     each flat floor F of the part adds a level at F + axial leave, kept only
     when it sits at least `min_level_gap` below every other level (so it is
     neither redundant with the final level nor a duplicate of a neighbouring
@@ -114,12 +114,13 @@ def plan_stepup_levels(stock_zmax, final_zmin, stepdown=19.05, stepup=1.905,
                       axial_leave=0.381, min_level_gap=0.5):
     """Execution-order level list (Task G item 3).
 
-    Big levels: stock_zmax - k*stepdown down to final_zmin (the last level is
-    final_zmin). After each big level, climb candidates every `stepup` mm
-    upward (capped at one stepdown above it and below the stock top), so a
-    big level is followed immediately by its step-up levels climbing the
-    remaining tall stock - like Fusion's measured 41.91 -> 43.81/45.72/47.62
-    and 24.95 -> 36.2/38.1/40.0 pattern. Candidates too close to an earlier
+    Defaults are James's cutting data (stepdown 19.05, stepup 1.905, axial
+    leave 0.381). Big levels: stock_zmax - k*stepdown down to final_zmin (the
+    last level is final_zmin). After each big level, climb candidates every
+    `stepup` mm upward (capped at one stepdown above it and below the stock
+    top), so a big level is followed immediately by its step-up levels climbing
+    the remaining tall stock (the 41.91 -> 43.81/45.72/47.62 and
+    24.95 -> 36.2/38.1/40.0 climb pattern). Candidates too close to an earlier
     level are dropped; empties get pruned at runtime against the stock model.
     """
     big = []

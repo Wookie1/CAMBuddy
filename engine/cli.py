@@ -26,8 +26,9 @@ def _run_post(a):
     with open(a.inp, newline="") as fh:
         text = fh.read()
     kw = dict(metric=a.metric, program=a.program, op_name=a.op_name,
-              wcs=a.wcs, dwell_ms=a.dwell_ms, tool_desc=a.tool_desc,
-              crlf=not a.lf)
+              wcs=a.wcs, dwell_ms=a.dwell_ms, dwell_p_ms=a.dwell_p_ms,
+              comment_style=getattr(a, "comment_style", "paren"),
+              tool_desc=a.tool_desc, crlf=not a.lf)
     if a.tool_number is not None:
         kw["tool_number"] = a.tool_number
     if a.rpm is not None:
@@ -128,14 +129,15 @@ def main(argv=None):
     r.add_argument("--floor", type=float, default=24.765,
                    help="main floor Z; last level = floor + axial leave")
     r.add_argument("--leave", type=float, default=0.381,
-                  help="radial stock to leave mm")
+                  help="radial stock to leave mm (James's cutting data)")
     r.add_argument("--axial-leave", dest="axial_leave", type=float, default=None,
                    help="axial leave mm (default: --leave); used for the final "
                         "level and the stock-region clip")
     r.add_argument("--final-zmin", dest="final_zmin", type=float, default=None,
                   help="explicit final level tip Z (overrides floor+axial "
-                     "leave; e.g. 24.95 to match Fusion's ZMIN)")
-    r.add_argument("--stepdown", type=float, default=19.05)
+                     "leave; e.g. 24.95 from James's cutting data)")
+    r.add_argument("--stepdown", type=float, default=19.05,
+                   help="max stepdown mm (James's cutting data)")
     r.add_argument("--stepup", type=float, default=1.905,
                   help="step-up climb grid pitch mm above each big level")
     r.add_argument("--stepover", type=float, default=None,
@@ -143,7 +145,8 @@ def main(argv=None):
                        "--optimal-load-mm given)")
     r.add_argument("--optimal-load-mm", dest="optimal_load_mm", type=float,
                    default=2.03,
-                   help="adaptive optimal load mm -> stepover = load / dia")
+                   help="adaptive optimal load mm -> stepover = load / dia "
+                        "(James's cutting data)")
     r.add_argument("--hf", default=None,
                   help="part heightfield .npy (+ .json sidecar): clips step-up "
                        "levels to where remaining stock above the part is "
@@ -157,9 +160,12 @@ def main(argv=None):
                        "than this mm^2")
     r.add_argument("--stock-cell", dest="stock_cell", type=float, default=0.5,
                   help="stock heightfield cell size mm")
-    r.add_argument("--cut-feed", dest="cut_feed", type=float, default=3429.0)
-    r.add_argument("--ramp-feed", dest="ramp_feed", type=float, default=1270.0)
-    r.add_argument("--spindle", type=int, default=7500)
+    r.add_argument("--cut-feed", dest="cut_feed", type=float, default=3429.0,
+                   help="cutting feed mm/min (James's cutting data)")
+    r.add_argument("--ramp-feed", dest="ramp_feed", type=float, default=1270.0,
+                   help="ramp/plunge feed mm/min (James's cutting data)")
+    r.add_argument("--spindle", type=int, default=7500,
+                   help="spindle rpm (James's cutting data)")
     r.add_argument("--workers", type=int, default=None,
                   help="parallel waterline workers (default $ENGINE_WORKERS or 4)")
     r.add_argument("--tolerance", type=float, default=0.05,
@@ -201,7 +207,12 @@ def main(argv=None):
     pp.add_argument("--clear", type=float, default=None,
                    help="clearance/retract height mm (default: max Z of path)")
     pp.add_argument("--wcs", type=int, default=54, help="work offset G-code (54)")
+    pp.add_argument("--comment-style", choices=("paren", "slashstar"), default="paren",
+                   help="P3: ( ) comments need LNC parameter 42 = 1; slashstar emits /*...*/")
     pp.add_argument("--dwell-ms", dest="dwell_ms", type=int, default=3000)
+    pp.add_argument("--dwell-p-ms", dest="dwell_p_ms", action="store_true",
+                   help="emit the P8 dwell as G04 P<milliseconds> instead of "
+                        "the default G04 X<seconds>")
     pp.add_argument("--tool-desc", dest="tool_desc", default=None)
     pp.add_argument("--lf", action="store_true", help="use LF instead of CRLF")
     a = p.parse_args(argv)

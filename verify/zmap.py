@@ -295,7 +295,7 @@ def resolve_moves(moves, x_init=0.0, y_init=0.0, z_init=None):
 
     ``z_init`` is the Z assumed by moves BEFORE the first explicit Z word. The
     default (None) means "Z unknown, above stock": a leading XY-only rapid
-    (e.g. ``G00 X.. Y..`` then ``G43 Z3. H03``, as in 1001.nc) must resolve
+    (e.g. ``G00 X.. Y..`` then ``G43 Z3. H03``, as our posted op headers emit) must resolve
     to the first explicit Z of the program, NOT machine 0 -- defaulting to 0
     simulates a phantom dive up/down through the stock. With no Z word at all
     in the list, 0.0 is used.
@@ -330,7 +330,7 @@ def resolve_moves(moves, x_init=0.0, y_init=0.0, z_init=None):
 # --------------------------------------------------------------------------
 # Cutter radius compensation (G41/G42) — optional pre-offset
 # --------------------------------------------------------------------------
-# Default zmap behaviour is Fusion "wear" compensation: the programmed path is
+# Default zmap behaviour is "wear" compensation: the programmed path is
 # simulated as the tool centre and comp-active moves are only counted/reported,
 # because the D register value is not in the file. --comp-radius>0 instead
 # pre-offsets each G41/G42 section by the given radius (registry-style
@@ -464,7 +464,7 @@ def apply_cutter_comp(moves, radius):
     """Pre-offset G41/G42-compensated sections of a RESOLVED move list by
     `radius` mm (registry-style compensation). The activation block (the G1
     carrying G41/G42) and the G40-cancel block run as programmed — matching
-    Fusion-posted NC where the activation move is an explicit lead to a safe
+    posted NC where the activation move is an explicit lead to a safe
     point; elements between them are offset perpendicular (lines) or
     concentrically (XY arcs), joined at curve intersections (miter) where one
     exists, otherwise linked with straight feed moves. Approximates but does

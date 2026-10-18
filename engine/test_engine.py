@@ -132,13 +132,13 @@ def test_plan_levels():
     print("PASS plan_levels: %d levels %.3f..%.3f" % (len(zs), zs[0], zs[-1]))
 
 
-def test_plan_levels_fusion_settings():
-    """Task F: stepdown 19.05, axial leave, explicit final ZMIN matching
-    Fusion, flat-area levels at floor + axial leave."""
+def test_plan_levels_cutting_data():
+    """James's cutting data: stepdown 19.05, axial leave, explicit final
+    ZMIN 24.95, flat-area levels at floor + axial leave."""
     floors = [42.463, 42.545, 39.908, 39.224, 34.925, 24.765]
     zs = plan_levels(60.96, 24.765, 0.381, 19.05, flat_floors=floors,
                     axial_leave=0.381, final_zmin=24.95)
-    assert abs(zs[-1] - 24.95) < 1e-9, "final level must match Fusion ZMIN"
+    assert abs(zs[-1] - 24.95) < 1e-9, "final level must match the given ZMIN"
     assert all(zs[i] > zs[i + 1] for i in range(len(zs) - 1))
     assert all(zs[i] - zs[i + 1] <= 19.05 + 1e-9 for i in range(len(zs) - 1))
     assert zs[0] < 60.96
@@ -152,7 +152,7 @@ def test_plan_levels_fusion_settings():
     assert not any(abs(z - 42.545 + 0.381) < 1e-9 and
                    abs(z - 42.926) > 1e-9 for z in zs)
     assert all(zs[i] - zs[i + 1] >= 0.5 - 1e-9 for i in range(len(zs) - 1))
-    print("PASS plan_levels fusion settings: levels %r" % (zs,))
+    print("PASS plan_levels cutting data: levels %r" % (zs,))
 
 
 def test_allowance_violation():
@@ -268,8 +268,8 @@ def test_stock_contours():
 
 
 def test_stock_links_and_stepups():
-    """Link clearance follows the model; step-up level plan matches the
-    Fusion pattern (big level, climb grid, floor, climb grid)."""
+    """Link clearance follows the model; step-up level plan matches James's
+    cutting-data pattern (big level, climb grid, floor, climb grid)."""
     sf = StockField(SB, cell=0.5)
     sf.set_tool(SR)
     assert not sf.link_clear([(-10.0, 5.0), (10.0, 5.0)], 8.0)  # solid stock
@@ -314,7 +314,7 @@ def test_island_clear_fn():
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
-               test_plan_levels_fusion_settings, test_allowance_violation,
+               test_plan_levels_cutting_data, test_allowance_violation,
                test_decimate, test_gcode_emit,
                test_stock_mill_and_region, test_stock_bull_footprint,
                test_stock_contours, test_stock_links_and_stepups,

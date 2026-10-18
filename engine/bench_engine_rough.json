@@ -1,0 +1,50 @@
+{
+  "bench": "engine rough - absolute criteria only (no vendor comparison)",
+  "gcode": "out/core_front_roughG.ngc",
+  "engine_stats": "out/engine_roughG_stats.json",
+  "zmap_report": "out/zmap_engine_roughG.json",
+  "generated": "2026-10-17 (fresh zmap rerun, --jobs 8)",
+  "setup": {
+    "part_hf": "out/core_front_setup_hf.npy",
+    "cell_mm": 0.5,
+    "stock_box": [-128.651, 128.651, -82.55, 82.55, 0.0, 60.96],
+    "tool": {"type": "bull", "diameter_mm": 12.7, "corner_radius_mm": 0.127, "flute_mm": 25.4},
+    "cutting_data": "James's cutting data: stepdown 19.05, optimal load 2.03, leave 0.381 mm, rpm 7500, feeds 3429/1270 mm/min"
+  },
+  "results": {
+    "gouges": 0,
+    "gouge_max_depth_mm": 0.0,
+    "rapid_collisions": 0,
+    "over_flute_moves_25p4mm": 0,
+    "leftover_mm": {
+      "mean": 1.5271,
+      "p95": 6.985,
+      "max": 36.4357
+    },
+    "leftover_beyond_allowance_0p381mm": {
+      "note": "leftover minus James's 0.381 mm stock-to-leave, clipped at 0; roughing intentionally leaves tall rest material for finishing",
+      "mean": 1.2579,
+      "p95": 6.604,
+      "max": 36.0547,
+      "cells_over_allowance_fraction": 0.4292
+    },
+    "within_0p5mm_fraction": 0.5709,
+    "cutting_length_mm": 58036.9,
+    "rapid_length_mm": 38210.3,
+    "air_fraction_vs_stock_sim": 0.2649,
+    "est_time_s": 1360.1
+  },
+  "criteria": {
+    "gouges_eq_0": true,
+    "rapid_collisions_eq_0": true,
+    "over_flute_eq_0": true,
+    "p95_leftover_le_7p9mm": true,
+    "pass": true
+  },
+  "notes": [
+    "Absolute pass/fail only: safety metrics (gouges, rapid collisions, over-flute at flute 25.4 mm) must be exactly 0; p95 leftover <= 7.9 mm is James's round-7 goal for the rough stage.",
+    "Leftover vs allowance 0.381 mm: mean/p95/max of (stock - part) and of max(0, stock - part - 0.381); the rough op holds the 0.381 mm radial leave by design and leaves rest material in tall regions for slope-split finishing.",
+    "est_time_s from the zmap wear-model cycle (feeds 3429/1270 mm/min, rapids 15000 mm/min).",
+    "Reproduce: /opt/homebrew/bin/python3 verify/zmap.py out/core_front_roughG.ngc --part out/core_front_setup_hf.npy --tool bull --dia 12.7 --corner 0.127 --stock -128.651 128.651 -82.55 82.55 0.0 60.96 --jobs 8 --flute 25.4 --stock-out out/stock_after_roughG.npy --out-json out/zmap_engine_roughG.json"
+  ]
+}

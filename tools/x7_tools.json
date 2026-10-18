@@ -1,6 +1,6 @@
 {
   "machine": "SyilCNC X7 (LNCv2)",
-  "comment": "X7 tool table: maps a tool spec (type + diameter + corner radius, mm) to the machine's T/H/D numbers. Seeded from reference/1001.nc: 0.5 in bull nose, CR 0.005 in -> T3 / H03 / D03. Used by engine/post_lnc.py; an explicit --tool-number overrides the lookup.",
+  "comment": "James's X7 tool table: maps a tool spec (type + diameter + corner radius, mm) to the machine's T/H/D numbers. Seeded with James's cutting data: 0.5 in bull nose, CR 0.005 in -> T3 / H03 / D03. Used by engine/post_lnc.py; an explicit --tool-number overrides the lookup.",
   "tolerance_mm": 0.001,
   "tools": [
     {

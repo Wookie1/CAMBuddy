@@ -342,7 +342,7 @@ G17
 def test_parallel_rapid_collisions_exact():
     """--jobs chunking must report the SAME rapid collisions as serial.
 
-    Regression for the Fusion-rough artifact: a rapid descending into material
+    Regression for the rapid-dive artifact: a rapid descending into material
     already removed by an earlier chunk used to be a false collision (chunks
     started from fresh stock). Now chunks re-run with the prefix stock of all
     earlier chunks (two-pass), so false positives are gone and real collisions
@@ -413,7 +413,7 @@ def test_leading_xy_rapid_z_unknown_matches_serial():
     """A leading XY-only rapid before the first Z word = Z unknown, above
     stock -- NOT machine 0.
 
-    Regression for the 1001.nc op-header shape (G00 X.. Y.. then G43 Z.. H..):
+    Regression for the posted op-header shape (G00 X.. Y.. then G43 Z.. H..):
     resolving the leading rapid's Z to 0 made chunked (--jobs>1) sims register a
     phantom dive through the stock that serial (which starts from the first real
     Z) does not see. resolve_moves now defaults unknown leading Z to the first
