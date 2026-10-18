@@ -568,7 +568,7 @@ def apply_cutter_comp(moves, radius):
 
 def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
              corner=0.0, stock_init=None, window=None, rapid_feed=RAPID_FEED,
-             start=None, flute=None):
+             start=None, flute=None, shank_dia=None):
     """Run the toolpath over a stock heightfield.
 
     part      : (ny, nx) array of part top-Z heights
@@ -589,7 +589,14 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 tip goes more than this below the material surface under the
                 move's start/end XY before the move (plunges/ramps/traverses
                 into material deeper than the flutes: reach/evacuation
-                problem). Reported as count + first line.
+                problem). Reported as plunge_over_flute: count + first line.
+    shank_dia : optional shank diameter mm (default = tool dia; only used
+                when flute is set). The shank occupies z > tip + flute within
+                radius shank_dia/2 of the centre; a cutting sample is a HIT if
+                max(current stock, part) over cells within that radius exceeds
+                tip + flute + 0.01 mm (the shank above the flutes rubs a
+                wall). Reported as over_flute: count of cutting moves with a
+                hit, max excess mm, worst xy, first line.
     Returns dict with 'stock' array and report fields.
     """
     sxmin, sxmax, symin, symax, szmin, szmax = stock_box
@@ -616,12 +623,18 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     R = dia / 2.0
     dz = tool_dz(tool, dia, corner)
     k = int(math.ceil(R / cell)) + 1  # +1 so the padded engagement mask fits
+    # shank/over-flute check (only with flute): radius S/2, its own window
+    shank_on = flute is not None
+    Rs = (shank_dia if shank_dia else dia) / 2.0
+    ks = int(math.ceil(Rs / cell)) + 1 if shank_on else k
 
     if window is not None:
         # samples only matter within tool reach of the window; dilate once so
-        # the per-sample skip is a single mask lookup
+        # the per-sample skip is a single mask lookup (kd covers the shank
+        # radius too when the over-flute check is on)
+        kd = max(k, ks)
         near = window.copy()
-        for _ in range(k):
+        for _ in range(kd):
             w = near.copy()
             w[1:, :] |= near[:-1, :]
             w[:-1, :] |= near[1:, :]
@@ -659,6 +672,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     cycle_s = 0.0
     over_flute = 0
     first_over_flute_line = None
+    shank_hits = 0
+    first_shank_line = None
+    shank_depth = 0.0
+    shank_worst_xy = None
     zbands = {}
     comp_moves = 0
     comp_first_line = None
@@ -684,6 +701,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         cutting = mv["motion"] in ("G1", "G2", "G3")
         move_collided = False
         move_over_flute = False
+        move_shank = False
         if cutting and flute is not None:
             # material surface under the move's start/end XY as it stands
             # BEFORE this move cuts (the footprint leads the centre by R, so
@@ -708,6 +726,35 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     continue
             i0 = int(math.floor((sx - x0) / cell))
             j0 = int(math.floor((sy - y0) / cell))
+            if cutting and shank_on:
+                # shank above the flutes: z > tip + F within radius S/2 of the
+                # centre. HIT if stock/part there rises above the flute top
+                slo, shi = max(0, i0 - ks), min(nx, i0 + ks + 1)
+                tlo, thi = max(0, j0 - ks), min(ny, j0 + ks + 1)
+                if slo < shi and tlo < thi:
+                    dsg = np.meshgrid(xs[slo:shi] - sx, ys[tlo:thi] - sy)
+                    dd = np.hypot(dsg[0], dsg[1])
+                    dsh = dd <= Rs + 0.75 * cell
+                    vsh = np.where(dsh, np.maximum(stock[tlo:thi, slo:shi],
+                                                   part[tlo:thi, slo:shi]),
+                                  -np.inf)
+                    vtop = float(vsh.max())
+                    if vtop > sz + flute + 0.01:
+                        move_shank = True
+                        excess = vtop - (sz + flute)
+                        if excess > shank_depth:
+                            shank_depth = excess
+                            # among cells at the max height, report the one
+                            # whose PART is that high (the wall itself, not
+                            # just uncut stock) and closest to the centre
+                            psl = part[tlo:thi, slo:shi]
+                            cand = dd + np.where(psl >= vtop - 1e-9,
+                                               0.0, 1e6)
+                            cand = np.where(vsh >= vtop - 1e-9, cand, np.inf)
+                            tj, ti = np.unravel_index(int(np.argmin(cand)),
+                                                     cand.shape)
+                            shank_worst_xy = [float(xs[slo + ti]),
+                                            float(ys[tlo + tj])]
             ilo, ihi = max(0, i0 - k), min(nx, i0 + k + 1)
             jlo, jhi = max(0, j0 - k), min(ny, j0 + k + 1)
             if ilo >= ihi or jlo >= jhi:
@@ -756,6 +803,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 over_flute += 1
                 if first_over_flute_line is None:
                     first_over_flute_line = mv["line"]
+            if shank_on and move_shank:
+                shank_hits += 1
+                if first_shank_line is None:
+                    first_shank_line = mv["line"]
             feed = mv.get("f")
             cycle_s += length / (feed if feed and feed > 0 else rapid_feed) * 60.0
         else:  # rapid
@@ -771,8 +822,12 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         "stock": stock,
         "rapid_collisions": {"count": rapid_collisions,
                             "first_line": first_rapid_line},
-        "over_flute": ({"count": over_flute, "flute_mm": flute,
-                        "first_line": first_over_flute_line}
+        "plunge_over_flute": ({"count": over_flute, "flute_mm": flute,
+                               "first_line": first_over_flute_line}
+                              if flute is not None else None),
+        "over_flute": ({"count": shank_hits, "max_depth": shank_depth,
+                        "worst_xy": shank_worst_xy,
+                        "first_line": first_shank_line}
                        if flute is not None else None),
         "air_fraction": (air_length / cut_length) if cut_length > 0 else 0.0,
         "cutting_length_mm": cut_length,
@@ -817,12 +872,13 @@ def _chunk_worker(idx):
                     corner=g["corner"],
                     stock_init=g["stock_init_per"][idx],
                     window=g["window"], rapid_feed=g["rapid_feed"],
-                    start=g["start_per"][idx], flute=g["flute"])
+                    start=g["start_per"][idx], flute=g["flute"],
+                    shank_dia=g["shank_dia"])
 
 
 def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                       dia=6.0, corner=0.0, stock_init=None, window=None,
-                      rapid_feed=RAPID_FEED, flute=None):
+                      rapid_feed=RAPID_FEED, flute=None, shank_dia=None):
     import multiprocessing as mp
     # leading moves without a Z word: Z unknown = above stock, not machine 0;
     # use the first explicit Z (as serial simulate does), else the stock top
@@ -836,7 +892,8 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
     _CHUNK.update(moves=moves, spans=spans, part=part, cell=cell, x0=x0,
                   y0=y0,
                   stock_box=stock_box, tool=tool, dia=dia, corner=corner,
-                  window=window, rapid_feed=rapid_feed, flute=flute)
+                  window=window, rapid_feed=rapid_feed, flute=flute,
+                  shank_dia=shank_dia)
     # true machine position at each chunk start = end of the previous chunk's
     # last move (chunks must not simulate their first move from its own target)
     start_per = []
@@ -873,12 +930,25 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                              default=None),
             "note": "exact under --jobs (two-pass prefix stock + chunk starts)",
         },
+        "plunge_over_flute": (
+            {"count": sum(r["plunge_over_flute"]["count"] for r in results),
+             "flute_mm": flute,
+             "first_line": min((r["plunge_over_flute"]["first_line"]
+                               for r in results
+                               if r["plunge_over_flute"]["first_line"]),
+                              default=None)}
+            if flute is not None else None),
         "over_flute": (
             {"count": sum(r["over_flute"]["count"] for r in results),
-             "flute_mm": flute,
+             "max_depth": max(r["over_flute"]["max_depth"]
+                             for r in results),
+             "worst_xy": max(results,
+                            key=lambda r: r["over_flute"]["max_depth"])[
+                                "over_flute"]["worst_xy"],
              "first_line": min((r["over_flute"]["first_line"]
                                for r in results
-                               if r["over_flute"]["first_line"]), default=None)}
+                               if r["over_flute"]["first_line"]),
+                              default=None)}
             if flute is not None else None),
         "air_fraction": 0.0,
         "cutting_length_mm": sum(r["cutting_length_mm"] for r in results),
@@ -1026,7 +1096,12 @@ def main(argv=None):
     p.add_argument("--flute", type=float, default=None,
                   help="flute length mm: when set, report cutting moves whose "
                        "tip is more than this deep below the local stock "
-                       "surface at that XY (count + first line). Default off.")
+                       "surface at that XY (plunge_over_flute: count + first "
+                       "line) and run the shank rub check (over_flute). "
+                       "Default off.")
+    p.add_argument("--shank-dia", dest="shank_dia", type=float, default=None,
+                  help="shank diameter mm for the over-flute shank rub check "
+                       "(default: tool dia); used with --flute")
     args = p.parse_args(argv)
 
     if args.stock is None and not args.stock_in:
@@ -1063,12 +1138,13 @@ def main(argv=None):
                                args.jobs, tool=args.tool, dia=args.dia,
                                corner=args.corner, stock_init=stock_init,
                                window=window, rapid_feed=args.rapid_feed,
-                               flute=args.flute)
+                               flute=args.flute, shank_dia=args.shank_dia)
     else:
         res = simulate(moves, part, cell, x0, y0, stock_box,
                        tool=args.tool, dia=args.dia, corner=args.corner,
                        stock_init=stock_init, window=window,
-                       rapid_feed=args.rapid_feed, flute=args.flute)
+                       rapid_feed=args.rapid_feed, flute=args.flute,
+                       shank_dia=args.shank_dia)
 
     report = {
         "gcode": os.path.abspath(args.gcode),
@@ -1082,6 +1158,7 @@ def main(argv=None):
         "leftover": res["leftover"],
         "within_0p5mm_fraction": res["within_0p5mm_fraction"],
         "rapid_collisions": res["rapid_collisions"],
+        "plunge_over_flute": res["plunge_over_flute"],
         "over_flute": res["over_flute"],
         "cutter_comp": res["cutter_comp"],
         "comp_radius_mm": args.comp_radius,

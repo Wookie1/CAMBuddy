@@ -473,11 +473,12 @@ G1 X10. Y5. F500.
     # line 4 plunge 50->10 into surface 40 (depth 30 > 25), line 5 traverse
     # at Z10 through still-40 material (30), the diagonal plunge ending at
     # Z8 and the y=5 traverse at Z8 (32): all over-flute = 4 moves
-    assert res["over_flute"]["count"] == 4
-    assert res["over_flute"]["first_line"] == 4
-    assert res["over_flute"]["flute_mm"] == 25.0
+    assert res["plunge_over_flute"]["count"] == 4
+    assert res["plunge_over_flute"]["first_line"] == 4
+    assert res["plunge_over_flute"]["flute_mm"] == 25.0
     off = zmap.simulate(moves, part, CELL, X0, Y0, sb, tool="flat", dia=6.0)
     assert off["over_flute"] is None
+    assert off["plunge_over_flute"] is None
     # a floor cut riding its own groove is NOT over-flute: the y=0 strip was
     # cut to Z10 above, so a Z9 re-pass there sees surface 10 (depth 1)
     res2 = zmap.simulate(zmap.parse_gcode(gcode + """
@@ -485,7 +486,7 @@ G0 Z50.
 G1 X-10. Y0. Z9. F100.
 G1 X10. Y0. F500.
 """), part, CELL, X0, Y0, sb, tool="flat", dia=6.0, flute=25.0)
-    assert res2["over_flute"]["count"] == 4  # no new flags: depth 1 < 25
+    assert res2["plunge_over_flute"]["count"] == 4  # no new flags: depth 1 < 25
 
     zb = res["cutting_length_by_zband"]
     assert abs(sum(zb.values()) - res["cutting_length_mm"]) < 0.5
@@ -495,10 +496,68 @@ G1 X10. Y0. F500.
 
     par = zmap.simulate_parallel(moves, part, CELL, X0, Y0, sb, 2,
                                 tool="flat", dia=6.0, flute=25.0)
-    assert par["over_flute"]["count"] == 4
-    assert par["over_flute"]["first_line"] == 4
+    assert par["plunge_over_flute"]["count"] == 4
+    assert par["plunge_over_flute"]["first_line"] == 4
     assert abs(sum(par["cutting_length_by_zband"].values())
                - sum(zb.values())) < 0.5
+
+
+def test_shank_over_flute_wall():
+    """--flute + default shank dia: a ball riding tangent to a deep wall has
+    its SHANK (z > tip + F within S/2 of the centre) rub the wall. over_flute
+    reports cutting moves with such a hit, the max excess above the flute top
+    and where; the plunge counter stays separate as plunge_over_flute."""
+    cell, n, x0 = 0.1, 100, -5.0
+
+    def run_shank(xc, top, shank=None, dia=6.0, jobs=None):
+        xs = (x0 + (np.arange(n) + 0.5) * cell)[None, :]
+        part = np.broadcast_to(np.where(xs >= 0.0, top, 0.0), (n, n)).copy()
+        sb = (-5.0, 5.0, -5.0, 5.0, 0.0, float(top))
+        gcode = ("G21 G90 F500\n"
+                "G0 X%.1f Y-3. Z%.1f\n" % (xc, top + 8.0) +
+                "G1 Z0. F100.\n" +
+                "G1 X%.1f Y3. F500.\n" % (xc,))
+        moves = zmap.parse_gcode(gcode)
+        if jobs:
+            return zmap.simulate_parallel(moves, part, cell, x0, -5.0, sb,
+                                         jobs, tool="ball", dia=dia,
+                                         flute=15.0, shank_dia=shank)
+        return zmap.simulate(moves, part, cell, x0, -5.0, sb, tool="ball",
+                            dia=dia, flute=15.0, shank_dia=shank)
+
+    # (a) ball R3 exactly tangent to a 22 mm wall: flute top at Z15, wall
+    #     reaches 22 -> shank rubs with ~7 mm excess on plunge and traverse
+    res = run_shank(-3.0, 22.0)
+    assert res["over_flute"]["count"] == 2
+    assert abs(res["over_flute"]["max_depth"] - 7.0) < 0.2
+    wx, wy = res["over_flute"]["worst_xy"]
+    assert -0.1 <= wx <= 0.2 and abs(wy) <= 3.5  # worst cell is at the wall
+    assert res["over_flute"]["first_line"] == 3   # the plunge move
+    # old centre-based counter kept separately
+    assert res["plunge_over_flute"]["count"] >= 1
+    assert res["plunge_over_flute"]["flute_mm"] == 15.0
+
+    # (b) same tangent path, wall only 10 mm high (< tip + F): no shank hit
+    res_b = run_shank(-3.0, 10.0)
+    assert res_b["over_flute"]["count"] == 0
+    assert res_b["over_flute"]["max_depth"] == 0.0
+    assert res_b["over_flute"]["worst_xy"] is None
+
+    # (c) far from the wall: nothing within S/2 above the flute top
+    res_c = run_shank(-10.0, 22.0)
+    assert res_c["over_flute"]["count"] == 0
+
+    # (d) necked shank S=2 < D=6: radius 1 can no longer reach the wall
+    res_d = run_shank(-3.0, 22.0, shank=2.0)
+    assert res_d["over_flute"]["count"] < res["over_flute"]["count"]
+
+    # parallel combines count, depth and worst xy identically
+    par = run_shank(-3.0, 22.0, jobs=2)
+    assert par["over_flute"]["count"] == res["over_flute"]["count"]
+    assert abs(par["over_flute"]["max_depth"]
+               - res["over_flute"]["max_depth"]) < 1e-9
+    assert par["over_flute"]["worst_xy"] == res["over_flute"]["worst_xy"]
+    assert par["over_flute"]["first_line"] == res["over_flute"]["first_line"]
 
 
 def test_cutter_comp_reporting():
