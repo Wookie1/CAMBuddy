@@ -24,6 +24,7 @@ report 0 points below CL by > 0.005 mm. PLAN B unit checks: refined
 marching-squares contours vs analytic CL radii (hemisphere, cone), and a
 gap-split whose link is verified clear.
 """
+import json
 import math
 import os
 import sys
@@ -42,8 +43,10 @@ from engine import model  # noqa: E402
 from engine.finish import (finish, finish_to_gcode, surf_bounds,  # noqa: E402
                            batch_drop, make_cutter, cl_grid, march_level,
                            refine_contours, steep_runs_grid, segment_net,
-                           link_plan, CHORD_TOL)
+                           link_plan, compute_rest_mask, CHORD_TOL,
+                           RAPID_MARGIN)
 import zmap  # noqa: E402
+from engine import post_lnc  # noqa: E402
 
 CELL = 0.1
 BALL_DIA = 6.0
@@ -267,9 +270,9 @@ def hf_cyl(X, Y, R=5.0, H=12.0):
 # CL - z <= 0.005 mm at every sample.
 # ---------------------------------------------------------------------------
 
-def clcheck_moves(surf, moves, step=0.25, threads=4):
+def clcheck_moves(surf, moves, step=0.25, threads=4, dia=None):
     """(n_points, n_below, max_depth) for all G1 moves of `moves`."""
-    cutter = make_cutter("ball", BALL_DIA, 0.0)
+    cutter = make_cutter("ball", dia or BALL_DIA, 0.0)
     xs, ys, zs = [], [], []
     prev = None
     for mv in moves:
@@ -339,13 +342,15 @@ def dup_cut_segments(moves, ztol=0.01, ytol=0.2, overlap=1.0):
 # drive one case
 # ---------------------------------------------------------------------------
 
-def run_case(name, stl_path, hf_fn, box, floor_z, assert_shallow_lt=None):
-    """Finish the STL, simulate with zmap (ball 6) at 0.1 mm, check.
+def run_case(name, stl_path, hf_fn, box, floor_z, assert_shallow_lt=None,
+             dia=None, extra_calls=0):
+    """Finish the STL, simulate with zmap at 0.1 mm, check.
     box: (xmin, xmax, ymin, ymax) of the stock (zmin=0, zmax=part top)."""
+    dia = dia or BALL_DIA
     surf = model.load_surf(stl_path)
     zmax = float(surf.getBounds()[5])
     moves, stats = finish(surf, stl_path=stl_path,
-                          tool=("ball", BALL_DIA, 0.0), floor_z=floor_z,
+                          tool=("ball", dia, 0.0), floor_z=floor_z,
                           threads=4)
     assert moves, "%s: no moves" % name
     text = finish_to_gcode(moves)
@@ -353,14 +358,25 @@ def run_case(name, stl_path, hf_fn, box, floor_z, assert_shallow_lt=None):
     X, Y, nx, ny = _grid(box)
     part = hf_fn(X, Y)
     stock_box = (box[0], box[1], box[2], box[3], 0.0, zmax)
+    # finish starts from POST-ROUGHING stock (part + axial leave), matching
+    # the acceptance chain --stock-in out/stock_roughG_01.npy; a raw full-box
+    # start would flag verified rapids (CL + margin + allow) against material
+    # no finish op ever sees.
+    stock_init = np.minimum(zmax, part + 0.381)
     res = zmap.simulate(gmv, part, CELL, box[0], box[2], stock_box,
-                        tool="ball", dia=BALL_DIA)
+                        tool="ball", dia=dia, stock_init=stock_init)
     gouges = res["gouges"]
     print("%-14s moves=%6d cut=%.0fmm plunge=%.0fmm lifts=%d "
+          "rapid_links=%d/%d(%.0fmm) feed_links=%d(%.0fmm) "
           "steep_runs=%d shallow_runs=%d gouges=%d removed=%d splits=%d "
           "drop_calls=%d (rounds=%d chords=%d)" %
           (name, len(moves), stats["cut_len"], stats["plunge_len"],
-           stats["n_lifts"], stats["n_steep_runs"], stats["n_shallow_runs"],
+           stats["n_lifts"], stats["n_rapid_links"],
+           stats["n_rapid_links"] + stats["n_feed_links"]
+           + stats["n_lift_links"], stats["rapid_link_len"],
+           stats["n_feed_links"] + stats["n_lift_links"],
+           stats["feed_link_len"],
+           stats["n_steep_runs"], stats["n_shallow_runs"],
            gouges["count"], stats["n_steep_removed"], stats["n_seg_splits"],
            stats["n_drop_calls"],
            stats["n_simplify_rounds"], stats["n_chords_checked"]))
@@ -369,7 +385,8 @@ def run_case(name, stl_path, hf_fn, box, floor_z, assert_shallow_lt=None):
     # every call re-indexes the whole STL (setSTL). Fixed overhead: raster
     # row batches, window probe, CL grid, refine rounds (<=6) + jump check,
     # segment net, curve-sample extras, links.
-    assert stats["n_drop_calls"] <= 26 + 2 * stats["n_simplify_rounds"], \
+    assert stats["n_drop_calls"] <= 26 + 2 * stats["n_simplify_rounds"] \
+        + extra_calls, \
         "%s: %d drop-cutter calls vs rounds=%d (expected O(rounds))" % (
             name, stats["n_drop_calls"], stats["n_simplify_rounds"])
     # leftover > 0.05 mm per slope zone (of the part surface). Cells where
@@ -380,7 +397,7 @@ def run_case(name, stl_path, hf_fn, box, floor_z, assert_shallow_lt=None):
     slope = np.degrees(np.arctan(np.hypot(gx, gy)))
     leftover = res["stock"] - part
     fin = np.isfinite(res["stock"])
-    cl = batch_drop(surf, make_cutter("ball", BALL_DIA, 0.0),
+    cl = batch_drop(surf, make_cutter("ball", dia, 0.0),
                    [tuple(p) for p in np.column_stack([X.ravel(), Y.ravel()])],
                    threads=4).reshape(X.shape)
     reachable = np.isfinite(cl) & (cl - part <= 0.05 + 1e-9)
@@ -408,7 +425,7 @@ def run_case(name, stl_path, hf_fn, box, floor_z, assert_shallow_lt=None):
         "%s: rapid collisions at line %s" % (
             name, res["rapid_collisions"]["first_line"])
     # S2 acceptance (engine/probe_clcheck.py criterion): 0 points below CL
-    n_ck, n_bad, mx = clcheck_moves(surf, moves)
+    n_ck, n_bad, mx = clcheck_moves(surf, moves, dia=dia)
     print("  clcheck: %d samples, below CL by >%.3f mm: %d (max %.4f)"
           % (n_ck, CHORD_TOL, n_bad, mx))
     assert n_bad == 0, "%s: clcheck %d points below CL, max %.3f" % (
@@ -640,7 +657,7 @@ def test_gap_split_and_verified_link():
                             [((float(a[0]), float(a[1]), z),
                               (float(b[0]), float(b[1]), z))], threads=4)[0]
             mode, lift_z, mx = plan
-            assert mode == "lift" and lift_z >= mx + 0.99, \
+            assert mode in ("lift", "rapid") and lift_z >= mx + 0.99, \
                 "gap link not lifted clear: %s" % (plan,)
         # segment net: after its splits, every surviving segment interior is
         # verified clear (no sample below CL)
@@ -660,13 +677,250 @@ def test_gap_split_and_verified_link():
               % (n_split, len(runs2)))
 
 
+# ---------------------------------------------------------------------------
+# S3: flat-plate cut length + link kinds, two-boss verified rapid,
+#    placeholder corner rest pass
+# ---------------------------------------------------------------------------
+
+def plate_stl(path, q=15.0, top=10.0, thick=2.0):
+    """Flat plate [-q,q]^2, top face z=top, no features."""
+    return write_stl(path, _box(-q, q, -q, q, -thick, top))
+
+
+def hf_plate(X, Y, top=10.0):
+    return np.full(X.shape, top)
+
+
+def two_boss_stl(path, q=15.0, top=10.0, bx=2.5, cx=5.0, bh=20.0):
+    """Plate top z=top with two square bosses ([-bx,bx]^2 around (+-cx, 0))
+    up to z=bh; the inner faces leave a 2*bx-wide gap narrower than the
+    6 mm ball, so row links must lift OVER a boss (S3 item 2)."""
+    tris = _box(-q, q, -q, q, 0.0, top)
+    tris += _box(cx - bx, cx + bx, -bx, bx, top, bh)
+    tris += _box(-cx - bx, -cx + bx, -bx, bx, top, bh)
+    return write_stl(path, tris)
+
+
+def hf_two_boss(X, Y, top=10.0, bx=2.5, cx=5.0, bh=20.0):
+    inb = np.abs(np.abs(X) - cx) < bx
+    iny = np.abs(Y) < bx
+    return np.where(inb & iny, bh, top)
+
+
+def _rapids(moves):
+    """G0 moves with XY travel: [(x0, y0, x1, y1, z), ...] (rapids that
+    actually traverse; pure-Z rapids excluded)."""
+    out, prev = [], None
+    for mv in moves:
+        cur = (mv.get("x"), mv.get("y"), mv.get("z"))
+        if None in cur:
+            continue
+        if prev is not None and mv["g"] == 0:
+            Lxy = math.hypot(cur[0] - prev[0], cur[1] - prev[1])
+            if Lxy > 1.0:
+                out.append((prev[0], prev[1], cur[0], cur[1], cur[2]))
+        prev = cur
+    return out
+
+
+def rapid_max_cl(surf, rapids, step=0.25, threads=4, dia=None):
+    """max drop-cutter CL along each rapid's XY path (sampled <= 0.25 mm)."""
+    if not rapids:
+        return []
+    xy, spans = [], []
+    for (x0, y0, x1, y1, _z) in rapids:
+        m = max(2, int(math.ceil(math.hypot(x1 - x0, y1 - y0) / step))) + 1
+        s0 = len(xy)
+        t = np.arange(m) / (m - 1)
+        xy.extend(zip(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+        spans.append((s0, len(xy)))
+    cl = batch_drop(surf, make_cutter("ball", dia or BALL_DIA, 0.0), xy,
+                   threads=threads)
+    out = []
+    for (rap, (s0, s1)) in zip(rapids, spans):
+        c = cl[s0:s1]
+        out.append((rap, float(np.nanmax(c)) if np.isfinite(c).any()
+                   else float("-inf")))
+    return out
+
+
+def test_flat_plate_length_and_links():
+    """S3 item 2: flat plate, no features. Cut length must be within
+    1.2 x the ideal raster length (area/stepover + row transitions) and
+    every link must be a rapid or a stepover move (no drags, no lifts -
+    the plate links are verified-clear at cutting height)."""
+    q, top, so = 15.0, 10.0, 0.3
+    with tempfile.TemporaryDirectory() as td:
+        stl = plate_stl(os.path.join(td, "plate.stl"))
+        stats = run_case("flat-plate", stl, hf_plate,
+                         (-q, q, -q, q), floor_z=top)
+        ideal = (2 * q) * (2 * q) / so + (2 * q / so) * so  # + transitions
+        assert stats["cut_len"] <= 1.2 * ideal, \
+            "flat plate cut %.0f mm > 1.2 x ideal %.0f" % (stats["cut_len"],
+                                                           1.2 * ideal)
+        assert stats["cut_len"] >= 0.5 * ideal, \
+            "flat plate cut %.0f mm < 0.5 x ideal (degenerate)" % \
+            stats["cut_len"]
+        n_links = (stats["n_rapid_links"] + stats["n_feed_links"]
+                   + stats["n_lift_links"])
+        assert n_links >= 10, "expected ~row-count links, got %d" % n_links
+        # links must be rapids or stepover moves: no blocked (lift) links,
+        # and the feed links average one stepover
+        assert stats["n_lift_links"] == 0, \
+            "flat plate has %d feed-lift links" % stats["n_lift_links"]
+        mean_feed = stats["feed_link_len"] / max(1, stats["n_feed_links"])
+        assert mean_feed <= so + 0.05, \
+            "mean feed link %.3f mm > stepover + tol" % mean_feed
+        assert stats["n_feed_links"] == n_links, \
+            "flat-plate links not all verified stepover downs"
+
+
+def test_two_boss_rapid_over_boss():
+    """S3 item 2b: two bosses, gap narrower than the ball - a link must
+    lift OVER a boss as a verified G0 rapid: z >= max CL along the path
+    + margin, and at least one rapid clears the boss CL + margin."""
+    q, top, bx, cx, bh = 15.0, 10.0, 2.5, 5.0, 20.0
+    with tempfile.TemporaryDirectory() as td:
+        stl = two_boss_stl(os.path.join(td, "2boss.stl"))
+        stats = run_case("two-boss", stl, hf_two_boss,
+                         (-q, q, -q, q), floor_z=top)
+        assert stats["n_rapid_links"] >= 1, "no rapid links emitted"
+        surf = model.load_surf(stl)
+        moves, _ = finish(surf, stl_path=stl, tool=("ball", BALL_DIA, 0.0),
+                          floor_z=top, threads=4)
+        raps = rapid_max_cl(surf, _rapids(moves))
+        for (x0, y0, x1, y1, z), mx in raps:
+            assert z >= mx + RAPID_MARGIN - 1e-6, \
+                "rapid at %.3f not clear: max CL along path %.3f + margin" \
+                % (z, mx)
+        over = [r for (r, mx) in raps if mx >= bh - 0.5]
+        assert over, "no rapid lifted over a boss (max CL >= %.1f)" % (bh - 0.5)
+        for (x0, y0, x1, y1, z) in over:
+            assert z >= bh + RAPID_MARGIN - 1e-6, \
+                "over-boss rapid z=%.3f < boss CL %.1f + margin" % (z, bh)
+        print("two-boss rapids: %d total, %d over a boss (z>=%.1f)"
+              % (len(raps), len(over), bh + RAPID_MARGIN))
+
+
+def test_rest_pass_placeholder():
+    """S3 item 3: corner rest pass with a PLACEHOLDER 3 mm ball on the
+    slot-boss (slot 4 mm < 6 mm ball leaves >0.5 mm on the floor). The
+    rest mask comes from the engine's own CL6-vs-CL3 drop-cutter map; the
+    slot floor must get cut, the plate top must NOT, clcheck (ball 3)
+    must be 0, zmap ball-3 gouges/rapid collisions 0, and the LNC post
+    must refuse the placeholder tool."""
+    q, hy, top, slot_half, slot_floor = 15.0, 10.0, 10.0, 2.0, 4.0
+    with tempfile.TemporaryDirectory() as td:
+        stl = slot_boss_stl(os.path.join(td, "slot.stl"))
+        surf = model.load_surf(stl)
+        # post-rough stock heightfield: block top + 0.381 axial leave
+        X, Y, nx, ny = _grid((-q, q, -hy, hy))
+        stock = np.full(X.shape, top + 0.381)
+        np.save(os.path.join(td, "stock.npy"), stock)
+        with open(os.path.join(td, "stock.json"), "w") as fh:
+            json.dump({"x0": -q, "y0": -hy, "cell": CELL}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 3.0, 0.0),
+                             floor_z=slot_floor, threads=4,
+                             rest_from=os.path.join(td, "stock.npy"),
+                             big_tool=("ball", 6.0, 0.0), min_rest=0.5)
+        assert moves, "rest pass: no moves"
+        assert stats.get("rest_pass") and stats.get("placeholder_tool")
+        assert stats["n_rest_cells"] > 0, "empty rest mask"
+        print("rest-pass: cells=%d runs steep/shallow=%d/%d cut=%.0fmm "
+              "rapid_links=%d feed_links=%d" %
+              (stats["n_rest_cells"], stats["n_steep_runs"],
+               stats["n_shallow_runs"], stats["cut_len"],
+               stats["n_rapid_links"], stats["n_feed_links"]))
+        # slot floor reached by the 3 mm ball: some G1 near z=slot_floor
+        zs = [mv["z"] for mv in moves if mv["g"] == 1
+              and mv.get("z") is not None]
+        assert min(zs) <= slot_floor + 0.35, \
+            "rest pass never reached the slot floor (min z %.2f)" % min(zs)
+        # plate top untouched: zmap with ball 3, leftover on the plate
+        # (outside +-4 mm of the slot) must equal the roughing leave
+        text = finish_to_gcode(moves, tool_comment="PLACEHOLDER ball D=3.000")
+        assert "PLACEHOLDER" in text.splitlines()[4], "header lacks PLACEHOLDER"
+        gmv = zmap.parse_gcode(text)
+        part = hf_slot_boss(X, Y, top=top, slot_half=slot_half,
+                            slot_floor=slot_floor)
+        res = zmap.simulate(gmv, part, CELL, -q, -hy,
+                            (-q, q, -hy, hy, 0.0, top + 0.381),
+                            tool="ball", dia=3.0, stock_init=stock)
+        assert res["gouges"]["count"] == 0, \
+            "rest pass gouged: %d (max %.3f)" % (res["gouges"]["count"],
+                                                 res["gouges"]["max_depth"])
+        assert res["rapid_collisions"]["count"] == 0, \
+            "rest pass rapid collision at line %s" % \
+            res["rapid_collisions"]["first_line"]
+        # plate top untouched in the far field (>= 2.5 mm from any wall -
+        # near-wall cells are corner rest material and get cut to the part)
+        plate = ((np.abs(X) > 4.0) & (np.abs(X) < q - 2.5)
+                 & (np.abs(Y) < hy - 2.5))
+        left = res["stock"] - part
+        fin = np.isfinite(res["stock"]) & plate
+        assert float(np.min(left[fin])) > 0.3, \
+            "rest pass cut the plate top (min leftover %.3f)" % \
+            float(np.min(left[fin]))
+        slot = np.abs(X) <= 0.5  # strip the 3 mm ball can reach on the floor
+        fins = np.isfinite(res["stock"]) & slot
+        assert fins.any()
+        assert float(np.max(left[fins])) < 0.1, \
+            "rest pass left >0.1 mm on the reachable slot strip (max %.3f)" % \
+            float(np.max(left[fins]))
+        # exact one-sided CL check with the 3 mm ball: 0 below CL
+        n_ck, n_bad, mx = clcheck_moves(surf, moves, dia=3.0)
+        print("rest-pass clcheck(ball3): %d samples, below CL: %d (max %.4f)"
+              % (n_ck, n_bad, mx))
+        assert n_bad == 0, "rest-pass clcheck: %d below CL, max %.3f" % (
+            n_bad, mx)
+        # the LNC post must refuse the placeholder tool (not in the table)
+        refused = False
+        try:
+            post_lnc.post_text(text, metric=True, tool_kind="ball",
+                              dia_mm=3.0, corner_mm=1.5)
+        except ValueError:
+            refused = True
+        assert refused, "LNC post accepted the PLACEHOLDER 3 mm ball"
+        print("rest-pass: LNC post refused placeholder tool OK")
+
+
+def test_rest_mask_units():
+    """compute_rest_mask unit check on the slot-boss: cells over the slot
+    (CL6 - CL3 > 0.5) selected, plate cells not; stock gate honoured."""
+    with tempfile.TemporaryDirectory() as td:
+        stl = slot_boss_stl(os.path.join(td, "slot.stl"))
+        surf = model.load_surf(stl)
+        xs = np.arange(-15.0, 15.0 + 0.05, 0.5)
+        ys = np.arange(-10.0, 10.0 + 0.05, 0.5)
+        m = compute_rest_mask(surf, xs, ys, ("ball", 6.0, 0.0),
+                             ("ball", 3.0, 0.0), 0.5, threads=4)
+        X, Y = np.meshgrid(xs, ys)
+        # the 3 mm ball reaches the slot floor only where its centre has
+        # wall clearance (|x| + 1.5 <= 2): CL6 - CL3 = 5.24 there
+        in_slot = np.abs(X) < 0.4
+        assert m[in_slot].all(), "slot-floor cells missing from rest mask"
+        assert not m[np.abs(X) > 4.0].any(), \
+            "plate cells in rest mask (CL6 - CL3 there is 0)"
+        stock = np.full(X.shape, 4.2)  # barely above the slot floor
+        m2 = compute_rest_mask(surf, xs, ys, ("ball", 6.0, 0.0),
+                              ("ball", 3.0, 0.0), 0.5,
+                              stock=(stock, -15.0, -10.0, 0.5), threads=4)
+        assert not m2.any(), "stock gate failed: nothing to cut, mask empty"
+        print("rest-mask units: slot=%d cells selected, stock gate OK"
+              % int(m.sum()))
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
                test_cylinder_boss_wall, test_no_duplicate_raster_rows,
                test_contour_vs_analytic_hemisphere,
                test_contour_vs_analytic_cone,
-               test_gap_split_and_verified_link):
+               test_gap_split_and_verified_link,
+               test_flat_plate_length_and_links,
+               test_two_boss_rapid_over_boss,
+               test_rest_mask_units,
+               test_rest_pass_placeholder):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))
