@@ -230,6 +230,11 @@ def main(argv=None):
                        "than this mm^2")
     r.add_argument("--stock-cell", dest="stock_cell", type=float, default=0.5,
                   help="stock heightfield cell size mm")
+    r.add_argument("--rapid-margin", dest="rapid_margin", type=float,
+                   default=1.0,
+                   help="R5: every G0 must clear max(live stock top, part) "
+                        "within tool radius + this margin along the swept "
+                        "path by this margin (mm)")
     r.add_argument("--cut-feed", dest="cut_feed", type=float, default=3429.0,
                    help="cutting feed mm/min (James's cutting data)")
     r.add_argument("--ramp-feed", dest="ramp_feed", type=float, default=1270.0,
@@ -426,6 +431,7 @@ def main(argv=None):
                                   part_hf=part_hf, stock_cell=a.stock_cell,
                                   stepup=a.stepup, min_rest=a.min_rest,
                                   min_level_area=a.min_level_area,
+                                  rapid_margin=a.rapid_margin,
                                    progress=prog, stock_out=a.stock_out)
     if a.post == "lnc":
         from engine import post_lnc

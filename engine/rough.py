@@ -307,12 +307,29 @@ def level_islands(surf, cutter_big, Zg, xs, ys, z, axl, threads=None):
     # touching NaN must stay valid for marching - unlike finish's dilated
     # cl_grid, this grid is not pre-grown past the contour of interest.
     mlvl = lvl + 1e-6
-    circuits = [(P, K, c) for (P, K, c) in
-                _contour_circuits(Zg, xs, ys, mlvl,
-                                 comp=np.ones_like(Zg, dtype=bool))
-                if c and len(P) > 2]
+    allc = _contour_circuits(Zg, xs, ys, mlvl,
+                             comp=np.ones_like(Zg, dtype=bool))
+    circuits = [(P, K, c) for (P, K, c) in allc if c and len(P) > 2]
+    Fm = np.isfinite(Zg) & (Zg > lvl)
+    # R3: if F reaches the CL grid boundary (open circuits, or forbidden cells
+    # on the outermost rows/cols) its outer boundary cannot close inside the
+    # grid. Silently dropping those open circuits flips the even-odd parity of
+    # the island test and ADMITS cutter centres next to pocket walls (the synth
+    # pocket failure: centres at 0.39 mm from the wall instead of >= R +
+    # leave). Close F with a fence rectangle at the grid bounds so parity stays
+    # correct; centres are confined to the stock territory strictly inside the
+    # grid anyway, so the fence never rejects a legitimate centre.
+    edge = bool(Fm[0, :].any() or Fm[-1, :].any() or
+               Fm[:, 0].any() or Fm[:, -1].any())
+    fence = edge or any((not c) and len(P) > 1 for (P, _K, c) in allc)
     if not circuits:
-        return [], np.zeros_like(Zg, dtype=bool)
+        if not fence:
+            return [], Fm
+        # F covers the whole grid (tool too big for the gap): fence alone.
+        rect = [[round(gx, 4), round(gy, 4)] for gx, gy in
+                ((xs[0], ys[0]), (xs[-1], ys[0]),
+                 (xs[-1], ys[-1]), (xs[0], ys[-1]))]
+        return [rect], Fm
     tagged = [(mlvl, np.asarray(P, dtype=float), K, True)
               for (P, K, _c) in circuits]
     pitch = float(xs[1] - xs[0])
@@ -331,7 +348,11 @@ def level_islands(surf, cutter_big, Zg, xs, ys, z, axl, threads=None):
             continue
         forbidden.append([[round(x, 4), round(y, 4)] for (x, y) in pts])
     forbidden = _ccw(forbidden)
-    Fm = np.isfinite(Zg) & (Zg > lvl)
+    if fence:
+        rect = [[round(gx, 4), round(gy, 4)] for gx, gy in
+                ((xs[0], ys[0]), (xs[-1], ys[0]),
+                 (xs[-1], ys[-1]), (xs[0], ys[-1]))]
+        forbidden.append(rect)   # CCW, encloses every refined loop
     return forbidden, Fm
 
 
@@ -727,7 +748,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           tolerance=0.05, keep_tool_down=3.0, stl_path=None, workers=None,
           axial_leave=None, final_zmin=None, allowance_check=True,
           corner_r=0.127, part_hf=None, stock_cell=0.5, stepup=1.905,
-          min_rest=1.0, min_level_area=20.0, progress=None, stock_out=None):
+          min_rest=1.0, min_level_area=20.0, rapid_margin=1.0,
+          progress=None, stock_out=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -747,6 +769,12 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     Links: stay tool-down within/between levels when the stock heightfield
       says the straight link at cutting Z (or Z + lift) is clear; otherwise
       retract to clearance and helix/plunge.
+    rapid_margin: Task R5 - every G0 (retracts, lifts, traverses) is checked
+      against the engine's LIVE stock model (StockField as cut so far, plus
+      the part heightfield): the rapid height must be >= max(stock top, part)
+      within the tool radius along the swept path + rapid_margin (default
+      1.0 mm); emit() raises the height to that verified level when needed
+      (or to the clearance plane), so no rapid can pass through uncut stock.
     allowance_check: HARD post-check per level that no cutter centre at the
       level's Z entered or came within 0.005 mm of that level's forbidden
       island loops, plus the part-heightfield backstop; at the very end an
@@ -790,7 +818,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     order = insert_levels(order, mand)
 
     stats = {"levels": [], "n_regions": 0, "cut_len": 0.0, "plunge_len": 0.0,
-             "rapid_len": 0.0, "t_islands": 0.0, "t_adaptive": 0.0,
+             "rapid_len": 0.0, "n_rapid_bumps": 0,
+             "t_islands": 0.0, "t_adaptive": 0.0,
              "n_retracts": 0, "n_lifts": 0, "n_notclear_links": 0,
              "n_clip_breaks": 0,
              "n_tooldown_links": 0, "levels_planned": [round(z, 3) for z in order],
@@ -828,6 +857,19 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         x0 = mv["x"] if x0 is None else x0
         y0 = mv["y"] if y0 is None else y0
         z0 = mv["z"] if z0 is None else z0
+        if mv["g"] == 0:
+            # R5: every rapid (retract, lift, traverse) is verified against
+            # the LIVE stock model + part: the height must clear max(stock
+            # top, part) within tool_r + rapid_margin along the swept path
+            # by rapid_margin (the radial pad covers heightfield
+            # quantisation - a wall sliver whose cell centres sit just
+            # beyond the tool radius can still stand under the flank);
+            # otherwise lift to that verified height.
+            req = stock.link_top_max([(x0, y0), (mv["x"], mv["y"])],
+                                    tool_r + rapid_margin)
+            if req > -1e8 and mv["z"] < req + rapid_margin:
+                mv = dict(mv, z=round(max(mv["z"], req + rapid_margin), 4))
+                stats["n_rapid_bumps"] += 1
         if (mv.get("x") is not None and mv.get("y") is not None
                 and mv.get("z") is not None
                 and abs(mv["x"] - x0) < 1e-9 and abs(mv["y"] - y0) < 1e-9
