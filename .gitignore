@@ -8,3 +8,4 @@ samples/cavity_front.step
 samples/core_check.step
 spike/probe_*.py
 engine/probe_*.py
+connector/probe_*.py

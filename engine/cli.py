@@ -5,6 +5,7 @@ Runs with VibeCAD python (opencamlib + area)."""
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -46,9 +47,77 @@ def _run_post(a):
     return 0
 
 
+def _run_prepare(a):
+    """python -m engine.cli prepare --step S --out-dir D [--orient ...]
+    [--stock-xy N --stock-top N --stock-bottom N] [--cell 0.5]
+
+    Orient the STEP (180 deg flips), derive the stock box from mm offsets
+    (origin = stock bottom centre) and rasterise the part heightfield.
+    Emits JSON progress lines and writes prepare.json in --out-dir."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    from engine import model
+    os.makedirs(a.out_dir, exist_ok=True)
+    step_out = os.path.join(a.out_dir, "model.step")
+    meta_out = os.path.join(a.out_dir, "orient.json")
+    hf_out = os.path.join(a.out_dir, "part_hf.npy")
+
+    def prog(p, m):
+        print(json.dumps({"progress": p, "message": m}), flush=True)
+
+    prog(0.05, "orienting STEP")
+    env = dict(os.environ, STEP_IN=a.step, STEP_OUT=step_out,
+               ORIENT=a.orient, META_OUT=meta_out)
+    r = subprocess.run([model.freecadcmd(), os.path.join(here, "_orient.py")],
+                      env=env, capture_output=True, text=True)
+    if not os.path.exists(meta_out):
+        raise SystemExit("orient failed: %s\n%s" % (r.stdout[-1500:],
+                                                    r.stderr[-1500:]))
+    with open(meta_out) as fh:
+        bbox = json.load(fh)["bbox"]
+
+    prog(0.4, "rasterising part heightfield")
+    env = dict(os.environ, STEP_IN=step_out, HF_OUT=hf_out,
+               CELL=str(a.cell), PAD="0")
+    r = subprocess.run([model.freecadcmd(),
+                       os.path.join(repo, "verify", "heightfield.py")],
+                      env=env, capture_output=True, text=True)
+    if not os.path.exists(hf_out):
+        raise SystemExit("heightfield failed: %s\n%s" % (r.stdout[-1500:],
+                                                         r.stderr[-1500:]))
+
+    pxmin, pxmax, pymin, pymax, pzmin, pzmax = bbox
+    stock = [pxmin - a.stock_xy, pxmax + a.stock_xy,
+             pymin - a.stock_xy, pymax + a.stock_xy,
+             pzmin - a.stock_bottom, pzmax + a.stock_top]
+    out = {"step": step_out, "hf": hf_out, "bbox": bbox, "stock": stock,
+           "orient": a.orient}
+    with open(os.path.join(a.out_dir, "prepare.json"), "w") as fh:
+        json.dump(out, fh, indent=2)
+    prog(1.0, "prepared")
+    print(json.dumps({"prepare": out}), flush=True)
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="engine.cli")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    pr = sub.add_parser("prepare",
+                       help="orient STEP, derive stock box, part heightfield")
+    pr.add_argument("--step", required=True)
+    pr.add_argument("--out-dir", dest="out_dir", required=True)
+    pr.add_argument("--orient", default="as_modeled",
+                    choices=("as_modeled", "flip_x_180", "flip_y_180",
+                           "flip_z_180"))
+    pr.add_argument("--stock-xy", dest="stock_xy", type=float, default=1.0,
+                   help="XY stock offset per side mm")
+    pr.add_argument("--stock-top", dest="stock_top", type=float, default=1.0)
+    pr.add_argument("--stock-bottom", dest="stock_bottom", type=float,
+                   default=1.0)
+    pr.add_argument("--cell", type=float, default=0.5,
+                   help="part heightfield cell size mm")
+
     r = sub.add_parser("rough")
     r.add_argument("--step", required=True)
     r.add_argument("--stock", type=float, nargs=6, required=True,
@@ -109,6 +178,9 @@ def main(argv=None):
     r.add_argument("--tool-number", dest="tool_number", type=int, default=None,
                    help="LNC tool number (T/H) with --post lnc; default: look "
                         "the tool up in tools/x7_tools.json")
+    r.add_argument("--json-progress", dest="json_progress", action="store_true",
+                   help='emit JSON progress lines '
+                       '{"progress":0.4,"message":"level 3/7"} for callers')
 
     pp = sub.add_parser("post", help="post neutral/engine moves to LNC G-code")
     pp.add_argument("--in", dest="inp", required=True,
@@ -136,6 +208,8 @@ def main(argv=None):
 
     if a.cmd == "post":
         return _run_post(a)
+    if a.cmd == "prepare":
+        return _run_prepare(a)
 
     from engine import model, rough as roughmod
     kind, dia, corner = parse_tool(a.tool)
@@ -148,6 +222,9 @@ def main(argv=None):
     stl = model.step_to_stl(a.step)
     surf = model.load_surf(stl)
     print("STL %s: %d triangles" % (stl, surf.size()), flush=True)
+    if a.json_progress:
+        print(json.dumps({"progress": 0.02, "message": "model loaded"}),
+              flush=True)
 
     part_hf = None
     if a.hf:
@@ -172,6 +249,10 @@ def main(argv=None):
               " (wl %.1fs a2d %.1fs)"
               % (zi, z, lvl.get("region_mm2", 0.0), len(islands), nreg,
                  stats["t_waterline"], stats["t_adaptive"]), flush=True)
+        if a.json_progress:
+            print(json.dumps({
+                "progress": round(0.05 + 0.9 * zi / max(1, len(order)), 3),
+                "message": "level %d/%d" % (zi, len(order))}), flush=True)
 
     workers = a.workers if a.workers is not None else int(os.environ.get("ENGINE_WORKERS", 4))  # 4: keeps local oMLX under its memory watermark
     moves, stats = roughmod.rough(surf, tuple(a.stock), dia / 2.0, a.floor,
@@ -212,6 +293,9 @@ def main(argv=None):
     if a.stats_json:
         with open(a.stats_json, "w") as fh:
             json.dump(stats, fh, indent=2)
+    if a.json_progress:
+        print(json.dumps({"progress": 1.0, "message": "paths done"}),
+              flush=True)
     return 0
 
 

@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Panel dev harness (fake STEVE bridge)</title>
+<style>
+  body { margin:0; background:#2a2a30; font-family: -apple-system, sans-serif;
+         display:flex; gap:12px; padding:12px; color:#eee; }
+  iframe { width:420px; height:760px; border:1px solid #555; border-radius:8px;
+           background:#fff; }
+  #log { flex:1; font:11px/1.5 ui-monospace, monospace; white-space:pre-wrap;
+         background:#17171b; padding:10px; border-radius:8px; overflow:auto; }
+</style>
+</head>
+<body>
+<iframe id="panel" src="index.html" title="panel"></iframe>
+<div id="log"></div>
+<script>
+"use strict";
+// Dev harness: fakes the STEVE panel bridge so the panel can be opened and
+// screenshotted locally. No network.
+const frame = document.getElementById("panel");
+const logEl = document.getElementById("log");
+let theme = "dark";
+let runSeq = 0;
+
+function log(...a) { logEl.textContent += a.map(String).join(" ") + "\n";
+                     logEl.scrollTop = logEl.scrollHeight; }
+function post(msg) { frame.contentWindow.postMessage(msg, "*"); }
+
+// fake leftover preview PNG (gradient) built on a canvas
+function fakePreviewPng() {
+  return new Promise((resolve) => {
+    const c = document.createElement("canvas");
+    c.width = c.height = 160;
+    const g = c.getContext("2d");
+    const grad = g.createLinearGradient(0, 0, 160, 160);
+    grad.addColorStop(0, "#440154"); grad.addColorStop(0.5, "#20a584");
+    grad.addColorStop(1, "#fde725");
+    g.fillStyle = grad; g.fillRect(0, 0, 160, 160);
+    g.fillStyle = "#fff"; g.font = "14px sans-serif";
+    g.fillText("leftover (mm)", 20, 84);
+    c.toBlob((blob) => resolve(blob));
+  });
+}
+
+window.addEventListener("message", async (event) => {
+  if (event.source !== frame.contentWindow) return;
+  const m = event.data;
+  if (!m || m.steve !== 1) return;
+
+  if (m.method === "context") {
+    log("-> context");
+    event.source.postMessage({ steve: 1, id: m.id, result: {
+      panel: "adaptive_rough", connector: "stevecam-rough",
+      document: { id: "doc-42", kind: "part", revision: 7 },
+      theme } }, "*");
+  } else if (m.method === "actions") {
+    log("-> actions");
+    event.source.postMessage({ steve: 1, id: m.id, result: [{
+      id: "act-1", name: "adaptive_rough", title: "Adaptive roughing",
+      allowed: true, needs_confirmation: false,
+      sends_open_document_on_click: true, inputs: {} }] }, "*");
+  } else if (m.method === "events") {
+    log("-> events");
+    event.source.postMessage({ steve: 1, id: m.id, result: [
+      { name: "engine_state", data: { state: "idle", action: null,
+        progress: null }, at: Date.now() }] }, "*");
+  } else if (m.method === "run") {
+    runSeq += 1;
+    const id = "dev-run-" + runSeq;
+    log("-> run " + JSON.stringify(m.params));
+    const run = (state, extra) => Object.assign(
+      { id, action: "adaptive_rough", state, progress: 0, message: "",
+        result: null, error: null, files: [] }, extra || {});
+    event.source.postMessage({ steve: 1, id: m.id,
+      result: run("awaiting_confirmation", { message: "confirm me" }) }, "*");
+    const steps = [
+      ["received", 0], ["running", 0.1], ["running", 0.45],
+      ["running", 0.8], ["running", 0.95]];
+    let d = 600;
+    for (const [state, p] of steps) {
+      setTimeout(() => post({ steve: 1, event: "run",
+        run: run(state, { progress: p, message: "level " + Math.round(p * 5) + "/5" }) }), d);
+      d += 700;
+    }
+    setTimeout(() => post({ steve: 1, event: "run", run: run("succeeded", {
+      progress: 1, message: "done",
+      result: { estimated_time_min: 0.82, cut_length_mm: 1253.9,
+                zmap_gouges: { count: 0 }, rapid_collisions: { count: 0 },
+                over_flute: { count: 0 },
+                leftover: { mean_mm: 0.42, p95_mm: 0.5,
+                          within_0p5mm_fraction: 0.98 } },
+      files: ["rough.nc", "check.json", "preview.png"] }) }), d);
+  } else if (m.method === "run.file") {
+    log("-> run.file " + m.params.name);
+    fakePreviewPng().then((blob) => {
+      event.source.postMessage({ steve: 1, id: m.id, result: {
+        name: m.params.name, media_type: "image/png",
+        bytes: blob.size, blob } }, "*");
+    });
+  } else if (m.method === "cancel") {
+    log("-> cancel " + m.params.id);
+    event.source.postMessage({ steve: 1, id: m.id, result: { ok: true } }, "*");
+    post({ steve: 1, event: "run", run: { id: m.params.id,
+      action: "adaptive_rough", state: "cancelled", progress: 0,
+      message: "cancelled", result: null, error: null, files: [] } });
+  } else if (m.method === "run.get") {
+    event.source.postMessage({ steve: 1, id: m.id, error:
+      { code: "action_not_found", message: "n/a in harness" } }, "*");
+  }
+});
+
+// theme toggle from the harness page: click anywhere on the log
+document.getElementById("log").addEventListener("click", () => {
+  theme = theme === "dark" ? "light" : "dark";
+  log("theme -> " + theme);
+  post({ steve: 1, event: "context", context: { theme } });
+});
+log("Harness ready. Click 'Rough the open document' in the panel.\nClick here to toggle theme.");
+</script>
+</body>
+</html>
