@@ -54,9 +54,22 @@ With --stock-from, the stock top within shank radius must also stay at or
 below tip_z + flute. Removed points are reported per level together with
 the estimated wall area left uncut (stats: n_shank_removed,
 shank_removed_by_level, removed_wall_mm2). Rest passes use the same rule
-with the rest tool's flute (e.g. ball:3.175 -> 7.9375 mm) and report
+with the rest tool's flute (e.g. ball:3.142 -> 6.35 mm) and report
 n_rest_clean / n_rest_shank_blocked; the PLACEHOLDER marker stays only
 for tools absent from the table.
+
+S5 (holder clearance): stick-out + holder name are read from
+tools/x7_tools.json by diameter too (CLI --stickout/--holder override). The
+shank rule above is unchanged and covers the shank from tip + flute up to the
+holder nose at tip + stick-out; additionally the holder solid - the frustum
+stack [z_lo, z_hi, r_lo, r_hi] above the nose from the table's "holders" map
+- must stay >= 1.0 mm from the part and the --stock-from stock: violating CL
+vertices are dropped (path split, rejoined only through the verified link
+logic; points never lowered). Implemented as ONE batched drop-cutter per net
+with a conservative CylCutter of radius max(segment radii) + 1.0 mm, hitting
+when material within that envelope stands above the nose (the stack is
+contiguous from z_lo = 0; conservative per task S5 item 1). Dropped points
+are reported split by cause: n_shank_removed vs n_holder_removed.
 """
 import json
 import math
@@ -83,6 +96,7 @@ NO_CONTACT = -1e30    # ocl keeps the initial Z when nothing is touched
 DROP_CHUNK = 250_000  # CLPoints per BatchDropCutter call
 BALL_HEIGHT = 50.0
 SHANK_TOL = 0.01      # mm, S4: axial safety margin of the shank rule
+HOLD_CLEAR = 1.0      # mm, S5: min clearance of the holder stack to part/stock
 
 # X7 tool table (James's tools): flute length + shank diameter per tool,
 # read by type + diameter (the ball corner radius is implied by the dia).
@@ -90,11 +104,11 @@ TOOL_TABLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               os.pardir, "tools", "x7_tools.json")
 
 
-def tool_geometry(kind, dia, path=None):
-    """S4: look the tool up in tools/x7_tools.json by type + diameter
-    (within 0.001 mm; the corner radius is not matched - for a ball it is
-    D/2 and CLI specs give only kind:dia). Returns (flute_mm, shank_dia)
-    or None when the tool is not in the table (or lacks flute/shank data)."""
+def _tool_entry(kind, dia, path=None):
+    """Table entry for type + diameter (within 0.001 mm; the corner radius
+    is not matched - for a ball it is D/2 and CLI specs give only
+    kind:dia), requiring flute + shank data. Returns the raw entry dict or
+    None."""
     p = path or TOOL_TABLE_PATH
     try:
         with open(p) as fh:
@@ -109,8 +123,50 @@ def tool_geometry(kind, dia, path=None):
         fl, sh = e.get("flute_mm"), e.get("shank_diameter_mm")
         if fl is None or sh is None:
             continue
-        return (float(fl), float(sh))
+        return e
     return None
+
+
+def tool_geometry(kind, dia, path=None):
+    """S4: look the tool up in tools/x7_tools.json by type + diameter.
+    Returns (flute_mm, shank_dia) or None when the tool is not in the table
+    (or lacks flute/shank data)."""
+    e = _tool_entry(kind, dia, path)
+    if e is None:
+        return None
+    return (float(e["flute_mm"]), float(e["shank_diameter_mm"]))
+
+
+def tool_geometry_full(kind, dia, path=None):
+    """S5: like tool_geometry but also returns the stick-out and holder name
+    when the entry carries them. Returns (flute_mm, shank_dia, stickout_mm
+    or None, holder name or None), or None when the tool is not in the
+    table."""
+    e = _tool_entry(kind, dia, path)
+    if e is None:
+        return None
+    st = e.get("stickout_mm")
+    return (float(e["flute_mm"]), float(e["shank_diameter_mm"]),
+            float(st) if st is not None else None, e.get("holder"))
+
+
+def holder_segments(name, path=None):
+    """S5: the holder frustum stack [z_lo, z_hi, r_lo, r_hi] (mm above the
+    holder nose, which sits at tool tip + stick-out) from the "holders" map
+    of tools/x7_tools.json, or None when the name has no geometry."""
+    p = path or TOOL_TABLE_PATH
+    try:
+        with open(p) as fh:
+            hmap = json.load(fh).get("holders", {})
+    except (IOError, OSError, ValueError):
+        return None
+    h = hmap.get(name)
+    if not isinstance(h, dict):
+        return None
+    segs = h.get("segments")
+    if not segs:
+        return None
+    return [[float(v) for v in s] for s in segs]
 
 
 _DROP_CALLS = 0       # BatchDropCutter.setSTL calls (re-indexes the STL)
@@ -1142,6 +1198,70 @@ def shank_net(surf, paths, shank_dia, flute_mm, stock=None, band=0.3,
     return out, by_level, area, src
 
 
+def holder_net(surf, paths, segments, stickout_mm, stock=None, band=0.3,
+               threads=None):
+    """S5 holder safety on every emitted CL vertex: the holder solid is the
+    frustum stack `segments` ([z_lo, z_hi, r_lo, r_hi] mm above the holder
+    nose at tip_z + stickout_mm); it must stay >= HOLD_CLEAR mm from the
+    part (and, with stock = (A, x0, y0, cell), from the --stock-from stock).
+    Conservative implementation (documented per task S5 item 1): ONE batched
+    drop-cutter with a CylCutter of radius max(segment radii) + HOLD_CLEAR
+    per net - not one cutter per frustum segment. The stack is contiguous
+    from z_lo = 0 upward, so material reaching above the nose within that
+    envelope can come within HOLD_CLEAR of some frustum surface; material
+    below the nose cannot touch any segment radially inside the envelope
+    without first crossing the nose plane. If that cylinder's CL (highest
+    material within the envelope) sits above tip_z + stickout_mm, remove the
+    vertex and SPLIT the path there - pieces rejoin only through the
+    verified link logic, points are never lowered. `band` is the nominal cut
+    band height used to estimate the wall area left uncut (as shank_net).
+    Returns (paths, {round(z, 3): n_removed}, removed_wall_mm2, src) with
+    src[i] the index in `paths` that output path i came from."""
+    keep = [j for j, pth in enumerate(paths) if len(pth) >= 2]
+    rpth = [paths[j] for j in keep]
+    if not rpth:
+        return [], {}, 0.0, []
+    max_r = max(max(s[2], s[3]) for s in segments)
+    flat = [p for pth in rpth for p in pth]
+    xy = [(p[0], p[1]) for p in flat]
+    zv = np.array([p[2] for p in flat])
+    cyl = batch_drop(surf, make_cutter("flat", 2.0 * (max_r + HOLD_CLEAR)),
+                    xy, threads=threads)
+    bad = np.isfinite(cyl) & (cyl > zv + stickout_mm)
+    if stock is not None:
+        A, sx0, sy0, cell = stock
+        k = int(math.ceil((max_r + HOLD_CLEAR) / cell))
+        s = grid_sample(box_max(A, k), sx0, sy0, cell,
+                        np.array([p[0] for p in xy]),
+                        np.array([p[1] for p in xy]))
+        bad |= np.isfinite(s) & (s > zv + stickout_mm)
+    out = []
+    src = []
+    by_level = {}
+    area = 0.0
+    off = 0
+    for j, pth in zip(keep, rpth):
+        m = len(pth)
+        b = bad[off:off + m]
+        off += m
+        arr = np.asarray(pth)
+        dd = np.hypot(np.diff(arr[:, 0]), np.diff(arr[:, 1]))
+        sp = np.empty(m)
+        sp[0] = 0.5 * dd[0]
+        sp[-1] = 0.5 * dd[-1]
+        if m > 2:
+            sp[1:-1] = 0.5 * (dd[:-1] + dd[1:])
+        for i in np.where(b)[0]:
+            by_level[round(float(pth[i][2]), 3)] = \
+                by_level.get(round(float(pth[i][2]), 3), 0) + 1
+            area += float(sp[i]) * band
+        for i0, i1 in _runs_of_mask(~b):
+            if i1 - i0 >= 2:
+                out.append(pth[i0:i1])
+                src.append(j)
+    return out, by_level, area, src
+
+
 def box_max(A, k):
     """Max filter over a (2k+1) square window per axis (nan = -inf);
     conservative superset of a ball-radius footprint max."""
@@ -1287,7 +1407,7 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
            window=None, progress=None, rapid_margin=RAPID_MARGIN,
            use_rapids=True, rest_from=None, big_tool=("ball", 6.0, 0.0),
            min_rest=0.5, stock_from=None, stock_allow=RAPID_STOCK_ALLOW,
-           flute_mm=None, shank_dia=None):
+           flute_mm=None, shank_dia=None, stickout_mm=None, holder=None):
     """Slope-split finishing toolpath (action: slope_split_finish).
     Returns (moves, stats).
 
@@ -1314,19 +1434,38 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     diameter mm of the cutting tool; read from tools/x7_tools.json by
     diameter when None (CLI --flute/--shank overrides). No table entry
     and no override -> the shank rule is skipped. See shank_net.
+    stickout_mm / holder: S5 holder safety - stick-out mm and holder name;
+    read from tools/x7_tools.json by diameter when None (CLI --stickout/
+    --holder overrides). The shank rule (S4, unchanged) covers tip + flute up
+    to the holder nose at tip + stick-out; the holder frustum stack starting
+    at the nose must stay >= 1.0 mm from the part and the --stock-from
+    stock - see holder_net. No stick-out AND holder known -> holder rule off.
     """
     t_start = time.time()
     reset_drop_calls()
     cutter = make_cutter(*tool)
     # S4: flute/shank geometry from tools/x7_tools.json by diameter unless
     # overridden (CLI --flute/--shank); no table entry -> no shank rule.
-    if flute_mm is None or shank_dia is None:
-        g = tool_geometry(tool[0], tool[1])
+    # S5: stick-out + holder likewise (CLI --stickout/--holder overrides).
+    if flute_mm is None or shank_dia is None or stickout_mm is None \
+            or holder is None:
+        g = tool_geometry_full(tool[0], tool[1])
         if g is not None:
             if flute_mm is None:
                 flute_mm = g[0]
             if shank_dia is None:
                 shank_dia = g[1]
+            if stickout_mm is None:
+                stickout_mm = g[2]
+            if holder is None:
+                holder = g[3]
+    hsegs = None
+    if holder is not None:
+        if stickout_mm is None:
+            raise ValueError("holder %r given without stick-out: pass "
+                           "--stickout or a tool entry with stickout_mm"
+                           % holder)
+        hsegs = holder_segments(holder)
     workers = resolve_workers(workers)
     xmin, xmax, ymin, ymax, zmin, zmax = surf_bounds(surf)
     if floor_z is None:
@@ -1520,6 +1659,26 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
             shank_by_level[k] = shank_by_level.get(k, 0) + v
         shank_wall_mm2 += ar
         n_shank_removed = sum(shank_by_level.values())
+    # S5: holder safety on the vertices that survived the shank net (drop +
+    # split; pieces rejoin only through the verified link logic below)
+    n_holder_removed = 0
+    holder_by_level = {}
+    holder_wall_mm2 = 0.0
+    if hsegs is not None:
+        steep_paths, bl, ar, _ = holder_net(
+            surf, steep_paths, hsegs, stickout_mm, stock=link_stock,
+            band=stepdown, threads=threads)
+        for k, v in bl.items():
+            holder_by_level[k] = holder_by_level.get(k, 0) + v
+        holder_wall_mm2 += ar
+        shallow_paths, bl, ar, src_sh = holder_net(
+            surf, shallow_paths, hsegs, stickout_mm, stock=link_stock,
+            band=stepover, threads=threads)
+        src_shallow = [src_shallow[j] for j in src_sh]  # keep row_of aligned
+        for k, v in bl.items():
+            holder_by_level[k] = holder_by_level.get(k, 0) + v
+        holder_wall_mm2 += ar
+        n_holder_removed = sum(holder_by_level.values())
     # row / run index per EMITTED path (vertex_net splits runs, so the
     # pre-net row_of / s_runs indices no longer align with k)
     row_of = [row_of_pre[s] for s in src_shallow]
@@ -1600,10 +1759,19 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
         stats["shank_removed_by_level"] = [
             [z, n] for z, n in sorted(shank_by_level.items(), reverse=True)]
         stats["removed_wall_mm2"] = round(shank_wall_mm2, 1)
+    if hsegs is not None:
+        # S5: holder clearance pass (tools/x7_tools.json or --stickout/
+        # --holder); dropped points split by shank vs holder
+        stats["stickout_mm"] = round(float(stickout_mm), 4)
+        stats["holder"] = str(holder)
+        stats["n_holder_removed"] = n_holder_removed
+        stats["holder_removed_by_level"] = [
+            [z, n] for z, n in sorted(holder_by_level.items(), reverse=True)]
+        stats["holder_removed_wall_mm2"] = round(holder_wall_mm2, 1)
     if rest_from is not None:
         # S3 item 3 / S4: corner rest pass. The PLACEHOLDER marker stays only
         # for tools not in tools/x7_tools.json (the LNC post must refuse
-        # those); a table tool (e.g. ball:3.175) is a real rest tool.
+        # those); a table tool (e.g. ball:3.142) is a real rest tool.
         stats["rest_pass"] = True
         stats["placeholder_tool"] = tool_geometry(tool[0], tool[1]) is None
         stats["rest_from"] = str(rest_from)

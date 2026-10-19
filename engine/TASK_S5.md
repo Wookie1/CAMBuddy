@@ -22,3 +22,8 @@ James's rule (keep it, it is what S4 does): no vertical wall deeper than flute l
    finish and counted by zmap; real-flute case: T31 (flute 12) next to a vertical wall 13 mm deep -> those points dropped.
 Run /opt/homebrew/bin/python3 -m pytest verify connector engine/test_post.py -q and the VibeCAD-python engine
 suites (engine/test_engine.py, engine/test_finish.py). Do NOT run Core Front; the supervisor does.
+
+## Supervisor note (relaunch)
+A previous S5 session already changed 7 files (+735 lines: connector/runner.py, connector/test_connector.py,
+engine/cli.py, engine/finish.py, engine/test_finish.py, verify/test_zmap.py, verify/zmap.py) and exited; its log was lost.
+Check git diff first, keep that work, run all the test suites listed above, and finish whatever is missing or failing.

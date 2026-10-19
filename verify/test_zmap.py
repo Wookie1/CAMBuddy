@@ -658,3 +658,121 @@ def test_vertical_wall_ball_gouge():
     res_b = run_wall(-R + 0.05)
     assert res_b["gouges"]["count"] > 0, "intruding ball not flagged"
     assert res_b["gouges"]["max_depth"] > 0.0
+
+
+# ---------------------------------------------------------------------------
+# S5: independent holder clearance check (holder frustum stack from
+# tools/x7_tools.json vs max(stock, part), 1.0 mm clearance)
+# ---------------------------------------------------------------------------
+
+def holder_part():
+    """Part: slot |x| < 4 (floor z=0) along Y in a plate top z=10, plus a
+    tall boss x in [6, 12], |y| <= 8 up to z=20 - far enough from the slot
+    centreline (6 mm > any shank radius) that only the HOLDER reaches it."""
+    xs = centers()[None, :]
+    ys = centers()[:, None]
+    part = np.where(np.abs(xs) < 4.0, 0.0, 10.0)
+    inb = (xs >= 6.0) & (xs <= 12.0) & (np.abs(ys) <= 8.0)
+    return np.where(inb, 20.0, part)
+
+
+HOLDER_GCODE = """
+G21 G90 F500
+N3 G0 X0. Y-15. Z20.
+N4 G1 Z0. F100.
+N5 G1 Y15. F500.
+"""
+
+
+def _run_holder(holder, stickout, jobs=None):
+    moves = zmap.parse_gcode(HOLDER_GCODE)
+    sb = (-25.0, 25.0, -25.0, 25.0, 0.0, 20.0)
+    kw = dict(tool="ball", dia=6.0, holder=holder, stickout=stickout)
+    if jobs:
+        return zmap.simulate_parallel(moves, holder_part(), CELL, X0, Y0, sb,
+                                     jobs, **kw)
+    return zmap.simulate(moves, holder_part(), CELL, X0, Y0, sb, **kw)
+
+
+def test_holder_resolve_from_table():
+    segs, st, name = zmap.resolve_holder(tool_number=31)
+    assert name == "BT30-ER20-60" and st == 18.0
+    assert segs[0] == [0.0, 2.0, 15.0, 16.9]
+    # explicit holder + stickout overrides; T20 (3/8 ball) carries its own
+    segs2, st2, name2 = zmap.resolve_holder(tool_number=20)
+    assert name2 == "BT30-ER20-60" and st2 == 46.2
+    segs3, st3, _ = zmap.resolve_holder(holder="BT30-ER20-80", stickout=9.0)
+    assert st3 == 9.0 and segs3[1] == [2.0, 21.946, 16.9, 16.9]
+    # tool without holder data / unknown number -> off, not an error
+    assert zmap.resolve_holder(tool_number=13) is None  # ER32: no segments
+    assert zmap.resolve_holder(tool_number=99) is None
+    assert zmap.resolve_holder() is None
+    try:
+        zmap.resolve_holder(holder="NOPE", stickout=10.0)
+        assert False, "unknown holder accepted"
+    except ValueError:
+        pass
+    try:
+        zmap.resolve_holder(holder="BT30-ER20-60")
+        assert False, "holder without stickout accepted"
+    except ValueError:
+        pass
+
+
+def test_holder_hits_counted_and_cleared():
+    segs, st, _name = zmap.resolve_holder(tool_number=31)  # stickout 18
+    res = _run_holder(segs, st)
+    hh = res["holder_hits"]
+    assert hh is not None
+    # plunge (Z0: nose 18 < boss top 20 within the envelope) + traverse
+    assert hh["count"] == 2, hh
+    assert hh["first_line"] == 4, hh  # the G1 Z0 plunge
+    assert abs(hh["max_intrusion"] - 2.0) < 1e-9, hh  # 20 - (0 + 18)
+    wx, wy = hh["worst_xy"]
+    assert 5.9 <= wx <= 12.1 and -8.1 <= wy <= 8.1, hh  # on the boss
+    # no gouges / rapids: the ball itself is clean, only the holder hits
+    assert res["gouges"]["count"] == 0
+    assert res["rapid_collisions"]["count"] == 0
+    # longer stick-out: nose at 25 >= boss top -> nothing touches
+    res_b = _run_holder(segs, 25.0)
+    assert res_b["holder_hits"]["count"] == 0
+    assert res_b["holder_hits"]["max_intrusion"] == 0.0
+    assert res_b["holder_hits"]["worst_xy"] is None
+    # off without holder geometry
+    res_c = _run_holder(None, None)
+    assert res_c["holder_hits"] is None
+    # parallel chunking matches serial exactly
+    par = _run_holder(segs, st, jobs=2)
+    assert par["holder_hits"]["count"] == hh["count"]
+    assert abs(par["holder_hits"]["max_intrusion"]
+               - hh["max_intrusion"]) < 1e-9
+    assert par["holder_hits"]["worst_xy"] == hh["worst_xy"]
+    assert par["holder_hits"]["first_line"] == hh["first_line"]
+
+
+def test_holder_cli_tool_number(tmp_path):
+    gc = tmp_path / "p.ngc"
+    gc.write_text(HOLDER_GCODE)
+    npy = tmp_path / "part.npy"
+    np.save(npy, holder_part())
+    import json
+    (tmp_path / "part.json").write_text(json.dumps(
+        {"x0": X0, "y0": Y0, "cell": CELL, "tess_tol": 0.01}))
+    out = tmp_path / "rep.json"
+    rc = zmap.main([str(gc), "--part", str(npy), "--tool", "ball",
+                    "--dia", "6.0", "--stock", "-25", "25", "-25", "25",
+                    "0", "20", "--tool-number", "31",
+                    "--out-json", str(out)])
+    assert rc == 0
+    rep = json.loads(out.read_text())
+    assert rep["holder"] == {"name": "BT30-ER20-60", "stickout_mm": 18.0}
+    assert rep["holder_hits"]["count"] == 2
+    assert abs(rep["holder_hits"]["max_intrusion"] - 2.0) < 1e-9
+    # unknown tool number -> holder check off, report key present as null
+    out2 = tmp_path / "rep2.json"
+    rc = zmap.main([str(gc), "--part", str(npy), "--tool", "ball",
+                    "--dia", "6.0", "--stock", "-25", "25", "-25", "25",
+                    "0", "20", "--tool-number", "99",
+                    "--out-json", str(out2)])
+    assert rc == 0
+    assert json.loads(out2.read_text())["holder_hits"] is None
