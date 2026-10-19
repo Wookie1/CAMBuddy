@@ -1,9 +1,11 @@
 """Synthetic pytest suite for verify/zmap.py (no FreeCAD, no files)."""
+import json
 import math
 import os
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import zmap  # noqa: E402
@@ -1593,3 +1595,213 @@ def test_z5b_builder_grid_satisfies_zmap_stock_gate(tmp_path):
     rep = json.loads(out2.read_text())
     assert rep["outside_grid"]["count"] == 0
 
+
+
+# ============================================= task CP: --strict subset ====
+
+STRICT_OK = """O1001
+( posted program, supported subset )
+G21 G90 G17 G40 G80 G49 G94
+G54
+T13 M06
+G43 Z25. H13 M03 S7500 M08
+G0 X-20. Y0.
+G1 Z5. F300.
+G2 X0. Y20. I20. J0. F1500.
+G3 X20. Y0. R20.
+G04 P2000.
+G1 X-20. Y0. F1500.
+G0 Z25.
+M09
+M05
+G53 G00 Z0.
+G49
+G91 G28 X0. Y0.
+G90
+M30
+%
+"""
+
+
+def codes_of(findings):
+    return [(f["code"], f["line"]) for f in findings]
+
+
+def test_strict_accepts_supported_subset():
+    assert zmap.strict_check(STRICT_OK) == []
+
+
+@pytest.mark.parametrize("line,code", [
+    ("G18", "G18"),
+    ("G19", "G19"),
+    ("G41", "G41"),
+    ("G42", "G42"),
+    ("G81 Z-5. R2.", "G81"),
+    ("G82 Z-5. P1000.", "G82"),
+    ("G83 Z-5. Q2.", "G83"),
+    ("G84", "G84"),
+    ("G85 Z-5.", "G85"),
+    ("G86 Z-5.", "G86"),
+    ("G87 Z-5.", "G87"),
+    ("G88 Z-5.", "G88"),
+    ("G89 Z-5.", "G89"),
+    ("G91 X5.", "G91"),
+    ("G68", "G68"),
+    ("G51", "G51"),
+    ("M98 P1001", "M98"),
+    ("M99", "M99"),
+    ("#5=1", "#"),
+    ("U5.", "U"),
+    ("D3", "D"),
+])
+def test_strict_rejects_every_unsupported_code(line, code):
+    text = "G21 G90\nG0 X0. Y0.\n%s\n" % line
+    findings = zmap.strict_check(text)
+    assert codes_of(findings), "must not skip %r silently" % line
+    assert findings[0]["code"] == code
+    assert findings[0]["line"] == 3
+
+
+def test_strict_rejects_comp_and_planes_in_program():
+    text = ("G21 G90\nG1 X0. Y0. F500.\nG41 X10. D3 F500.\n"
+            "G18\nG2 X20. Z0. I10. K0.\n")
+    codes = [f["code"] for f in zmap.strict_check(text)]
+    assert "G41" in codes and "D" in codes and "G18" in codes
+    assert "K" in codes
+
+
+def test_strict_home_line_only_at_end():
+    home = "G91 G28 X0. Y0."
+    assert zmap.strict_check("G21\n%s\nM30\n%%\n" % home) == []
+    # a cutting move after the home line: the home line was not at the end
+    bad = "G21\n%s\nG1 X5. Y5. F100.\nM30\n" % home
+    findings = zmap.strict_check(bad)
+    assert ("G28", 2) in codes_of(findings)
+
+
+def test_strict_g53_z_only_ok_axes_rejected():
+    assert zmap.strict_check("G21\nG53 G00 Z0.\n") == []
+    findings = zmap.strict_check("G21\nG53 G00 X0. Y0. Z0.\n")
+    assert ("G53", 2) in codes_of(findings)
+
+
+def test_strict_g43_needs_h_and_dwell_needs_p():
+    findings = zmap.strict_check("G21\nG43 Z5.\n")
+    assert ("G43", 2) in codes_of(findings)
+    findings = zmap.strict_check("G21\nG0 X0.\nP1000.\n")
+    assert ("P", 3) in codes_of(findings)
+
+
+def test_strict_r_smaller_than_chord_rejected():
+    findings = zmap.strict_check("G21 G90\nG0 X0. Y0.\n"
+                                  "G1 X20. Y0.\nG2 X0. Y0. R5.\n")
+    assert ("R", 4) in codes_of(findings)
+
+
+def test_strict_cli_rejects_with_json(tmp_path):
+    gc = tmp_path / "p.nc"
+    gc.write_text("G21 G90\nG0 X0. Y0.\nG81 Z-5. R2. F100.\n"
+                  "G41 X5. D1\n")
+    out = tmp_path / "rep.json"
+    rc = zmap.main([str(gc), "--part", str(tmp_path / "none.npy"),
+                    "--strict", "--out-json", str(out)])
+    assert rc != 0, "unsupported program must exit non-zero"
+    rep = json.loads(out.read_text())
+    codes = [f["code"] for f in rep["unsupported"]]
+    assert codes[0] == "G81" and "G41" in codes
+    assert rep["unsupported"][0]["line"] == 3
+
+
+def test_strict_cli_ok_and_reports(tmp_path):
+    gc = tmp_path / "p.nc"
+    gc.write_text(STRICT_OK)
+    part = np.full((100, 100), 5.0)
+    p = tmp_path / "part.npy"
+    np.save(p, part)
+    (tmp_path / "part.json").write_text(json.dumps(
+        {"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}))
+    out = tmp_path / "rep.json"
+    rc = zmap.main([str(gc), "--part", str(p), "--stock", "-25", "25",
+                    "-25", "25", "0", "10", "--tool", "flat", "--dia", "6",
+                    "--strict", "--engage-report", "--out-json", str(out)])
+    assert rc == 0, "supported program must pass --strict"
+    rep = json.loads(out.read_text())
+    assert rep["strict"] is True and rep["unsupported"] == []
+    # report-only engagement: present, no threshold, nothing flagged
+    assert rep["engagement"]["threshold_mm"] is None
+    assert rep["engagement"]["count"] == 0
+
+
+def _arc_compare_programs(R=10.0):
+    """(I/J form, R form, finely linearized G1) of the same CW semicircle
+    from (R,0) to (-R,0), chord <= 0.01 mm on the linear form."""
+    head = "G21 G90 F500\nG0 X%.3f Y0. Z20.\nG1 Z5. F100.\n" % R
+    tail = "\nG0 Z20.\nM30\n"
+    ij = head + "G2 X%.3f Y0. I-%.3f J0. F500." % (-R, R) + tail
+    rr = head + "G2 X%.3f Y0. R%.3f F500." % (-R, R) + tail
+    n = int(math.ceil(math.pi * R / 0.01))
+    pts = []
+    for k in range(1, n + 1):
+        a = -math.pi * k / n
+        pts.append("G1 X%.5f Y%.5f F500." % (R * math.cos(a),
+                                               R * math.sin(a)))
+    lin = head + "\n".join(pts) + tail
+    return ij, rr, lin
+
+
+def test_r_form_and_ij_form_match_fine_linearization():
+    Rpath, Rtool = 10.0, 3.0
+    xs = centers()[None, :]
+    ys = centers()[:, None]
+    r = np.hypot(xs, ys)
+    part = np.where((r >= Rpath - Rtool) & (r <= Rpath + Rtool), 5.0, 10.0)
+    ij, rr, lin = _arc_compare_programs(Rpath)
+    res_ij = run(ij, part)
+    res_r = run(rr, part)
+    res_lin = run(lin, part)
+    for key in ("gouges", "rapid_collisions"):
+        assert res_r[key]["count"] == res_ij[key]["count"] == \
+            res_lin[key]["count"], key
+    assert res_ij["gouges"]["count"] == 0
+    assert res_r["leftover"]["max"] == pytest.approx(
+        res_lin["leftover"]["max"], abs=1e-6)
+    assert res_r["leftover"]["mean"] == pytest.approx(
+        res_lin["leftover"]["mean"], abs=1e-3)
+    assert res_ij["leftover"]["mean"] == pytest.approx(
+        res_lin["leftover"]["mean"], abs=1e-3)
+    assert abs(res_r["cutting_length_mm"] - res_lin["cutting_length_mm"]) \
+        < 0.05
+
+
+def test_negative_r_over_180_matches_linearization():
+    # 270 deg CW arc from (-10,0) to (0,-10): negative R in the R form
+    Rpath, Rtool = 10.0, 3.0
+    xs = centers()[None, :]
+    ys = centers()[:, None]
+    r = np.hypot(xs, ys)
+    part = np.where((r >= Rpath - Rtool) & (r <= Rpath + Rtool), 5.0, 10.0)
+    head = "G21 G90 F500\nG0 X-10. Y0. Z20.\nG1 Z5. F100.\n"
+    rr = head + "G2 X0. Y-10. R-10. F500.\nG0 Z20.\n"
+    n = int(math.ceil(1.5 * math.pi * Rpath / 0.01))
+    pts = []
+    for k in range(1, n + 1):
+        a = math.pi - 1.5 * math.pi * k / n
+        pts.append("G1 X%.5f Y%.5f F500." % (Rpath * math.cos(a),
+                                               Rpath * math.sin(a)))
+    lin = head + "\n".join(pts) + "\nG0 Z20.\n"
+    res_r = run(rr, part)
+    res_lin = run(lin, part)
+    assert res_r["gouges"]["count"] == res_lin["gouges"]["count"]
+    assert res_r["rapid_collisions"]["count"] == \
+        res_lin["rapid_collisions"]["count"]
+    assert res_r["leftover"]["mean"] == pytest.approx(
+        res_lin["leftover"]["mean"], abs=1e-3)
+
+
+def test_strict_skips_home_and_dwell_moves():
+    moves = zmap.parse_gcode(STRICT_OK, strict=True)
+    assert all(not (m["x"] == 0.0 and m["y"] == 0.0
+                   and m["motion"] == "G1") for m in moves)
+    # default behaviour unchanged: home line still parses as before
+    dflt = zmap.parse_gcode("G91 G28 X0. Y0.\n")
+    assert len(dflt) == 1

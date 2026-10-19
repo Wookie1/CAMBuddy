@@ -22,6 +22,16 @@
     passes split by slope - contour-style on steep walls, raster-style on
     flatter areas, overlapping where they meet.</p>
 
+  <p>Check a posted program: judges your posted G-code against the open
+    part and stock box with the independent zmap, using your tool table -
+    the program's T word picks the tool and the run checks gouges, rapid
+    collisions, shank/over-flute rub, holder clearance and the tool
+    footprint, plus an engagement report. Anything outside the supported
+    subset (XY moves and arcs only, one tool) fails with the code and line.
+    It does NOT check fixtures/vise, machine travel, multi-tool programs,
+    cutter comp, canned cycles, other planes or feeds/speeds suitability -
+    the dry run above the part on the X7 is still yours to do.</p>
+
   <form id="rough-form" autocomplete="off">
     <div class="grid">
       <label>Orientation

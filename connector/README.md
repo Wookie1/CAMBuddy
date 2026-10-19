@@ -26,6 +26,20 @@ anything.
   stock — and gives you both programs: rough.nc and finish.nc. Run finish.nc
   only after roughing.
 
+- **check_program** — judges a posted program (yours or STEVE's) against your
+  part and stock box with the independent zmap, using your tool table: the
+  program's T word picks the tool from tools/x7_tools.json (type, diameter,
+  corner, flute, shank, holder, stick-out) and the run checks the same gates
+  as a roughing run — no gouges, no rapid collisions, no shank/over-flute
+  rub, holder keeps its 1.0 mm clearance, every footprint inside the judged
+  grid — plus an engagement report (warning-only) and a strict subset check:
+  anything outside XY-plane moves and arcs (I/J or R), one tool per program,
+  fails with the offending code and line. What it does NOT check: fixtures
+  and the vise, machine travel limits, multi-tool programs, cutter
+  compensation, canned cycles, other motion planes, and whether the
+  feeds/speeds suit the material — and it never replaces your dry run above
+  the part on the X7.
+
 ## The gates — a run fails if any of these catch something
 
 - **Gouges** — the simulated tool cuts into the part where the model says it
