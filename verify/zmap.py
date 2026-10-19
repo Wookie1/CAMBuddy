@@ -1493,8 +1493,6 @@ def main(argv=None):
         "plunge_over_flute": res["plunge_over_flute"],
         "over_flute": res["over_flute"],
         "holder_hits": res["holder_hits"],
-        "holder": ({"name": holder_name, "stickout_mm": holder_stick}
-                   if holder_segs is not None else None),
         "cutter_comp": res["cutter_comp"],
         "comp_radius_mm": args.comp_radius,
         "air_fraction": res["air_fraction"],
