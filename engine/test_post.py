@@ -400,5 +400,9 @@ def test_ball_without_number_refused():
     moves = [{"g": 0, "x": 0.0, "y": 0.0, "z": 10.0}, {"g": 1, "x": 5.0, "y": 0.0, "z": 10.0, "f": 1000.0}]
     import pytest
     with pytest.raises(ValueError, match="no T/H/D number"):
-        post(moves, tool_kind="ball", dia_mm=6.0, corner_mm=3.0)
-    assert "T7 M06" in post(moves, tool_kind="ball", dia_mm=6.0, corner_mm=3.0, tool_number=7)
+        post(moves, tool_kind="ball", dia_mm=1.5875, corner_mm=0.79375)
+    assert "T7 M06" in post(moves, tool_kind="ball", dia_mm=1.5875, corner_mm=0.79375, tool_number=7)
+    # James's programming numbers (>12) for the balls he named, 2026-10-19
+    assert "T14 M06" in post(moves, tool_kind="ball", dia_mm=6.0, corner_mm=3.0)
+    assert "T15 M06" in post(moves, tool_kind="ball", dia_mm=9.525, corner_mm=4.7625)
+    assert "T16 M06" in post(moves, tool_kind="ball", dia_mm=3.175, corner_mm=1.5875)

@@ -17,32 +17,34 @@
       "shank_note": "assumed = D (not necked)"
     },
     {
-      "number": null,
+      "number": 14,
       "type": "ball",
       "diameter_mm": 6.0,
       "corner_radius_mm": 3.0,
-      "length_offset": null,
-      "diameter_offset": null,
+      "length_offset": "H14",
+      "diameter_offset": "D14",
       "flute_mm": 15.0,
       "flute_note": "2.5xD (James: normal flute length)",
       "shank_diameter_mm": 6.0,
       "shank_note": "assumed = D (not necked)",
       "description": "6mm BALL END MILL",
-      "source": "James 2026-10-18"
+      "source": "James 2026-10-18",
+      "number_note": "programming number (>12) chosen per James 2026-10-19; he reassigns to 1-12 and loads the changer before running"
     },
     {
-      "number": null,
+      "number": 15,
       "type": "ball",
       "diameter_mm": 9.525,
       "corner_radius_mm": 4.7625,
-      "length_offset": null,
-      "diameter_offset": null,
+      "length_offset": "H15",
+      "diameter_offset": "D15",
       "flute_mm": 23.8125,
       "flute_note": "2.5xD (James: normal flute length)",
       "shank_diameter_mm": 9.525,
       "shank_note": "assumed = D (not necked)",
       "description": "3/8in BALL END MILL",
-      "source": "James 2026-10-18"
+      "source": "James 2026-10-18",
+      "number_note": "programming number (>12) chosen per James 2026-10-19; he reassigns to 1-12 and loads the changer before running"
     },
     {
       "number": null,
@@ -73,18 +75,19 @@
       "source": "James 2026-10-18"
     },
     {
-      "number": null,
+      "number": 16,
       "type": "ball",
       "diameter_mm": 3.175,
       "corner_radius_mm": 1.5875,
-      "length_offset": null,
-      "diameter_offset": null,
+      "length_offset": "H16",
+      "diameter_offset": "D16",
       "flute_mm": 7.9375,
       "flute_note": "2.5xD (James: normal flute length)",
       "shank_diameter_mm": 3.175,
       "shank_note": "assumed = D (not necked)",
       "description": "1/8in BALL END MILL",
-      "source": "James 2026-10-18"
+      "source": "James 2026-10-18",
+      "number_note": "programming number (>12) chosen per James 2026-10-19; he reassigns to 1-12 and loads the changer before running"
     },
     {
       "number": null,
