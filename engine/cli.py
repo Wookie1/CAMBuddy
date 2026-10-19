@@ -149,6 +149,8 @@ def finish_main(a):
                     else a.stock_allow),
         flute_mm=getattr(a, "flute", None),
         shank_dia=getattr(a, "shank", None),
+        stickout_mm=getattr(a, "stickout", None),
+        holder=getattr(a, "holder", None),
         **rest_kw)
     if rest_kw:
         if finishmod.tool_geometry(kind, dia) is None:
@@ -371,7 +373,7 @@ def main(argv=None):
     f.add_argument("--rest-tool", dest="rest_tool", default="ball:3",
                    help="tool spec for --rest-from passes (default ball:3; "
                         "tools listed in tools/x7_tools.json, e.g. "
-                        "ball:3.175, are real rest tools - only unlisted "
+                        "ball:3.142, are real rest tools - only unlisted "
                         "tools get the PLACEHOLDER marker)")
     f.add_argument("--min-rest", dest="min_rest", type=float, default=0.5,
                    help="rest-pass threshold mm (default 0.5)")
@@ -382,6 +384,14 @@ def main(argv=None):
     f.add_argument("--shank", type=float, default=None,
                    help="shank diameter mm (S4 shank safety); default: read "
                         "from tools/x7_tools.json (assumed = D, not necked)")
+    f.add_argument("--stickout", type=float, default=None,
+                   help="tool stick-out mm, holder nose at tip + stick-out "
+                        "(S5 holder safety); default: read from "
+                        "tools/x7_tools.json by tool diameter")
+    f.add_argument("--holder", default=None,
+                   help="holder name in the tools/x7_tools.json \"holders\" "
+                        "map (S5 holder safety); default: read from the tool "
+                        "entry; needs a stick-out (table or --stickout)")
 
     a = p.parse_args(argv)
 
