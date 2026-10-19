@@ -44,6 +44,21 @@ Links: between paths/regions we stay tool-down when the stock model says the
 straight link at cutting Z (or Z + lift) is clear; only then do we retract to
 clearance and helix/plunge. The hard radial-allowance post-check from round 6
 still runs per level.
+
+R4 (quality): Adaptive2d's island input is F eroded by (R - margin), so its
+centres stay ~margin outside the true forbidden region and a full-height band
++ corner chunks survived below it (test block Z27 pocket: 142 mm2 of floor at
+8.38 mm, of which only ~20% is the unreachable R6 crescent). Per level we now
+emit wall-hugging rings (hug_regions): the refined (authoritative) island
+loops offset eps toward the allowed side, filtered by this level's territory
+and isl_ok - centres hug the walls at the closest distance the hard gates
+permit, and disk(r_t) cuts the band down to the level's Z, leaving only the
+analytic corner crescents. Two latent link bugs surfaced and were fixed with
+it: corridor sampling now also tests segment midpoints (a thin island tip can
+slip between 0.4 mm samples), and after a clip break the tool re-enters via
+the corridor-checked entry instead of diving across the forbidden gap; a flat
+level already in the step-up order (the final floor+axl level) keeps its
+mandatory flag so it can never be skipped.
 """
 import math
 import time
@@ -664,6 +679,104 @@ def _helix_moves(cx, cy, sx, sy, z_top, z_bot, feed):
     return out
 
 
+def _hug_offset(L, eps):
+    """Offset a closed polygon (N,2) by eps along per-vertex miter normals
+    (right normal of a CCW loop points away from its interior). Spikes at
+    sharp corners are capped; the caller chooses the sign so the ring lands
+    on the allowed (air) side of the forbidden loops."""
+    n = len(L)
+    out = np.empty_like(L)
+    for i in range(n):
+        px, py = L[i]
+        ax, ay = L[(i - 1) % n]
+        bx, by = L[(i + 1) % n]
+        e1 = (px - ax, py - ay)
+        e2 = (bx - px, by - py)
+        L1 = math.hypot(*e1)
+        L2 = math.hypot(*e2)
+        if L1 < 1e-12 or L2 < 1e-12:
+            out[i] = (px, py)
+            continue
+        n1 = (e1[1] / L1, -e1[0] / L1)
+        n2 = (e2[1] / L2, -e2[0] / L2)
+        bx_, by_ = n1[0] + n2[0], n1[1] + n2[1]
+        Lb = math.hypot(bx_, by_)
+        if Lb < 1e-9:            # 180 deg reversal: just use n1
+            out[i] = (px + eps * n1[0], py + eps * n1[1])
+            continue
+        cos_h = (bx_ * n1[0] + by_ * n1[1]) / Lb
+        scale = eps / max(cos_h, 0.34)   # cap miter spike ~3x
+        out[i] = (px + bx_ / Lb * scale, py + by_ / Lb * scale)
+    return out
+
+
+def hug_regions(islands, grown, stock, isl_ok, eps=0.05, min_run=1.0):
+    """R4: wall-hugging rings that close the reach gap Adaptive2d leaves at
+    pocket/island walls. The a2d island input is F eroded by (R - margin)
+    (margin ~1.25 mm covers raster quantisation), so a2d centres stay
+    margin-distance outside the true forbidden region F and a full-height
+    band + corner chunks survive below it (test block Z27 pocket: 142 mm2
+    of floor at 8.38 mm). Here each refined island loop (already the
+    authoritative, outward-rounded F boundary) is offset by eps toward the
+    ALLOWED side and emitted as a contour-parallel cutting run: centres sit
+    eps outside refined F - safe by the same construction every other centre
+    must obey (isl_ok, allowance post-check, hf backstop, CLCHECK all still
+    gate them) - and the disk(r_t) swept by the ring cuts the band down to
+    this level's Z, leaving only the analytic R-corner crescent. Points are
+    kept only where this level's territory (grown mask) exists and isl_ok
+    agrees, so rings appear exactly where rest material remains; the grid
+    fence loop filters out on its own (no territory outside the grid)."""
+    regions = []
+    for lp in islands:
+        L = np.asarray(lp, dtype=float)
+        if len(L) < 3:
+            continue
+        ring = _hug_offset(L, eps)
+        if int(_inside_loops(ring, islands).sum()) > len(L) // 2:
+            ring = _hug_offset(L, -eps)
+        P = ring
+        ii = np.floor((P[:, 0] - stock.x0) / stock.cell).astype(np.int64)
+        jj = np.floor((P[:, 1] - stock.y0) / stock.cell).astype(np.int64)
+        inb = (ii >= 0) & (ii < stock.nx) & (jj >= 0) & (jj < stock.ny)
+        terr = np.zeros(len(P), dtype=bool)
+        if inb.any():
+            terr[inb] = grown[jj[inb], ii[inb]]
+        ok = np.asarray(isl_ok([(float(x), float(y)) for x, y in P]))
+        good = terr & ok
+        if not good.any():
+            continue
+        # rotate to an invalid start so runs are linear, then split
+        order = np.roll(np.arange(len(P)), -(int(np.argmax(~good)) + 1)) \
+            if good.any() and not good[0] else np.arange(len(P))
+        g = good[order]
+        runs = []
+        s = None
+        for k in range(len(g)):
+            if g[k] and s is None:
+                s = k
+            if not g[k] and s is not None:
+                runs.append((s, k))
+                s = None
+        if s is not None:
+            runs.append((s, len(g)))
+        # merge wrap-around run (loop): first and last both good
+        if len(runs) > 1 and runs[0][0] == 0 and runs[-1][1] == len(g):
+            runs[0] = (runs[-1][0] - len(g), runs[0][1])
+            runs.pop()
+        for (a, b) in runs:
+            idx = [order[t % len(g)] for t in range(a, b)]
+            if len(idx) < 2:
+                continue
+            pts = [(round(float(P[t, 0]), 4), round(float(P[t, 1]), 4))
+                   for t in idx]
+            per = sum(math.dist(pts[i], pts[i + 1]) for i in range(len(pts) - 1))
+            if per < min_run:
+                continue
+            regions.append({"start": list(pts[0]), "helix": None,
+                           "paths": [["cutting", pts]]})
+    return regions
+
+
 def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
              keep_tool_down):
     """One level's Adaptive2d run; returns plain picklable region dicts."""
@@ -812,10 +925,13 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     order = plan_stepup_levels(szmax, final, stepdown=stepdown, stepup=stepup,
                               axial_leave=axl)
     # R2 item 3: mandatory flat-floor levels (up-facing flat faces + axl)
+    # R4: a flat level already present in the step-up order (typically the
+    # final level floor+axl) keeps its mandatory flag too - it is the level
+    # that must finish the floor at exactly axial leave and may never be
+    # skipped because an early hug pass already cut most of the rest.
     mand = set(mandatory_flat_levels(fin.flat_face_zs(surf), axl, final,
                                     szmax))
-    mand -= {round(z, 4) for z in order}
-    order = insert_levels(order, mand)
+    order = insert_levels(order, mand - {round(z, 4) for z in order})
 
     stats = {"levels": [], "n_regions": 0, "cut_len": 0.0, "plunge_len": 0.0,
              "rapid_len": 0.0, "n_rapid_bumps": 0,
@@ -988,7 +1104,15 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             n = max(2, int(L / 0.4) + 1)
             pts = [(p0[0] + (p1[0] - p0[0]) * t / (n - 1),
                     p0[1] + (p1[1] - p0[1]) * t / (n - 1)) for t in range(n)]
-            return all(isl_ok(pts))
+            if not all(isl_ok(pts)):
+                return False
+            # R4: also test segment midpoints - a thin island tip can slip
+            # between 0.4 mm samples on a long link (the level-29.906 ring
+            # link crossing the boss fillet corner at (-17.5, 13.9))
+            mids = [((p0[0] + (p1[0] - p0[0]) * (t + 0.5) / (n - 1),
+                     p0[1] + (p1[1] - p0[1]) * (t + 0.5) / (n - 1)))
+                    for t in range(n - 1)]
+            return all(isl_ok(mids))
 
         # drop clearance-ring outers: a territory component that passes within
         # tool_r+leave of an island input loop usually has no room for the tool
@@ -1039,6 +1163,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         t0 = time.time()
         regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
                            tolerance, keep_tool_down)
+        # R4: wall-hugging rings close the margin-wide rest band + corner
+        # chunks Adaptive2d cannot reach (its islands are pre-eroded).
+        regions.extend(hug_regions(islands, grown, stock, isl_ok,
+                                  eps=max(0.5 * tolerance, 0.03)))
         t_a2d = time.time() - t0
         stats["t_adaptive"] += t_a2d
         if not regions:
@@ -1072,19 +1200,26 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 if kind == "cutting":
                     good = isl_ok(pts)
                     i = 0
+                    gap = False
                     while i < len(pts):
                         if not good[i]:
                             stats["n_clip_breaks"] += 1
+                            gap = True
                             i += 1
                             continue
-                        if prev[2] is None or abs(prev[2] - z) > 1e-6:
+                        if prev[2] is None or abs(prev[2] - z) > 1e-6 or gap:
                             # tool is up (after a notclear link or a clip
-                            # break): re-enter at this point, don't dive
-                            enter_at(round(pts[i][0], 4),
-                                   round(pts[i][1], 4), z, None)
-                            level_pts.append((round(pts[i][0], 4),
-                                            round(pts[i][1], 4),
-                                            "reentry r%d" % nreg))
+                            # break) or the path skipped over forbidden ground
+                            # (clip break at z): re-enter at this point via the
+                            # corridor-checked entry, don't dive across the gap
+                            if prev[2] is None or abs(prev[2] - z) > 1e-6 or \
+                                    math.dist((prev[0], prev[1]), pts[i]) > 0.6:
+                                enter_at(round(pts[i][0], 4),
+                                       round(pts[i][1], 4), z, None)
+                                level_pts.append((round(pts[i][0], 4),
+                                                round(pts[i][1], 4),
+                                                "reentry r%d" % nreg))
+                            gap = False
                         j = i
                         while j + 1 < len(pts) and good[j + 1]:
                             j += 1

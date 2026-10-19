@@ -555,6 +555,129 @@ def test_rough_testblock_r2():
               % (len(moves), med - 27.0, len(pts_near), worst))
 
 
+def test_rough_testblock_r4():
+    """R4 (quality): pocket-corner reach on samples/test_block. In the four
+    R6 corner zones of the Z27 pocket (30x22 at centre (12,-2)) a
+    r 6.343 + 0.381 leave tool reaches everything except the crescent
+    between the R6 corner arc and the tool arc. On the engine's own stock
+    model every floor cell OUTSIDE the analytic crescent must end
+    0.381 +- 0.05 mm high, and the material that stays standing must be
+    ~the analytic crescent area (not the old margin-wide band)."""
+    if not (HAVE_AREA and os.path.exists(TB_STL) and os.path.exists(TB_HF)):
+        print("SKIP test_rough_testblock_r4 (no area or out/test_block.*)")
+        return
+    import tempfile
+    import json as _json
+    import numpy as np
+    from opencamlib import ocl
+    from engine.rough import rough
+    surf = ocl.STLSurf()
+    ocl.STLReader(TB_STL, surf)
+    part = np.load(TB_HF)
+    with open(TB_HF[:-4] + ".json") as fh:
+        meta = _json.load(fh)
+    hx0, hy0, hcell = float(meta["x0"]), float(meta["y0"]), float(meta["cell"])
+    stock_box = (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0)
+    kw = dict(leave=0.381, axial_leave=0.381, stepdown=19.05, stepover=0.16,
+              stl_path=TB_STL, workers=None, threads=4, stock_cell=0.5,
+              final_zmin=20.381, part_hf=(part, hx0, hy0, hcell))
+    with tempfile.TemporaryDirectory() as td:
+        stock_out = os.path.join(td, "stock.npy")
+        moves, stats = rough(surf, stock_box, 6.343, 20.0,
+                            stock_out=stock_out, **kw)
+        st = np.load(stock_out)
+        with open(stock_out[:-4] + ".json") as fh:
+            sm = _json.load(fh)
+        sx0, sy0, scell = float(sm["x0"]), float(sm["y0"]), float(sm["cell"])
+        X0, X1, Y0, Y1 = -3.0, 27.0, -13.0, 9.0     # pocket rect
+        Rc, r_t, lv = 6.0, 6.343, 0.381
+        R_eff = r_t + lv
+
+        def dist_wall(x, y):
+            d = np.minimum.reduce([x - X0, X1 - x, y - Y0, Y1 - y])
+            for cx, cy, sx, sy in ((X0 + Rc, Y0 + Rc, -1, -1),
+                                   (X1 - Rc, Y0 + Rc, 1, -1),
+                                   (X1 - Rc, Y1 - Rc, 1, 1),
+                                   (X0 + Rc, Y1 - Rc, -1, 1)):
+                m = ((x - cx) * sx > 0) & ((y - cy) * sy > 0)
+                d = np.where(m, np.minimum(d, Rc - np.hypot(x - cx, y - cy)), d)
+            return d
+
+        jj, ii = np.nonzero(np.isfinite(st))
+        sxx = sx0 + (ii + 0.5) * scell
+        syy = sy0 + (jj + 0.5) * scell
+        h = st[jj, ii] - 27.0
+
+        # analytic machinable set: legal centres C = {db >= R+leave+margin}.
+        # Since Rc(6) < R+leave(6.724) the centre set is a SHARP rectangle
+        # [X0+A, X1-A] x [Y0+A, Y1-A], A = R+leave+margin; a floor point is
+        # machinable iff its distance to that rectangle is <= r_t. Points at
+        # db >= leave but not machinable are the corner crescents.
+        # margin (0.05) is what the engine's HARD gates physically permit:
+        # the allowance post-check keeps every centre >= 0.025 mm outside the
+        # refined forbidden loop, refinement rounds the loop outward by a few
+        # microns and the ring's miter at the sharp centre-corner adds
+        # ~eps*(sqrt2-1). Cells whose only centres sit inside that band
+        # (reach margin < 0.05 mm at the R6 corners) count as crescent -
+        # cutting them would require weakening a safety gate.
+        ring_margin = 0.05
+        A = R_eff + ring_margin
+
+        def machinable(px, py):
+            dx = np.maximum(np.maximum(X0 + A - px, px - (X1 - A)), 0.0)
+            dy = np.maximum(np.maximum(Y0 + A - py, py - (Y1 - A)), 0.0)
+            return np.hypot(dx, dy) <= r_t
+
+        inside = (sxx > X0) & (sxx < X1) & (syy > Y0) & (syy < Y1)
+        reach = inside & machinable(sxx, syy)
+        bad_hi = reach & (h > 0.381 + 0.05)
+        bad_lo = reach & (h < 0.381 - 0.05)
+        # crescent area on a fine grid (margin-aware, matches what any legal
+        # program can reach); ideal crescent uses margin 0 (centres exactly
+        # at tool_r + leave from the walls).
+        hq = 0.05
+        gx = np.arange(X0 + hq / 2, X1, hq)
+        gy = np.arange(Y0 + hq / 2, Y1, hq)
+        GX, GY = np.meshgrid(gx, gy)
+        dG = dist_wall(GX, GY)
+        inQ = (GX > X0) & (GX < X1) & (GY > Y0) & (GY < Y1)
+        cres_mm2 = float((inQ & ~machinable(GX, GY)).sum()) * hq * hq
+
+        def mach_ideal(px, py):
+            dx = np.maximum(np.maximum(X0 + R_eff - px, px - (X1 - R_eff)),
+                           0.0)
+            dy = np.maximum(np.maximum(Y0 + R_eff - py, py - (Y1 - R_eff)),
+                           0.0)
+            return np.hypot(dx, dy) <= r_t
+
+        cres_ideal = float((inQ & ~mach_ideal(GX, GY)).sum()) * hq * hq
+        left_mm2 = float((~reach & inside & (h > 0.381 + 0.05)).sum()) \
+            * scell * scell
+        # corner zone report (8x8 squares at the pocket corners)
+        rep = []
+        for ax0, ay0 in ((X0, Y0), (X1 - 8, Y0), (X0, Y1 - 8),
+                         (X1 - 8, Y1 - 8)):
+            zc = inside & (sxx >= ax0) & (sxx <= ax0 + 8) \
+                & (syy >= ay0) & (syy <= ay0 + 8)
+            rep.append("%.1f" % float((zc & ~reach).sum()) )
+        assert not bad_hi.any(), \
+            "%d pocket-floor cells outside the crescent end %.3f mm high " \
+            "(want <= 0.431), worst at (%.2f, %.2f)" % (
+                int(bad_hi.sum()), h[bad_hi].max(),
+                sxx[bad_hi][int(np.argmax(h[bad_hi]))],
+                syy[bad_hi][int(np.argmax(h[bad_hi]))])
+        assert not bad_lo.any(), \
+            "%d pocket-floor cells cut below axial leave (min %.3f)" % (
+                int(bad_lo.sum()), h[bad_lo].min())
+        assert abs(left_mm2 - cres_mm2) <= 0.15 * cres_mm2, \
+            "leftover %.1f mm2 vs analytic crescent %.1f mm2" % (
+                left_mm2, cres_mm2)
+        print("PASS rough test-block R4: %d floor cells outside the crescent "
+              "all end 0.381 +- 0.05 mm; leftover %.1f mm2 vs crescent %.1f "
+              "mm2 (ideal %.1f); corner-zone rest cells [BL BR TL TR] = %s"
+              % (int(reach.sum()), left_mm2, cres_mm2, cres_ideal, rep))
+
+
 def _pocket_block_stl(path, half=14.0, ztop=8.0, pk_half=8.0, pk_floor=4.0):
     """ASCII STL: block +-half x, +-half y, 0..ztop with an open-top square
     pocket +-pk_half down to pk_floor (28 triangles, synth_pocket shape)."""
@@ -885,6 +1008,7 @@ def _main():
                test_stock_contours, test_stock_links_and_stepups,
                test_island_clear_fn, test_allowance_violation_containment,
                test_rough_without_hf_safe, test_rough_testblock_r2,
+               test_rough_testblock_r4,
                test_islands_grid_edge_parity, test_rough_pocket_in_block,
                test_rough_synth_pocket_repro, test_rough_rapids_clear_stock,
                test_stl_cache_keyed_by_content):
