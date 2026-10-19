@@ -402,7 +402,12 @@ def test_ball_without_number_refused():
     with pytest.raises(ValueError, match="no T/H/D number"):
         post(moves, tool_kind="ball", dia_mm=1.5875, corner_mm=0.79375)
     assert "T7 M06" in post(moves, tool_kind="ball", dia_mm=1.5875, corner_mm=0.79375, tool_number=7)
-    # James's programming numbers (>12) for the balls he named, 2026-10-19
-    assert "T14 M06" in post(moves, tool_kind="ball", dia_mm=6.0, corner_mm=3.0)
-    assert "T15 M06" in post(moves, tool_kind="ball", dia_mm=9.525, corner_mm=4.7625)
-    assert "T16 M06" in post(moves, tool_kind="ball", dia_mm=3.175, corner_mm=1.5875)
+    # James's STEVE tool library numbers (My shop rev 24): T31 6 mm (D 5.958), T20 3/8 in, T33 1/8 in (D 3.142)
+    assert "T31 M06" in post(moves, tool_kind="ball", dia_mm=5.958, corner_mm=2.979)
+    assert "T20 M06" in post(moves, tool_kind="ball", dia_mm=9.525, corner_mm=4.7625)
+    assert "T33 M06" in post(moves, tool_kind="ball", dia_mm=3.142, corner_mm=1.571)
+    # the old nominal sizes and the clashing picks are gone (T14 is James's 9 mm drill)
+    with pytest.raises(ValueError):
+        post(moves, tool_kind="ball", dia_mm=6.0, corner_mm=3.0)
+    for bad in ("T14 M06", "T15 M06", "T16 M06"):
+        assert bad not in post(moves, tool_kind="ball", dia_mm=9.525, corner_mm=4.7625)
