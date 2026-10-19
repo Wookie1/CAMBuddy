@@ -45,13 +45,19 @@ s = ocl.STLSurf()
 ocl.STLReader(stl_path, s)
 
 # ---------------------------------------------------------------------------
-# Parse G-code into CL points
+# Parse G-code into CL points (task UN: honor the program's own units -
+# a G20 program is inch and is scaled to mm before the drop-cutter probe)
 # ---------------------------------------------------------------------------
 P = {'X': None, 'Y': None, 'Z': None}
 mode = '0'
 prev = None
 xs, ys, zs, ln = [], [], [], []
+units = 1.0
 for n, line in enumerate(open(gcode_path), 1):
+    if 'G20' in line:
+        units = 25.4
+    elif 'G21' in line:
+        units = 1.0
     if line.startswith('('):
         continue
     g = re.search(r'\bG0?([0-3])\b', line)
@@ -63,7 +69,7 @@ for n, line in enumerate(open(gcode_path), 1):
             P[a] = float(v.group(1))
     if None in P.values():
         continue
-    cur = (P['X'], P['Y'], P['Z'])
+    cur = (P['X'] * units, P['Y'] * units, P['Z'] * units)
     if prev and mode in '123':
         dist = math.hypot(cur[0] - prev[0], cur[1] - prev[1])
         m = max(1, int(dist / step))
