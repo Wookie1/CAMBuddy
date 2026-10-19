@@ -38,6 +38,11 @@ def _check_zmap_gates(check):
         raise EngineError(
             "zmap gate: %d over-flute/shank hits (max %.3f mm)"
             % (of["count"], of.get("max_depth", 0.0)))
+    hd = check.get("holder") or {}
+    if hd.get("status") != "checked" or not isinstance(check.get("holder_hits"), dict):
+        raise EngineError(
+            "zmap gate: holder unknown (%s) - a run is never judged without "
+            "the holder clearance check" % hd.get("reason", hd.get("status", "no holder report")))
     hh = check.get("holder_hits")
     if isinstance(hh, dict) and hh.get("count", 0) > 0:
         raise EngineError(

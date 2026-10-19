@@ -137,7 +137,7 @@
       "flute_mm": 50.8,
       "shank_diameter_mm": 12.686,
       "stickout_mm": 71.6,
-      "holder": "ER32 collet chuck",
+      "holder": "BT30-ER32-70",
       "description": "1/2 in LONG REACH FLAT END MILL",
       "source": "James's shop T13 via STEVE comparison 2026-10-18",
       "note": "T/H/D 13 assigned for the STEVE comparison only"
@@ -309,6 +309,25 @@
           80.774,
           15.875,
           15.875
+        ]
+      ]
+    },
+    "BT30-ER32-70": {
+      "note": "stack of frustums: [z_lo, z_hi, r_lo, r_hi] mm above the holder nose (nose at tool tip + stick-out)",
+      "source": "Steve catalogue item bt30_er32 (\"BT30 ER32 collet chuck, 70 mm\")",
+      "dimension_source": "estimated",
+      "segments": [
+        [
+          0,
+          35,
+          25,
+          25
+        ],
+        [
+          35,
+          70,
+          27,
+          23
         ]
       ]
     }
