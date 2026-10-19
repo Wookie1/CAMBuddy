@@ -19,6 +19,7 @@ cells are part-free (zmin floor), exactly like PAD cells; PAD keeps
 working for old callers. The sidecar records stock_box, tool_r, margin,
 the resulting pad_mm per side and the grid bounds.
 """
+import hashlib
 import json
 import math
 import os
@@ -141,6 +142,9 @@ def main():
     tol = float(os.environ.get("TESS_TOL", 0.01))  # 0.01 = the engine STL tolerance
     hf, meta = rasterize(shape, cell=cell, tol=tol, pad=pad,
                          stock_box=stock_box, tool_r=tool_r, margin=margin)
+    # task HC: the sidecar pins WHICH STEP this field came from, so a
+    # reused run dir can never pass off a stale heightfield
+    meta["step_sha256"] = hashlib.sha256(open(step, "rb").read()).hexdigest()
     outdir = os.path.dirname(os.path.abspath(out))
     if outdir:
         os.makedirs(outdir, exist_ok=True)

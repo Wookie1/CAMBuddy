@@ -9,6 +9,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import threading
 
 # Engagement warning factors (report-only warnings, never gates):
@@ -97,6 +98,13 @@ class EngineRun:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 proc.terminate()
+
+    def _freshness(self):
+        """engine.freshness (task HC): guards against stale build outputs."""
+        if self.cfg["repo_root"] not in sys.path:
+            sys.path.insert(0, self.cfg["repo_root"])
+        from engine import freshness
+        return freshness
 
     def _spawn(self, argv, stage_lo, stage_hi, on_progress, json_out=None,
                extra_env=None):
@@ -203,7 +211,12 @@ class EngineRun:
         if on_progress:
             on_progress(0.86, "checking")
         fc = os.path.join(os.path.dirname(py), "freecadcmd")
+        # task HC: remove any stale heightfield from a reused run dir
+        # before rebuilding, then require the fresh .npy + sidecar to match
+        fr = self._freshness()
+        step_sha = fr.sha256_file(prep["step"])
         hf_zmap = os.path.join(self.work, "part_hf_zmap.npy")
+        fr.remove_stale(hf_zmap)
         self._spawn([fc, os.path.join(self.cfg["repo_root"], "verify",
                                        "heightfield.py")],
                     0.86, 0.90, on_progress,
@@ -212,6 +225,11 @@ class EngineRun:
                               "STOCK_BOX": " ".join("%.4f" % v
                                                     for v in stock[:4]),
                               "TOOL_R": "%.4f" % (values["tool_diameter"] / 2.0)})
+        try:
+            fr.require_fresh(hf_zmap, step_sha256=step_sha, cell=cell,
+                             tess_tol=0.01)
+        except OSError as e:
+            raise EngineError(str(e))
         check_path = os.path.join(self.work, "check.json")
         png_path = os.path.join(self.work, "preview.png")
         self._spawn([py, "-m", "verify.zmap", nc,
@@ -326,7 +344,13 @@ class EngineRun:
         #    The shared builder covers STOCK_BOX + TOOL_R + MARGIN: zmap
         #    exits non-zero when the stock box or a tool footprint extends
         #    beyond its grid.
+        # task HC: remove any stale artifacts from a reused run dir before
+        # rebuilding; after each build require the fresh files to exist and
+        # the sidecar to pin this run's STEP, cell and tess tolerance
+        fr = self._freshness()
+        step_sha = fr.sha256_file(prep["step"])
         hf01 = os.path.join(self.work, "part_hf01.npy")
+        fr.remove_stale(hf01)
         self._spawn([fc, os.path.join(repo, "verify", "heightfield.py")],
                     0.12, 0.17, on_progress,
                     extra_env={"STEP_IN": prep["step"], "HF_OUT": hf01,
@@ -334,6 +358,11 @@ class EngineRun:
                               "STOCK_BOX": " ".join("%.4f" % v
                                                     for v in stock[:4]),
                               "TOOL_R": "%.4f" % max_tool_r})
+        try:
+            fr.require_fresh(hf01, step_sha256=step_sha, cell=0.1,
+                             tess_tol=0.01)
+        except OSError as e:
+            raise EngineError(str(e))
 
         # 3) adaptive roughing (LNC post, full stock)
         nc = os.path.join(self.work, "rough.nc")
@@ -359,12 +388,18 @@ class EngineRun:
                     "--json-progress", "--stats-json", stats_path],
                    0.17, 0.45, on_progress)
 
-        # 4) tessellate the oriented model (finish input + clcheck probe)
+        # 4) tessellate the oriented model (finish input + clcheck probe);
+        #    stale model.stl removed first, fresh non-empty output asserted
         stl = os.path.join(self.work, "model.stl")
+        fr.remove_stale(stl)
         self._spawn([fc, os.path.join(repo, "engine", "_tessellate.py")],
                     0.45, 0.50, on_progress,
                     extra_env={"STEP_IN": prep["step"], "STL_OUT": stl,
                               "TOL": "0.01"})
+        try:
+            fr.require_stl(stl)
+        except OSError as e:
+            raise EngineError(str(e))
 
         # 5) slope-split finishing (neutral G-code)
         fin_neutral = os.path.join(self.work, "finish_neutral.ngc")

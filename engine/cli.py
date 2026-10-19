@@ -85,14 +85,24 @@ def _run_prepare(a):
              pzmin - a.stock_bottom, pzmax + a.stock_top]
 
     prog(0.4, "rasterising part heightfield")
+    # task HC: never accept a stale part_hf.npy from a reused out dir -
+    # remove it (and its sidecar) first, then require both to exist and
+    # match this run's STEP, cell and tessellation tolerance
+    from engine import freshness
+    freshness.remove_stale(hf_out)
+    hf_tol = 0.01
     env = dict(os.environ, STEP_IN=step_out, HF_OUT=hf_out,
-               CELL=str(a.cell), PAD="0")
+               CELL=str(a.cell), PAD="0", TESS_TOL=str(hf_tol))
     r = subprocess.run([model.freecadcmd(),
                        os.path.join(repo, "verify", "heightfield.py")],
                       env=env, capture_output=True, text=True)
-    if not os.path.exists(hf_out):
-        raise SystemExit("heightfield failed: %s\n%s" % (r.stdout[-1500:],
-                                                         r.stderr[-1500:]))
+    try:
+        freshness.require_fresh(hf_out,
+                                step_sha256=freshness.sha256_file(step_out),
+                                cell=a.cell, tess_tol=hf_tol)
+    except OSError as e:
+        raise SystemExit("%s\n%s\n%s" % (e, r.stdout[-1500:],
+                                          r.stderr[-1500:]))
 
     out = {"step": step_out, "hf": hf_out, "bbox": bbox, "stock": stock,
            "orient": a.orient}
