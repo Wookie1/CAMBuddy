@@ -86,9 +86,7 @@ def _run_prepare(a):
 
     prog(0.4, "rasterising part heightfield")
     env = dict(os.environ, STEP_IN=step_out, HF_OUT=hf_out,
-               CELL=str(a.cell), PAD="0",
-               STOCK_BOX=" ".join("%.4f" % v for v in stock[:4]),
-               TOOL_R="%.4f" % a.tool_r)
+               CELL=str(a.cell), PAD="0")
     r = subprocess.run([model.freecadcmd(),
                        os.path.join(repo, "verify", "heightfield.py")],
                       env=env, capture_output=True, text=True)
