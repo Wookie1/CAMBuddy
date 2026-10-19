@@ -677,7 +677,6 @@ class TestSlopeCatalog:
 
 
 class TestSlopeSplitFinish:
-    @pytest.mark.xfail(strict=True, reason="engine finish verifies 4-decimal coords but the LNC post rounds mm to 3 decimals; at vertical-wall CL jumps the posted point falls below CL (connector clcheck gate correctly fails the run) - fix in engine task PQ")
     def test_e2e_chain_rough_then_finish(self, live):
         mock, home, programs = live
         mock.enqueue_run(801, action=catalog_mod.SLOPE_ACTION,
@@ -789,7 +788,6 @@ class TestWarningsInCheckJson:
             assert math.isfinite(eng["max_mm"]), \
                 "engagement max_mm is not finite"
 
-    @pytest.mark.xfail(strict=True, reason="engine finish verifies 4-decimal coords but the LNC post rounds mm to 3 decimals; at vertical-wall CL jumps the posted point falls below CL (connector clcheck gate correctly fails the run) - fix in engine task PQ")
     def test_slope_check_json_has_warnings(self, live):
         """slope_split_finish: check.json carries warnings for both stages."""
         mock, home, _ = live

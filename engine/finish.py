@@ -101,6 +101,11 @@ DROP_CHUNK = 250_000  # CLPoints per BatchDropCutter call
 BALL_HEIGHT = 50.0
 SHANK_TOL = 0.01      # mm, S4: axial safety margin of the shank rule
 HOLD_CLEAR = 1.0      # mm, S5: min clearance of the holder stack to part/stock
+POST_GRID = 0.001     # mm, PQ: default LNC output grid (inch output: 0.00254)
+GRID_SPIKE = 0.01     # mm, PQ: drop an emitted point whose closest
+                      # output-grid CL still differs from its Z by more than
+                      # this (no one-point spikes)
+GRID_SS = 0.1         # mm, PQ: sample spacing of the post-snap chord net
 HOLDER_SS = 0.5       # mm, S5(HN): max sample spacing along a path for the
                       # holder net (zmap samples its moves at cell/4; the net
                       # checks a window of Rh + HOLDER_SS/2 + grid slack around
@@ -1145,6 +1150,213 @@ def vertex_net(surf, cutter, paths, tol=NET_TOL, threads=None):
     return out, src, n
 
 
+def grid_decimals(grid):
+    """Decimals needed to write multiples of `grid` exactly (never fewer
+    than 4, the neutral file's default). 0.001 -> 4, 0.00254 -> 5."""
+    d = 4
+    while d < 12:
+        v = grid * (10 ** d)
+        if abs(v - round(v)) < 1e-6:
+            return d
+        d += 1
+    return d
+
+
+def grid_snap(surf, cutter, paths, grid=POST_GRID, threads=None):
+    """PQ: snap every emitted CL vertex onto the post's output grid so the
+    post's coordinate rounding is a no-op and cannot land on the low side of
+    a CL jump.
+
+    For every vertex: of the output-grid points bracketing its XY (the 4
+    neighbouring grid nodes), pick the one whose exact drop-cutter CL is
+    closest to the vertex's original Z - normally the open side of the
+    wall, never a jump up the wall. The new Z is that CL rounded UP to the
+    grid (never down), so the posted tip stays at or above CL at its own
+    emitted XY. If even the closest grid CL differs from the original Z by
+    more than GRID_SPIKE the point is DROPPED (no one-point spikes) -
+    unless the vertex's own XY sits at or above its CL within GRID_SPIKE
+    (a steep but continuous CL surface, e.g. the ball-catch cylinder
+    near a wall, can move more than GRID_SPIKE across one grid step; those
+    points are legitimate and only the XY/Z move onto the grid). Every chord
+    of the resulting polylines is then re-checked one-sided against the CL
+    (CL - z <= NET_TOL on samples every GRID_SS mm) and repaired only if the
+    dip exceeds BOTH NET_TOL and the pre-snap dip of the same chord (what
+    upstream already verified); repair = DENSIFY the chord with its own
+    on-grid samples at CL rounded up to the grid. Points are never lowered
+    and no path is split (a densified sub-chord ~GRID_SS long has
+    negligible sag; all-air chords cannot gouge).
+
+    Returns (paths, src, n_dropped, n_splits) with src[i] the index in
+    `paths` that output path i came from (splits keep input order)."""
+    src_in = [i for i, pth in enumerate(paths) if len(pth) >= 2]
+    if not src_in or grid <= 0.0:
+        return [list(paths[i]) for i in src_in], list(range(len(src_in))), 0, 0
+    flat = [p for i in src_in for p in paths[i]]
+    # output-grid nodes bracketing each vertex XY (deduplicated): the 4
+    # neighbouring grid points, fewer when a coordinate sits on the grid
+    keys = {}
+    cand = []
+    cand_idx = []
+    own_idx = []
+    for (x, y, _z) in flat:
+        ix0 = int(math.floor(x / grid + 1e-6))
+        ix1 = int(math.ceil(x / grid - 1e-6))
+        iy0 = int(math.floor(y / grid + 1e-6))
+        iy1 = int(math.ceil(y / grid - 1e-6))
+        idx = []
+        for ix in (ix0, ix1):
+            for iy in (iy0, iy1):
+                key = (ix, iy)
+                ci = keys.get(key)
+                if ci is None:
+                    ci = len(cand)
+                    keys[key] = ci
+                    cand.append((ix * grid, iy * grid))
+                idx.append(ci)
+        cand_idx.append(idx)
+        own_idx.append(len(cand))
+        cand.append((x, y))       # the vertex's own XY (validity reference)
+    cl = batch_drop(surf, cutter, cand, threads=threads)
+    snapped = []
+    n_dropped = 0
+    for k, (x, y, z) in enumerate(flat):
+        best = None              # closest finite CL among the grid corners
+        for ci in cand_idx[k]:
+            c = cl[ci]
+            if not np.isfinite(c):
+                continue
+            d = abs(float(c) - z)
+            if best is None or d < best[0]:
+                best = (d, ci, float(c))
+        c_own = cl[own_idx[k]]
+        # one-sided validity at the vertex's own XY: on a steep but
+        # continuous CL surface (ball-catch cylinder near a wall) the grid
+        # step can move more than GRID_SPIKE; a point at or above its own
+        # CL (within tolerance) is legitimate and only moves onto the grid.
+        own_ok = np.isfinite(c_own) and float(c_own) - z <= GRID_SPIKE
+        if best is None:
+            # air at every grid neighbour: nothing to protect; keep the
+            # point, XY onto the nearest grid node, Z up to the grid
+            snapped.append((int(round(x / grid)) * grid,
+                          int(round(y / grid)) * grid,
+                          math.ceil(z / grid - 1e-9) * grid))
+            continue
+        d, ci, c = best
+        if d > GRID_SPIKE and not own_ok:
+            snapped.append(None)
+            n_dropped += 1
+        else:
+            gx, gy = cand[ci]
+            # never lower the point: Z = grid step up from max(chosen CL, the
+            # vertex's own Z) - a corner CL slightly below the original would
+            # push chord sag past the post's gouge threshold on convex CL
+            snapped.append((gx, gy,
+                           math.ceil(max(c, z) / grid - 1e-9) * grid))
+    # rebuild runs (split at dropped points); keep the original (pre-snap)
+    # polyline in parallel so each snapped chord can be compared against the
+    # chord upstream already verified
+    runs = []          # (src, [snapped points])
+    runs_orig = []     # original points of the same runs
+    for si, i0 in enumerate(src_in):
+        pth = paths[i0]
+        base = sum(len(paths[j]) for j in src_in[:si])
+        seg = []
+        seg_o = []
+        for t, p in enumerate(pth):
+            s = snapped[base + t]
+            if s is None:
+                if len(seg) >= 2:
+                    runs.append((src_in[si], seg))
+                    runs_orig.append(seg_o)
+                seg = []
+                seg_o = []
+            else:
+                seg.append(s)
+                seg_o.append(p)
+        if len(seg) >= 2:
+            runs.append((src_in[si], seg))
+            runs_orig.append(seg_o)
+
+    def _seg_samples(pth, snap_xy=False):
+        ss = []
+        for k in range(len(pth) - 1):
+            L = math.hypot(pth[k + 1][0] - pth[k][0],
+                           pth[k + 1][1] - pth[k][1])
+            m = max(1, int(math.ceil(L / GRID_SS)))
+            s0 = len(xy)
+            if m > 1:
+                t = np.arange(1, m) / float(m)
+                px = pth[k][0] + (pth[k + 1][0] - pth[k][0]) * t
+                py = pth[k][1] + (pth[k + 1][1] - pth[k][1]) * t
+                if snap_xy:      # repair points must sit on the output grid
+                    px = np.round(px / grid) * grid
+                    py = np.round(py / grid) * grid
+                xy.extend(zip(px.tolist(), py.tolist()))
+            ss.append((s0, len(xy)))
+        return ss
+
+    # one-sided net check on every snapped chord (XY snap shifted endpoints),
+    # batched: snapped samples double as repair points (on-grid, CL rounded
+    # up), original-chord samples give the dip upstream already accepted.
+    # A snapped chord is repaired only if its dip exceeds NET_TOL AND the
+    # pre-snap dip - chords upstream verified within tolerance are left
+    # alone (their sag is scallop, and re-splitting them fragments closed
+    # contours into link_plan drags). Repair = densify with the snapped
+    # samples at ceil(CL); split only where no sample has contact.
+    xy = []
+    spans_post = [_seg_samples(seg, snap_xy=True) for (_s, seg) in runs]
+    spans_pre = [_seg_samples(seg_o) for seg_o in runs_orig]
+    zc = batch_drop(surf, cutter, xy, threads=threads) if xy \
+        else np.zeros(0)
+
+    def _dips(ss, seg):
+        out_d = []
+        for k, (s0, s1) in enumerate(ss):
+            worst = -math.inf
+            if s1 > s0:
+                cz = zc[s0:s1]
+                fin = np.isfinite(cz)
+                if fin.any():
+                    t = (np.arange(1, (s1 - s0) + 1)
+                       / ((s1 - s0) + 1.0))[fin]
+                    lz = seg[k][2] + (seg[k + 1][2] - seg[k][2]) * t
+                    worst = float(np.max(cz[fin] - lz))
+            out_d.append(worst)
+        return out_d
+
+    out = []
+    src = []
+    n_repair = 0
+    for (src_i, seg), ss, ss_o, seg_o in zip(runs, spans_post, spans_pre,
+                                             runs_orig):
+        dp = _dips(ss_o, seg_o)
+        pts = [seg[0]]
+        for k, (s0, s1) in enumerate(ss):
+            a, b = seg[k], seg[k + 1]
+            if s1 > s0:
+                cz = zc[s0:s1]
+                fin = np.isfinite(cz)
+                if fin.any():
+                    t = (np.arange(1, (s1 - s0) + 1)
+                       / ((s1 - s0) + 1.0))[fin]
+                    lz = a[2] + (b[2] - a[2]) * t
+                    if float(np.max(cz[fin] - lz)) > max(NET_TOL, dp[k]):
+                        # densify: insert the (on-grid) samples at CL rounded
+                        # up - never below CL at their own XY, and sub-chords
+                        # ~GRID_SS long have negligible sag
+                        n_repair += 1
+                        for (px, py), pz in zip(xy[s0:s1], cz):
+                            if np.isfinite(pz):
+                                pts.append((px, py,
+                                          math.ceil(float(pz) / grid - 1e-9)
+                                          * grid))
+            pts.append(b)
+        if len(pts) >= 2:
+            out.append(pts)
+            src.append(src_i)
+    return out, src, n_dropped, n_repair
+
+
 def shank_net(surf, paths, shank_dia, flute_mm, stock=None, band=0.3,
               threads=None):
     """S4 shank safety on every emitted CL vertex: drop-cutter a cylinder
@@ -1553,7 +1765,7 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
            window=None, progress=None, rapid_margin=RAPID_MARGIN,
            use_rapids=True, rest_from=None, big_tool=("ball", 6.0, 0.0),
            min_rest=0.5, stock_from=None, stock_allow=RAPID_STOCK_ALLOW,
-           flute_mm=None, shank_dia=None, stickout_mm=None, holder=None):
+           flute_mm=None, shank_dia=None, stickout_mm=None, holder=None, post_grid_mm=POST_GRID):
     """Slope-split finishing toolpath (action: slope_split_finish).
     Returns (moves, stats).
 
@@ -1835,6 +2047,16 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
             holder_by_level[k] = holder_by_level.get(k, 0) + v
         holder_wall_mm2 += ar
         n_holder_removed = sum(holder_by_level.values())
+    # PQ: snap every emitted vertex onto the post's output grid (the exact
+    # coordinates that survive the post's rounding), Z = closest-side CL
+    # rounded up; spikes dropped, violating chords split into link pieces
+    steep_paths, _src_gs_steep, n_gs_drop_steep, n_gs_split_steep = \
+        grid_snap(surf, cutter, steep_paths, grid=post_grid_mm,
+                  threads=threads)
+    shallow_paths, src_gs_shallow, n_gs_drop_shallow, n_gs_split_shallow = \
+        grid_snap(surf, cutter, shallow_paths, grid=post_grid_mm,
+                  threads=threads)
+    src_shallow = [src_shallow[j] for j in src_gs_shallow]  # keep row_of aligned
     # row / run index per EMITTED path (vertex_net splits runs, so the
     # pre-net row_of / s_runs indices no longer align with k)
     row_of = [row_of_pre[s] for s in src_shallow]
@@ -1910,6 +2132,9 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                               for z, v in sorted(lvl_stat.items(),
                                                 key=lambda kv: -kv[0])]}
     stats["n_drop_calls"] = drop_calls()
+    stats["post_grid_mm"] = post_grid_mm
+    stats["n_gridsnap_dropped"] = n_gs_drop_steep + n_gs_drop_shallow
+    stats["n_gridsnap_splits"] = n_gs_split_steep + n_gs_split_shallow
     stats["n_simplify_rounds"] = n_rounds_steep + n_rounds_shallow
     stats["n_chords_checked"] = n_chords + n_chords_sh
     if flute_mm is not None and shank_dia is not None:
@@ -1949,9 +2174,16 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
         stats["stock_from"] = str(stock_from)
         stats["stock_allow_mm"] = stock_allow
     prev = None
+    gdec = grid_decimals(post_grid_mm) if post_grid_mm > 0.0 else 4
 
     def emit(g, x, y, z, f=None, stat=None):
         nonlocal prev
+        if post_grid_mm > 0.0:
+            # PQ: emit exactly the output-grid coordinates the post will
+            # round to; Z only ever moves up (never down)
+            x = int(round(x / post_grid_mm)) * post_grid_mm
+            y = int(round(y / post_grid_mm)) * post_grid_mm
+            z = math.ceil(z / post_grid_mm - 1e-9) * post_grid_mm
         if prev is not None and math.dist(prev, (x, y, z)) <= 1e-9:
             return  # skip zero-length moves (down-link with bz == pz)
         if prev is not None:
@@ -1965,8 +2197,8 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                 stats["plunge_len"] += L
             else:
                 stats["cut_len"] += L
-        moves.append({"g": g, "x": round(x, 4), "y": round(y, 4),
-                      "z": round(z, 4), "f": f})
+        moves.append({"g": g, "x": round(x, gdec), "y": round(y, gdec),
+                      "z": round(z, gdec), "f": f})
         prev = (x, y, z)
 
     for k, path in enumerate(ordered):
@@ -2031,8 +2263,14 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     return moves, stats
 
 
-def finish_to_gcode(moves, spindle_rpm=7500, tool_comment=None):
-    """Same neutral move list as engine.gcode.moves_to_gcode, finished label."""
+def finish_to_gcode(moves, spindle_rpm=7500, tool_comment=None,
+                    decimals=4):
+    """Same neutral move list as engine.gcode.moves_to_gcode, finished label.
+
+    ``decimals``: coordinate decimals to write (PQ: engine.cli passes
+    :func:`grid_decimals` of the post grid so the emitted values are exact
+    on the page and the LNC post's rounding is a no-op)."""
+    fmt = "%%.%df" % decimals
     out = ["G21", "G90", "G94", "G17"]
     if tool_comment:
         out.append("(%s)" % tool_comment)
@@ -2041,11 +2279,11 @@ def finish_to_gcode(moves, spindle_rpm=7500, tool_comment=None):
     for mv in moves:
         bits = []
         if mv.get("x") is not None:
-            bits.append("X%.4f" % mv["x"])
+            bits.append("X" + fmt % mv["x"])
         if mv.get("y") is not None:
-            bits.append("Y%.4f" % mv["y"])
+            bits.append("Y" + fmt % mv["y"])
         if mv.get("z") is not None:
-            bits.append("Z%.4f" % mv["z"])
+            bits.append("Z" + fmt % mv["z"])
         if mv["g"] == 0:
             out.append("G0 " + " ".join(bits))
         else:
@@ -2054,7 +2292,7 @@ def finish_to_gcode(moves, spindle_rpm=7500, tool_comment=None):
             out.append("G1 " + " ".join(bits))
     top = max((m["z"] for m in moves if m.get("z") is not None
                and m["g"] == 0), default=5.0)
-    out.append("G0 Z%.4f" % top)
+    out.append("G0 Z" + fmt % top)
     out.append("M5")
     out.append("M30")
     return "\n".join(out) + "\n"

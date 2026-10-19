@@ -341,7 +341,17 @@ def post(moves, *, metric=False, units_in=1.0, program=1001,
     out.append("%")                                  # P1
     out.append("O%d" % program)                   # P2 (integer, no point: N2)
     dia_out = dia_mm * units_in / out_to_mm
-    cr_out = corner_mm * units_in / out_to_mm
+    # CR is the tool's corner radius: D/2 for a ball (the implied geometry),
+    # 0 for a flat end mill, the table corner radius for a bull-nose. The
+    # neutral file's CR word may carry 0 for balls (the CLI spec is kind:dia),
+    # never post that as the ball's corner.
+    if tool_kind == "ball":
+        cr_hdr_mm = dia_mm / 2.0
+    elif tool_kind in ("flat", "endmill"):
+        cr_hdr_mm = 0.0
+    else:
+        cr_hdr_mm = corner_mm
+    cr_out = cr_hdr_mm * units_in / out_to_mm
     zmin_out = min_z_mm * units_in / out_to_mm
     type_str = _TYPE.get(tool_kind, "END MILL")
     out.append("(T%d D=%s CR=%s - ZMIN=%s - %s)"
