@@ -58,9 +58,10 @@ anything.
 
 ## Warnings — reported, never a fail
 
-- **Engagement** — cutting moves where the side bite is more than 1.5x the
-  optimal load (roughing) or 1.5x the stepover (finishing). Review them;
-  they can chatter or load the tool heavily.
+- **Engagement** — cutting moves where the side bite is more than 1.2x the
+  optimal load (roughing, e.g. 2.438 mm for an optimal load of 2.032) or
+  1.5x the stepover (finishing). Review them; they can chatter or load the
+  tool heavily.
 
 - **Plunge** — descending feed moves straight into stock that are not a
   shallow helix/ramp (3 degrees or less). Steep entries are hard on the

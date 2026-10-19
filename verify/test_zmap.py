@@ -911,7 +911,7 @@ G1 X20. Y0. F500.
 
 
 def test_cli_optimal_load_computes_engage_max():
-    """CLI --optimal-load computes engage_max as 1.5x the value."""
+    """CLI --optimal-load computes engage_max as 1.2x the value (roughing)."""
     import tempfile, json, os
     part = block_part(hi=10.0, half=15.0)
     with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as hf:
@@ -937,11 +937,51 @@ G1 X20. Y0. F500.
         with open(out_json.name) as f:
             report = json.load(f)
         eng = report["engagement"]
-        # threshold should be 1.5 * 2.0 = 3.0
+        # threshold should be 1.2 * 2.0 = 2.4 (roughing: warn above 1.2x)
         assert eng is not None, "engagement should not be None"
-        assert eng["threshold_mm"] == 3.0,             "threshold %.3f != 3.0 (1.5 * 2.0)" % eng["threshold_mm"]
-        # The full-width cut should be flagged (engagement ~6 > 3)
-        assert eng["count"] >= 1, "full-width cut not flagged at threshold 3.0"
+        assert eng["threshold_mm"] == 2.4,             "threshold %.3f != 2.4 (1.2 * 2.0)" % eng["threshold_mm"]
+        # The full-width cut should be flagged (engagement ~6 > 2.4)
+        assert eng["count"] >= 1, "full-width cut not flagged at threshold 2.4"
+    finally:
+        for p in (hf.name, sidecar, gcode.name, out_json.name):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+def test_cli_optimal_load_2p032_threshold_2p4384():
+    """Z6: roughing --optimal-load 2.032 derives threshold_mm 2.4384
+    (1.2 x optimal load; was 1.5x = 3.048)."""
+    import tempfile, json, os
+    part = block_part(hi=10.0, half=15.0)
+    with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as hf:
+        np.save(hf, part)
+    sidecar = hf.name.replace(".npy", ".json")
+    with open(sidecar, "w") as f:
+        json.dump({"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}, f)
+    gcode = tempfile.NamedTemporaryFile(suffix=".ngc", delete=False, mode="w")
+    gcode.write("""
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""")
+    gcode.close()
+    out_json = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    out_json.close()
+    try:
+        stock_args = ["--stock"] + [str(v) for v in STOCK]
+        rc = zmap.main([gcode.name, "--part", hf.name] + stock_args
+                       + ["--optimal-load", "2.032",
+                          "--out-json", out_json.name])
+        assert rc == 0
+        with open(out_json.name) as f:
+            report = json.load(f)
+        eng = report["engagement"]
+        assert eng is not None
+        assert abs(eng["threshold_mm"] - 2.4384) < 1e-9, \
+            "threshold %r != 2.4384 (1.2 * 2.032)" % eng["threshold_mm"]
+        assert abs(report["warnings"]["engagement"]["threshold_mm"]
+                   - 2.4384) < 1e-9
     finally:
         for p in (hf.name, sidecar, gcode.name, out_json.name):
             if os.path.exists(p):
@@ -976,12 +1016,12 @@ G1 X20. Y0. F500.
         with open(out_json.name) as f:
             report = json.load(f)
         eng = report["engagement"]
-        assert eng["threshold_mm"] == 3.0,             "threshold %.3f != 3.0" % eng["threshold_mm"]
+        assert eng["threshold_mm"] == 2.4,             "threshold %.3f != 2.4 (1.2 * 2.0)" % eng["threshold_mm"]
         plunge = report["plunge"]
         assert plunge["ramp_angle_deg"] == 5.0,             "ramp_angle %.1f != 5.0" % plunge["ramp_angle_deg"]
         # Both appear in warnings
         w = report["warnings"]
-        assert w["engagement"]["threshold_mm"] == 3.0
+        assert w["engagement"]["threshold_mm"] == 2.4
         assert w["plunge"]["ramp_angle_deg"] == 5.0
     finally:
         for p in (hf.name, sidecar, gcode.name, out_json.name):
