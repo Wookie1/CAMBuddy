@@ -151,22 +151,28 @@ def finish_main(a):
         shank_dia=getattr(a, "shank", None),
         stickout_mm=getattr(a, "stickout", None),
         holder=getattr(a, "holder", None),
+        post_grid_mm=a.post_grid_mm,
         **rest_kw)
+    # PQ: header corner radius = D/2 for a ball, the table corner radius for
+    # a bull, 0 for a flat (the CLI spec carries only kind:dia for balls)
+    cr_hdr = dia / 2.0 if kind == "ball" else (0.0 if kind == "flat"
+                                               else corner)
     if rest_kw:
         if finishmod.tool_geometry(kind, dia) is None:
             # S4: placeholder marker stays only for tools not in the table
             tool_comment = ("PLACEHOLDER %s D=%.3f CR=%.3f (not in "
                             "tools/x7_tools.json - LNC post must refuse)"
-                            % (a.rest_tool, dia, corner))
+                            % (a.rest_tool, dia, cr_hdr))
             stats["tool"] = "PLACEHOLDER %s" % a.rest_tool
         else:
             tool_comment = ("REST %s D=%.3f CR=%.3f (tools/x7_tools.json)"
-                           % (a.rest_tool, dia, corner))
+                           % (a.rest_tool, dia, cr_hdr))
             stats["tool"] = a.rest_tool
     else:
-        tool_comment = "T1 %s D=%.3f CR=%.3f" % (kind, dia, corner)
+        tool_comment = "T1 %s D=%.3f CR=%.3f" % (kind, dia, cr_hdr)
     text = finishmod.finish_to_gcode(
-        moves, spindle_rpm=a.spindle, tool_comment=tool_comment)
+        moves, spindle_rpm=a.spindle, tool_comment=tool_comment,
+        decimals=finishmod.grid_decimals(a.post_grid_mm))
     with open(a.out, "w") as fh:
         fh.write(text)
     stats["out"] = a.out
@@ -392,6 +398,11 @@ def main(argv=None):
                    help="holder name in the tools/x7_tools.json \"holders\" "
                         "map (S5 holder safety); default: read from the tool "
                         "entry; needs a stick-out (table or --stickout)")
+    f.add_argument("--post-grid-mm", dest="post_grid_mm", type=float,
+                   default=0.001,
+                   help="PQ: output grid mm the emitted points are snapped to "
+                        "(0.001 for a metric post, 0.00254 for inch output; "
+                        "the caller passes the grid matching its post units)")
 
     a = p.parse_args(argv)
 

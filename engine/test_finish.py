@@ -387,8 +387,9 @@ def run_case(name, stl_path, hf_fn, box, floor_z, assert_shallow_lt=None,
     # every call re-indexes the whole STL (setSTL). Fixed overhead: raster
     # row batches, window probe, CL grid, refine rounds (<=6) + jump check,
     # segment net, curve-sample extras, links, S4 shank nets (steep+shallow:
-    # +2).
-    assert stats["n_drop_calls"] <= 28 + 2 * stats["n_simplify_rounds"] \
+    # +2), PQ grid_snap (candidate CL + snapped-chord net, steep+shallow:
+    # +4).
+    assert stats["n_drop_calls"] <= 32 + 2 * stats["n_simplify_rounds"] \
         + extra_calls, \
         "%s: %d drop-cutter calls vs rounds=%d (expected O(rounds))" % (
             name, stats["n_drop_calls"], stats["n_simplify_rounds"])
@@ -505,6 +506,73 @@ def test_cylinder_boss_wall():
                          (-15.0, 15.0, -15.0, 15.0), floor_z=0.0)
         assert stats["n_steep_runs"] >= len(zs), \
             "cyl-boss steep runs %d < %d" % (stats["n_steep_runs"], len(zs))
+
+
+def test_cl_jump_between_grid_points_posts_zero_below_cl():
+    """PQ item 4: vertical-wall part whose CL jump circle sits BETWEEN
+    output-grid points (R = 5.0005 -> jump at rho = R + r = 8.0005 mm for
+    the 6 mm ball). The engine snaps every emitted point onto the post grid
+    (metric post: 0.001 mm) with Z rounded UP to the closest-side CL, so
+    the posted 3-decimal program keeps every point at or above CL:
+    engine/probe_clcheck.py must report 0 points below CL, and the post's
+    rounding is a no-op on the neutral (snapped) coordinates."""
+    import re
+    import subprocess
+    from engine.finish import grid_decimals
+    R, H = 5.0005, 12.0
+    r = 0.5 * BALL_DIA
+    assert abs((R + r) / 0.001 - round((R + r) / 0.001)) > 0.2, \
+        "jump line must fall between 0.001 mm grid points"
+    with tempfile.TemporaryDirectory() as td:
+        stl = cylinder_boss_stl(os.path.join(td, "wall.stl"), q=15.0,
+                                R=R, H=H)
+        surf = model.load_surf(stl)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", BALL_DIA, 0.0),
+                             floor_z=0.0, threads=4)
+        assert stats["n_steep_pts"] > 0 and moves
+        # every emitted coordinate is exactly on the output grid
+        for mv in moves:
+            for a in ("x", "y", "z"):
+                v = mv.get(a)
+                if v is not None:
+                    assert abs(v / 0.001 - round(v / 0.001)) < 1e-6, \
+                        "off-grid %s=%r" % (a, v)
+        neutral = os.path.join(td, "finish_neutral.ngc")
+        with open(neutral, "w") as fh:
+            fh.write(finish_to_gcode(moves, decimals=grid_decimals(0.001)))
+        posted = os.path.join(td, "finish.nc")
+        with open(posted, "w", newline="") as fh:
+            fh.write(post_lnc.post_text(open(neutral).read(), metric=True,
+                                       program=1001, tool_number=20,
+                                       crlf=False))
+        # post rounding is a no-op: every posted coordinate equals a
+        # neutral (grid-snapped) coordinate
+        want = set()
+        for mv in moves:
+            for a in ("x", "y", "z"):
+                if mv.get(a) is not None:
+                    want.add(round(mv[a], 3))
+        got = [float(m.group(2))
+               for l in open(posted).read().splitlines()
+               if not l.startswith("(") and "G53" not in l and "G28" not in l
+               for m in re.finditer(r"\b([XYZ])(-?[0-9]*\.?[0-9]+)", l)]
+        assert got, "no coordinates in posted program"
+        assert all(v in want for v in got), \
+            "post rounding changed a coordinate: %s" % (
+                sorted(set(v for v in got if v not in want))[:5],)
+        # the judge: probe_clcheck on the posted program (0 below CL)
+        py = sys.executable
+        r_ = subprocess.run([py, os.path.join(ROOT, "engine",
+                                             "probe_clcheck.py"),
+                             posted, stl, "%.4f" % BALL_DIA],
+                            capture_output=True, text=True)
+        assert r_.returncode == 0, r_.stderr[-500:]
+        rep = json.loads(r_.stdout.strip().splitlines()[-1])
+        print("grid-jump post: points=%d below_cl=%d max=%.4f"
+              % (rep["points"], rep["below_cl"], rep["max_depth_mm"]))
+        assert rep["points"] > 0 and rep["below_cl"] == 0, \
+            "posted program has %d points below CL (max %.3f mm)" % (
+                rep["below_cl"], rep.get("max_depth_mm", 0.0))
 
 
 def test_plate_at_floor():
@@ -1319,6 +1387,7 @@ if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
                test_cylinder_boss_wall, test_no_duplicate_raster_rows,
+               test_cl_jump_between_grid_points_posts_zero_below_cl,
                test_contour_vs_analytic_hemisphere,
                test_contour_vs_analytic_cone,
                test_gap_split_and_verified_link,

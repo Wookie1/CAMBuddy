@@ -62,8 +62,9 @@ def _tool_number(cfg, values):
         from engine import post_lnc
         e = post_lnc.lookup_tool(values["tool_type"], values["tool_diameter"],
                                  values["corner_radius"],
-                                 os.path.join(cfg["repo_root"], "tools",
-                                            "x7_tools.json"))
+                                 post_lnc.load_tool_table(
+                                     os.path.join(cfg["repo_root"], "tools",
+                                                "x7_tools.json")))
         if e:
             return int(e["number"])
     except Exception:
@@ -251,8 +252,9 @@ class EngineRun:
             from engine import post_lnc
             e = post_lnc.lookup_tool("ball", values["tool_diameter"],
                                      values["tool_diameter"] / 2.0,
-                                     os.path.join(self.cfg["repo_root"],
-                                                 "tools", "x7_tools.json"))
+                                     post_lnc.load_tool_table(
+                                         os.path.join(self.cfg["repo_root"],
+                                                    "tools", "x7_tools.json")))
             if e:
                 return int(e["number"])
         except Exception:
@@ -332,7 +334,9 @@ class EngineRun:
                     extra_env={"STEP_IN": prep["step"], "STL_OUT": stl,
                               "TOL": "0.01"})
 
-        # 5) slope-split finishing (neutral G-code)
+        # 5) slope-split finishing (neutral G-code). PQ: the engine snaps the
+        #    emitted points to the output grid matching this op's post units
+        #    (step 6 posts metric -> 0.001 mm; an inch post would be 0.00254)
         fin_neutral = os.path.join(self.work, "finish_neutral.ngc")
         fin_stats = os.path.join(self.work, "finish_stats.json")
         self._spawn([py, "-m", "engine.cli", "finish",
@@ -346,6 +350,7 @@ class EngineRun:
                     "--cut-feed", "%.1f" % values["feed"],
                     "--ramp-feed", "%.1f" % values["ramp_feed"],
                     "--spindle", str(int(values["rpm"])),
+                    "--post-grid-mm", "0.001",
                     "--stats-json", fin_stats], 0.50, 0.72, on_progress)
 
         # 6) post to LNC (metric: the posted artifact is what clcheck

@@ -352,6 +352,90 @@ def test_zmap_matches_neutral():
           "cutting length within 1e-3 relative)")
 
 
+def test_header_cr_per_tool_type():
+    """PQ: header CR is D/2 for a ball, the table corner radius for a bull,
+    0 for a flat - never CR=0. on a ball because the neutral file left the
+    corner unspecified."""
+    moves = [{"g": 0, "x": 0.0, "y": 0.0, "z": 5.0},
+             {"g": 1, "x": 5.0, "y": 0.0, "z": 5.0, "f": 1000.0}]
+    # ball with CR=0 in the input (the engine CLI spec carries kind:dia only)
+    ball = _lines(post_lnc.post(moves, tool_kind="ball", dia_mm=9.525,
+                               corner_mm=0.0, tool_number=20, crlf=False))
+    hdr = next(l for l in ball if l.startswith("(T20 "))
+    assert "D=0.375" in hdr, hdr          # inch: 3/8 in
+    assert "CR=0.1875" in hdr, \
+        "ball header CR must be D/2, got %r" % hdr
+    # bull: the table corner radius
+    bull = _lines(post_lnc.post(moves, tool_kind="bull", dia_mm=12.7,
+                               corner_mm=0.127, tool_number=3, crlf=False))
+    assert "CR=0.005" in next(l for l in bull if l.startswith("(T3 ")), bull[2]
+    # flat: corner 0 even if a bogus corner was passed
+    flat = _lines(post_lnc.post(moves, tool_kind="flat", dia_mm=6.0,
+                               corner_mm=0.3, tool_number=2, crlf=False))
+    assert "CR=0." in next(l for l in flat if l.startswith("(T2 ")), flat[2]
+    # through post_text: the neutral header's CR=0.000 ball still posts CR=D/2
+    neutral = ("G21\nG90\n(T1 ball D=9.525 CR=0.000)\nS7500 M3\n"
+               "G0 X0.0000 Y0.0000 Z5.0000\n"
+               "G1 X5.0000 Y0.0000 Z5.0000 F1000\n")
+    txt = _lines(post_lnc.post_text(neutral, tool_number=20, crlf=False))
+    assert "CR=0.1875" in next(l for l in txt if l.startswith("(T20 ")), txt[2]
+    print("PASS header CR: ball D/2, bull table corner, flat 0")
+
+
+def test_post_rounding_noop_on_grid_snapped():
+    """PQ: coordinates already on the post's output grid (metric 0.001 mm,
+    inch 0.00254 mm) must survive posting unchanged - post(neutral) coords
+    == neutral coords."""
+    def _coords(text):
+        out = []
+        for l in _lines(text):
+            if l.startswith("(") or not l:
+                continue
+            if "G53" in l or "G28" in l:
+                continue          # machine home lines are not path coordinates
+            for m in re.finditer(r"\b([XYZ])(-?[0-9]*\.?[0-9]+)", l):
+                out.append(float(m.group(2)))
+        return out
+
+    # metric: multiples of 0.001 written at the neutral file's 4 decimals
+    mm_pts = [(-30.492, 34.738, 4.051), (-30.492, 34.738, 1.000),
+              (-25.123, 30.001, 1.000), (-25.123, 30.001, 4.051)]
+    lines = ["G21", "G90", "(T1 bull D=12.700 CR=0.127)",
+             "(ENGINE FINISH SLOPE-SPLIT)", "S7500 M3"]
+    lines.append("G0 X%.4f Y%.4f Z%.4f" % mm_pts[0])
+    for p in mm_pts[1:]:
+        lines.append("G1 X%.4f Y%.4f Z%.4f F3429" % p)
+    neutral = "\n".join(lines) + "\n"
+    want = set()
+    for p in mm_pts:
+        want.update(round(v, 3) for v in p)
+    posted = post_lnc.post_text(neutral, metric=True, program=1001,
+                               tool_number=3, crlf=False)
+    got = _coords(posted)
+    assert got and all(v in want for v in got), \
+        "mm rounding changed a coordinate: %s" % sorted(
+            set(v for v in got if v not in want))[:5]
+
+    # inch: multiples of 0.00254 mm written with 5 decimals (grid_decimals)
+    in_mm = [(30.48254, 34.73196, 4.05384), (25.11428, 30.00246, 1.00064)]
+    want_in = set()
+    for p in in_mm:
+        want_in.update(round(v / 25.4, 4) for v in p)
+    lines = ["G21", "G90", "(T1 bull D=12.700 CR=0.127)",
+             "(ENGINE FINISH SLOPE-SPLIT)", "S7500 M3"]
+    lines.append("G0 X%.5f Y%.5f Z%.5f" % in_mm[0])
+    for p in in_mm[1:]:
+        lines.append("G1 X%.5f Y%.5f Z%.5f F3429" % p)
+    neutral = "\n".join(lines) + "\n"
+    posted = post_lnc.post_text(neutral, program=1001, tool_number=3,
+                                crlf=False)
+    got = _coords(posted)
+    assert got and all(v in want_in for v in got), \
+        "inch rounding changed a coordinate: %s" % sorted(
+            set(v for v in got if v not in want_in))[:5]
+    print("PASS post rounding no-op on the output grid (mm + inch)")
+
+
 def _main():
     fails = 0
     for fn in (test_spec_header_and_footer_order,
@@ -361,6 +445,8 @@ def _main():
                test_spec_modal_suppression,
                test_spec_crlf,
                test_number_format_edge_cases,
+               test_header_cr_per_tool_type,
+               test_post_rounding_noop_on_grid_snapped,
                test_tool_table_lookup,
                test_tool_number_override,
                test_unknown_tool_refused,
