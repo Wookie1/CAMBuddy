@@ -15,6 +15,23 @@
 <main>
   <section id="doc-line">No open document.</section>
 
+  <p>Roughing: constant-engagement roughing with a flat or bull end mill,
+    level by level, leaving stock for finishing. Nothing goes to the
+    machine - always graphics-check and dry-run above the part on the X7
+    first. Slope-split finishing (run from STEVE, after roughing): ball-end
+    passes split by slope - contour-style on steep walls, raster-style on
+    flatter areas, overlapping where they meet.</p>
+
+  <p>Check a posted program: judges your posted G-code against the open
+    part and stock box with the independent zmap, using your tool table -
+    the program's T word picks the tool and the run checks gouges, rapid
+    collisions, shank/over-flute rub, holder clearance and the tool
+    footprint, plus an engagement report. Anything outside the supported
+    subset (XY moves and arcs only, one tool) fails with the code and line.
+    It does NOT check fixtures/vise, machine travel, multi-tool programs,
+    cutter comp, canned cycles, other planes or feeds/speeds suitability -
+    the dry run above the part on the X7 is still yours to do.</p>
+
   <form id="rough-form" autocomplete="off">
     <div class="grid">
       <label>Orientation
@@ -75,6 +92,26 @@
     <div id="run-message"></div>
     <pre id="run-summary" class="hidden"></pre>
     <img id="run-preview" class="hidden" alt="leftover preview">
+  </section>
+
+  <section id="gate-help">
+    <strong>What the run checks mean</strong>
+    <ul>
+      <li>gouges - the tool cuts into the part where the model says it
+        should not. Check orientation, tool size, stepdown; rerun.</li>
+      <li>rapid collisions - a G0 move hits stock or the part. Check floor Z
+        and stock sizes; rerun.</li>
+      <li>shank / over-flute - a wall deeper than the flutes makes the
+        shank rub. Use a longer-flute or reduced-neck tool.</li>
+      <li>holder - the collet nut or holder cannot keep 1.0 mm clearance; a
+        tool with no known holder outline is never run. More stick-out or a
+        different holder.</li>
+      <li>clcheck - exact check of the posted finish program (finishing
+        only): no point below the tool path by more than 0.005 mm.</li>
+      <li>engagement / plunge - warnings only: engagement fires above 1.2x
+        the optimal load (roughing, e.g. 2.438 mm for 2.032) and 1.5x the
+        stepover (finishing); plus steep entries into stock.</li>
+    </ul>
   </section>
 
   <section id="events"></section>

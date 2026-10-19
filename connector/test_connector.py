@@ -778,6 +778,11 @@ class TestWarningsInCheckJson:
         # numeric fields are finite)
         eng = w["engagement"]
         assert "max_mm" in eng
+        # Z6: the roughing threshold is explicitly 1.2 x optimal load
+        assert eng["threshold_mm"] == pytest.approx(
+            1.2 * GOOD_INPUTS["optimal_load"]), \
+            "rough check.json threshold %r != 1.2 x optimal load" \
+            % eng["threshold_mm"]
         if eng["max_mm"] is not None:
             import math
             assert math.isfinite(eng["max_mm"]), \
@@ -811,6 +816,267 @@ class TestWarningsInCheckJson:
             "warnings.plunge.rough missing"
         assert "finish" in w["plunge"], \
             "warnings.plunge.finish missing"
+        # Z6: rough threshold 1.2 x rough optimal load, finish 1.5 x stepover
+        assert w["engagement"]["rough"]["threshold_mm"] == pytest.approx(
+            1.2 * SLOPE_GOOD_INPUTS["rough_optimal_load"])
+        assert w["engagement"]["finish"]["threshold_mm"] == pytest.approx(
+            1.5 * SLOPE_GOOD_INPUTS["stepover"])
+
+
+class TestEngageThresholdArgs:
+    """Z6 (unit, no engine): every roughing zmap call carries an explicit
+    --engage-max of 1.2 x rough optimal load (ROUGH_ENGAGE_FACTOR); the
+    finishing call keeps 1.5 x stepover (FINISH_ENGAGE_FACTOR); the combined
+    check.json carries both thresholds."""
+
+    def test_module_constants(self):
+        import runner as runner_mod
+        assert runner_mod.ROUGH_ENGAGE_FACTOR == 1.2
+        assert runner_mod.FINISH_ENGAGE_FACTOR == 1.5
+
+    def test_slope_zmap_calls_and_check_json_thresholds(self, tmp_path,
+                                                          monkeypatch):
+        import numpy as np
+        import runner as runner_mod
+
+        calls = []
+
+        def fake_spawn(self, argv, lo, hi, on_progress, json_out=None,
+                       extra_env=None):
+            a = list(argv)
+            calls.append(a)
+
+            def opt(flag):
+                return a[a.index(flag) + 1] if flag in a else None
+
+            if "verify.zmap" in a:
+                engage, optimal = opt("--engage-max"), opt("--optimal-load")
+                thr = float(engage) if engage is not None else (
+                    1.2 * float(optimal) if optimal is not None else None)
+                so = opt("--stock-out")
+                if so:
+                    np.save(so, np.full((8, 8), -1.0))
+                report = {
+                    "gouges": {"count": 0, "max_depth": 0.0,
+                              "worst_xy": None},
+                    "rapid_collisions": {"count": 0, "first_line": None},
+                    "outside_grid": {"count": 0, "first_line": None},
+                    "over_flute": {"count": 0, "max_depth": 0.0,
+                                   "worst_xy": None, "first_line": None},
+                    "holder": {"status": "checked", "name": "BT30-ER20-60",
+                              "stickout_mm": 60.0,
+                              "dimension_source": "drawing"},
+                    "holder_hits": {"count": 0, "max_intrusion": 0.0,
+                                    "worst_xy": None, "first_line": None},
+                    "leftover": {"max": 0.0, "mean": 0.0, "p95": 0.0},
+                    "within_0p5mm_fraction": 1.0,
+                    "cycle_time_s": 1.0,
+                    "cutting_length_mm": 100.0,
+                    "rapid_length_mm": 10.0,
+                    "engagement": {"threshold_mm": thr, "count": 0,
+                                   "max_mm": 0.0, "spikes": []},
+                    "plunge": {"ramp_angle_deg": 3.0, "count": 0,
+                               "flags": []},
+                }
+                with open(opt("--out-json"), "w") as fh:
+                    json.dump(report, fh)
+            elif any(tok.endswith("heightfield.py") for tok in a):
+                np.save(extra_env["HF_OUT"], np.full((8, 8), 0.4))
+                # well-behaved build under task HC: sidecar pins the STEP,
+                # cell and tess tolerance of THIS build
+                with open(os.path.splitext(extra_env["HF_OUT"])[0] + ".json",
+                          "w") as fh:
+                    json.dump({
+                        "step_sha256": hashlib.sha256(
+                            open(extra_env["STEP_IN"], "rb").read()
+                        ).hexdigest(),
+                        "cell": float(extra_env["CELL"]),
+                        "tess_tol": float(extra_env.get("TESS_TOL", 0.01)),
+                    }, fh)
+            elif any(tok.endswith("_tessellate.py") for tok in a):
+                with open(extra_env["STL_OUT"], "wb") as fh:
+                    fh.write(b"solid fake\nendsolid fake\n")
+            elif any(tok.endswith("probe_clcheck.py") for tok in a):
+                if json_out is not None:
+                    json_out.append({"below_cl": 0, "points": 42,
+                                     "max_depth_mm": 0.0})
+            elif "engine.cli" in a:
+                sub = a[a.index("engine.cli") + 1]
+                if sub == "prepare":
+                    with open(os.path.join(self.work, "o.step"), "w") as fh:
+                        fh.write("ISO-10303-21; fake oriented step\nEND;")
+                    with open(os.path.join(self.work, "prepare.json"),
+                             "w") as fh:
+                        json.dump({"step": os.path.join(self.work, "o.step"),
+                                   "hf": os.path.join(self.work, "hf.npz"),
+                                   "stock": [-10.0, 10.0, -10.0, 10.0,
+                                           -1.0, 0.4]}, fh)
+                else:
+                    out = opt("--out")
+                    if out:
+                        with open(out, "w") as fh:
+                            fh.write("G21 G90\nG0 X0. Y0. Z5.\n")
+                    sj = opt("--stats-json")
+                    if sj:
+                        with open(sj, "w") as fh:
+                            json.dump({"levels": [{"skipped": False}],
+                                       "n_moves": 10}, fh)
+            return None
+
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", fake_spawn)
+        cfg = {"engine_python": PY, "repo_root": REPO}
+        run = runner_mod.EngineRun(cfg, str(tmp_path))
+        values = dict(SLOPE_GOOD_INPUTS)
+        run.run_slope_split_finish(os.path.join(HERE, "unused.step"),
+                                    values)
+
+        zmap_calls = [a for a in calls if "verify.zmap" in a]
+        assert len(zmap_calls) == 2, "expected 2 zmap calls: %r" % (
+            zmap_calls,)
+        rough_call, finish_call = zmap_calls  # rough runs first
+        assert "--engage-max" in rough_call
+        assert float(rough_call[rough_call.index("--engage-max") + 1]) \
+            == pytest.approx(1.2 * values["rough_optimal_load"]), \
+            "rough zmap threshold is not 1.2 x rough optimal load"
+        assert "--engage-max" in finish_call
+        assert float(finish_call[finish_call.index("--engage-max") + 1]) \
+            == pytest.approx(1.5 * values["stepover"]), \
+            "finish zmap threshold is not 1.5 x stepover"
+
+        with open(os.path.join(str(tmp_path), "check.json")) as fh:
+            check = json.load(fh)
+        w = check["warnings"]["engagement"]
+        assert w["rough"]["threshold_mm"] == pytest.approx(
+            1.2 * values["rough_optimal_load"]), \
+            "check.json rough threshold is not 1.2x"
+        assert w["finish"]["threshold_mm"] == pytest.approx(
+            1.5 * values["stepover"]), \
+            "check.json finish threshold is not 1.5x"
+
+
+class TestStaleArtifactsRejected:
+    """HC (unit, no FreeCAD): a reused run dir can never accept a stale
+    heightfield or STL. The runner removes the .npy + sidecar (and STL)
+    before each build, then requires both to exist and the sidecar to carry
+    step_sha256 / tess_tol / cell matching what was requested."""
+
+    @staticmethod
+    def _fake_spawn(hf_writes=True, hf_sidecar="ok", stl_writes=True):
+        """A fake EngineRun._spawn for the slope-split chain.
+
+        hf_sidecar: "ok" pins this build's STEP, "wrong" plants a bogus
+        step_sha256. hf_writes/stl_writes=False simulate a build that
+        fails silently (rc 0, no output)."""
+        import hashlib
+
+        import numpy as np
+
+        def fake_spawn(self, argv, lo, hi, on_progress, json_out=None,
+                       extra_env=None):
+            a = list(argv)
+
+            def opt(flag):
+                return a[a.index(flag) + 1] if flag in a else None
+
+            if any(tok.endswith("heightfield.py") for tok in a):
+                if hf_writes:
+                    np.save(extra_env["HF_OUT"], np.full((8, 8), 0.4))
+                    sha = ("deadbeef" * 8 if hf_sidecar == "wrong"
+                          else hashlib.sha256(
+                              open(extra_env["STEP_IN"], "rb").read()
+                          ).hexdigest())
+                    with open(os.path.splitext(extra_env["HF_OUT"])[0]
+                              + ".json", "w") as fh:
+                        json.dump({"step_sha256": sha,
+                                   "cell": float(extra_env["CELL"]),
+                                   "tess_tol": float(
+                                       extra_env.get("TESS_TOL", 0.01))}, fh)
+            elif any(tok.endswith("_tessellate.py") for tok in a):
+                if stl_writes:
+                    with open(extra_env["STL_OUT"], "wb") as fh:
+                        fh.write(b"solid fake\nendsolid fake\n")
+            elif "engine.cli" in a:
+                sub = a[a.index("engine.cli") + 1]
+                if sub == "prepare":
+                    with open(os.path.join(self.work, "o.step"), "w") as fh:
+                        fh.write("ISO-10303-21; fake oriented step\nEND;")
+                    with open(os.path.join(self.work, "prepare.json"),
+                             "w") as fh:
+                        json.dump({"step": os.path.join(self.work, "o.step"),
+                                   "hf": os.path.join(self.work, "hf.npz"),
+                                   "stock": [-10.0, 10.0, -10.0, 10.0,
+                                           -1.0, 0.4]}, fh)
+                else:
+                    out = opt("--out")
+                    if out:
+                        with open(out, "w") as fh:
+                            fh.write("G21 G90\nG0 X0. Y0. Z5.\n")
+                    sj = opt("--stats-json")
+                    if sj:
+                        with open(sj, "w") as fh:
+                            json.dump({"levels": [{"skipped": False}],
+                                       "n_moves": 10}, fh)
+            return None
+
+        return fake_spawn
+
+    def _run_expect_fail(self, tmp_path, monkeypatch, fake_spawn):
+        import runner as runner_mod
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", fake_spawn)
+        cfg = {"engine_python": PY, "repo_root": REPO}
+        run = runner_mod.EngineRun(cfg, str(tmp_path))
+        with pytest.raises(runner_mod.EngineError):
+            run.run_slope_split_finish(os.path.join(HERE, "unused.step"),
+                                        dict(SLOPE_GOOD_INPUTS))
+        return run
+
+    def test_stale_hf01_wrong_step_sha_rejected(self, tmp_path,
+                                                  monkeypatch):
+        """A planted part_hf01.json whose step_sha256 is not this run's
+        STEP fails the run even when the .npy rebuild 'succeeds'."""
+        import numpy as np
+        # plant stale outputs (a redelivered run id reuses this dir)
+        np.save(str(tmp_path / "part_hf01.npy"), np.full((8, 8), 9.9))
+        with open(str(tmp_path / "part_hf01.json"), "w") as fh:
+            json.dump({"step_sha256": "0" * 64, "cell": 0.1,
+                      "tess_tol": 0.01}, fh)
+        self._run_expect_fail(
+            tmp_path, monkeypatch, self._fake_spawn(hf_sidecar="wrong"))
+
+    def test_failing_hf_build_with_stale_file_fails_run(self, tmp_path,
+                                                          monkeypatch):
+        """The stale part_hf01.npy is removed BEFORE the build, so a build
+        that writes nothing cannot leave the old file to be accepted."""
+        import numpy as np
+        seen = []
+
+        def fake_spawn(self, argv, lo, hi, on_progress, json_out=None,
+                       extra_env=None):
+            a = list(argv)
+            if any(tok.endswith("heightfield.py") for tok in a):
+                # stale file must already be gone when the build starts
+                seen.append(os.path.exists(extra_env["HF_OUT"]))
+                return None  # build fails silently (rc 0, no output)
+            return TestStaleArtifactsRejected._fake_spawn(
+                hf_writes=False)(self, argv, lo, hi, on_progress,
+                                 json_out, extra_env)
+
+        np.save(str(tmp_path / "part_hf01.npy"), np.full((8, 8), 9.9))
+        with open(str(tmp_path / "part_hf01.json"), "w") as fh:
+            json.dump({"step_sha256": "0" * 64, "cell": 0.1,
+                      "tess_tol": 0.01}, fh)
+        self._run_expect_fail(tmp_path, monkeypatch, fake_spawn)
+        assert seen and all(gone is False for gone in seen), \
+            "stale part_hf01.npy was still present when the build ran"
+        assert not os.path.exists(str(tmp_path / "part_hf01.npy")), \
+            "stale part_hf01.npy survived the run"
+
+    def test_stale_model_stl_fails_run(self, tmp_path, monkeypatch):
+        """A planted model.stl cannot stand in for a failed tessellation."""
+        with open(str(tmp_path / "model.stl"), "wb") as fh:
+            fh.write(b"solid stale\nendsolid stale\n")
+        self._run_expect_fail(
+            tmp_path, monkeypatch, self._fake_spawn(stl_writes=False))
 
 
 class TestHolderUnknownGate:
@@ -1075,3 +1341,197 @@ def test_zz_print_e2e_result(live):
     print(json.dumps(E2E.get("result", {}), indent=2))
     print("==== states:", mock.states_for(501), "====")
 
+
+
+# ============================================ task CP: check_program ======
+
+CHECK_INPUTS = {
+    "orientation": "as_modeled", "stock_xy": 1.0, "stock_top": 0.4,
+    "stock_bottom": 1.0,
+}
+
+
+def program_input(mock, name="check_ok.nc"):
+    with open(os.path.join(HERE, "testdata", name), "rb") as fh:
+        data = fh.read()
+    return {
+        "kind": "program", "name": name,
+        "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
+        "url": mock.base_url + "/files/" + name,
+        "headers": {"X-Steve-Ticket": "ticket-%d" % (next(_tick),)},
+        "document": {"id": "doc-1"}, "revision": 3,
+    }
+
+
+class TestCheckProgramCatalog:
+    def test_action_shape(self):
+        a = catalog_mod.get_action(catalog_mod.CHECK_ACTION)
+        assert a is not None
+        assert a["name"] == "check_program" and a["confirm"] is False
+        props = a["inputs"]["properties"]
+        assert props["program"].get("x-steve") == "program"
+        assert props["model"]["x-steve"] == "file"
+        assert props["model"]["format"] == "step"
+        assert a["inputs"]["required"] == ["program", "model"]
+        # stock box inputs identical to adaptive_rough (no floor_z: the
+        # program defines its own depths)
+        r = catalog_mod.get_action(catalog_mod.ACTION)["inputs"]["properties"]
+        for k in ("orientation", "stock_xy", "stock_top", "stock_bottom"):
+            assert props[k] == r[k], k
+        assert "floor_z" not in props
+
+    def test_validate_inputs(self):
+        ok, code, v = catalog_mod.validate_inputs(
+            {"program": {"url": "u"}, "model": {"url": "u"}},
+            catalog_mod.CHECK_ACTION)
+        assert ok, code
+        ok, code, _ = catalog_mod.validate_inputs(
+            {"model": {"url": "u"}}, catalog_mod.CHECK_ACTION)
+        assert not ok and code == "input_missing"
+        ok, code, _ = catalog_mod.validate_inputs(
+            {"program": {"url": "u"}, "model": {"url": "u"},
+             "floor_z": 4.0}, catalog_mod.CHECK_ACTION)
+        assert not ok and code == "input_unknown"
+        ok, code, _ = catalog_mod.validate_inputs(
+            {"program": {"url": "u"}, "model": {"url": "u"},
+             "tool_number": 5000}, catalog_mod.CHECK_ACTION)
+        assert not ok and code == "input_out_of_range"
+
+
+class TestCheckProgramToolLookup:
+    """Unit tests for the check_program tool resolution (no engine)."""
+
+    def test_program_tool_numbers(self):
+        from runner import program_tool_numbers
+        assert program_tool_numbers("T13 M06\nG1 X1.\n") == [13]
+        assert program_tool_numbers("( T99 in a comment )\nT3 M06\n"
+                                    "T3\n") == [3]
+        assert program_tool_numbers("T13\nG43 Z5. H13\nT20 M06\n") == \
+            [13, 20]
+
+    def test_check_tool_entry_t13(self):
+        from runner import check_tool_entry
+        t = check_tool_entry(13)
+        assert t["type"] == "flat"
+        assert abs(t["diameter_mm"] - 12.686) < 1e-9
+        assert t["corner_radius_mm"] == 0.0
+        assert t["flute_mm"] == 50.8
+        assert t["shank_diameter_mm"] == 12.686
+        assert t["holder"] == "BT30-ER32-70"
+        assert t["stickout_mm"] == 71.6
+
+    def test_check_tool_entry_unknown_fails(self):
+        from runner import check_tool_entry, EngineError
+        with pytest.raises(EngineError) as ei:
+            check_tool_entry(99)
+        assert "not in tools/x7_tools.json" in str(ei.value)
+
+    def test_multi_tool_program_fails_before_engine(self, tmp_path,
+                                                     monkeypatch):
+        import runner as runner_mod
+
+        def boom(*a, **k):
+            raise AssertionError("engine ran for a multi-tool program")
+
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", boom)
+        run = runner_mod.EngineRun({"engine_python": PY, "repo_root": REPO},
+                                    str(tmp_path))
+        prog = tmp_path / "multi.nc"
+        prog.write_text("G21 G90\nT13 M06\nG0 X0.\nT20 M06\n")
+        with pytest.raises(runner_mod.EngineError) as ei:
+            run.run_check_program(str(prog), "unused.step",
+                                  dict(CHECK_INPUTS))
+        assert "multi-tool" in str(ei.value)
+
+    def test_no_t_word_fails(self, tmp_path, monkeypatch):
+        import runner as runner_mod
+
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn",
+                            lambda *a, **k: None)
+        run = runner_mod.EngineRun({"engine_python": PY, "repo_root": REPO},
+                                    str(tmp_path))
+        prog = tmp_path / "not.nc"
+        prog.write_text("G21 G90\nG0 X0. Y0.\n")
+        with pytest.raises(runner_mod.EngineError) as ei:
+            run.run_check_program(str(prog), "unused.step",
+                                  dict(CHECK_INPUTS))
+        assert "T word" in str(ei.value)
+
+
+class TestCheckProgramE2E:
+    def test_check_program_ok(self, live):
+        mock, _, programs = live
+        mock.enqueue_run(910, action=catalog_mod.CHECK_ACTION,
+                         inputs=dict(CHECK_INPUTS, model=model_input(mock),
+                                    program=program_input(mock)))
+        assert mock.wait_state(910, "received", 30), \
+            "run never received: %s" % mock.states_for(910)
+        final = mock.wait_terminal(910, timeout=600)
+        assert final == "succeeded", \
+            "run ended %s: %s" % (final, mock.states_for(910))
+        reps = {r["body"]["state"]: r["body"] for r in mock.reports
+                if str(r["run_id"]) == "910"}
+        result = reps["succeeded"].get("result") or {}
+        assert result["strict"] is True and result["unsupported"] == []
+        assert result["zmap_gouges"]["count"] == 0
+        assert result["rapid_collisions"]["count"] == 0
+        assert result["over_flute"]["count"] == 0
+        assert result["holder_hits"]["count"] == 0
+        assert result["outside_grid"]["count"] == 0
+        # tool came from the program's T word (T13, not an override)
+        assert result["tool"]["number"] == 13
+        assert result["tool"]["holder"] == "BT30-ER32-70"
+        # engagement: report-only, no threshold
+        assert result["engagement"]["threshold_mm"] is None
+        # check.json + preview.png only: NO .nc upload, nothing new in the
+        # programs folder (nothing is sent anywhere near the machine)
+        assert mock.file_names(910) == ["check.json", "preview.png"]
+        assert not list(programs.glob("O4501*"))
+
+    def test_check_program_g81_fails_unsupported(self, live):
+        mock, _, programs = live
+        mock.enqueue_run(911, action=catalog_mod.CHECK_ACTION,
+                         inputs=dict(CHECK_INPUTS, model=model_input(mock),
+                                    program=program_input(mock,
+                                                       "check_g81.nc")))
+        assert mock.wait_state(911, "received", 30)
+        final = mock.wait_terminal(911, timeout=600)
+        assert final == "failed", \
+            "G81 run must fail: %s" % mock.states_for(911)
+        rep = [r["body"] for r in mock.reports
+               if str(r["run_id"]) == "911"
+               and r["body"]["state"] == "failed"][-1]
+        msg = rep.get("error", {}).get("message", "")
+        assert "unsupported" in msg and "G81" in msg, msg
+        assert not any(n.endswith(".nc") for n in mock.file_names(911))
+        assert not list(programs.glob("O4502*"))
+
+    def test_check_program_unknown_tool_number_fails_fast(self, live):
+        mock, _, _ = live
+        mock.enqueue_run(912, action=catalog_mod.CHECK_ACTION,
+                         inputs=dict(CHECK_INPUTS, model=model_input(mock),
+                                    program=program_input(mock),
+                                    tool_number=99))
+        final = mock.wait_terminal(912, timeout=120)
+        assert final == "failed", mock.states_for(912)
+        rep = [r["body"] for r in mock.reports
+               if str(r["run_id"]) == "912"
+               and r["body"]["state"] == "failed"][-1]
+        assert "x7_tools.json" in rep.get("error", {}).get("message", "")
+        assert mock.file_names(912) == []
+
+
+def test_check_program_tool_number_mismatch_refused(tmp_path):
+    """A tool_number override that disagrees with the program's T word
+    must fail, never judge with a different tool."""
+    import runner as runner_mod
+    prog = tmp_path / "p.nc"
+    prog.write_text("%\nO1\nT20 M06\nG0 X0. Y0. Z10.\nM30\n%\n")
+    eng = runner_mod.EngineRun.__new__(runner_mod.EngineRun)
+    eng.cfg = {"repo_root": REPO, "engine_python": sys.executable}
+    eng.work = str(tmp_path)
+    with pytest.raises(runner_mod.EngineError, match="does not match"):
+        eng.run_check_program(str(prog), str(tmp_path / "m.step"),
+                              {"tool_number": 31, "orientation": "Z+",
+                               "stock_xy": 1.0, "stock_top": 1.0,
+                               "stock_bottom": 0.0}, None)

@@ -7,9 +7,17 @@ ENGINE_WORKERS=4, cwd = repo root, and its own work dir
 """
 import json
 import os
+import re
 import signal
 import subprocess
+import sys
 import threading
+
+# Engagement warning factors (report-only warnings, never gates):
+# roughing warns above ROUGH_ENGAGE_FACTOR x optimal load, finishing above
+# FINISH_ENGAGE_FACTOR x stepover.
+ROUGH_ENGAGE_FACTOR = 1.2
+FINISH_ENGAGE_FACTOR = 1.5
 
 
 class Cancelled(Exception):
@@ -72,6 +80,69 @@ def _tool_number(cfg, values):
     return 1  # not in the table: explicit number keeps the post happy
 
 
+T_WORD_RE = re.compile(r"\bT\s*(\d+)", re.IGNORECASE)
+
+
+def program_tool_numbers(text):
+    """Distinct T word numbers in a posted program (comments stripped),
+    in order of first appearance."""
+    out = []
+    for line in text.splitlines():
+        s = line.split(";", 1)[0]
+        depth = 0
+        kept = []
+        for ch in s:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0:
+                kept.append(ch)
+        for m in T_WORD_RE.findall("".join(kept)):
+            n = int(m)
+            if n not in out:
+                out.append(n)
+    return out
+
+
+def check_tool_entry(number, path=None):
+    """check_program: the tools/x7_tools.json entry for tool `number`.
+    Returns {type, diameter_mm, corner_radius_mm, flute_mm,
+    shank_diameter_mm, holder, stickout_mm}. Unknown tool (no entry, a
+    null number, or missing shape data) -> EngineError, same as today's
+    refusal to run a tool the table does not know."""
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "tools", "x7_tools.json")
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (IOError, OSError, ValueError) as e:
+        raise EngineError("cannot read tool table %s: %s" % (path, e))
+    e = next((t for t in data.get("tools", [])
+              if t.get("number") == int(number)), None)
+    if e is None:
+        raise EngineError(
+            "tool T%d is not in tools/x7_tools.json: unknown tool - add it "
+            "to the X7 table (or pass a tool_number that is in the table)"
+            % int(number))
+    for k in ("type", "diameter_mm"):
+        if e.get(k) is None:
+            raise EngineError("tool T%d entry in %s has no %s"
+                              % (int(number), path, k))
+    return {"number": int(number), "type": e["type"],
+            "diameter_mm": float(e["diameter_mm"]),
+            "corner_radius_mm": float(e.get("corner_radius_mm") or 0.0),
+            "flute_mm": (float(e["flute_mm"])
+                         if e.get("flute_mm") is not None else None),
+            "shank_diameter_mm": (float(e["shank_diameter_mm"])
+                                  if e.get("shank_diameter_mm") is not None
+                                  else float(e["diameter_mm"])),
+            "holder": e.get("holder"),
+            "stickout_mm": (float(e["stickout_mm"])
+                            if e.get("stickout_mm") is not None else None)}
+
+
 class EngineRun:
     """Runs one roughing job; .cancel() stops the active subprocess."""
 
@@ -92,6 +163,13 @@ class EngineRun:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 proc.terminate()
+
+    def _freshness(self):
+        """engine.freshness (task HC): guards against stale build outputs."""
+        if self.cfg["repo_root"] not in sys.path:
+            sys.path.insert(0, self.cfg["repo_root"])
+        from engine import freshness
+        return freshness
 
     def _spawn(self, argv, stage_lo, stage_hi, on_progress, json_out=None,
                extra_env=None):
@@ -148,14 +226,17 @@ class EngineRun:
     def run(self, step_path, values, on_progress=None):
         py = self.cfg["engine_python"]
         cell = 0.5
-        # 1) orient + stock box + part heightfield
+        # 1) orient + stock box + part heightfield (grid covers the run's
+        #    stock + tool radius + margin via STOCK_BOX/TOOL_R, task Z5b)
         self._spawn([py, "-m", "engine.cli", "prepare",
                     "--step", step_path, "--out-dir", self.work,
                     "--orient", values["orientation"],
                     "--stock-xy", "%.4f" % values["stock_xy"],
                     "--stock-top", "%.4f" % values["stock_top"],
                     "--stock-bottom", "%.4f" % values["stock_bottom"],
-                    "--cell", str(cell)], 0.05, 0.2, on_progress)
+                    "--cell", str(cell),
+                    "--tool-r", "%.4f" % (values["tool_diameter"] / 2.0)],
+                   0.05, 0.2, on_progress)
         with open(os.path.join(self.work, "prepare.json")) as fh:
             prep = json.load(fh)
         stock = prep["stock"]
@@ -187,19 +268,45 @@ class EngineRun:
         with open(stats_path) as fh:
             stats = json.load(fh)
 
-        # 3) independent zmap check + leftover preview
+        # 3) independent zmap check + leftover preview. The zmap part grid
+        #    must cover stock + tool radius (zmap exits non-zero if the
+        #    stock box extends beyond the grid by more than half a cell, or
+        #    a tool footprint leaves the grid): the shared heightfield
+        #    builder grows the grid from STOCK_BOX + TOOL_R + MARGIN.
         if on_progress:
-            on_progress(0.88, "checking")
+            on_progress(0.86, "checking")
+        fc = os.path.join(os.path.dirname(py), "freecadcmd")
+        # task HC: remove any stale heightfield from a reused run dir
+        # before rebuilding, then require the fresh .npy + sidecar to match
+        fr = self._freshness()
+        step_sha = fr.sha256_file(prep["step"])
+        hf_zmap = os.path.join(self.work, "part_hf_zmap.npy")
+        fr.remove_stale(hf_zmap)
+        self._spawn([fc, os.path.join(self.cfg["repo_root"], "verify",
+                                       "heightfield.py")],
+                    0.86, 0.90, on_progress,
+                    extra_env={"STEP_IN": prep["step"], "HF_OUT": hf_zmap,
+                              "CELL": str(cell), "TESS_TOL": "0.01",
+                              "STOCK_BOX": " ".join("%.4f" % v
+                                                    for v in stock[:4]),
+                              "TOOL_R": "%.4f" % (values["tool_diameter"] / 2.0)})
+        try:
+            fr.require_fresh(hf_zmap, step_sha256=step_sha, cell=cell,
+                             tess_tol=0.01)
+        except OSError as e:
+            raise EngineError(str(e))
         check_path = os.path.join(self.work, "check.json")
         png_path = os.path.join(self.work, "preview.png")
         self._spawn([py, "-m", "verify.zmap", nc,
-                    "--part", prep["hf"],
+                    "--part", hf_zmap,
                     "--tool", values["tool_type"],
                     "--dia", "%.4f" % values["tool_diameter"],
                     "--corner", "%.4f" % values["corner_radius"],
                     "--stock", *[("%.4f" % v) for v in stock],
                     "--flute", "%.1f" % values["flute_length"],
                     "--optimal-load", "%.4f" % values["optimal_load"],
+                    "--engage-max", "%.4f"
+                    % (ROUGH_ENGAGE_FACTOR * values["optimal_load"]),
                     "--tool-number", str(_tool_number(self.cfg, values)),
                     "--out-json", check_path, "--png", png_path],
                    0.88, 0.95, on_progress)
@@ -235,6 +342,140 @@ class EngineRun:
         }
         files = {"rough.nc": (nc, "application/octet-stream"),
                  "check.json": (check_path, "application/json"),
+                 "preview.png": (png_path, "image/png")}
+        return result, files
+
+    # -------------------------------------------------- check_program ----
+    def run_check_program(self, program_path, step_path, values,
+                          on_progress=None):
+        """check_program (task CP): judge a STEVE-posted program with the
+        independent zmap --strict against the oriented part and the stock
+        box, using the program's T word from tools/x7_tools.json. One
+        program = one tool. Gates as adaptive_rough (gouges, rapid
+        collisions, over-flute/shank, holder, outside grid) plus a
+        report-only engagement summary. Returns check.json + preview.png;
+        nothing new is uploaded as .nc, nothing goes to the machine."""
+        py = self.cfg["engine_python"]
+        fc = os.path.join(os.path.dirname(py), "freecadcmd")
+        repo = self.cfg["repo_root"]
+
+        # 1) tool up front: one T word, known in the X7 table (unknown tool
+        #    or holder fails the run, same as today)
+        with open(program_path) as fh:
+            ptext = fh.read()
+        numbers = program_tool_numbers(ptext)
+        if len(numbers) > 1:
+            raise EngineError("multi-tool programs not supported yet "
+                              "(T words: %s)" % ", ".join("T%d" % n
+                                                           for n in numbers))
+        number = (int(values["tool_number"]) if values.get("tool_number")
+                  else (numbers[0] if numbers else None))
+        if number is None:
+            raise EngineError("no T word in the program and no tool_number "
+                              "override: the tool cannot be resolved")
+        tool = check_tool_entry(number, os.path.join(repo, "tools",
+                                                     "x7_tools.json"))
+        if numbers and number != numbers[0]:
+            raise EngineError("tool_number T%d does not match the program's "
+                              "T%d: refusing to judge with a different tool"
+                              % (number, numbers[0]))
+        cell = 0.1  # judge grid: same 0.1 mm as the finishing chain
+
+        # 2) orient + stock box + part heightfield (shared builder grid:
+        #    STOCK_BOX + TOOL_R + margin, task Z5b)
+        if on_progress:
+            on_progress(0.05, "preparing part")
+        self._spawn([py, "-m", "engine.cli", "prepare",
+                     "--step", step_path, "--out-dir", self.work,
+                     "--orient", values["orientation"],
+                     "--stock-xy", "%.4f" % values["stock_xy"],
+                     "--stock-top", "%.4f" % values["stock_top"],
+                     "--stock-bottom", "%.4f" % values["stock_bottom"],
+                     "--cell", "0.5",
+                     "--tool-r", "%.4f" % (tool["diameter_mm"] / 2.0)],
+                    0.05, 0.35, on_progress)
+        with open(os.path.join(self.work, "prepare.json")) as fh:
+            prep = json.load(fh)
+        stock = prep["stock"]
+
+        # 3) fresh judge heightfield (task HC: stale files removed first,
+        #    sidecar must pin this run's STEP/cell/tess tol)
+        fr = self._freshness()
+        step_sha = fr.sha256_file(prep["step"])
+        hf_zmap = os.path.join(self.work, "part_hf_zmap.npy")
+        fr.remove_stale(hf_zmap)
+        if on_progress:
+            on_progress(0.35, "building heightfield")
+        self._spawn([fc, os.path.join(repo, "verify", "heightfield.py")],
+                    0.35, 0.55, on_progress,
+                    extra_env={"STEP_IN": prep["step"], "HF_OUT": hf_zmap,
+                              "CELL": str(cell), "TESS_TOL": "0.01",
+                              "STOCK_BOX": " ".join("%.4f" % v
+                                                    for v in stock[:4]),
+                              "TOOL_R": "%.4f" % (tool["diameter_mm"] / 2.0)})
+        try:
+            fr.require_fresh(hf_zmap, step_sha256=step_sha, cell=cell,
+                             tess_tol=0.01)
+        except OSError as e:
+            raise EngineError(str(e))
+
+        # 4) zmap --strict: unsupported codes fail with the first offender
+        #    (full list in check json); gates as adaptive_rough. No optimal
+        #    load input for this action: engagement is report-only, no
+        #    threshold.
+        if on_progress:
+            on_progress(0.55, "checking program")
+        check_path = os.path.join(self.work, "check.json")
+        png_path = os.path.join(self.work, "preview.png")
+        argv = [py, "-m", "verify.zmap", program_path,
+                "--part", hf_zmap,
+                "--tool", tool["type"],
+                "--dia", "%.4f" % tool["diameter_mm"],
+                "--corner", "%.4f" % tool["corner_radius_mm"],
+                "--stock", *[("%.4f" % v) for v in stock],
+                "--tool-number", str(number),
+                "--strict", "--engage-report",
+                "--out-json", check_path, "--png", png_path]
+        if tool["flute_mm"] is not None:
+            argv += ["--flute", "%.4f" % tool["flute_mm"]]
+        if tool["shank_diameter_mm"] is not None:
+            argv += ["--shank-dia", "%.4f" % tool["shank_diameter_mm"]]
+        self._spawn(argv, 0.55, 0.95, on_progress)
+        with open(check_path) as fh:
+            check = json.load(fh)
+        _check_zmap_gates(check)
+
+        result = {
+            "units": "mm",
+            "program": os.path.basename(program_path),
+            "tool": {"number": number, "type": tool["type"],
+                     "diameter_mm": tool["diameter_mm"],
+                     "corner_radius_mm": tool["corner_radius_mm"],
+                     "flute_mm": tool["flute_mm"],
+                     "shank_diameter_mm": tool["shank_diameter_mm"],
+                     "holder": tool["holder"],
+                     "stickout_mm": tool["stickout_mm"]},
+            "orientation": values["orientation"],
+            "stock_box_mm": stock,
+            "strict": True,
+            "unsupported": check.get("unsupported", []),
+            "zmap_gouges": check["gouges"],
+            "rapid_collisions": check["rapid_collisions"],
+            "over_flute": check["over_flute"],
+            "holder_hits": check.get("holder_hits"),
+            "outside_grid": check.get("outside_grid"),
+            "engagement": check.get("engagement"),
+            "leftover": {
+                "mean_mm": check["leftover"]["mean"],
+                "p95_mm": check["leftover"]["p95"],
+                "within_0p5mm_fraction": check["within_0p5mm_fraction"],
+            },
+            "estimated_time_min": round(check["cycle_time_s"] / 60.0, 2),
+            "cut_length_mm": check["cutting_length_mm"],
+            "rapid_length_mm": check["rapid_length_mm"],
+            "files": ["check.json", "preview.png"],
+        }
+        files = {"check.json": (check_path, "application/json"),
                  "preview.png": (png_path, "image/png")}
         return result, files
 
@@ -281,27 +522,47 @@ class EngineRun:
             "tool_diameter": values["rough_tool_diameter"],
             "corner_radius": values["rough_corner_radius"]})
 
-        # 1) orient + stock box + part heightfield (for the roughing clip)
+        # 1) orient + stock box + part heightfield (for the roughing clip;
+        #    grid covers stock + largest tool radius of the run + margin)
+        max_tool_r = max(values["tool_diameter"],
+                         values["rough_tool_diameter"]) / 2.0
         self._spawn([py, "-m", "engine.cli", "prepare",
                     "--step", step_path, "--out-dir", self.work,
                     "--orient", values["orientation"],
                     "--stock-xy", "%.4f" % values["stock_xy"],
                     "--stock-top", "%.4f" % values["stock_top"],
                     "--stock-bottom", "%.4f" % values["stock_bottom"],
-                    "--cell", "0.5"], 0.02, 0.12, on_progress)
+                    "--cell", "0.5",
+                    "--tool-r", "%.4f" % max_tool_r], 0.02, 0.12, on_progress)
         with open(os.path.join(self.work, "prepare.json")) as fh:
             prep = json.load(fh)
         stock = prep["stock"]
         floor = stock[4] + values["floor_z"]
 
         # 2) fresh zmap part heightfield (verify/heightfield.py, 0.01 mm
-        #    tess, 0.1 mm cell) - independent of the roughing clip grid
+        #    tess, 0.1 mm cell) - independent of the roughing clip grid.
+        #    The shared builder covers STOCK_BOX + TOOL_R + MARGIN: zmap
+        #    exits non-zero when the stock box or a tool footprint extends
+        #    beyond its grid.
+        # task HC: remove any stale artifacts from a reused run dir before
+        # rebuilding; after each build require the fresh files to exist and
+        # the sidecar to pin this run's STEP, cell and tess tolerance
+        fr = self._freshness()
+        step_sha = fr.sha256_file(prep["step"])
         hf01 = os.path.join(self.work, "part_hf01.npy")
+        fr.remove_stale(hf01)
         self._spawn([fc, os.path.join(repo, "verify", "heightfield.py")],
                     0.12, 0.17, on_progress,
                     extra_env={"STEP_IN": prep["step"], "HF_OUT": hf01,
                               "CELL": "0.1", "TESS_TOL": "0.01",
-                              "PAD": "0"})
+                              "STOCK_BOX": " ".join("%.4f" % v
+                                                    for v in stock[:4]),
+                              "TOOL_R": "%.4f" % max_tool_r})
+        try:
+            fr.require_fresh(hf01, step_sha256=step_sha, cell=0.1,
+                             tess_tol=0.01)
+        except OSError as e:
+            raise EngineError(str(e))
 
         # 3) adaptive roughing (LNC post, full stock)
         nc = os.path.join(self.work, "rough.nc")
@@ -327,12 +588,18 @@ class EngineRun:
                     "--json-progress", "--stats-json", stats_path],
                    0.17, 0.45, on_progress)
 
-        # 4) tessellate the oriented model (finish input + clcheck probe)
+        # 4) tessellate the oriented model (finish input + clcheck probe);
+        #    stale model.stl removed first, fresh non-empty output asserted
         stl = os.path.join(self.work, "model.stl")
+        fr.remove_stale(stl)
         self._spawn([fc, os.path.join(repo, "engine", "_tessellate.py")],
                     0.45, 0.50, on_progress,
                     extra_env={"STEP_IN": prep["step"], "STL_OUT": stl,
                               "TOL": "0.01"})
+        try:
+            fr.require_stl(stl)
+        except OSError as e:
+            raise EngineError(str(e))
 
         # 5) slope-split finishing (neutral G-code). PQ: the engine snaps the
         #    emitted points to the output grid matching this op's post units
@@ -388,21 +655,25 @@ class EngineRun:
                     "--stock", *[("%.4f" % v) for v in stock],
                     "--flute", "%.1f" % values["rough_flute_length"],
                     "--optimal-load", "%.4f" % values["rough_optimal_load"],
+                    "--engage-max", "%.4f"
+                    % (ROUGH_ENGAGE_FACTOR * values["rough_optimal_load"]),
                     "--tool-number", str(rough_number),
                     "--out-json", check_rough,
                     "--stock-out", stock_out], 0.80, 0.90, on_progress)
         check_finish = os.path.join(self.work, "check_finish.json")
         png_path = os.path.join(self.work, "preview.png")
-        # Finish engagement threshold: use the finish stepover (distance between
-        # finish passes) rather than the roughing optimal load; finish passes are
-        # much lighter and the roughing threshold would over-flag them.
+        # Finish engagement threshold: 1.5 x the finish stepover (distance
+        # between finish passes) rather than the roughing optimal load; finish
+        # passes are much lighter and the roughing threshold would over-flag
+        # them. Passed explicitly so zmap never derives a roughing threshold.
         self._spawn([py, "-m", "verify.zmap", fin,
                     "--part", hf01,
                     "--tool", "ball",
                     "--dia", "%.4f" % values["tool_diameter"],
                     "--corner", "%.4f" % (values["tool_diameter"] / 2.0),
                     "--stock-in", stock_out,
-                    "--engage-max", "%.4f" % (1.5 * values["stepover"]),
+                    "--engage-max", "%.4f"
+                    % (FINISH_ENGAGE_FACTOR * values["stepover"]),
                     "--tool-number", str(finish_number),
                     "--out-json", check_finish, "--png", png_path],
                    0.90, 0.97, on_progress)

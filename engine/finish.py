@@ -63,13 +63,17 @@ tools/x7_tools.json by diameter too (CLI --stickout/--holder override). The
 shank rule above is unchanged and covers the shank from tip + flute up to the
 holder nose at tip + stick-out; additionally the holder solid - the frustum
 stack [z_lo, z_hi, r_lo, r_hi] above the nose from the table's "holders" map
-- must stay >= 1.0 mm from the part and the --stock-from stock: violating CL
-vertices are dropped (path split, rejoined only through the verified link
-logic; points never lowered). Implemented as ONE batched drop-cutter per net
-with a conservative CylCutter of radius max(segment radii) + 1.0 mm, hitting
-when material within that envelope stands above the nose (the stack is
-contiguous from z_lo = 0; conservative per task S5 item 1). Dropped points
-are reported split by cause: n_shank_removed vs n_holder_removed.
+- must stay >= 1.0 mm from the part and the --stock-from stock: violating
+points are dropped (path split, rejoined only through the verified link
+logic; points never lowered). Task HN: the check runs ALONG THE WHOLE OUTLINE
+(samples every <= 0.5 mm, not just at vertices) against max(part, roughing
+stock) dilated to the envelope radius max(segment radii) + 1.0 mm (the stack
+is contiguous from z_lo = 0, nose ring included - at least as conservative as
+verify/zmap.py's along-move envelope check, which it must dominate: the
+heightfield is padded past the stock box and windowed with sub-cell slack),
+and feed-height link traverses that would break the envelope escalate to
+rapids. Dropped points are reported split by cause: n_shank_removed vs
+n_holder_removed.
 """
 import json
 import math
@@ -102,6 +106,11 @@ GRID_SPIKE = 0.01     # mm, PQ: drop an emitted point whose closest
                       # output-grid CL still differs from its Z by more than
                       # this (no one-point spikes)
 GRID_SS = 0.1         # mm, PQ: sample spacing of the post-snap chord net
+HOLDER_SS = 0.5       # mm, S5(HN): max sample spacing along a path for the
+                      # holder net (zmap samples its moves at cell/4; the net
+                      # checks a window of Rh + HOLDER_SS/2 + grid slack around
+                      # every sample, so it dominates zmap's envelope anywhere)
+HOLDER_GRID_CELL = 0.5  # mm, material grid cell when no --stock-from is given
 
 # X7 tool table (James's tools): flute length + shank diameter per tool,
 # read by type + diameter (the ball corner radius is implied by the dia).
@@ -1410,23 +1419,97 @@ def shank_net(surf, paths, shank_dia, flute_mm, stock=None, band=0.3,
     return out, by_level, area, src
 
 
+def holder_material_field(surf, stock, max_r, threads=None):
+    """S5(HN): a queryable conservative material field for the holder check -
+    max(part, stock) dilated to the holder envelope radius. Built ONCE per
+    finish op on a heightfield grid (the --stock-from grid when given, else
+    the surf bounds at HOLDER_GRID_CELL): each cell gets the drop-cutter CL of
+    a flat cylinder of radius `cell` (the part height at any point of the
+    neighbouring cell areas, dominating a rasterised part grid the same way
+    zmap's cell maxima do), maxed with the stock top, then box_max over
+    ceil((Rh + HOLDER_SS/2 + 1.5*cell)/cell) cells so a nearest-cell lookup at
+    any path sample sees every material column within Rh + half the sample
+    spacing of that sample (Rh = max segment radius + HOLD_CLEAR, zmap's
+    envelope). The stock is the ROUGHING heightfield as given: finishing cuts
+    only ever lower it, so this never reads below zmap's live stock.
+    Returns {"M", "x0", "y0", "cell", "Rh", "ss"}."""
+    Rh = float(max_r) + HOLD_CLEAR
+    if stock is not None:
+        A, x0, y0, cell = stock
+        ny, nx = A.shape
+    else:
+        cell = HOLDER_GRID_CELL
+        b = surf.getBounds()
+        x0 = float(b[0])
+        y0 = float(b[2])
+        nx = int(math.ceil((float(b[1]) - float(b[0])) / cell))
+        ny = int(math.ceil((float(b[3]) - float(b[2])) / cell))
+        A = None
+    # pad by the envelope reach: a point OUTSIDE the stock grid (waterlines
+    # and links run beyond the stock box by up to the tool radius) must still
+    # see the stock/part material within Rh of it - without padding the
+    # out-of-grid lookup reads -inf and the check passes vacuously where
+    # zmap (whose grid follows the part heightfield) counts a hit
+    reach = Rh + 0.5 * HOLDER_SS + cell
+    kp = int(math.ceil(reach / cell))
+    x0 -= kp * cell
+    y0 -= kp * cell
+    nx += 2 * kp
+    ny += 2 * kp
+    gx = x0 + (np.arange(nx) + 0.5) * cell
+    gy = y0 + (np.arange(ny) + 0.5) * cell
+    GX, GY = np.meshgrid(gx, gy)
+    cl = batch_drop(surf, make_cutter("flat", 2.0 * cell),
+                   list(zip(GX.ravel().tolist(), GY.ravel().tolist())),
+                   threads=threads).reshape(ny, nx)
+    Mat = np.where(np.isfinite(cl), cl, -np.inf)
+    if A is not None:
+        # stock values on the stock grid, -inf elsewhere (incl. the pad)
+        blk = np.full((ny, nx), -np.inf)
+        blk[kp:kp + A.shape[0], kp:kp + A.shape[1]] = \
+            np.where(np.isfinite(A), A, -np.inf)
+        Mat = np.maximum(Mat, blk)
+    kk = int(math.ceil((Rh + 0.5 * HOLDER_SS + 1.5 * cell) / cell))
+    return {"M": box_max(Mat, kk), "x0": x0, "y0": y0, "cell": cell,
+            "Rh": Rh, "ss": HOLDER_SS}
+
+
+def field_max_at(field, X, Y):
+    """Nearest-cell lookup of the dilated material field at points (X, Y);
+    -inf outside the grid. Nearest (not bilinear) so a cell at the top of a
+    dilated ridge is never interpolated down below what zmap reads there."""
+    M = field["M"]
+    cell = field["cell"]
+    i = np.floor((np.asarray(X, dtype=float) - field["x0"]) / cell).astype(
+        np.int64)
+    j = np.floor((np.asarray(Y, dtype=float) - field["y0"]) / cell).astype(
+        np.int64)
+    ny, nx = M.shape
+    ok = (i >= 0) & (i < nx) & (j >= 0) & (j < ny)
+    v = M[np.clip(j, 0, ny - 1), np.clip(i, 0, nx - 1)]
+    return np.where(ok, v, -np.inf)
+
+
 def holder_net(surf, paths, segments, stickout_mm, stock=None, band=0.3,
-               threads=None):
-    """S5 holder safety on every emitted CL vertex: the holder solid is the
-    frustum stack `segments` ([z_lo, z_hi, r_lo, r_hi] mm above the holder
-    nose at tip_z + stickout_mm); it must stay >= HOLD_CLEAR mm from the
-    part (and, with stock = (A, x0, y0, cell), from the --stock-from stock).
-    Conservative implementation (documented per task S5 item 1): ONE batched
-    drop-cutter with a CylCutter of radius max(segment radii) + HOLD_CLEAR
-    per net - not one cutter per frustum segment. The stack is contiguous
-    from z_lo = 0 upward, so material reaching above the nose within that
-    envelope can come within HOLD_CLEAR of some frustum surface; material
-    below the nose cannot touch any segment radially inside the envelope
-    without first crossing the nose plane. If that cylinder's CL (highest
-    material within the envelope) sits above tip_z + stickout_mm, remove the
-    vertex and SPLIT the path there - pieces rejoin only through the
-    verified link logic, points are never lowered. `band` is the nominal cut
-    band height used to estimate the wall area left uncut (as shank_net).
+               threads=None, field=None):
+    """S5 holder safety along the WHOLE outline of every emitted path (task
+    HN): the holder solid is the frustum stack `segments` ([z_lo, z_hi, r_lo,
+    r_hi] mm above the holder nose at tip_z + stickout_mm); it must stay
+    >= HOLD_CLEAR mm from the part AND from the remaining stock. The check
+    runs on samples every <= HOLDER_SS mm along each segment, not just at the
+    vertices: at each sample the material within the envelope radius Rh = max
+    segment radius + HOLD_CLEAR - taken from holder_material_field, i.e.
+    max(part, the --stock-from roughing stock, never lower than zmap's live
+    stock) - must not stand above the nose at sample_z + stickout_mm. The
+    stack is contiguous from z_lo = 0 (nose ring included), so the single
+    Rh envelope covers every frustum band over its full height with no gaps,
+    at each band's true radius + HOLD_CLEAR or more - at least as
+    conservative as zmap's envelope cylinder (which flags any material above
+    the nose within max_r + 1.0 mm of the move, sampled along the whole
+    move). Violating samples are dropped and the path SPLIT there (pieces
+    rejoin only through the verified link logic; original vertices are never
+    lowered - split endpoints are new points on the emitted chord). `band` is
+    the nominal cut band height used to estimate the wall area left uncut.
     Returns (paths, {round(z, 3): n_removed}, removed_wall_mm2, src) with
     src[i] the index in `paths` that output path i came from."""
     keep = [j for j, pth in enumerate(paths) if len(pth) >= 2]
@@ -1434,43 +1517,60 @@ def holder_net(surf, paths, segments, stickout_mm, stock=None, band=0.3,
     if not rpth:
         return [], {}, 0.0, []
     max_r = max(max(s[2], s[3]) for s in segments)
-    flat = [p for pth in rpth for p in pth]
-    xy = [(p[0], p[1]) for p in flat]
-    zv = np.array([p[2] for p in flat])
-    cyl = batch_drop(surf, make_cutter("flat", 2.0 * (max_r + HOLD_CLEAR)),
-                    xy, threads=threads)
-    bad = np.isfinite(cyl) & (cyl > zv + stickout_mm)
-    if stock is not None:
-        A, sx0, sy0, cell = stock
-        k = int(math.ceil((max_r + HOLD_CLEAR) / cell))
-        s = grid_sample(box_max(A, k), sx0, sy0, cell,
-                        np.array([p[0] for p in xy]),
-                        np.array([p[1] for p in xy]))
-        bad |= np.isfinite(s) & (s > zv + stickout_mm)
+    if field is None:
+        field = holder_material_field(surf, stock, max_r, threads=threads)
+    ss = field["ss"]
+    # dense samples along every segment (the vertex itself is the previous
+    # segment's t=1 sample; the path start is sampled too)
+    Xs, Ys, Zs, vidx = [], [], [], []
+    for k, pth in enumerate(rpth):
+        Xs.append(pth[0][0])
+        Ys.append(pth[0][1])
+        Zs.append(pth[0][2])
+        vi = [0]
+        for (x0, y0, z0), (x1, y1, z1) in zip(pth[:-1], pth[1:]):
+            L = math.hypot(x1 - x0, y1 - y0)
+            m = max(1, int(math.ceil(L / ss)))
+            t = np.arange(1, m + 1) / m
+            Xs.extend((x0 + (x1 - x0) * t).tolist())
+            Ys.extend((y0 + (y1 - y0) * t).tolist())
+            Zs.extend((z0 + (z1 - z0) * t).tolist())
+            vi.append(vi[-1] + m)
+        vidx.append(vi)
+    Xs = np.asarray(Xs, dtype=float)
+    Ys = np.asarray(Ys, dtype=float)
+    Zs = np.asarray(Zs, dtype=float)
+    mat = field_max_at(field, Xs, Ys)
+    bad = np.isfinite(mat) & (mat > Zs + stickout_mm)
     out = []
     src = []
     by_level = {}
     area = 0.0
-    off = 0
-    for j, pth in zip(keep, rpth):
-        m = len(pth)
-        b = bad[off:off + m]
-        off += m
-        arr = np.asarray(pth)
-        dd = np.hypot(np.diff(arr[:, 0]), np.diff(arr[:, 1]))
-        sp = np.empty(m)
-        sp[0] = 0.5 * dd[0]
-        sp[-1] = 0.5 * dd[-1]
-        if m > 2:
-            sp[1:-1] = 0.5 * (dd[:-1] + dd[1:])
-        for i in np.where(b)[0]:
-            by_level[round(float(pth[i][2]), 3)] = \
-                by_level.get(round(float(pth[i][2]), 3), 0) + 1
-            area += float(sp[i]) * band
+    if bad.any():
+        zl = np.round(Zs[bad], 3)
+        for z, n in zip(*np.unique(zl, return_counts=True)):
+            k = round(float(z), 3)
+            by_level[k] = by_level.get(k, 0) + int(n)
+        area = float(bad.sum()) * ss * band
+    base = 0
+    for k, pth in enumerate(rpth):
+        n = vidx[k][-1] + 1
+        b = bad[base:base + n]
+        pbase = base
+        base += n
+        vs = vidx[k]
         for i0, i1 in _runs_of_mask(~b):
-            if i1 - i0 >= 2:
-                out.append(pth[i0:i1])
-                src.append(j)
+            if i1 - i0 < 2:
+                continue
+            g0, g1 = pbase + i0, pbase + i1 - 1
+            piece = [(float(Xs[g0]), float(Ys[g0]), float(Zs[g0]))]
+            for jv in range(1, len(pth) - 1):
+                if i0 < vs[jv] < i1:
+                    piece.append(pth[jv])
+            piece.append((float(Xs[g1]), float(Ys[g1]), float(Zs[g1])))
+            if len(piece) >= 2:
+                out.append(piece)
+                src.append(keep[k])
     return out, by_level, area, src
 
 
@@ -1488,7 +1588,8 @@ def box_max(A, k):
 
 def link_plan(surf, cutter, links, sampling=0.1, threads=None,
               rapid_margin=RAPID_MARGIN, clearance=None, use_rapids=True,
-              stock=None, stock_allow=RAPID_STOCK_ALLOW):
+              stock=None, stock_allow=RAPID_STOCK_ALLOW,
+              holder_field=None, stickout=None):
     """For each ((x0,y0,z0), (x1,y1,z1)) decide 'down', 'rapid' or 'lift'.
     - 'down': stay at cutting height - drop-cutter CL along the link stays
       below the link line (one-sided, no tolerance).
@@ -1509,6 +1610,16 @@ def link_plan(surf, cutter, links, sampling=0.1, threads=None,
     - 'lift': the verified feed link (retract to local max CL + LINK_LIFT,
       traverse at ramp feed) - used when use_rapids is off; with a stock
       model the lift height must clear the stock the same way (S3b).
+    - S5(HN): with holder_field (holder_material_field) + stickout, a link
+      whose horizontal traverse happens at FEED height (G1 - which the
+      verifier holder-checks like any cutting move) must also keep the
+      dilated holder material (max(part, stock) within the envelope radius)
+      along the whole link line at or below the nose: material <=
+      traverse_z + stickout. A 'down' link traverses at max(z0, z1), a
+      'lift' at its lift height. On violation the link escalates to 'rapid'
+      (G0 across at a verified ball-clear height - the traverse is no
+      longer a feed move); with rapids disabled, the lift height is raised
+      until the nose clears.
     Returns [(mode, height_or_None, local_max_cl_or_None), ...]."""
     if not links:
         return []
@@ -1526,6 +1637,13 @@ def link_plan(surf, cutter, links, sampling=0.1, threads=None,
                        a[1] + (b[1] - a[1]) * t))
         spans.append((s0, len(xy)))
     z = batch_drop(surf, cutter, xy, threads=threads)
+    holder_on = holder_field is not None and stickout is not None
+    if holder_on:
+        # dilated holder material (max(part, stock) within the envelope
+        # radius + sample-spacing slack) along every link line, sampled at
+        # ss <= HOLDER_SS/2 - dominates zmap's along-move envelope check
+        hv = field_max_at(holder_field, np.array([p[0] for p in xy]),
+                          np.array([p[1] for p in xy]))
     smax = None
     if stock is not None:
         A, sx0, sy0, cell = stock
@@ -1539,10 +1657,29 @@ def link_plan(surf, cutter, links, sampling=0.1, threads=None,
         hi = -np.inf
         if stock is not None:
             svl = sv[s0:s1]
-            if np.isfinite(svl).any():
-                hi = float(np.max(svl))  # stock within ball reach of path
+            svl = svl[np.isfinite(svl)]
+            if svl.size:
+                hi = float(svl.max())  # stock within ball reach of path
+        mat = -np.inf
+        if holder_on:
+            lv = hv[s0:s1]
+            lv = lv[np.isfinite(lv)]
+            if lv.size:
+                mat = float(lv.max())  # holder-envelope material on path
+
+        def _nose_ok(h):
+            return (not holder_on) or not np.isfinite(mat) \
+                or mat <= h + stickout + 0.01
+
         if not fin.any():
-            if hi > -np.inf and use_rapids:
+            if holder_on and np.isfinite(mat) \
+                    and mat > max(a[2], b[2]) + stickout + 0.01:
+                # all part-air but the envelope material stands above the
+                # nose at the link height: traverse as G0 (never at feed)
+                zc = hi + rapid_margin if hi > -np.inf \
+                    else max(a[2], b[2])
+                out.append(("rapid", max(zc, mat - stickout + 0.01), None))
+            elif hi > -np.inf and use_rapids:
                 # all part-air but stock stands under the path: S3b - the
                 # rapid must clear it; never clamp below that requirement
                 out.append(("rapid", hi + rapid_margin, None))
@@ -1552,16 +1689,25 @@ def link_plan(surf, cutter, links, sampling=0.1, threads=None,
         mx = float(np.max(cz[fin]))
         ts = np.linspace(0.0, 1.0, s1 - s0)
         link_z = a[2] + (b[2] - a[2]) * ts
-        if float(np.max(cz[fin] - link_z[fin])) <= 1e-9:
+        if float(np.max(cz[fin] - link_z[fin])) <= 1e-9 \
+                and _nose_ok(max(a[2], b[2])):
             out.append(("down", None, None))
         elif use_rapids:
             # S3b: z_r >= max(CL along path, stock within tool radius along
-            # path) + margin; `clearance` only caps heights already above it
+            # path) + margin; `clearance` only caps heights already above it.
+            # S5(HN): with a holder, the traverse also lifts until the nose
+            # clears the envelope material along the path (mat - stickout).
             zr = max(mx + rapid_margin + stock_allow, hi + rapid_margin)
+            if holder_on and np.isfinite(mat):
+                zr = max(zr, mat - stickout + 0.01)
             out.append(("rapid", zr, mx))
         else:
-            # feed lift: with a stock model the traverse must clear it too
-            out.append(("lift", max(mx + LINK_LIFT, hi + rapid_margin), mx))
+            # feed lift: with a stock model the traverse must clear it too,
+            # and S5(HN) the holder nose must clear the envelope material
+            h = max(mx + LINK_LIFT, hi + rapid_margin)
+            if holder_on and np.isfinite(mat):
+                h = max(h, mat - stickout + 0.01)
+            out.append(("lift", h, mx))
     return out
 
 
@@ -1871,21 +2017,31 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
             shank_by_level[k] = shank_by_level.get(k, 0) + v
         shank_wall_mm2 += ar
         n_shank_removed = sum(shank_by_level.values())
-    # S5: holder safety on the vertices that survived the shank net (drop +
-    # split; pieces rejoin only through the verified link logic below)
+    # S5: holder safety on the vertices AND segment interiors of the paths
+    # that survived the shank net (drop + split; pieces rejoin only through
+    # the verified link logic below). Task HN: one conservative material
+    # field (max(part, --stock-from stock), dilated to the envelope radius)
+    # shared by both nets and the link planning - the roughing stock is
+    # never lower than zmap's live stock, and every sample along the whole
+    # outline (and every feed-height link traverse) is checked, not just
+    # the vertices.
     n_holder_removed = 0
     holder_by_level = {}
     holder_wall_mm2 = 0.0
+    hfield = None
     if hsegs is not None:
+        hfield = holder_material_field(
+            surf, link_stock, max(max(s[2], s[3]) for s in hsegs),
+            threads=threads)
         steep_paths, bl, ar, _ = holder_net(
             surf, steep_paths, hsegs, stickout_mm, stock=link_stock,
-            band=stepdown, threads=threads)
+            band=stepdown, threads=threads, field=hfield)
         for k, v in bl.items():
             holder_by_level[k] = holder_by_level.get(k, 0) + v
         holder_wall_mm2 += ar
         shallow_paths, bl, ar, src_sh = holder_net(
             surf, shallow_paths, hsegs, stickout_mm, stock=link_stock,
-            band=stepover, threads=threads)
+            band=stepover, threads=threads, field=hfield)
         src_shallow = [src_shallow[j] for j in src_sh]  # keep row_of aligned
         for k, v in bl.items():
             holder_by_level[k] = holder_by_level.get(k, 0) + v
@@ -1937,7 +2093,11 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     stock_arg = None
     if link_stock is not None:
         A, sx0, sy0, cell = link_stock
-        r_px = int(math.ceil(0.5 * tool[1] / cell))
+        # +1 cell: the box-max footprint must cover the tool radius PLUS the
+        # verifier's own sub-cell slack (zmap checks cells within r + 0.75 of
+        # ITS finer cell), so a coarse --stock-from grid never under-reads
+        # stock under a rapid
+        r_px = int(math.ceil(0.5 * tool[1] / cell)) + 1
         i0 = max(0, int((xs[0] - sx0) / cell) - r_px)
         i1 = min(A.shape[1], int((xs[-1] - sx0) / cell) + r_px + 1)
         j0 = max(0, int((ys[0] - sy0) / cell) - r_px)
@@ -1948,7 +2108,8 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     lplan = link_plan(surf, cutter, links, sampling=sampling,
                       threads=threads, rapid_margin=rapid_margin,
                       clearance=clearance, use_rapids=use_rapids,
-                      stock=stock_arg, stock_allow=stock_allow)
+                      stock=stock_arg, stock_allow=stock_allow,
+                      holder_field=hfield, stickout=stickout_mm)
     t_link = time.time() - t0
 
     # -- emit -------------------------------------------------------------

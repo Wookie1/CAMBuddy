@@ -1,9 +1,11 @@
 """Synthetic pytest suite for verify/zmap.py (no FreeCAD, no files)."""
+import json
 import math
 import os
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import zmap  # noqa: E402
@@ -237,7 +239,7 @@ def test_stock_chain_cli(tmp_path):
     hf = tmp_path / "part.npy"
     np.save(hf, part)
     with open(str(hf).replace(".npy", ".json"), "w") as f:
-        json.dump({"cell": CELL, "x0": X0, "y0": Y0}, f)
+        json.dump({"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}, f)
     g1 = tmp_path / "s1.ngc"
     g2 = tmp_path / "s2.ngc"
     g1.write_text("""
@@ -665,14 +667,14 @@ def test_vertical_wall_ball_gouge():
 # ---------------------------------------------------------------------------
 
 def _run_engage(gcode, part, dia=6.0, engage_max=None, ramp_angle=3.0,
-                stock=None, tool="flat"):
+                stock=None, tool="flat", stock_init=None):
     """Run simulate with engagement tracking."""
     if stock is None:
         stock = STOCK
     moves = zmap.parse_gcode(gcode)
     return zmap.simulate(moves, part, CELL, X0, Y0, stock, tool=tool,
                          dia=dia, engage_max=engage_max,
-                         ramp_angle=ramp_angle)
+                         ramp_angle=ramp_angle, stock_init=stock_init)
 
 
 def test_engagement_full_width_slot_flagged():
@@ -716,6 +718,117 @@ G1 X-10. Y3. F500.
     assert res["engagement"]["count"] >= 1, \
         "corner spike not flagged: count=%d max=%.3f" % (
             res["engagement"]["count"], res["engagement"]["max_mm"])
+
+
+def test_engagement_side_cut_stepover_1_5():
+    """Side cut with 1.5 mm of stock under one side of the tool (rest
+    already cleared): engagement reads the cut band (~1.5), not 2R."""
+    part = block_part(hi=10.0, half=15.0)
+    ys = centers()[:, None]
+    # pre-cleared to Z5 everywhere except material at y >= 1.5 (height 10);
+    # tool at Y0 R3 cuts the band y in [1.5, 3.0] -> chord ~1.5 mm
+    stock_init = np.broadcast_to(
+        np.where(ys >= 1.5 - 1e-9, 10.0, 5.0), (N, N)).copy()
+    res = _run_engage("""
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""", part, dia=6.0, engage_max=2.0, stock_init=stock_init)
+    eng = res["engagement"]
+    assert eng is not None
+    assert abs(eng["max_mm"] - 1.5) <= 0.3, \
+        "side-cut engagement %.3f not within 1.5 +/- 0.3" % eng["max_mm"]
+    assert eng["count"] == 0, \
+        "1.5 mm side cut flagged at engage_max=2.0 (max %.3f)" % eng["max_mm"]
+
+
+def test_engagement_second_pass_stepover_1_0():
+    """Second parallel pass at 1.0 mm stepover over a cleared band:
+    engagement reads ~1.0 mm."""
+    part = block_part(hi=10.0, half=15.0)
+    # pass 1: clears a band centered at Y0.2 (tool edge reaches Y3.2)
+    res1 = _run_engage("""
+G21 G90 F500
+G0 X-20. Y0.2 Z20.
+G1 Z5. F100.
+G1 X20. Y0.2 F500.
+""", part, dia=6.0)
+    # pass 2: centerline at Y1.2 -> 1.0 mm stepover into fresh material;
+    # stay inside pass 1's X range so its round end-cap sliver is not cut
+    res2 = _run_engage("""
+G21 G90 F500
+G0 X-15. Y1.2 Z20.
+G1 Z5. F100.
+G1 X15. Y1.2 F500.
+""", part, dia=6.0, engage_max=2.0, stock_init=res1["stock"])
+    eng = res2["engagement"]
+    assert eng is not None
+    assert abs(eng["max_mm"] - 1.0) <= 0.3, \
+        "stepover engagement %.3f not within 1.0 +/- 0.3" % eng["max_mm"]
+
+
+def test_engagement_horizontal_distribution_straight_side_cut():
+    """Straight 1.5 mm side cut: horizontal p50 ~1.5 +/- 0.3, entry empty."""
+    part = block_part(hi=10.0, half=15.0)
+    ys = centers()[:, None]
+    xs = centers()[None, :]
+    # fresh material (height 10) in the band y >= 1.5, but the plunge zone
+    # (x < -16, fully covering the tool at the Z5 entry point) is cleared
+    # to 5 so the vertical entry cuts nothing and stays out of "entry"
+    stock_init = np.where((ys >= 1.5 - 1e-9) & (xs >= -16.0), 10.0, 5.0)
+    res = _run_engage("""
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""", part, dia=6.0, engage_max=2.0, stock_init=stock_init)
+    eng = res["engagement"]
+    assert eng is not None
+    horiz = eng["horizontal"]
+    assert horiz["n"] >= 1, "straight side cut not in horizontal bucket"
+    assert abs(horiz["p50"] - 1.5) <= 0.3, \
+        "horizontal p50 %.3f not within 1.5 +/- 0.3" % horiz["p50"]
+    for key in ("p95", "p99", "max"):
+        assert horiz[key] is not None and horiz[key] >= horiz["p50"] - 1e-9
+    assert eng["entry"]["n"] == 0, \
+        "entry bucket not empty for a horizontal cut (n=%d)" % eng["entry"]["n"]
+
+
+def test_engagement_ramp_entry_not_horizontal():
+    """Descending ramp into stock: lands in 'entry', not 'horizontal'."""
+    part = block_part(hi=10.0, half=15.0)
+    # ramp from Z12 down to Z8 across the block (top at 10): engages stock
+    # while descending -> entry bucket only
+    res = _run_engage("""
+G21 G90 F500
+G0 X-10. Y0. Z12.
+G1 X10. Y0. Z8. F100
+""", part, dia=6.0, engage_max=2.0)
+    eng = res["engagement"]
+    assert eng is not None
+    assert eng["entry"]["n"] >= 1, "ramp into stock not in entry bucket"
+    assert abs(eng["entry"]["max"] - 6.0) <= 0.5, \
+        "ramp entry max %.3f not ~full width" % eng["entry"]["max"]
+    assert eng["horizontal"]["n"] == 0, \
+        "descending ramp counted as horizontal (n=%d)" % eng["horizontal"]["n"]
+
+
+def test_engagement_spike_kind():
+    """Spike > engage_max carries kind: horizontal for level cuts, entry
+    for descending ones."""
+    part = block_part(hi=10.0, half=15.0)
+    res = _run_engage("""
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""", part, dia=6.0, engage_max=5.0)
+    spikes = res["engagement"]["spikes"]
+    assert len(spikes) >= 1
+    assert all(s["kind"] in ("horizontal", "entry") for s in spikes)
+    assert any(s["kind"] == "horizontal" for s in spikes), \
+        "level full-width slot spike not kind=horizontal"
 
 
 def test_plunge_helix_not_flagged():
@@ -800,7 +913,7 @@ G1 X20. Y0. F500.
 
 
 def test_cli_optimal_load_computes_engage_max():
-    """CLI --optimal-load computes engage_max as 1.5x the value."""
+    """CLI --optimal-load computes engage_max as 1.2x the value (roughing)."""
     import tempfile, json, os
     part = block_part(hi=10.0, half=15.0)
     with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as hf:
@@ -826,11 +939,51 @@ G1 X20. Y0. F500.
         with open(out_json.name) as f:
             report = json.load(f)
         eng = report["engagement"]
-        # threshold should be 1.5 * 2.0 = 3.0
+        # threshold should be 1.2 * 2.0 = 2.4 (roughing: warn above 1.2x)
         assert eng is not None, "engagement should not be None"
-        assert eng["threshold_mm"] == 3.0,             "threshold %.3f != 3.0 (1.5 * 2.0)" % eng["threshold_mm"]
-        # The full-width cut should be flagged (engagement ~6 > 3)
-        assert eng["count"] >= 1, "full-width cut not flagged at threshold 3.0"
+        assert eng["threshold_mm"] == 2.4,             "threshold %.3f != 2.4 (1.2 * 2.0)" % eng["threshold_mm"]
+        # The full-width cut should be flagged (engagement ~6 > 2.4)
+        assert eng["count"] >= 1, "full-width cut not flagged at threshold 2.4"
+    finally:
+        for p in (hf.name, sidecar, gcode.name, out_json.name):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+def test_cli_optimal_load_2p032_threshold_2p4384():
+    """Z6: roughing --optimal-load 2.032 derives threshold_mm 2.4384
+    (1.2 x optimal load; was 1.5x = 3.048)."""
+    import tempfile, json, os
+    part = block_part(hi=10.0, half=15.0)
+    with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as hf:
+        np.save(hf, part)
+    sidecar = hf.name.replace(".npy", ".json")
+    with open(sidecar, "w") as f:
+        json.dump({"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}, f)
+    gcode = tempfile.NamedTemporaryFile(suffix=".ngc", delete=False, mode="w")
+    gcode.write("""
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""")
+    gcode.close()
+    out_json = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    out_json.close()
+    try:
+        stock_args = ["--stock"] + [str(v) for v in STOCK]
+        rc = zmap.main([gcode.name, "--part", hf.name] + stock_args
+                       + ["--optimal-load", "2.032",
+                          "--out-json", out_json.name])
+        assert rc == 0
+        with open(out_json.name) as f:
+            report = json.load(f)
+        eng = report["engagement"]
+        assert eng is not None
+        assert abs(eng["threshold_mm"] - 2.4384) < 1e-9, \
+            "threshold %r != 2.4384 (1.2 * 2.032)" % eng["threshold_mm"]
+        assert abs(report["warnings"]["engagement"]["threshold_mm"]
+                   - 2.4384) < 1e-9
     finally:
         for p in (hf.name, sidecar, gcode.name, out_json.name):
             if os.path.exists(p):
@@ -865,12 +1018,12 @@ G1 X20. Y0. F500.
         with open(out_json.name) as f:
             report = json.load(f)
         eng = report["engagement"]
-        assert eng["threshold_mm"] == 3.0,             "threshold %.3f != 3.0" % eng["threshold_mm"]
+        assert eng["threshold_mm"] == 2.4,             "threshold %.3f != 2.4 (1.2 * 2.0)" % eng["threshold_mm"]
         plunge = report["plunge"]
         assert plunge["ramp_angle_deg"] == 5.0,             "ramp_angle %.1f != 5.0" % plunge["ramp_angle_deg"]
         # Both appear in warnings
         w = report["warnings"]
-        assert w["engagement"]["threshold_mm"] == 3.0
+        assert w["engagement"]["threshold_mm"] == 2.4
         assert w["plunge"]["ramp_angle_deg"] == 5.0
     finally:
         for p in (hf.name, sidecar, gcode.name, out_json.name):
@@ -1103,3 +1256,552 @@ def test_holder_cli_tool_number(tmp_path):
     rep2 = json.loads(out2.read_text())
     assert rep2["holder_hits"] is None
     assert rep2["holder"]["status"] == "holder unknown"
+
+
+# ---------------------------------------------------------------------------
+# Task Z5: zmap must never silently judge less than the whole stock/toolpath
+# ---------------------------------------------------------------------------
+
+def _z5_hf(tmp_path, tess_tol=0.01):
+    """Part heightfield on the standard grid [-25, 25]^2 + sidecar."""
+    import json
+    npy = tmp_path / "part.npy"
+    np.save(npy, block_part(hi=10.0, half=15.0))
+    meta = {"cell": CELL, "x0": X0, "y0": Y0}
+    if tess_tol is not None:
+        meta["tess_tol"] = tess_tol
+    (tmp_path / "part.json").write_text(json.dumps(meta))
+    return npy
+
+
+def _z5_gcode(tmp_path, body):
+    gc = tmp_path / "p.ngc"
+    gc.write_text("G21 G90 F500\n" + body)
+    return gc
+
+
+def test_z5_stock_beyond_part_grid_fails(tmp_path, capsys):
+    """Supervisor case: stock box extends beyond the part grid by more than
+    half a cell -> non-zero exit naming both bounds, no report, no bypass."""
+    npy = _z5_hf(tmp_path)
+    gc = _z5_gcode(tmp_path, "G0 X0. Y0. Z20.\nG1 Z5. F100.\n"
+                              "G1 X10. Y0. F500.\n")
+    out = tmp_path / "rep.json"
+    rc = zmap.main([str(gc), "--part", str(npy), "--stock",
+                    "-25", "25", "-25", "26.7", "0", "10",
+                    "--out-json", str(out)])
+    assert rc != 0, "stock 1.7 mm beyond grid accepted silently"
+    err = capsys.readouterr().err
+    assert "stock box" in err and "part grid" in err
+    assert "-25.000..25.000" in err and "26.700" in err
+    assert not out.exists()
+
+
+def test_z5_stock_within_half_cell_ok(tmp_path):
+    """A stock box overhanging the grid by at most half a cell per side is
+    within rounding and must pass."""
+    npy = _z5_hf(tmp_path)
+    gc = _z5_gcode(tmp_path, "G0 X0. Y0. Z20.\nG1 Z5. F100.\n"
+                              "G1 X10. Y0. F500.\n")
+    out = tmp_path / "rep.json"
+    rc = zmap.main([str(gc), "--part", str(npy), "--stock",
+                    "-25.25", "25.25", "-25.25", "25.25", "0", "10",
+                    "--out-json", str(out)])
+    assert rc == 0
+
+
+def test_z5_footprint_outside_grid_fails(tmp_path, capsys):
+    """A move whose footprint (XY +- R) leaves the part grid is counted as
+    outside_grid and fails the run; parallel chunking agrees."""
+    import json
+    npy = _z5_hf(tmp_path)
+    gc = _z5_gcode(tmp_path, "G0 X-20. Y0. Z20.\nG1 Z5. F100.\n"
+                              "G1 X23. Y0. F500.\n")  # R3 -> x reaches 26 > 25
+    out = tmp_path / "rep.json"
+    rc = zmap.main([str(gc), "--part", str(npy), "--stock",
+                    "-25", "25", "-25", "25", "0", "10",
+                    "--out-json", str(out)])
+    assert rc != 0, "footprint 1 mm outside grid accepted silently"
+    err = capsys.readouterr().err
+    assert "outside the part grid" in err
+    rep = json.loads(out.read_text())
+    assert rep["outside_grid"]["count"] == 1
+    assert rep["outside_grid"]["first_line"] == 4
+
+
+def test_z5_footprint_outside_grid_parallel_matches(tmp_path):
+    npy = _z5_hf(tmp_path)
+    gc = _z5_gcode(tmp_path, "G0 X-20. Y0. Z20.\nG1 Z5. F100.\n"
+                              "G1 X23. Y0. F500.\n")
+    out = tmp_path / "rep.json"
+    rc = zmap.main([str(gc), "--part", str(npy), "--stock",
+                    "-25", "25", "-25", "25", "0", "10", "--jobs", "2",
+                    "--out-json", str(out)])
+    assert rc != 0
+    import json
+    rep = json.loads(out.read_text())
+    assert rep["outside_grid"]["count"] == 1
+    assert rep["outside_grid"]["first_line"] == 4
+
+
+def test_z5_air_rapid_outside_stock_box_counts_when_off_grid(tmp_path):
+    """An in-air rapid outside the STOCK box is fine only while it stays
+    inside the part grid; leaving the grid counts even in clean air."""
+    import json
+    part = pocket_part(floor=4.0, top=10.0, half=12.0, block=20.0)
+    npy = tmp_path / "part.npy"
+    np.save(npy, part)
+    (tmp_path / "part.json").write_text(json.dumps(
+        {"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}))
+    # stock box inset 5 mm inside the grid in +X: rapids over it are air
+    gc = _z5_gcode(tmp_path, "G0 X-20. Y0. Z20.\nG1 Z5. F100.\n"
+                              "G1 X10. Y0. F500.\n"     # cuts, all in grid
+                              "G0 Z20.\n"
+                              "G0 X27. Y0.\n")           # air, off grid (R3 -> 30)
+    out = tmp_path / "rep.json"
+    rc = zmap.main([str(gc), "--part", str(npy), "--stock",
+                    "-25", "20", "-25", "25", "0", "10",
+                    "--out-json", str(out)])
+    assert rc != 0, "off-grid air rapid exempted"
+    rep = json.loads(out.read_text())
+    assert rep["outside_grid"]["count"] == 1
+    assert rep["outside_grid"]["first_line"] == 6
+    # the same rapid staying inside the grid (X22: footprint to exactly 25)
+    # is air outside... still inside the grid -> passes
+    gc2 = _z5_gcode(tmp_path, "G0 X-20. Y0. Z20.\nG1 Z5. F100.\n"
+                               "G1 X10. Y0. F500.\n"
+                               "G0 Z20.\n"
+                               "G0 X22. Y0.\n")
+    out2 = tmp_path / "rep2.json"
+    rc = zmap.main([str(gc2), "--part", str(npy), "--stock",
+                    "-25", "20", "-25", "25", "0", "10",
+                    "--out-json", str(out2)])
+    assert rc == 0
+    assert json.loads(out2.read_text())["outside_grid"]["count"] == 0
+
+
+def test_z5_tess_tol_gate(tmp_path, capsys):
+    """tess_tol missing or > 0.02 in the part sidecar is a hard failure;
+    0.01 passes."""
+    gc = _z5_gcode(tmp_path, "G0 X0. Y0. Z20.\nG1 Z5. F100.\n"
+                              "G1 X10. Y0. F500.\n")
+    stock = ["--stock", "-25", "25", "-25", "25", "0", "10"]
+    rc = zmap.main([str(gc), "--part", str(_z5_hf(tmp_path, None))] + stock)
+    assert rc != 0, "missing tess_tol accepted"
+    assert "tess_tol" in capsys.readouterr().err
+    rc = zmap.main([str(gc), "--part", str(_z5_hf(tmp_path, 0.05))] + stock)
+    assert rc != 0, "tess_tol 0.05 accepted"
+    assert "tess_tol" in capsys.readouterr().err
+    rc = zmap.main([str(gc), "--part", str(_z5_hf(tmp_path, 0.01))] + stock)
+    assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# Task Z5b: the shared heightfield builder always covers stock + tool + 5 mm
+# ---------------------------------------------------------------------------
+
+import hf_extent  # noqa: E402
+
+
+def test_z5b_grid_extent_covers_stock_plus_tool_and_margin():
+    """Stock-dominant case: grid bounds == stock +- (tool_r + margin),
+    cell-aligned outward, and pad_mm records the per-side growth."""
+    bbox = (-10.0, 8.0, -6.0, 5.0)
+    stock = [-20.0, 20.0, -15.0, 15.0]
+    tool_r, margin, cell = 6.35, 5.0, 0.5
+    ext = hf_extent.grid_extent(bbox, stock_box=stock, tool_r=tool_r,
+                                 margin=margin, cell=cell)
+    grow = tool_r + margin
+    gxmin, gxmax, gymin, gymax = ext["grid_bounds"]
+    assert gxmin == stock[0] - grow                    # exact on cell 0.5
+    assert gxmax >= stock[1] + grow and gxmax < stock[1] + grow + cell
+    assert gymin == stock[2] - grow
+    assert gymax >= stock[3] + grow and gymax < stock[3] + grow + cell
+    assert ext["x0"] == gxmin and ext["y0"] == gymin
+    assert ext["nx"] == round((gxmax - gxmin) / cell)
+    assert ext["ny"] == round((gymax - gymin) / cell)
+    # pad_mm: distance from the part bbox to each grid edge, >= grow
+    p = ext["pad_mm"]
+    assert abs(p["xmin"] - (bbox[0] - gxmin)) < 1e-9
+    assert abs(p["xmax"] - (gxmax - bbox[1])) < 1e-9
+    assert all(v >= grow - 1e-9 for v in p.values())
+
+
+def test_z5b_grid_extent_part_dominant_and_pad_legacy():
+    """Part bigger than stock+growth: grid stays on the part bbox; PAD-only
+    callers keep the old behaviour (bbox grown per side)."""
+    bbox = (-30.0, 30.0, -30.0, 30.0)
+    stock = [-20.0, 20.0, -20.0, 20.0]
+    ext = hf_extent.grid_extent(bbox, stock_box=stock, tool_r=3.0,
+                                 margin=5.0, cell=0.5)
+    assert ext["x0"] == -30.0 and ext["y0"] == -30.0
+    assert ext["grid_bounds"] == [-30.0, 30.0, -30.0, 30.0]
+    assert ext["pad_mm"] == {"xmin": 0.0, "xmax": 0.0,
+                             "ymin": 0.0, "ymax": 0.0}
+    # legacy PAD path (no stock box): exactly the old rasterize geometry
+    ext2 = hf_extent.grid_extent(bbox, pad=8.0, cell=0.5)
+    assert ext2["x0"] == -38.0 and ext2["y0"] == -38.0
+    assert ext2["nx"] == int(math.ceil((76.0) / 0.5))
+    assert ext2["grid_bounds"][1] == 38.0
+    # no stock box, no pad: tight part bbox (old default)
+    ext3 = hf_extent.grid_extent(bbox, cell=0.5)
+    assert ext3["grid_bounds"] == [-30.0, 30.0, -30.0, 30.0]
+
+
+def test_z5b_parse_stock_box():
+    assert hf_extent.parse_stock_box("-1 2 -3 4") == [-1.0, 2.0, -3.0, 4.0]
+    assert hf_extent.parse_stock_box(None) is None
+    assert hf_extent.parse_stock_box("") is None
+    for bad in ("-1 2 -3", "-1 2 -3 4 5", "1 0 -3 4", "-1 -2 3 4"):
+        try:
+            hf_extent.parse_stock_box(bad)
+            assert False, "bad STOCK_BOX accepted: %r" % bad
+        except SystemExit:
+            pass
+
+
+def test_z5b_heightfield_rasterize_sidecar(tmp_path, monkeypatch):
+    """Fake rasteriser (no FreeCAD): rasterize with STOCK_BOX produces a
+    grid covering stock + tool_r + margin; sidecar meta records stock_box,
+    tool_r, margin, pad_mm per side and grid_bounds; outer cells are the
+    zmin floor. PAD-only callers keep the old meta shape (stock_box null)."""
+    import json
+    import types
+    sys.modules.setdefault("FreeCAD", types.ModuleType("FreeCAD"))
+    sys.modules.setdefault("Part", types.ModuleType("Part"))
+    import heightfield
+
+    class _FakeShape:
+        """Flat square top at z=10 over [-10, 8] x [-6, 5]."""
+        BoundBox = types.SimpleNamespace(XMin=-10.0, XMax=8.0,
+                                          YMin=-6.0, YMax=5.0,
+                                          ZMin=0.0, ZMax=10.0)
+
+        def tessellate(self, tol):
+            v = [types.SimpleNamespace(x=x, y=y, z=10.0)
+                 for x, y in ((-10.0, -6.0), (8.0, -6.0),
+                              (8.0, 5.0), (-10.0, 5.0))]
+            return v, [(0, 1, 2), (0, 2, 3)]
+
+    cell = 0.5
+    stock = [-20.0, 20.0, -15.0, 15.0]
+    tool_r, margin = 6.35, 5.0
+    hf, meta = heightfield.rasterize(_FakeShape(), cell=cell, tol=0.01,
+                                      stock_box=stock, tool_r=tool_r,
+                                      margin=margin)
+    grow = tool_r + margin
+    gxmin, gxmax, gymin, gymax = meta["grid_bounds"]
+    assert gxmin <= stock[0] - grow and gxmax >= stock[1] + grow
+    assert gymin <= stock[2] - grow and gymax >= stock[3] + grow
+    assert meta["x0"] == gxmin and meta["y0"] == gymin
+    assert hf.shape == (meta["ny"], meta["nx"])
+    assert meta["stock_box"] == stock
+    assert meta["tool_r"] == tool_r
+    assert meta["margin"] == margin
+    for side, need in (("xmin", stock[0] - grow - gxmin),
+                       ("xmax", gxmax - (stock[1] + grow))):
+        assert meta["pad_mm"][side] >= need
+    # geometry lands where it should; the grown ring is part-free = zmin
+    i_part = int((0.0 - gxmin) / cell)
+    j_part = int((0.0 - gymin) / cell)
+    assert hf[j_part, i_part] == 10.0
+    assert hf[0, 0] == 0.0 and hf[-1, -1] == 0.0
+    # sidecar written through the same meta keeps every new field
+    npy = tmp_path / "part_hf.npy"
+    np.save(npy, hf)
+    with open(str(npy).replace(".npy", ".json"), "w") as f:
+        json.dump(meta, f)
+    side = json.loads((tmp_path / "part_hf.json").read_text())
+    for key in ("stock_box", "tool_r", "margin", "pad_mm", "grid_bounds"):
+        assert key in side
+
+
+def test_z5b_heightfield_get_args(monkeypatch):
+    """Env and flag forms of the new inputs; PAD stays for old callers."""
+    import types
+    sys.modules.setdefault("FreeCAD", types.ModuleType("FreeCAD"))
+    sys.modules.setdefault("Part", types.ModuleType("Part"))
+    import heightfield
+
+    for k in ("STEP_IN", "HF_OUT", "CELL", "PAD", "STOCK_BOX", "TOOL_R",
+              "MARGIN"):
+        monkeypatch.delenv(k, raising=False)
+
+    monkeypatch.setattr(sys, "argv", ["heightfield.py"])
+    monkeypatch.setenv("STEP_IN", "a.step")
+    monkeypatch.setenv("HF_OUT", "hf.npy")
+    monkeypatch.setenv("STOCK_BOX", "-20 20 -15 15")
+    monkeypatch.setenv("TOOL_R", "6.35")
+    step, out, cell, pad, sb, tr, mg = heightfield.get_args()
+    assert (step, out) == ("a.step", "hf.npy")
+    assert sb == [-20.0, 20.0, -15.0, 15.0]
+    assert tr == 6.35 and mg == 5.0 and pad == 0.0
+
+    monkeypatch.setattr(sys, "argv", ["heightfield.py", "a.step", "hf.npy",
+                                       "0.1", "2.0", "--stock-box",
+                                       "-30", "30", "-25", "25",
+                                       "--tool-r", "8", "--margin", "7"])
+    step, out, cell, pad, sb, tr, mg = heightfield.get_args()
+    assert (step, out, cell, pad) == ("a.step", "hf.npy", 0.1, 2.0)
+    assert sb == [-30.0, 30.0, -25.0, 25.0]
+    assert tr == 8.0 and mg == 7.0
+
+    # no stock box: old caller path, everything defaults
+    monkeypatch.delenv("STOCK_BOX")
+    monkeypatch.delenv("TOOL_R")
+    monkeypatch.setattr(sys, "argv", ["heightfield.py"])
+    step, out, cell, pad, sb, tr, mg = heightfield.get_args()
+    assert sb is None and tr == 0.0 and mg == 5.0
+
+
+def test_z5b_builder_grid_satisfies_zmap_stock_gate(tmp_path):
+    """End-to-end on synthetic arrays: a zmap run whose stock exceeded the
+    old tight grid now passes when judged on a builder-sized grid, while an
+    un-grown grid still fails (the zmap gate itself is untouched)."""
+    import json
+    part = block_part(hi=10.0, half=15.0)  # part bbox [-25,25]^2 on std grid
+    gc = _z5_gcode(tmp_path, "G0 X-20. Y0. Z20.\nG1 Z5. F100.\n"
+                              "G1 X23. Y0. F500.\n")
+    stock = [-25.0, 25.0, -25.0, 28.0, 0.0, 10.0]  # 3 mm past the std grid
+    stock_args = ["--stock"] + [str(v) for v in stock]
+    tight = tmp_path / "tight.npy"
+    np.save(tight, part)
+    (tmp_path / "tight.json").write_text(json.dumps(
+        {"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}))
+    out = tmp_path / "rep.json"
+    assert zmap.main([str(gc), "--part", str(tight)] + stock_args
+                     + ["--out-json", str(out)]) != 0, \
+        "tight grid must still fail the stock gate"
+
+    # builder-sized grid: stock + tool_r(3) + margin(5), cell-aligned
+    ext = hf_extent.grid_extent((X0, X0 + N * CELL, Y0, Y0 + N * CELL),
+                                 stock_box=stock[:4], tool_r=3.0, margin=5.0,
+                                 cell=CELL)
+    grown = np.full((ext["ny"], ext["nx"]), 0.0)
+    j0 = int(round((Y0 - ext["y0"]) / CELL))
+    i0 = int(round((X0 - ext["x0"]) / CELL))
+    grown[j0:j0 + N, i0:i0 + N] = part
+    big = tmp_path / "grown.npy"
+    np.save(big, grown)
+    (tmp_path / "grown.json").write_text(json.dumps(
+        {"cell": CELL, "x0": ext["x0"], "y0": ext["y0"],
+         "tess_tol": 0.01, "stock_box": stock[:4], "tool_r": 3.0,
+         "margin": 5.0, "pad_mm": ext["pad_mm"],
+         "grid_bounds": ext["grid_bounds"]}))
+    out2 = tmp_path / "rep2.json"
+    rc = zmap.main([str(gc), "--part", str(big)] + stock_args
+                   + ["--out-json", str(out2)])
+    assert rc == 0, "builder grid must satisfy the stock + footprint gates"
+    rep = json.loads(out2.read_text())
+    assert rep["outside_grid"]["count"] == 0
+
+
+
+# ============================================= task CP: --strict subset ====
+
+STRICT_OK = """O1001
+( posted program, supported subset )
+G21 G90 G17 G40 G80 G49 G94
+G54
+T13 M06
+G43 Z25. H13 M03 S7500 M08
+G0 X-20. Y0.
+G1 Z5. F300.
+G2 X0. Y20. I20. J0. F1500.
+G3 X20. Y0. R20.
+G04 P2000.
+G1 X-20. Y0. F1500.
+G0 Z25.
+M09
+M05
+G53 G00 Z0.
+G49
+G91 G28 X0. Y0.
+G90
+M30
+%
+"""
+
+
+def codes_of(findings):
+    return [(f["code"], f["line"]) for f in findings]
+
+
+def test_strict_accepts_supported_subset():
+    assert zmap.strict_check(STRICT_OK) == []
+
+
+@pytest.mark.parametrize("line,code", [
+    ("G18", "G18"),
+    ("G19", "G19"),
+    ("G41", "G41"),
+    ("G42", "G42"),
+    ("G81 Z-5. R2.", "G81"),
+    ("G82 Z-5. P1000.", "G82"),
+    ("G83 Z-5. Q2.", "G83"),
+    ("G84", "G84"),
+    ("G85 Z-5.", "G85"),
+    ("G86 Z-5.", "G86"),
+    ("G87 Z-5.", "G87"),
+    ("G88 Z-5.", "G88"),
+    ("G89 Z-5.", "G89"),
+    ("G91 X5.", "G91"),
+    ("G68", "G68"),
+    ("G51", "G51"),
+    ("M98 P1001", "M98"),
+    ("M99", "M99"),
+    ("#5=1", "#"),
+    ("U5.", "U"),
+    ("D3", "D"),
+])
+def test_strict_rejects_every_unsupported_code(line, code):
+    text = "G21 G90\nG0 X0. Y0.\n%s\n" % line
+    findings = zmap.strict_check(text)
+    assert codes_of(findings), "must not skip %r silently" % line
+    assert findings[0]["code"] == code
+    assert findings[0]["line"] == 3
+
+
+def test_strict_rejects_comp_and_planes_in_program():
+    text = ("G21 G90\nG1 X0. Y0. F500.\nG41 X10. D3 F500.\n"
+            "G18\nG2 X20. Z0. I10. K0.\n")
+    codes = [f["code"] for f in zmap.strict_check(text)]
+    assert "G41" in codes and "D" in codes and "G18" in codes
+    assert "K" in codes
+
+
+def test_strict_home_line_only_at_end():
+    home = "G91 G28 X0. Y0."
+    assert zmap.strict_check("G21\n%s\nM30\n%%\n" % home) == []
+    # a cutting move after the home line: the home line was not at the end
+    bad = "G21\n%s\nG1 X5. Y5. F100.\nM30\n" % home
+    findings = zmap.strict_check(bad)
+    assert ("G28", 2) in codes_of(findings)
+
+
+def test_strict_g53_z_only_ok_axes_rejected():
+    assert zmap.strict_check("G21\nG53 G00 Z0.\n") == []
+    findings = zmap.strict_check("G21\nG53 G00 X0. Y0. Z0.\n")
+    assert ("G53", 2) in codes_of(findings)
+
+
+def test_strict_g43_needs_h_and_dwell_needs_p():
+    findings = zmap.strict_check("G21\nG43 Z5.\n")
+    assert ("G43", 2) in codes_of(findings)
+    findings = zmap.strict_check("G21\nG0 X0.\nP1000.\n")
+    assert ("P", 3) in codes_of(findings)
+
+
+def test_strict_r_smaller_than_chord_rejected():
+    findings = zmap.strict_check("G21 G90\nG0 X0. Y0.\n"
+                                  "G1 X20. Y0.\nG2 X0. Y0. R5.\n")
+    assert ("R", 4) in codes_of(findings)
+
+
+def test_strict_cli_rejects_with_json(tmp_path):
+    gc = tmp_path / "p.nc"
+    gc.write_text("G21 G90\nG0 X0. Y0.\nG81 Z-5. R2. F100.\n"
+                  "G41 X5. D1\n")
+    out = tmp_path / "rep.json"
+    rc = zmap.main([str(gc), "--part", str(tmp_path / "none.npy"),
+                    "--strict", "--out-json", str(out)])
+    assert rc != 0, "unsupported program must exit non-zero"
+    rep = json.loads(out.read_text())
+    codes = [f["code"] for f in rep["unsupported"]]
+    assert codes[0] == "G81" and "G41" in codes
+    assert rep["unsupported"][0]["line"] == 3
+
+
+def test_strict_cli_ok_and_reports(tmp_path):
+    gc = tmp_path / "p.nc"
+    gc.write_text(STRICT_OK)
+    part = np.full((100, 100), 5.0)
+    p = tmp_path / "part.npy"
+    np.save(p, part)
+    (tmp_path / "part.json").write_text(json.dumps(
+        {"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}))
+    out = tmp_path / "rep.json"
+    rc = zmap.main([str(gc), "--part", str(p), "--stock", "-25", "25",
+                    "-25", "25", "0", "10", "--tool", "flat", "--dia", "6",
+                    "--strict", "--engage-report", "--out-json", str(out)])
+    assert rc == 0, "supported program must pass --strict"
+    rep = json.loads(out.read_text())
+    assert rep["strict"] is True and rep["unsupported"] == []
+    # report-only engagement: present, no threshold, nothing flagged
+    assert rep["engagement"]["threshold_mm"] is None
+    assert rep["engagement"]["count"] == 0
+
+
+def _arc_compare_programs(R=10.0):
+    """(I/J form, R form, finely linearized G1) of the same CW semicircle
+    from (R,0) to (-R,0), chord <= 0.01 mm on the linear form."""
+    head = "G21 G90 F500\nG0 X%.3f Y0. Z20.\nG1 Z5. F100.\n" % R
+    tail = "\nG0 Z20.\nM30\n"
+    ij = head + "G2 X%.3f Y0. I-%.3f J0. F500." % (-R, R) + tail
+    rr = head + "G2 X%.3f Y0. R%.3f F500." % (-R, R) + tail
+    n = int(math.ceil(math.pi * R / 0.01))
+    pts = []
+    for k in range(1, n + 1):
+        a = -math.pi * k / n
+        pts.append("G1 X%.5f Y%.5f F500." % (R * math.cos(a),
+                                               R * math.sin(a)))
+    lin = head + "\n".join(pts) + tail
+    return ij, rr, lin
+
+
+def test_r_form_and_ij_form_match_fine_linearization():
+    Rpath, Rtool = 10.0, 3.0
+    xs = centers()[None, :]
+    ys = centers()[:, None]
+    r = np.hypot(xs, ys)
+    part = np.where((r >= Rpath - Rtool) & (r <= Rpath + Rtool), 5.0, 10.0)
+    ij, rr, lin = _arc_compare_programs(Rpath)
+    res_ij = run(ij, part)
+    res_r = run(rr, part)
+    res_lin = run(lin, part)
+    for key in ("gouges", "rapid_collisions"):
+        assert res_r[key]["count"] == res_ij[key]["count"] == \
+            res_lin[key]["count"], key
+    assert res_ij["gouges"]["count"] == 0
+    assert res_r["leftover"]["max"] == pytest.approx(
+        res_lin["leftover"]["max"], abs=1e-6)
+    assert res_r["leftover"]["mean"] == pytest.approx(
+        res_lin["leftover"]["mean"], abs=1e-3)
+    assert res_ij["leftover"]["mean"] == pytest.approx(
+        res_lin["leftover"]["mean"], abs=1e-3)
+    assert abs(res_r["cutting_length_mm"] - res_lin["cutting_length_mm"]) \
+        < 0.05
+
+
+def test_negative_r_over_180_matches_linearization():
+    # 270 deg CW arc from (-10,0) to (0,-10): negative R in the R form
+    Rpath, Rtool = 10.0, 3.0
+    xs = centers()[None, :]
+    ys = centers()[:, None]
+    r = np.hypot(xs, ys)
+    part = np.where((r >= Rpath - Rtool) & (r <= Rpath + Rtool), 5.0, 10.0)
+    head = "G21 G90 F500\nG0 X-10. Y0. Z20.\nG1 Z5. F100.\n"
+    rr = head + "G2 X0. Y-10. R-10. F500.\nG0 Z20.\n"
+    n = int(math.ceil(1.5 * math.pi * Rpath / 0.01))
+    pts = []
+    for k in range(1, n + 1):
+        a = math.pi - 1.5 * math.pi * k / n
+        pts.append("G1 X%.5f Y%.5f F500." % (Rpath * math.cos(a),
+                                               Rpath * math.sin(a)))
+    lin = head + "\n".join(pts) + "\nG0 Z20.\n"
+    res_r = run(rr, part)
+    res_lin = run(lin, part)
+    assert res_r["gouges"]["count"] == res_lin["gouges"]["count"]
+    assert res_r["rapid_collisions"]["count"] == \
+        res_lin["rapid_collisions"]["count"]
+    assert res_r["leftover"]["mean"] == pytest.approx(
+        res_lin["leftover"]["mean"], abs=1e-3)
+
+
+def test_strict_skips_home_and_dwell_moves():
+    moves = zmap.parse_gcode(STRICT_OK, strict=True)
+    assert all(not (m["x"] == 0.0 and m["y"] == 0.0
+                   and m["motion"] == "G1") for m in moves)
+    # default behaviour unchanged: home line still parses as before
+    dflt = zmap.parse_gcode("G91 G28 X0. Y0.\n")
+    assert len(dflt) == 1
