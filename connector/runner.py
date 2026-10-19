@@ -147,14 +147,17 @@ class EngineRun:
     def run(self, step_path, values, on_progress=None):
         py = self.cfg["engine_python"]
         cell = 0.5
-        # 1) orient + stock box + part heightfield
+        # 1) orient + stock box + part heightfield (grid covers the run's
+        #    stock + tool radius + margin via STOCK_BOX/TOOL_R, task Z5b)
         self._spawn([py, "-m", "engine.cli", "prepare",
                     "--step", step_path, "--out-dir", self.work,
                     "--orient", values["orientation"],
                     "--stock-xy", "%.4f" % values["stock_xy"],
                     "--stock-top", "%.4f" % values["stock_top"],
                     "--stock-bottom", "%.4f" % values["stock_bottom"],
-                    "--cell", str(cell)], 0.05, 0.2, on_progress)
+                    "--cell", str(cell),
+                    "--tool-r", "%.4f" % (values["tool_diameter"] / 2.0)],
+                   0.05, 0.2, on_progress)
         with open(os.path.join(self.work, "prepare.json")) as fh:
             prep = json.load(fh)
         stock = prep["stock"]
@@ -186,13 +189,27 @@ class EngineRun:
         with open(stats_path) as fh:
             stats = json.load(fh)
 
-        # 3) independent zmap check + leftover preview
+        # 3) independent zmap check + leftover preview. The zmap part grid
+        #    must cover stock + tool radius (zmap exits non-zero if the
+        #    stock box extends beyond the grid by more than half a cell, or
+        #    a tool footprint leaves the grid): the shared heightfield
+        #    builder grows the grid from STOCK_BOX + TOOL_R + MARGIN.
         if on_progress:
-            on_progress(0.88, "checking")
+            on_progress(0.86, "checking")
+        fc = os.path.join(os.path.dirname(py), "freecadcmd")
+        hf_zmap = os.path.join(self.work, "part_hf_zmap.npy")
+        self._spawn([fc, os.path.join(self.cfg["repo_root"], "verify",
+                                       "heightfield.py")],
+                    0.86, 0.90, on_progress,
+                    extra_env={"STEP_IN": prep["step"], "HF_OUT": hf_zmap,
+                              "CELL": str(cell), "TESS_TOL": "0.01",
+                              "STOCK_BOX": " ".join("%.4f" % v
+                                                    for v in stock[:4]),
+                              "TOOL_R": "%.4f" % (values["tool_diameter"] / 2.0)})
         check_path = os.path.join(self.work, "check.json")
         png_path = os.path.join(self.work, "preview.png")
         self._spawn([py, "-m", "verify.zmap", nc,
-                    "--part", prep["hf"],
+                    "--part", hf_zmap,
                     "--tool", values["tool_type"],
                     "--dia", "%.4f" % values["tool_diameter"],
                     "--corner", "%.4f" % values["corner_radius"],
@@ -279,27 +296,36 @@ class EngineRun:
             "tool_diameter": values["rough_tool_diameter"],
             "corner_radius": values["rough_corner_radius"]})
 
-        # 1) orient + stock box + part heightfield (for the roughing clip)
+        # 1) orient + stock box + part heightfield (for the roughing clip;
+        #    grid covers stock + largest tool radius of the run + margin)
+        max_tool_r = max(values["tool_diameter"],
+                         values["rough_tool_diameter"]) / 2.0
         self._spawn([py, "-m", "engine.cli", "prepare",
                     "--step", step_path, "--out-dir", self.work,
                     "--orient", values["orientation"],
                     "--stock-xy", "%.4f" % values["stock_xy"],
                     "--stock-top", "%.4f" % values["stock_top"],
                     "--stock-bottom", "%.4f" % values["stock_bottom"],
-                    "--cell", "0.5"], 0.02, 0.12, on_progress)
+                    "--cell", "0.5",
+                    "--tool-r", "%.4f" % max_tool_r], 0.02, 0.12, on_progress)
         with open(os.path.join(self.work, "prepare.json")) as fh:
             prep = json.load(fh)
         stock = prep["stock"]
         floor = stock[4] + values["floor_z"]
 
         # 2) fresh zmap part heightfield (verify/heightfield.py, 0.01 mm
-        #    tess, 0.1 mm cell) - independent of the roughing clip grid
+        #    tess, 0.1 mm cell) - independent of the roughing clip grid.
+        #    The shared builder covers STOCK_BOX + TOOL_R + MARGIN: zmap
+        #    exits non-zero when the stock box or a tool footprint extends
+        #    beyond its grid.
         hf01 = os.path.join(self.work, "part_hf01.npy")
         self._spawn([fc, os.path.join(repo, "verify", "heightfield.py")],
                     0.12, 0.17, on_progress,
                     extra_env={"STEP_IN": prep["step"], "HF_OUT": hf01,
                               "CELL": "0.1", "TESS_TOL": "0.01",
-                              "PAD": "0"})
+                              "STOCK_BOX": " ".join("%.4f" % v
+                                                    for v in stock[:4]),
+                              "TOOL_R": "%.4f" % max_tool_r})
 
         # 3) adaptive roughing (LNC post, full stock)
         nc = os.path.join(self.work, "rough.nc")
