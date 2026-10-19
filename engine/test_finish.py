@@ -45,7 +45,7 @@ from engine.finish import (finish, finish_to_gcode, surf_bounds,  # noqa: E402
                            refine_contours, steep_runs_grid, segment_net,
                            link_plan, compute_rest_mask, CHORD_TOL,
                            RAPID_MARGIN, RAPID_STOCK_ALLOW, box_max,
-                           load_heightfield)
+                           load_heightfield, tool_geometry, SHANK_TOL)
 import zmap  # noqa: E402
 from engine import post_lnc  # noqa: E402
 
@@ -385,8 +385,9 @@ def run_case(name, stl_path, hf_fn, box, floor_z, assert_shallow_lt=None,
     # batched drop-cutter calls (one per round), not one call per chord -
     # every call re-indexes the whole STL (setSTL). Fixed overhead: raster
     # row batches, window probe, CL grid, refine rounds (<=6) + jump check,
-    # segment net, curve-sample extras, links.
-    assert stats["n_drop_calls"] <= 26 + 2 * stats["n_simplify_rounds"] \
+    # segment net, curve-sample extras, links, S4 shank nets (steep+shallow:
+    # +2).
+    assert stats["n_drop_calls"] <= 28 + 2 * stats["n_simplify_rounds"] \
         + extra_calls, \
         "%s: %d drop-cutter calls vs rounds=%d (expected O(rounds))" % (
             name, stats["n_drop_calls"], stats["n_simplify_rounds"])
@@ -1042,6 +1043,122 @@ def test_stock_from_ridge_rapids():
                   crossed, stats["n_rapid_links"], ridge_top + RAPID_MARGIN))
 
 
+# ---------------------------------------------------------------------------
+# S4: flute/shank-aware passes (James's tools, tools/x7_tools.json)
+# ---------------------------------------------------------------------------
+
+def deep_wall_stl(path, q=15.0, hy=10.0, top=22.0, slot_half=3.5):
+    """Block with a straight slot (width 2*slot_half, floor z=0) along Y:
+    ~22 mm deep vertical walls (Core Front class)."""
+    return slot_boss_stl(path, half_x=q, half_y=hy, top=top,
+                         slot_half=slot_half, slot_floor=0.0)
+
+
+def hf_deep_wall(X, Y, top=22.0, slot_half=3.5):
+    return np.where(np.abs(X) < slot_half, 0.0, top)
+
+
+def test_shank_deep_wall_short_flute():
+    """S4 item 3: deep wall (22 mm) + D=6 F=15 (table: flute = 2.5 x D).
+    Every CL point deeper than the flute next to a wall is dropped (the
+    shank, dia = D, would touch), split + verified relink; removed points
+    are reported per level and every removed level is deeper than the flute
+    below the wall top; probe_clcheck (ball 6) stays 0 and zmap sees no
+    gouges (points are only ever dropped, never moved down)."""
+    q, hy, top = 15.0, 10.0, 22.0
+    with tempfile.TemporaryDirectory() as td:
+        stl = deep_wall_stl(os.path.join(td, "wall.stl"), q, hy, top)
+        surf = model.load_surf(stl)
+        stats = run_case("deep-wall-6", stl, hf_deep_wall,
+                         (-q, q, -hy, hy), floor_z=0.0)
+        assert stats["flute_mm"] == 15.0, "flute not read from table"
+        assert stats["shank_dia_mm"] == 6.0, "shank not read from table"
+        assert stats["n_shank_removed"] > 0, "no shank-blocked points dropped"
+        zl = [z for z, n in stats["shank_removed_by_level"]]
+        assert max(zl) <= top - 15.0 + SHANK_TOL + 1e-9, \
+            "removed points above the flute limit (max z %.2f)" % max(zl)
+        # no emitted vertex violates the shank rule anymore
+        moves, _ = finish(surf, stl_path=stl, tool=("ball", 6.0, 0.0),
+                         floor_z=0.0, threads=4)
+        pts = [(mv["x"], mv["y"], mv["z"]) for mv in moves
+               if mv["g"] == 1 and mv.get("z") is not None]
+        cyl = batch_drop(surf, make_cutter("flat", 6.0 + 2 * SHANK_TOL),
+                        [(p[0], p[1]) for p in pts], threads=4)
+        zv = np.array([p[2] for p in pts])
+        n_viol = int((np.isfinite(cyl)
+                      & (cyl > zv + 15.0 - SHANK_TOL)).sum())
+        assert n_viol == 0, "%d emitted vertices still shank-blocked" % n_viol
+        print("deep-wall D=6 F=15: removed=%d (levels %.2f..%.2f, "
+              "wall=%.0fmm2), 0 remaining violations"
+              % (stats["n_shank_removed"], min(zl), max(zl),
+                 stats["removed_wall_mm2"]))
+
+
+def test_shank_deep_wall_long_flute():
+    """S4 item 3: same 22 mm wall with D=9.525 F=23.8 (table: 2.5 x D =
+    23.8125 >= wall depth) - nothing is dropped, clcheck (ball 9.525) 0."""
+    q, hy, top = 15.0, 10.0, 22.0
+    with tempfile.TemporaryDirectory() as td:
+        stl = deep_wall_stl(os.path.join(td, "wall.stl"), q, hy, top)
+        surf = model.load_surf(stl)
+        stats = run_case("deep-wall-95", stl, hf_deep_wall,
+                         (-q, q, -hy, hy), floor_z=0.0, dia=9.525)
+        assert stats["flute_mm"] == 23.8125, "flute not read from table"
+        assert stats["n_shank_removed"] == 0, \
+            "long flute dropped %d points" % stats["n_shank_removed"]
+        print("deep-wall D=9.525 F=23.8125: 0 points dropped (kept)")
+
+
+def test_rest_pass_table_tool():
+    """S4 item 2: corner rest pass with --rest-tool ball:3.175 (1/8 in, IN
+    tools/x7_tools.json): no PLACEHOLDER marker, flute 7.9375 + shank 3.175
+    read from the table, rest cells reported clean vs shank-blocked, and
+    clcheck (ball 3.175) 0."""
+    q, hy, top, slot_half, slot_floor = 15.0, 10.0, 10.0, 2.0, 4.0
+    with tempfile.TemporaryDirectory() as td:
+        stl = slot_boss_stl(os.path.join(td, "slot.stl"))
+        surf = model.load_surf(stl)
+        X, Y, nx, ny = _grid((-q, q, -hy, hy))
+        stock = np.full(X.shape, top + 0.381)
+        np.save(os.path.join(td, "stock.npy"), stock)
+        with open(os.path.join(td, "stock.json"), "w") as fh:
+            json.dump({"x0": -q, "y0": -hy, "cell": CELL}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 3.175, 0.0),
+                             floor_z=slot_floor, threads=4,
+                             rest_from=os.path.join(td, "stock.npy"),
+                             big_tool=("ball", 6.0, 0.0), min_rest=0.5)
+        assert moves and stats.get("rest_pass")
+        assert not stats["placeholder_tool"], \
+            "ball:3.175 is in tools/x7_tools.json - not a placeholder"
+        assert stats["flute_mm"] == 7.9375 and stats["shank_dia_mm"] == 3.175
+        assert stats["n_rest_cells"] > 0, "empty rest mask"
+        assert (stats["n_rest_clean"] + stats["n_rest_shank_blocked"]
+                == stats["n_rest_cells"])
+        print("rest-pass ball:3.175: cells=%d clean=%d shank-blocked=%d"
+              % (stats["n_rest_cells"], stats["n_rest_clean"],
+                 stats["n_rest_shank_blocked"]))
+        n_ck, n_bad, mx = clcheck_moves(surf, moves, dia=3.175)
+        assert n_bad == 0, "rest-pass clcheck: %d below CL, max %.3f" % (
+            n_bad, mx)
+
+
+
+def test_shank_net_keeps_source_index():
+    """A path split by the shank net keeps its source index, so per-row bookkeeping
+    (row_of / run_i0 for serpentine ordering) stays aligned (Core Front 6 mm crash)."""
+    import numpy as np
+    from engine import finish as F
+    paths = [[(0, 0, 1.0), (1, 0, 1.0), (2, 0, 1.0), (3, 0, 1.0), (4, 0, 1.0)],
+             [(0, 1, 1.0), (1, 1, 1.0)]]
+    orig = F.batch_drop
+    F.batch_drop = lambda surf, cut, xy, threads=None: np.array(
+        [1.0, 1.0, 50.0, 1.0, 1.0, 1.0, 1.0])
+    try:
+        out, bl, ar, src = F.shank_net(None, paths, 6.0, 15.0)
+    finally:
+        F.batch_drop = orig
+    assert [len(p) for p in out] == [2, 2, 2] and src == [0, 0, 1], (out, src)
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -1055,7 +1172,10 @@ if __name__ == "__main__":
                test_rest_pass_placeholder,
                test_stock_out_roundtrip,
                test_link_plan_stock_ridge,
-               test_stock_from_ridge_rapids):
+               test_stock_from_ridge_rapids,
+               test_shank_deep_wall_short_flute,
+               test_shank_deep_wall_long_flute,
+               test_rest_pass_table_tool, test_shank_net_keeps_source_index):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))

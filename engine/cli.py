@@ -104,13 +104,14 @@ def finish_main(a):
     slope_split_finish), engine/finish.py."""
     from engine import finish as finishmod, model
     kind, dia, corner = parse_tool(a.tool)
+    big = (kind, dia, corner)  # previous finish tool for the rest mask (S4)
     rest_kw = {}
     if getattr(a, "rest_from", None):
-        # S3 item 3: corner rest pass with a PLACEHOLDER small ball; the
-        # leftover map is computed by the engine itself from its own
-        # drop-cutter CL (6 mm vs 3 mm) - see finish.compute_rest_mask.
+        # S3 item 3 / S4: corner rest pass; the leftover map is computed by
+        # the engine itself from its own drop-cutter CL (finish tool vs the
+        # rest tool) - see finish.compute_rest_mask.
         kind, dia, corner = parse_tool(a.rest_tool)
-        rest_kw = dict(rest_from=a.rest_from, big_tool=("ball", 6.0, 0.0),
+        rest_kw = dict(rest_from=a.rest_from, big_tool=big,
                        min_rest=a.min_rest)
     t0 = time.time()
     if a.stl:
@@ -146,12 +147,20 @@ def finish_main(a):
         stock_from=a.stock_from,
         stock_allow=(finishmod.RAPID_STOCK_ALLOW if a.stock_allow is None
                     else a.stock_allow),
+        flute_mm=getattr(a, "flute", None),
+        shank_dia=getattr(a, "shank", None),
         **rest_kw)
     if rest_kw:
-        tool_comment = ("PLACEHOLDER %s D=%.3f CR=%.3f (not in "
-                        "tools/x7_tools.json - LNC post must refuse)"
-                        % (a.rest_tool, dia, corner))
-        stats["tool"] = "PLACEHOLDER %s" % a.rest_tool
+        if finishmod.tool_geometry(kind, dia) is None:
+            # S4: placeholder marker stays only for tools not in the table
+            tool_comment = ("PLACEHOLDER %s D=%.3f CR=%.3f (not in "
+                            "tools/x7_tools.json - LNC post must refuse)"
+                            % (a.rest_tool, dia, corner))
+            stats["tool"] = "PLACEHOLDER %s" % a.rest_tool
+        else:
+            tool_comment = ("REST %s D=%.3f CR=%.3f (tools/x7_tools.json)"
+                           % (a.rest_tool, dia, corner))
+            stats["tool"] = a.rest_tool
     else:
         tool_comment = "T1 %s D=%.3f CR=%.3f" % (kind, dia, corner)
     text = finishmod.finish_to_gcode(
@@ -361,9 +370,18 @@ def main(argv=None):
                         "> --min-rest mm (PLACEHOLDER tool)")
     f.add_argument("--rest-tool", dest="rest_tool", default="ball:3",
                    help="tool spec for --rest-from passes (default ball:3; "
-                        "marked PLACEHOLDER, LNC post refuses it)")
+                        "tools listed in tools/x7_tools.json, e.g. "
+                        "ball:3.175, are real rest tools - only unlisted "
+                        "tools get the PLACEHOLDER marker)")
     f.add_argument("--min-rest", dest="min_rest", type=float, default=0.5,
                    help="rest-pass threshold mm (default 0.5)")
+    f.add_argument("--flute", type=float, default=None,
+                   help="flute length mm (S4 shank safety); default: read "
+                        "from tools/x7_tools.json by tool diameter (flute = "
+                        "2.5 x D, James); no table entry -> shank rule off")
+    f.add_argument("--shank", type=float, default=None,
+                   help="shank diameter mm (S4 shank safety); default: read "
+                        "from tools/x7_tools.json (assumed = D, not necked)")
 
     a = p.parse_args(argv)
 
