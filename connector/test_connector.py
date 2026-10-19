@@ -737,6 +737,70 @@ class TestSlopeSplitFinish:
         assert mock.file_names(803) == []
 
 
+class TestWarningsInCheckJson:
+    """Review 2: check.json must contain warnings.engagement and warnings.plunge."""
+
+    def test_rough_check_json_has_warnings(self, live):
+        """adaptive_rough: check.json carries warnings.engagement + warnings.plunge."""
+        mock, home, _ = live
+        mock.enqueue_run(850, inputs=dict(GOOD_INPUTS,
+                                         model=model_input(mock)))
+        assert mock.wait_state(850, "received", 30)
+        final = mock.wait_terminal(850, timeout=300)
+        assert final == "succeeded", \
+            "run ended %s: %s" % (final, mock.states_for(850))
+
+        # check.json uploaded with the run
+        names = mock.file_names(850)
+        assert "check.json" in names, "missing check.json: %s" % names
+
+        # Read the check.json from the work dir
+        with open(home / "runs" / "850" / "check.json") as fh:
+            check = json.load(fh)
+        w = check.get("warnings", {})
+        assert "engagement" in w, \
+            "warnings.engagement missing from check.json"
+        assert "plunge" in w, \
+            "warnings.plunge missing from check.json"
+        # No inf/NaN in the JSON (json.load already succeeded, but verify
+        # numeric fields are finite)
+        eng = w["engagement"]
+        assert "max_mm" in eng
+        if eng["max_mm"] is not None:
+            import math
+            assert math.isfinite(eng["max_mm"]), \
+                "engagement max_mm is not finite"
+
+    def test_slope_check_json_has_warnings(self, live):
+        """slope_split_finish: check.json carries warnings for both stages."""
+        mock, home, _ = live
+        mock.enqueue_run(851, action=catalog_mod.SLOPE_ACTION,
+                         inputs=dict(SLOPE_GOOD_INPUTS,
+                                     model=model_input(mock)))
+        assert mock.wait_state(851, "received", 30), \
+            "run never received: %s" % mock.states_for(851)
+        final = mock.wait_terminal(851, timeout=600)
+        assert final == "succeeded", \
+            "run ended %s: %s" % (final, mock.states_for(851))
+
+        with open(home / "runs" / "851" / "check.json") as fh:
+            check = json.load(fh)
+        w = check.get("warnings", {})
+        assert "engagement" in w, \
+            "warnings.engagement missing from check.json"
+        assert "plunge" in w, \
+            "warnings.plunge missing from check.json"
+        # Both rough and finish stages present
+        assert "rough" in w["engagement"], \
+            "warnings.engagement.rough missing"
+        assert "finish" in w["engagement"], \
+            "warnings.engagement.finish missing"
+        assert "rough" in w["plunge"], \
+            "warnings.plunge.rough missing"
+        assert "finish" in w["plunge"], \
+            "warnings.plunge.finish missing"
+
+
 # ======================================================== final printout ==
 
 

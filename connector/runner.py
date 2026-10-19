@@ -193,6 +193,7 @@ class EngineRun:
                     "--corner", "%.4f" % values["corner_radius"],
                     "--stock", *[("%.4f" % v) for v in stock],
                     "--flute", "%.1f" % values["flute_length"],
+                    "--optimal-load", "%.4f" % values["optimal_load"],
                     "--tool-number", str(_tool_number(self.cfg, values)),
                     "--out-json", check_path, "--png", png_path],
                    0.88, 0.95, on_progress)
@@ -376,17 +377,22 @@ class EngineRun:
                     "--corner", "%.4f" % values["rough_corner_radius"],
                     "--stock", *[("%.4f" % v) for v in stock],
                     "--flute", "%.1f" % values["rough_flute_length"],
+                    "--optimal-load", "%.4f" % values["rough_optimal_load"],
                     "--tool-number", str(rough_number),
                     "--out-json", check_rough,
                     "--stock-out", stock_out], 0.80, 0.90, on_progress)
         check_finish = os.path.join(self.work, "check_finish.json")
         png_path = os.path.join(self.work, "preview.png")
+        # Finish engagement threshold: use the finish stepover (distance between
+        # finish passes) rather than the roughing optimal load; finish passes are
+        # much lighter and the roughing threshold would over-flag them.
         self._spawn([py, "-m", "verify.zmap", fin,
                     "--part", hf01,
                     "--tool", "ball",
                     "--dia", "%.4f" % values["tool_diameter"],
                     "--corner", "%.4f" % (values["tool_diameter"] / 2.0),
                     "--stock-in", stock_out,
+                    "--engage-max", "%.4f" % (1.5 * values["stepover"]),
                     "--tool-number", str(finish_number),
                     "--out-json", check_finish, "--png", png_path],
                    0.90, 0.97, on_progress)
@@ -405,6 +411,16 @@ class EngineRun:
             "probe_clcheck": {"gcode": "finish.nc", **cl},
             "rough": check_r,
             "finish": check_f,
+            "warnings": {
+                "engagement": {
+                    "rough": check_r.get("engagement"),
+                    "finish": check_f.get("engagement"),
+                },
+                "plunge": {
+                    "rough": check_r.get("plunge"),
+                    "finish": check_f.get("plunge"),
+                },
+            },
         }
         with open(os.path.join(self.work, "check.json"), "w") as fh:
             json.dump(check, fh, indent=2)
