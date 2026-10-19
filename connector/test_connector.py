@@ -779,6 +779,11 @@ class TestWarningsInCheckJson:
         # numeric fields are finite)
         eng = w["engagement"]
         assert "max_mm" in eng
+        # Z6: the roughing threshold is explicitly 1.2 x optimal load
+        assert eng["threshold_mm"] == pytest.approx(
+            1.2 * GOOD_INPUTS["optimal_load"]), \
+            "rough check.json threshold %r != 1.2 x optimal load" \
+            % eng["threshold_mm"]
         if eng["max_mm"] is not None:
             import math
             assert math.isfinite(eng["max_mm"]), \
@@ -813,6 +818,129 @@ class TestWarningsInCheckJson:
             "warnings.plunge.rough missing"
         assert "finish" in w["plunge"], \
             "warnings.plunge.finish missing"
+        # Z6: rough threshold 1.2 x rough optimal load, finish 1.5 x stepover
+        assert w["engagement"]["rough"]["threshold_mm"] == pytest.approx(
+            1.2 * SLOPE_GOOD_INPUTS["rough_optimal_load"])
+        assert w["engagement"]["finish"]["threshold_mm"] == pytest.approx(
+            1.5 * SLOPE_GOOD_INPUTS["stepover"])
+
+
+class TestEngageThresholdArgs:
+    """Z6 (unit, no engine): every roughing zmap call carries an explicit
+    --engage-max of 1.2 x rough optimal load (ROUGH_ENGAGE_FACTOR); the
+    finishing call keeps 1.5 x stepover (FINISH_ENGAGE_FACTOR); the combined
+    check.json carries both thresholds."""
+
+    def test_module_constants(self):
+        import runner as runner_mod
+        assert runner_mod.ROUGH_ENGAGE_FACTOR == 1.2
+        assert runner_mod.FINISH_ENGAGE_FACTOR == 1.5
+
+    def test_slope_zmap_calls_and_check_json_thresholds(self, tmp_path,
+                                                          monkeypatch):
+        import numpy as np
+        import runner as runner_mod
+
+        calls = []
+
+        def fake_spawn(self, argv, lo, hi, on_progress, json_out=None,
+                       extra_env=None):
+            a = list(argv)
+            calls.append(a)
+
+            def opt(flag):
+                return a[a.index(flag) + 1] if flag in a else None
+
+            if "verify.zmap" in a:
+                engage, optimal = opt("--engage-max"), opt("--optimal-load")
+                thr = float(engage) if engage is not None else (
+                    1.2 * float(optimal) if optimal is not None else None)
+                so = opt("--stock-out")
+                if so:
+                    np.save(so, np.full((8, 8), -1.0))
+                report = {
+                    "gouges": {"count": 0, "max_depth": 0.0,
+                              "worst_xy": None},
+                    "rapid_collisions": {"count": 0, "first_line": None},
+                    "outside_grid": {"count": 0, "first_line": None},
+                    "over_flute": {"count": 0, "max_depth": 0.0,
+                                   "worst_xy": None, "first_line": None},
+                    "holder": {"status": "checked", "name": "BT30-ER20-60",
+                              "stickout_mm": 60.0,
+                              "dimension_source": "drawing"},
+                    "holder_hits": {"count": 0, "max_intrusion": 0.0,
+                                    "worst_xy": None, "first_line": None},
+                    "leftover": {"max": 0.0, "mean": 0.0, "p95": 0.0},
+                    "within_0p5mm_fraction": 1.0,
+                    "cycle_time_s": 1.0,
+                    "cutting_length_mm": 100.0,
+                    "rapid_length_mm": 10.0,
+                    "engagement": {"threshold_mm": thr, "count": 0,
+                                   "max_mm": 0.0, "spikes": []},
+                    "plunge": {"ramp_angle_deg": 3.0, "count": 0,
+                               "flags": []},
+                }
+                with open(opt("--out-json"), "w") as fh:
+                    json.dump(report, fh)
+            elif any(tok.endswith("heightfield.py") for tok in a):
+                np.save(extra_env["HF_OUT"], np.full((8, 8), 0.4))
+            elif any(tok.endswith("_tessellate.py") for tok in a):
+                with open(extra_env["STL_OUT"], "wb") as fh:
+                    fh.write(b"solid fake\nendsolid fake\n")
+            elif any(tok.endswith("probe_clcheck.py") for tok in a):
+                if json_out is not None:
+                    json_out.append({"below_cl": 0, "points": 42,
+                                     "max_depth_mm": 0.0})
+            elif "engine.cli" in a:
+                sub = a[a.index("engine.cli") + 1]
+                if sub == "prepare":
+                    with open(os.path.join(self.work, "prepare.json"),
+                             "w") as fh:
+                        json.dump({"step": os.path.join(self.work, "o.step"),
+                                   "hf": os.path.join(self.work, "hf.npz"),
+                                   "stock": [-10.0, 10.0, -10.0, 10.0,
+                                           -1.0, 0.4]}, fh)
+                else:
+                    out = opt("--out")
+                    if out:
+                        with open(out, "w") as fh:
+                            fh.write("G21 G90\nG0 X0. Y0. Z5.\n")
+                    sj = opt("--stats-json")
+                    if sj:
+                        with open(sj, "w") as fh:
+                            json.dump({"levels": [{"skipped": False}],
+                                       "n_moves": 10}, fh)
+            return None
+
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", fake_spawn)
+        cfg = {"engine_python": PY, "repo_root": REPO}
+        run = runner_mod.EngineRun(cfg, str(tmp_path))
+        values = dict(SLOPE_GOOD_INPUTS)
+        run.run_slope_split_finish(os.path.join(HERE, "unused.step"),
+                                    values)
+
+        zmap_calls = [a for a in calls if "verify.zmap" in a]
+        assert len(zmap_calls) == 2, "expected 2 zmap calls: %r" % (
+            zmap_calls,)
+        rough_call, finish_call = zmap_calls  # rough runs first
+        assert "--engage-max" in rough_call
+        assert float(rough_call[rough_call.index("--engage-max") + 1]) \
+            == pytest.approx(1.2 * values["rough_optimal_load"]), \
+            "rough zmap threshold is not 1.2 x rough optimal load"
+        assert "--engage-max" in finish_call
+        assert float(finish_call[finish_call.index("--engage-max") + 1]) \
+            == pytest.approx(1.5 * values["stepover"]), \
+            "finish zmap threshold is not 1.5 x stepover"
+
+        with open(os.path.join(str(tmp_path), "check.json")) as fh:
+            check = json.load(fh)
+        w = check["warnings"]["engagement"]
+        assert w["rough"]["threshold_mm"] == pytest.approx(
+            1.2 * values["rough_optimal_load"]), \
+            "check.json rough threshold is not 1.2x"
+        assert w["finish"]["threshold_mm"] == pytest.approx(
+            1.5 * values["stepover"]), \
+            "check.json finish threshold is not 1.5x"
 
 
 class TestHolderUnknownGate:

@@ -1471,13 +1471,17 @@ def main(argv=None):
                        "(default: tool dia); used with --flute")
     p.add_argument("--optimal-load", dest="optimal_load", type=float, default=None,
                   help="optimal radial engagement load mm: when given and "
-                       "--engage-max is not set, the engagement threshold is "
-                       "1.5 x this value. Default off.")
+                       "--engage-max is not set (roughing), the engagement "
+                       "threshold is 1.2 x this value. Finishing passes an "
+                       "explicit --engage-max (1.5 x stepover) instead. "
+                       "Default off.")
     p.add_argument("--engage-max", dest="engage_max", type=float, default=None,
                   help="radial engagement threshold mm: flag cutting moves whose "
                        "max engagement exceeds this (chord width of engaged arc "
-                       "perpendicular to travel). Default: 1.5 x --optimal-load "
-                       "when that is given, else off.")
+                       "perpendicular to travel). Roughing: 1.2 x optimal load; "
+                       "finishing passes an explicit value (1.5 x stepover). "
+                       "Default: 1.2 x --optimal-load when that is given, "
+                       "else off.")
     p.add_argument("--ramp-angle", dest="ramp_angle", type=float, default=3.0,
                   help="ramp/helix angle threshold deg for plunge detection "
                        "(default 3.0). Descending feed moves into stock are "
@@ -1498,9 +1502,11 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     # Derive engage_max from optimal_load when not explicitly given
+    # (roughing: warn above 1.2 x optimal load; finishing passes an explicit
+    # --engage-max of 1.5 x stepover)
     engage_max = args.engage_max
     if engage_max is None and args.optimal_load is not None:
-        engage_max = 1.5 * args.optimal_load
+        engage_max = 1.2 * args.optimal_load
 
     if args.stock is None and not args.stock_in:
         p.error("--stock is required unless --stock-in provides the stock state")
