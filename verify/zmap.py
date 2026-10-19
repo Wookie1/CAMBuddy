@@ -627,6 +627,19 @@ def apply_cutter_comp(moves, radius):
     return out
 
 
+def _engage_stats(vals):
+    """Distribution of per-move max chord engagement (mm) over numpy:
+    {n, p50, p95, p99, max}; n=0 -> percentiles/max are None."""
+    if not vals:
+        return {"n": 0, "p50": None, "p95": None, "p99": None, "max": None}
+    a = np.asarray(vals, dtype=float)
+    return {"n": int(a.size),
+            "p50": round(float(np.percentile(a, 50)), 4),
+            "p95": round(float(np.percentile(a, 95)), 4),
+            "p99": round(float(np.percentile(a, 99)), 4),
+            "max": round(float(a.max()), 4)}
+
+
 def _box_max_np(A, k):
     """Max filter over a (2k+1) square window per axis (non-finite = -inf);
     conservative superset of a disc-radius footprint max (numpy only)."""
@@ -791,9 +804,11 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     comp_last_line = None
     d_registers = set()
     # engagement tracking
-    engage_spikes = []  # list of dicts: {line, x, y, engagement_mm}
+    engage_spikes = []  # list of dicts: {line, x, y, engagement_mm, kind}
     engage_max_seen = 0.0
     engage_count = 0
+    engage_horiz = []   # per-move max chord mm: horizontal cuts (|dz|<=1e-6)
+    engage_entry = []   # per-move max chord mm: descending entries into stock
     # plunge tracking
     plunge_flags = []  # list of dicts: {line, x, y, z, angle_deg, depth_mm}
     plunge_count = 0
@@ -1014,16 +1029,25 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 if first_rapid_line is None:
                     first_rapid_line = mv["line"]
         # engagement: track the widest measured chord over all cutting moves;
-        # flag only those exceeding the threshold
+        # flag only those exceeding the threshold. Engaging cuts are bucketed
+        # by vertical motion: horizontal (|dz| <= 1e-6, the steady cuts) vs
+        # entry (descending: helix/ramp/plunge into stock).
         if cutting and engage_max is not None:
             if move_max_engage > engage_max_seen:
                 engage_max_seen = move_max_engage
+            dz_mv = z1 - cur[2]
+            if move_max_engage > 0.0:
+                if abs(dz_mv) <= 1e-6:
+                    engage_horiz.append(move_max_engage)
+                elif dz_mv < 0.0:
+                    engage_entry.append(move_max_engage)
             if move_max_engage > engage_max:
                 engage_count += 1
                 engage_spikes.append({
                     "line": mv["line"],
                     "x": round(x1, 4), "y": round(y1, 4),
-                    "engagement_mm": round(move_max_engage, 4)})
+                    "engagement_mm": round(move_max_engage, 4),
+                    "kind": "entry" if dz_mv < -1e-6 else "horizontal"})
         # plunge detection: feed move descending into stock
         if cutting and z1 < cur[2] - 1e-9:
             dx_m = x1 - cur[0]
@@ -1085,10 +1109,15 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             "threshold_mm": engage_max,
             "count": engage_count,
             "max_mm": round(engage_max_seen, 4),
+            # distribution over engaging cuts, per-move max chord mm
+            "horizontal": _engage_stats(engage_horiz),
+            "entry": _engage_stats(engage_entry),
             # top 10 worst spots (line, XY, value)
             "spikes": sorted(engage_spikes, key=lambda s: s["engagement_mm"],
                              reverse=True)[:10],
         } if engage_max is not None else None,
+        # raw per-bucket values for exact parallel merging (not reported)
+        "_engage_raw": {"horizontal": engage_horiz, "entry": engage_entry},
         "plunge": {
             "ramp_angle_deg": ramp_angle,
             "count": plunge_count,
@@ -1233,6 +1262,10 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
              "count": sum(r["engagement"]["count"] for r in results),
              "max_mm": round(max(r["engagement"]["max_mm"]
                                 for r in results), 4),
+             "horizontal": _engage_stats(
+                 [v for r in results for v in r["_engage_raw"]["horizontal"]]),
+             "entry": _engage_stats(
+                 [v for r in results for v in r["_engage_raw"]["entry"]]),
              "spikes": sorted([s for r in results
                               for s in r["engagement"]["spikes"]],
                              key=lambda s: s["engagement_mm"],
