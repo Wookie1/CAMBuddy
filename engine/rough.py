@@ -660,9 +660,11 @@ def hf_gouge_violation(points, stock, tool_r, tol=0.02):
     return None
 
 
-def _helix_moves(cx, cy, sx, sy, z_top, z_bot, feed):
-    """Downward CCW helix around (cx,cy) from (sx,sy)@z_top to depth z_bot."""
-    r = math.dist((cx, cy), (sx, sy))
+def _helix_moves(cx, cy, sx, sy, z_top, z_bot, feed, r):
+    """Downward CCW helix at FIXED radius r (the ONE helix entry diameter /
+    2, same centre Adaptive2d ramped against) starting at the angle of
+    (sx,sy), descending z_top->z_bot, finished with one full circle at
+    depth so the bore cut equals the bore Adaptive2d assumed."""
     if r < 0.05:
         return [{"g": 1, "x": sx, "y": sy, "z": z_bot, "f": feed}]
     a0 = math.atan2(sy - cy, sx - cx)
@@ -676,6 +678,12 @@ def _helix_moves(cx, cy, sx, sy, z_top, z_bot, feed):
         out.append({"g": 1, "x": round(cx + r * math.cos(a), 4),
                     "y": round(cy + r * math.sin(a), 4),
                     "z": round(z_top + t * (z_bot - z_top), 4), "f": feed})
+    # one full circle at depth to complete the entry bore
+    for i in range(1, 37):
+        a = a0 + turns * 2 * math.pi + i / 36.0 * 2 * math.pi
+        out.append({"g": 1, "x": round(cx + r * math.cos(a), 4),
+                    "y": round(cy + r * math.sin(a), 4),
+                    "z": round(z_bot, 4), "f": feed})
     return out
 
 
@@ -778,13 +786,15 @@ def hug_regions(islands, grown, stock, isl_ok, eps=0.05, min_run=1.0):
 
 
 def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
-             keep_tool_down):
+             keep_tool_down, helix_dia):
     """One level's Adaptive2d run; returns plain picklable region dicts."""
     a2d = area.Adaptive2d()
     a2d.stepOverFactor = stepover
     a2d.toolDiameter = 2 * tool_r
-    a2d.helixRampTargetDiameter = 0.8 * 2 * tool_r
-    a2d.helixRampMinDiameter = 0.4 * 2 * tool_r
+    # R6c-n: ONE helix entry diameter feeds both a2d's ramp settings and
+    # our entry generator, so the bore we cut equals the bore a2d assumed.
+    a2d.helixRampTargetDiameter = helix_dia
+    a2d.helixRampMinDiameter = helix_dia
     a2d.keepToolDownDistRatio = keep_tool_down
     a2d.stockToLeave = leave
     a2d.tolerance = tolerance
@@ -938,11 +948,15 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                     szmax))
     order = insert_levels(order, mand - {round(z, 4) for z in order})
 
+    # R6c-n: ONE helix entry diameter - feeds a2d.helixRampTargetDiameter/
+    # MinDiameter AND _helix_moves, so the entry bore we cut equals the
+    # bore Adaptive2d plans its first loops against.
+    helix_dia = 0.8 * 2 * tool_r
     stats = {"levels": [], "n_regions": 0, "cut_len": 0.0, "plunge_len": 0.0,
              "rapid_len": 0.0, "n_rapid_bumps": 0,
              "t_islands": 0.0, "t_adaptive": 0.0,
              "n_retracts": 0, "n_lifts": 0, "n_notclear_links": 0,
-             "n_clip_breaks": 0,
+             "n_clip_breaks": 0, "helix_dia_mm": round(helix_dia, 4),
              "n_tooldown_links": 0, "levels_planned": [round(z, 3) for z in order],
              "mandatory_levels": sorted(round(z, 3) for z in mand)}
 
@@ -1047,19 +1061,39 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # 3) retract to clearance, then helix or straight air plunge
         retract_to(x, y)
         top_stock = stock.top_at(x, y)
-        helix_r = math.dist((hc[0], hc[1]), (x, y)) if hc is not None else 0.0
         if top_stock <= z + 0.05:
             emit({"g": 1, "x": x, "y": y, "z": z, "f": ramp_feed})
             mill_now(x, y, z)
-        elif helix_r > 0.05:
+        elif hc is not None:
+            # R6c-n: helix at radius helix_dia/2 around hc - the SAME bore
+            # Adaptive2d assumed (same centre, same diameter), finished with
+            # one full circle at depth; mill it into the live stock model,
+            # then feed straight at depth onto the region start point ONLY
+            # through that already-cleared bore.
             z_top = min(clearance_z, z + stepdown)
             emit({"g": 1, "x": x, "y": y, "z": z_top, "f": ramp_feed})
             mill_now(x, y, z_top)
             # a helix arc swinging past stock + R is in air (never replace it
             # with a straight plunge into stock); zmap's outside_grid gate
             # still fails loudly if it ever leaves the judged grid
-            for hv in _helix_moves(hc[0], hc[1], x, y, z_top, z, ramp_feed):
+            p0 = (x, y, z_top)
+            for hv in _helix_moves(hc[0], hc[1], x, y, z_top, z, ramp_feed,
+                                    helix_dia / 2.0):
                 emit(hv)
+                stock.mill_sloped(p0[0], p0[1], hv["x"], hv["y"], p0[2],
+                                  hv["z"], tool_r, corner_r)
+                p0 = (hv["x"], hv["y"], hv["z"])
+            if math.dist(p0[:2], (x, y)) > 1e-6:
+                if stock.link_clear([p0[:2], (x, y)], z):
+                    emit({"g": 1, "x": x, "y": y, "z": z, "f": ramp_feed})
+                    mill_now(x, y, z)
+                else:
+                    # start point not reachable through cleared bore: get out
+                    # of the material and plunge straight at it (as before)
+                    stats["n_notclear_links"] += 1
+                    retract_to(x, y)
+                    emit({"g": 1, "x": x, "y": y, "z": z, "f": ramp_feed})
+                    mill_now(x, y, z)
         else:
             emit({"g": 1, "x": x, "y": y, "z": z, "f": ramp_feed})
             mill_now(x, y, z)
@@ -1174,7 +1208,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             continue
         t0 = time.time()
         regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
-                           tolerance, keep_tool_down)
+                           tolerance, keep_tool_down, helix_dia)
         # R4: wall-hugging rings close the margin-wide rest band + corner
         # chunks Adaptive2d cannot reach (its islands are pre-eroded).
         regions.extend(hug_regions(islands, grown, stock, isl_ok,
