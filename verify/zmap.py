@@ -21,6 +21,13 @@ HOLDER_CLEAR = 1.0  # mm, S5: min clearance of the holder stack to material
 TOOLS_JSON = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "tools", "x7_tools.json")
 
+# --strict (opt-in, task CP): the supported subset for judging a posted
+# program. Anything outside these sets is reported unsupported, never skipped.
+STRICT_ALLOWED_G = {0, 1, 2, 3, 4, 17, 20, 21, 40, 43, 49, 53,
+                   54, 55, 56, 57, 58, 59, 80, 90, 94}
+STRICT_ALLOWED_M = {3, 4, 5, 6, 8, 9, 30}
+STRICT_OK_WORDS = {"G", "X", "Y", "Z", "F", "S", "T", "M", "N", "O"}
+
 
 def resolve_holder(tool_number=None, holder=None, stickout=None, path=None):
     """S5: resolve a holder frustum stack + stick-out (independent of the
@@ -102,7 +109,144 @@ def strip_comments(line):
     return "".join(out)
 
 
-def parse_gcode(text):
+def _home_line(words):
+    """True for the 'G91 G28 X0. Y0.' XY home line (order-free, no Z,
+    zero XY, no other words): the only G91/G28 allowed under --strict."""
+    gs, axes = set(), {}
+    for L, num in words:
+        try:
+            v = float(num)
+        except ValueError:
+            return False
+        if L == "G":
+            gs.add(int(round(v)))
+        elif L in ("X", "Y", "Z"):
+            axes[L] = v
+        else:
+            return False
+    return (gs >= {28, 91} and set(axes) == {"X", "Y"}
+            and abs(axes["X"]) <= 1e-9 and abs(axes["Y"]) <= 1e-9)
+
+
+def strict_check(text):
+    """--strict (task CP): whitelist every word of a posted program.
+    Allowed: G0-G3 and G2/G3 arcs in G17 (I/J centre and R forms), G17,
+    G20/G21, G90, G94, G40, G49, G80 (cancel), G43 H, G53 Z-only retract
+    lines, G54-G59, one 'G91 G28 X0 Y0' home line at the end, G04 P,
+    F, S, T/M06, M03/M04/M05/M08/M09/M30, comments, N numbers, O, %.
+    Anything else is an offender. Never skips a line silently: returns a
+    list of {"code": <code>, "line": <1-based line>} in program order
+    (empty list = the program is fully supported)."""
+    findings = []
+    units = 1.0
+    pos_x = pos_y = None
+    modal = None
+    home_line = None
+
+    def flag(code, lineno):
+        findings.append({"code": code, "line": lineno})
+
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        s = strip_comments(raw)
+        if "#" in s:
+            flag("#", lineno)
+            continue
+        words = [(L.upper(), num) for L, num in WORD_RE.findall(s)]
+        if not words:
+            rest = WORD_RE.sub("", s).replace("%", "").strip()
+            if re.search(r"[A-Za-z0-9]", rest):
+                junk = re.search(r"[A-Za-z][A-Za-z0-9.]*", rest)
+                flag(junk.group(0) if junk else rest[:8], lineno)
+            continue
+        # a home line may only sit at the END: any axis word after it
+        # means the program kept cutting past home -> not a home line
+        if home_line is not None and any(
+                L in ("X", "Y", "Z") for L, _ in words):
+            flag("G28", home_line)
+            home_line = None
+        vals = {}
+        gcodes = []
+        for L, num in words:
+            try:
+                v = float(num)
+            except ValueError:
+                flag(L, lineno)
+                continue
+            if L == "G":
+                gcodes.append(int(round(v)))
+            vals.setdefault(L, []).append(v)
+        gs = set(gcodes)
+        home = _home_line(words)
+        if home:
+            if home_line is not None:
+                flag("G28", lineno)
+            else:
+                home_line = lineno
+        if 20 in gs:
+            units = 25.4
+        elif 21 in gs:
+            units = 1.0
+        axes = [L for L in vals if L in ("X", "Y", "Z")]
+        new_modal = modal
+        for g in (0, 1, 2, 3):
+            if g in gs:
+                new_modal = g
+        arc_line = new_modal in (2, 3)
+        for g in sorted(gs):
+            if g in (28, 91):
+                if not home:
+                    flag("G%d" % g, lineno)
+            elif g in STRICT_ALLOWED_G:
+                if g == 53 and any(L != "Z" for L in axes):
+                    flag("G53", lineno)  # only Z-only machine retracts
+                elif g == 43 and "H" not in vals:
+                    flag("G43", lineno)  # G43 must carry its H register
+            else:
+                flag("G%d" % g, lineno)
+        for v in vals.get("M", []):
+            m = int(round(v))
+            if m not in STRICT_ALLOWED_M:
+                flag("M%d" % m, lineno)
+        for L in vals:
+            if L in STRICT_OK_WORDS:
+                continue
+            if L == "H":
+                if 43 not in gs:
+                    flag("H", lineno)
+            elif L == "P":
+                if 4 not in gs:
+                    flag("P", lineno)
+            elif L in ("I", "J"):
+                if not arc_line:
+                    flag(L, lineno)
+            elif L == "R":
+                if not arc_line:
+                    flag("R", lineno)
+            else:
+                flag(L, lineno)
+        # R-form chord check (needs the pre-move position)
+        if "R" in vals and arc_line:
+            sx = pos_x if pos_x is not None else (
+                vals["X"][-1] * units if "X" in vals else None)
+            sy = pos_y if pos_y is not None else (
+                vals["Y"][-1] * units if "Y" in vals else None)
+            tx = vals["X"][-1] * units if "X" in vals else sx
+            ty = vals["Y"][-1] * units if "Y" in vals else sy
+            if None not in (sx, sy, tx, ty):
+                d = math.hypot(tx - sx, ty - sy)
+                for rv in vals["R"]:
+                    r = abs(rv) * units
+                    if d <= 1e-9 or r < d / 2.0 - 1e-9:
+                        flag("R", lineno)
+        if "X" in vals:
+            pos_x = vals["X"][-1] * units
+        if "Y" in vals:
+            pos_y = vals["Y"][-1] * units
+        modal = new_modal
+    return findings
+
+
+def parse_gcode(text, strict=False):
     """Parse G-code into a list of moves (absolute, mm where units known).
 
     Each move is a dict:
@@ -146,6 +290,8 @@ def parse_gcode(text):
                 params[L] = val
             elif L == "F":
                 params[L] = val
+            elif L == "R":
+                params[L] = val
             elif L == "D":
                 dreg = int(round(val))
         for g in gcodes:
@@ -171,6 +317,10 @@ def parse_gcode(text):
                 modal = "G%d" % g
         if "F" in params:
             feed = params["F"] * units  # mm/min
+        if strict and any(g == 4 for g in gcodes):
+            continue  # dwell: never a simulated move (a bare G04 X is not X)
+        if strict and _home_line([(L.upper(), n) for L, n in words]):
+            continue  # end-of-program XY home line: not a simulated move
         if g53:
             # G53 moves reference the machine origin, not the WCS the part
             # heightfield lives in (e.g. home retracts) -> ignore for sim.
@@ -189,6 +339,10 @@ def parse_gcode(text):
             # is meaningful depends on the active plane (see PLANE_AXES).
             for k in ("I", "J", "K"):
                 move[k.lower()] = params[k] * units if k in params else 0.0
+            # R form (G2/G3 ... R<n>): radius from the start point; negative
+            # R = arc > 180 deg. Resolved to a centre where I/J are absent.
+            if "R" in params:
+                move["r"] = params["R"] * units
         if comp and dreg is not None:
             move["dreg"] = dreg
         move["f"] = feed
@@ -296,6 +450,40 @@ def _move_samples(mv, cur, cell):
     return samples, length
 
 
+def _r_center(start, end, r, ccw):
+    """R-form arc (G2/G3 ... R<n>, G17): centre offset (i, j) from `start`
+    for radius r (signed: negative r = arc > 180 deg). Returns None when
+    |r| cannot span the start-end chord or the points coincide."""
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    d = math.hypot(dx, dy)
+    if d <= 1e-9:
+        return None  # R form cannot express a full circle
+    h2 = r * r - (d / 2.0) ** 2
+    if h2 < -1e-9:
+        return None  # radius too small for this chord
+    h = math.sqrt(max(h2, 0.0))
+    ux, uy = dx / d, dy / d
+    # CCW with r>0 (and CW with r<0): centre left of the travel chord
+    sgn = 1.0 if (ccw == (r > 0)) else -1.0
+    cx = 0.5 * (start[0] + end[0]) + sgn * h * (-uy)
+    cy = 0.5 * (start[1] + end[1]) + sgn * h * ux
+    return (cx - start[0], cy - start[1])
+
+
+def _arc_ijk(mv, start, end):
+    """Center offsets (i, j, k) for an arc move: I/J/K as programmed, or
+    resolved from an R word (G17) when they are absent."""
+    i = mv.get("i", 0.0) or 0.0
+    j = mv.get("j", 0.0) or 0.0
+    k = mv.get("k", 0.0) or 0.0
+    r = mv.get("r")
+    if r and abs(i) <= 1e-12 and abs(j) <= 1e-12:
+        c = _r_center(start, end, r, mv["motion"] == "G3")
+        if c is not None:
+            return (c[0], c[1], 0.0)
+    return (i, j, k)
+
+
 def _resolve_arcs(moves, x_init=0.0, y_init=0.0, z_init=0.0):
     """Fill modal x/y/z and attach arc geometry (plane-aware) to G2/G3 moves."""
     out = []
@@ -311,8 +499,7 @@ def _resolve_arcs(moves, x_init=0.0, y_init=0.0, z_init=0.0):
         m["x"], m["y"], m["z"] = x, y, z
         if mv["motion"] in ("G2", "G3"):
             g = _arc_geom((cx, cy, cz), (x, y, z),
-                         (mv.get("i", 0.0), mv.get("j", 0.0),
-                          mv.get("k", 0.0)),
+                         _arc_ijk(mv, (cx, cy, cz), (x, y, z)),
                          mv.get("plane", 17), mv["motion"] == "G3")
             if g is not None:
                 m["arc"] = g
@@ -378,8 +565,7 @@ def resolve_moves(moves, x_init=0.0, y_init=0.0, z_init=None):
         m["resolved"] = True
         if mv["motion"] in ("G2", "G3") and not mv.get("arc"):
             g = _arc_geom((cx, cy, cz), (x, y, z),
-                         (mv.get("i", 0.0), mv.get("j", 0.0),
-                          mv.get("k", 0.0)),
+                         _arc_ijk(mv, (cx, cy, cz), (x, y, z)),
                          mv.get("plane", 17), mv["motion"] == "G3")
             if g is not None:
                 m["arc"] = g
@@ -655,7 +841,8 @@ def _box_max_np(A, k):
 def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
              corner=0.0, stock_init=None, window=None, rapid_feed=RAPID_FEED,
              start=None, flute=None, shank_dia=None, holder=None,
-             stickout=None, engage_max=None, ramp_angle=3.0):
+             stickout=None, engage_max=None, ramp_angle=3.0,
+             engage_report=False):
     """Run the toolpath over a stock heightfield.
 
     part      : (ny, nx) array of part top-Z heights
@@ -688,6 +875,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 flag cutting moves whose max radial engagement (chord width of
                 the tool's engaged arc, measured perpendicular to travel)
                 exceeds this value. Default None = off.
+    engage_report: opt-in (task CP): measure and report engagement stats even
+                when engage_max is None (no threshold, so nothing is flagged);
+                the engagement block is present in the report with
+                threshold_mm=None, count=0. Default False = off (unchanged).
     ramp_angle: ramp/helix angle threshold in degrees (default 3.0). A plunge
                 (vertical feed into stock) is NOT flagged if it is a helix or
                 ramp at or below this angle.
@@ -732,6 +923,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         stock[~window] = -np.inf
     R = dia / 2.0
     dz = tool_dz(tool, dia, corner)
+    engage_track = engage_max is not None or engage_report
     k = int(math.ceil(R / cell)) + 1  # +1 so the padded engagement mask fits
     # shank/over-flute check (only with flute): radius S/2, its own window
     shank_on = flute is not None
@@ -994,7 +1186,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                          float(np.max(np.where(msk_e, win, -np.inf))) > sz + 1e-6)
                 # radial engagement: chord width of engaged arc perpendicular to
                 # travel (dx_t, dy_t); equivalent radial width = 2*R*sin(theta/2)
-                if engaged and engage_max is not None:
+                if engaged and engage_track:
                     perp_x, perp_y = -dy_t, dx_t
                     proj = (gx[None, :] * perp_x + gy[:, None] * perp_y)
                     # Measure the chord over the cells THIS move actually cuts:
@@ -1053,7 +1245,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         # flag only those exceeding the threshold. Engaging cuts are bucketed
         # by vertical motion: horizontal (|dz| <= 1e-6, the steady cuts) vs
         # entry (descending: helix/ramp/plunge into stock).
-        if cutting and engage_max is not None:
+        if cutting and engage_track:
             if move_max_engage > engage_max_seen:
                 engage_max_seen = move_max_engage
             dz_mv = z1 - cur[2]
@@ -1062,7 +1254,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     engage_horiz.append(move_max_engage)
                 elif dz_mv < 0.0:
                     engage_entry.append(move_max_engage)
-            if move_max_engage > engage_max:
+            if engage_max is not None and move_max_engage > engage_max:
                 engage_count += 1
                 engage_spikes.append({
                     "line": mv["line"],
@@ -1138,7 +1330,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             # top 10 worst spots (line, XY, value)
             "spikes": sorted(engage_spikes, key=lambda s: s["engagement_mm"],
                              reverse=True)[:10],
-        } if engage_max is not None else None,
+        } if engage_track else None,
         # raw per-bucket values for exact parallel merging (not reported)
         "_engage_raw": {"horizontal": engage_horiz, "entry": engage_entry},
         "plunge": {
@@ -1184,14 +1376,14 @@ def _chunk_worker(idx):
                     start=g["start_per"][idx], flute=g["flute"],
                     shank_dia=g["shank_dia"], holder=g["holder"],
                     stickout=g["stickout"], engage_max=g["engage_max"],
-                    ramp_angle=g["ramp_angle"])
+                    ramp_angle=g["ramp_angle"], engage_report=g["engage_report"])
 
 
 def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                       dia=6.0, corner=0.0, stock_init=None, window=None,
                       rapid_feed=RAPID_FEED, flute=None, shank_dia=None,
                       holder=None, stickout=None, engage_max=None,
-                      ramp_angle=3.0):
+                      ramp_angle=3.0, engage_report=False):
     import multiprocessing as mp
     # leading moves without a Z word: Z unknown = above stock, not machine 0;
     # use the first explicit Z (as serial simulate does), else the stock top
@@ -1207,7 +1399,8 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                   stock_box=stock_box, tool=tool, dia=dia, corner=corner,
                   window=window, rapid_feed=rapid_feed, flute=flute,
                   shank_dia=shank_dia, holder=holder, stickout=stickout,
-                  engage_max=engage_max, ramp_angle=ramp_angle)
+                  engage_max=engage_max, ramp_angle=ramp_angle,
+                  engage_report=engage_report)
     # true machine position at each chunk start = end of the previous chunk's
     # last move (chunks must not simulate their first move from its own target)
     start_per = []
@@ -1300,7 +1493,7 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                               for s in r["engagement"]["spikes"]],
                              key=lambda s: s["engagement_mm"],
                              reverse=True)[:10],
-            } if engage_max is not None else None),
+            } if engage_max is not None or engage_report else None),
         "plunge": {
             "ramp_angle_deg": ramp_angle,
             "count": sum(r["plunge"]["count"] for r in results),
@@ -1499,7 +1692,41 @@ def main(argv=None):
     p.add_argument("--tools-json", dest="tools_json", default=TOOLS_JSON,
                    help="tool table JSON for --tool-number/--holder "
                         "(default: tools/x7_tools.json)")
+    p.add_argument("--strict", action="store_true",
+                   help="task CP: judge a posted program against the "
+                        "supported subset (G17 I/J and R arcs, no cutter "
+                        "comp, no canned cycles, no other planes, one home "
+                        "line at the end). Anything else exits non-zero with "
+                        "'unsupported: <code> at line N' and the full list in "
+                        "the check json \"unsupported\". Default off: "
+                        "behaviour is exactly as before")
+    p.add_argument("--engage-report", dest="engage_report",
+                   action="store_true",
+                   help="report engagement stats (max/percentiles) without a "
+                        "threshold: nothing is flagged (report-only). "
+                        "Default off")
     args = p.parse_args(argv)
+
+    gtext = None
+    if args.strict:
+        # task CP: judge every line before anything else; unsupported codes
+        # fail the run with the first offender and the full list in json
+        with open(args.gcode) as f:
+            gtext = f.read()
+        findings = strict_check(gtext)
+        if findings:
+            report = _sanitize({"gcode": os.path.abspath(args.gcode),
+                                "strict": True, "unsupported": findings})
+            text = json.dumps(report, indent=2)
+            if args.out_json:
+                with open(args.out_json, "w") as f:
+                    f.write(text + "\n")
+            else:
+                print(text)
+            first = findings[0]
+            print("unsupported: %s at line %d"
+                  % (first["code"], first["line"]), file=sys.stderr)
+            return 1
 
     # Derive engage_max from optimal_load when not explicitly given
     # (roughing: warn above 1.2 x optimal load; finishing passes an explicit
@@ -1516,8 +1743,10 @@ def main(argv=None):
     if args.tool == "bull" and not (0 < args.corner < args.dia / 2):
         p.error("--corner must satisfy 0 < corner < dia/2 for a bull nose")
 
-    with open(args.gcode) as f:
-        moves = parse_gcode(f.read())
+    if gtext is None:
+        with open(args.gcode) as f:
+            gtext = f.read()
+    moves = parse_gcode(gtext, strict=args.strict)
     if args.comp_radius > 0:
         moves = apply_cutter_comp(resolve_moves(moves), args.comp_radius)
     try:
@@ -1569,7 +1798,8 @@ def main(argv=None):
                                flute=args.flute, shank_dia=args.shank_dia,
                                holder=holder_segs, stickout=holder_stick,
                                engage_max=engage_max,
-                               ramp_angle=args.ramp_angle)
+                               ramp_angle=args.ramp_angle,
+                               engage_report=args.engage_report)
     else:
         res = simulate(moves, part, cell, x0, y0, stock_box,
                        tool=args.tool, dia=args.dia, corner=args.corner,
@@ -1577,7 +1807,8 @@ def main(argv=None):
                        rapid_feed=args.rapid_feed, flute=args.flute,
                        shank_dia=args.shank_dia,
                        holder=holder_segs, stickout=holder_stick,
-                       engage_max=engage_max, ramp_angle=args.ramp_angle)
+                       engage_max=engage_max, ramp_angle=args.ramp_angle,
+                       engage_report=args.engage_report)
 
     report = {
         "gcode": os.path.abspath(args.gcode),
@@ -1613,6 +1844,9 @@ def main(argv=None):
             "plunge": res["plunge"],
         },
     }
+    if args.strict:
+        report["strict"] = True
+        report["unsupported"] = []
     report = _sanitize(report)
     text = json.dumps(report, indent=2)
     if args.out_json:

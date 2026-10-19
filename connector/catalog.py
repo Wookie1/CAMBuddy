@@ -6,7 +6,8 @@ values converted by the runner after validation.
 
 ACTION = "adaptive_rough"
 SLOPE_ACTION = "slope_split_finish"
-ACTIONS = (ACTION, SLOPE_ACTION)
+CHECK_ACTION = "check_program"
+ACTIONS = (ACTION, SLOPE_ACTION, CHECK_ACTION)
 EVENT = "engine_state"
 
 # inputs whose numeric value is a length/feeds in mm (or mm/min):
@@ -170,7 +171,44 @@ SLOPE_ACTION_SPEC = {
                "finish.nc, check.json, preview.png."),
 }
 
-CATALOG = {"actions": [ROUGHING_ACTION, SLOPE_ACTION_SPEC],
+CHECK_ACTION_SPEC = {
+    "name": CHECK_ACTION,
+    "title": "Check a posted program",
+    "description": ("Judges a posted G-code program against your part and "
+                    "stock box with the independent zmap: gouges, rapid "
+                    "collisions, over-flute/shank rub, holder clearance and "
+                    "the tool footprint, using the program's T word looked up "
+                    "in tools/x7_tools.json (one tool per program). The "
+                    "program must stay in the supported subset - XY-plane "
+                    "moves and arcs (I/J or R), no cutter comp, no canned "
+                    "cycles, no other planes - anything else fails with the "
+                    "offending code and line. Gives back check.json and "
+                    "preview.png. Nothing is sent to the machine."),
+    "confirm": False,
+    "inputs": {
+        "type": "object",
+        "properties": {
+            "program": {"x-steve": "program", "title": "Posted program"},
+            "model": {"x-steve": "file", "format": "step",
+                      "title": "STEP model"},
+            "orientation": _ORIENTATION,
+            **{k: v for k, v in _STOCK_INPUTS.items() if k != "floor_z"},
+            "tool_number": {"type": "integer", "minimum": 1,
+                            "maximum": 999,
+                            "description": "optional override of the "
+                                         "program's T word; the tool comes "
+                                         "from tools/x7_tools.json"},
+        },
+        "required": ["program", "model"],
+    },
+    "result": ("zmap gates (gouges, rapid collisions, over-flute/shank, "
+               "holder, outside grid), the engagement report (no threshold "
+               "unless an optimal load is given) and any unsupported codes "
+               "with their lines; files: check.json, preview.png."),
+}
+
+CATALOG = {"actions": [ROUGHING_ACTION, SLOPE_ACTION_SPEC,
+                       CHECK_ACTION_SPEC],
            "events": [{
                "name": EVENT,
                "description": "Engine state: idle or busy, the current "

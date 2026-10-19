@@ -1343,3 +1343,197 @@ def test_zz_print_e2e_result(live):
     print(json.dumps(E2E.get("result", {}), indent=2))
     print("==== states:", mock.states_for(501), "====")
 
+
+
+# ============================================ task CP: check_program ======
+
+CHECK_INPUTS = {
+    "orientation": "as_modeled", "stock_xy": 1.0, "stock_top": 0.4,
+    "stock_bottom": 1.0,
+}
+
+
+def program_input(mock, name="check_ok.nc"):
+    with open(os.path.join(HERE, "testdata", name), "rb") as fh:
+        data = fh.read()
+    return {
+        "kind": "program", "name": name,
+        "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
+        "url": mock.base_url + "/files/" + name,
+        "headers": {"X-Steve-Ticket": "ticket-%d" % (next(_tick),)},
+        "document": {"id": "doc-1"}, "revision": 3,
+    }
+
+
+class TestCheckProgramCatalog:
+    def test_action_shape(self):
+        a = catalog_mod.get_action(catalog_mod.CHECK_ACTION)
+        assert a is not None
+        assert a["name"] == "check_program" and a["confirm"] is False
+        props = a["inputs"]["properties"]
+        assert props["program"].get("x-steve") == "program"
+        assert props["model"]["x-steve"] == "file"
+        assert props["model"]["format"] == "step"
+        assert a["inputs"]["required"] == ["program", "model"]
+        # stock box inputs identical to adaptive_rough (no floor_z: the
+        # program defines its own depths)
+        r = catalog_mod.get_action(catalog_mod.ACTION)["inputs"]["properties"]
+        for k in ("orientation", "stock_xy", "stock_top", "stock_bottom"):
+            assert props[k] == r[k], k
+        assert "floor_z" not in props
+
+    def test_validate_inputs(self):
+        ok, code, v = catalog_mod.validate_inputs(
+            {"program": {"url": "u"}, "model": {"url": "u"}},
+            catalog_mod.CHECK_ACTION)
+        assert ok, code
+        ok, code, _ = catalog_mod.validate_inputs(
+            {"model": {"url": "u"}}, catalog_mod.CHECK_ACTION)
+        assert not ok and code == "input_missing"
+        ok, code, _ = catalog_mod.validate_inputs(
+            {"program": {"url": "u"}, "model": {"url": "u"},
+             "floor_z": 4.0}, catalog_mod.CHECK_ACTION)
+        assert not ok and code == "input_unknown"
+        ok, code, _ = catalog_mod.validate_inputs(
+            {"program": {"url": "u"}, "model": {"url": "u"},
+             "tool_number": 5000}, catalog_mod.CHECK_ACTION)
+        assert not ok and code == "input_out_of_range"
+
+
+class TestCheckProgramToolLookup:
+    """Unit tests for the check_program tool resolution (no engine)."""
+
+    def test_program_tool_numbers(self):
+        from runner import program_tool_numbers
+        assert program_tool_numbers("T13 M06\nG1 X1.\n") == [13]
+        assert program_tool_numbers("( T99 in a comment )\nT3 M06\n"
+                                    "T3\n") == [3]
+        assert program_tool_numbers("T13\nG43 Z5. H13\nT20 M06\n") == \
+            [13, 20]
+
+    def test_check_tool_entry_t13(self):
+        from runner import check_tool_entry
+        t = check_tool_entry(13)
+        assert t["type"] == "flat"
+        assert abs(t["diameter_mm"] - 12.686) < 1e-9
+        assert t["corner_radius_mm"] == 0.0
+        assert t["flute_mm"] == 50.8
+        assert t["shank_diameter_mm"] == 12.686
+        assert t["holder"] == "BT30-ER32-70"
+        assert t["stickout_mm"] == 71.6
+
+    def test_check_tool_entry_unknown_fails(self):
+        from runner import check_tool_entry, EngineError
+        with pytest.raises(EngineError) as ei:
+            check_tool_entry(99)
+        assert "not in tools/x7_tools.json" in str(ei.value)
+
+    def test_multi_tool_program_fails_before_engine(self, tmp_path,
+                                                     monkeypatch):
+        import runner as runner_mod
+
+        def boom(*a, **k):
+            raise AssertionError("engine ran for a multi-tool program")
+
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", boom)
+        run = runner_mod.EngineRun({"engine_python": PY, "repo_root": REPO},
+                                    str(tmp_path))
+        prog = tmp_path / "multi.nc"
+        prog.write_text("G21 G90\nT13 M06\nG0 X0.\nT20 M06\n")
+        with pytest.raises(runner_mod.EngineError) as ei:
+            run.run_check_program(str(prog), "unused.step",
+                                  dict(CHECK_INPUTS))
+        assert "multi-tool" in str(ei.value)
+
+    def test_no_t_word_fails(self, tmp_path, monkeypatch):
+        import runner as runner_mod
+
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn",
+                            lambda *a, **k: None)
+        run = runner_mod.EngineRun({"engine_python": PY, "repo_root": REPO},
+                                    str(tmp_path))
+        prog = tmp_path / "not.nc"
+        prog.write_text("G21 G90\nG0 X0. Y0.\n")
+        with pytest.raises(runner_mod.EngineError) as ei:
+            run.run_check_program(str(prog), "unused.step",
+                                  dict(CHECK_INPUTS))
+        assert "T word" in str(ei.value)
+
+
+class TestCheckProgramE2E:
+    def test_check_program_ok(self, live):
+        mock, _, programs = live
+        mock.enqueue_run(910, action=catalog_mod.CHECK_ACTION,
+                         inputs=dict(CHECK_INPUTS, model=model_input(mock),
+                                    program=program_input(mock)))
+        assert mock.wait_state(910, "received", 30), \
+            "run never received: %s" % mock.states_for(910)
+        final = mock.wait_terminal(910, timeout=600)
+        assert final == "succeeded", \
+            "run ended %s: %s" % (final, mock.states_for(910))
+        reps = {r["body"]["state"]: r["body"] for r in mock.reports
+                if str(r["run_id"]) == "910"}
+        result = reps["succeeded"].get("result") or {}
+        assert result["strict"] is True and result["unsupported"] == []
+        assert result["zmap_gouges"]["count"] == 0
+        assert result["rapid_collisions"]["count"] == 0
+        assert result["over_flute"]["count"] == 0
+        assert result["holder_hits"]["count"] == 0
+        assert result["outside_grid"]["count"] == 0
+        # tool came from the program's T word (T13, not an override)
+        assert result["tool"]["number"] == 13
+        assert result["tool"]["holder"] == "BT30-ER32-70"
+        # engagement: report-only, no threshold
+        assert result["engagement"]["threshold_mm"] is None
+        # check.json + preview.png only: NO .nc upload, nothing new in the
+        # programs folder (nothing is sent anywhere near the machine)
+        assert mock.file_names(910) == ["check.json", "preview.png"]
+        assert not list(programs.glob("O4501*"))
+
+    def test_check_program_g81_fails_unsupported(self, live):
+        mock, _, programs = live
+        mock.enqueue_run(911, action=catalog_mod.CHECK_ACTION,
+                         inputs=dict(CHECK_INPUTS, model=model_input(mock),
+                                    program=program_input(mock,
+                                                       "check_g81.nc")))
+        assert mock.wait_state(911, "received", 30)
+        final = mock.wait_terminal(911, timeout=600)
+        assert final == "failed", \
+            "G81 run must fail: %s" % mock.states_for(911)
+        rep = [r["body"] for r in mock.reports
+               if str(r["run_id"]) == "911"
+               and r["body"]["state"] == "failed"][-1]
+        msg = rep.get("error", {}).get("message", "")
+        assert "unsupported" in msg and "G81" in msg, msg
+        assert not any(n.endswith(".nc") for n in mock.file_names(911))
+        assert not list(programs.glob("O4502*"))
+
+    def test_check_program_unknown_tool_number_fails_fast(self, live):
+        mock, _, _ = live
+        mock.enqueue_run(912, action=catalog_mod.CHECK_ACTION,
+                         inputs=dict(CHECK_INPUTS, model=model_input(mock),
+                                    program=program_input(mock),
+                                    tool_number=99))
+        final = mock.wait_terminal(912, timeout=120)
+        assert final == "failed", mock.states_for(912)
+        rep = [r["body"] for r in mock.reports
+               if str(r["run_id"]) == "912"
+               and r["body"]["state"] == "failed"][-1]
+        assert "x7_tools.json" in rep.get("error", {}).get("message", "")
+        assert mock.file_names(912) == []
+
+
+def test_check_program_tool_number_mismatch_refused(tmp_path):
+    """A tool_number override that disagrees with the program's T word
+    must fail, never judge with a different tool."""
+    import runner as runner_mod
+    prog = tmp_path / "p.nc"
+    prog.write_text("%\nO1\nT20 M06\nG0 X0. Y0. Z10.\nM30\n%\n")
+    eng = runner_mod.EngineRun.__new__(runner_mod.EngineRun)
+    eng.cfg = {"repo_root": REPO, "engine_python": sys.executable}
+    eng.work = str(tmp_path)
+    with pytest.raises(runner_mod.EngineError, match="does not match"):
+        eng.run_check_program(str(prog), str(tmp_path / "m.step"),
+                              {"tool_number": 31, "orientation": "Z+",
+                               "stock_xy": 1.0, "stock_top": 1.0,
+                               "stock_bottom": 0.0}, None)

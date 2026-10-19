@@ -7,6 +7,7 @@ ENGINE_WORKERS=4, cwd = repo root, and its own work dir
 """
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -76,6 +77,69 @@ def _tool_number(cfg, values):
     except Exception:
         pass
     return 1  # not in the table: explicit number keeps the post happy
+
+
+T_WORD_RE = re.compile(r"\bT\s*(\d+)", re.IGNORECASE)
+
+
+def program_tool_numbers(text):
+    """Distinct T word numbers in a posted program (comments stripped),
+    in order of first appearance."""
+    out = []
+    for line in text.splitlines():
+        s = line.split(";", 1)[0]
+        depth = 0
+        kept = []
+        for ch in s:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0:
+                kept.append(ch)
+        for m in T_WORD_RE.findall("".join(kept)):
+            n = int(m)
+            if n not in out:
+                out.append(n)
+    return out
+
+
+def check_tool_entry(number, path=None):
+    """check_program: the tools/x7_tools.json entry for tool `number`.
+    Returns {type, diameter_mm, corner_radius_mm, flute_mm,
+    shank_diameter_mm, holder, stickout_mm}. Unknown tool (no entry, a
+    null number, or missing shape data) -> EngineError, same as today's
+    refusal to run a tool the table does not know."""
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "tools", "x7_tools.json")
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (IOError, OSError, ValueError) as e:
+        raise EngineError("cannot read tool table %s: %s" % (path, e))
+    e = next((t for t in data.get("tools", [])
+              if t.get("number") == int(number)), None)
+    if e is None:
+        raise EngineError(
+            "tool T%d is not in tools/x7_tools.json: unknown tool - add it "
+            "to the X7 table (or pass a tool_number that is in the table)"
+            % int(number))
+    for k in ("type", "diameter_mm"):
+        if e.get(k) is None:
+            raise EngineError("tool T%d entry in %s has no %s"
+                              % (int(number), path, k))
+    return {"number": int(number), "type": e["type"],
+            "diameter_mm": float(e["diameter_mm"]),
+            "corner_radius_mm": float(e.get("corner_radius_mm") or 0.0),
+            "flute_mm": (float(e["flute_mm"])
+                         if e.get("flute_mm") is not None else None),
+            "shank_diameter_mm": (float(e["shank_diameter_mm"])
+                                  if e.get("shank_diameter_mm") is not None
+                                  else float(e["diameter_mm"])),
+            "holder": e.get("holder"),
+            "stickout_mm": (float(e["stickout_mm"])
+                            if e.get("stickout_mm") is not None else None)}
 
 
 class EngineRun:
@@ -277,6 +341,140 @@ class EngineRun:
         }
         files = {"rough.nc": (nc, "application/octet-stream"),
                  "check.json": (check_path, "application/json"),
+                 "preview.png": (png_path, "image/png")}
+        return result, files
+
+    # -------------------------------------------------- check_program ----
+    def run_check_program(self, program_path, step_path, values,
+                          on_progress=None):
+        """check_program (task CP): judge a STEVE-posted program with the
+        independent zmap --strict against the oriented part and the stock
+        box, using the program's T word from tools/x7_tools.json. One
+        program = one tool. Gates as adaptive_rough (gouges, rapid
+        collisions, over-flute/shank, holder, outside grid) plus a
+        report-only engagement summary. Returns check.json + preview.png;
+        nothing new is uploaded as .nc, nothing goes to the machine."""
+        py = self.cfg["engine_python"]
+        fc = os.path.join(os.path.dirname(py), "freecadcmd")
+        repo = self.cfg["repo_root"]
+
+        # 1) tool up front: one T word, known in the X7 table (unknown tool
+        #    or holder fails the run, same as today)
+        with open(program_path) as fh:
+            ptext = fh.read()
+        numbers = program_tool_numbers(ptext)
+        if len(numbers) > 1:
+            raise EngineError("multi-tool programs not supported yet "
+                              "(T words: %s)" % ", ".join("T%d" % n
+                                                           for n in numbers))
+        number = (int(values["tool_number"]) if values.get("tool_number")
+                  else (numbers[0] if numbers else None))
+        if number is None:
+            raise EngineError("no T word in the program and no tool_number "
+                              "override: the tool cannot be resolved")
+        tool = check_tool_entry(number, os.path.join(repo, "tools",
+                                                     "x7_tools.json"))
+        if numbers and number != numbers[0]:
+            raise EngineError("tool_number T%d does not match the program's "
+                              "T%d: refusing to judge with a different tool"
+                              % (number, numbers[0]))
+        cell = 0.1  # judge grid: same 0.1 mm as the finishing chain
+
+        # 2) orient + stock box + part heightfield (shared builder grid:
+        #    STOCK_BOX + TOOL_R + margin, task Z5b)
+        if on_progress:
+            on_progress(0.05, "preparing part")
+        self._spawn([py, "-m", "engine.cli", "prepare",
+                     "--step", step_path, "--out-dir", self.work,
+                     "--orient", values["orientation"],
+                     "--stock-xy", "%.4f" % values["stock_xy"],
+                     "--stock-top", "%.4f" % values["stock_top"],
+                     "--stock-bottom", "%.4f" % values["stock_bottom"],
+                     "--cell", "0.5",
+                     "--tool-r", "%.4f" % (tool["diameter_mm"] / 2.0)],
+                    0.05, 0.35, on_progress)
+        with open(os.path.join(self.work, "prepare.json")) as fh:
+            prep = json.load(fh)
+        stock = prep["stock"]
+
+        # 3) fresh judge heightfield (task HC: stale files removed first,
+        #    sidecar must pin this run's STEP/cell/tess tol)
+        fr = self._freshness()
+        step_sha = fr.sha256_file(prep["step"])
+        hf_zmap = os.path.join(self.work, "part_hf_zmap.npy")
+        fr.remove_stale(hf_zmap)
+        if on_progress:
+            on_progress(0.35, "building heightfield")
+        self._spawn([fc, os.path.join(repo, "verify", "heightfield.py")],
+                    0.35, 0.55, on_progress,
+                    extra_env={"STEP_IN": prep["step"], "HF_OUT": hf_zmap,
+                              "CELL": str(cell), "TESS_TOL": "0.01",
+                              "STOCK_BOX": " ".join("%.4f" % v
+                                                    for v in stock[:4]),
+                              "TOOL_R": "%.4f" % (tool["diameter_mm"] / 2.0)})
+        try:
+            fr.require_fresh(hf_zmap, step_sha256=step_sha, cell=cell,
+                             tess_tol=0.01)
+        except OSError as e:
+            raise EngineError(str(e))
+
+        # 4) zmap --strict: unsupported codes fail with the first offender
+        #    (full list in check json); gates as adaptive_rough. No optimal
+        #    load input for this action: engagement is report-only, no
+        #    threshold.
+        if on_progress:
+            on_progress(0.55, "checking program")
+        check_path = os.path.join(self.work, "check.json")
+        png_path = os.path.join(self.work, "preview.png")
+        argv = [py, "-m", "verify.zmap", program_path,
+                "--part", hf_zmap,
+                "--tool", tool["type"],
+                "--dia", "%.4f" % tool["diameter_mm"],
+                "--corner", "%.4f" % tool["corner_radius_mm"],
+                "--stock", *[("%.4f" % v) for v in stock],
+                "--tool-number", str(number),
+                "--strict", "--engage-report",
+                "--out-json", check_path, "--png", png_path]
+        if tool["flute_mm"] is not None:
+            argv += ["--flute", "%.4f" % tool["flute_mm"]]
+        if tool["shank_diameter_mm"] is not None:
+            argv += ["--shank-dia", "%.4f" % tool["shank_diameter_mm"]]
+        self._spawn(argv, 0.55, 0.95, on_progress)
+        with open(check_path) as fh:
+            check = json.load(fh)
+        _check_zmap_gates(check)
+
+        result = {
+            "units": "mm",
+            "program": os.path.basename(program_path),
+            "tool": {"number": number, "type": tool["type"],
+                     "diameter_mm": tool["diameter_mm"],
+                     "corner_radius_mm": tool["corner_radius_mm"],
+                     "flute_mm": tool["flute_mm"],
+                     "shank_diameter_mm": tool["shank_diameter_mm"],
+                     "holder": tool["holder"],
+                     "stickout_mm": tool["stickout_mm"]},
+            "orientation": values["orientation"],
+            "stock_box_mm": stock,
+            "strict": True,
+            "unsupported": check.get("unsupported", []),
+            "zmap_gouges": check["gouges"],
+            "rapid_collisions": check["rapid_collisions"],
+            "over_flute": check["over_flute"],
+            "holder_hits": check.get("holder_hits"),
+            "outside_grid": check.get("outside_grid"),
+            "engagement": check.get("engagement"),
+            "leftover": {
+                "mean_mm": check["leftover"]["mean"],
+                "p95_mm": check["leftover"]["p95"],
+                "within_0p5mm_fraction": check["within_0p5mm_fraction"],
+            },
+            "estimated_time_min": round(check["cycle_time_s"] / 60.0, 2),
+            "cut_length_mm": check["cutting_length_mm"],
+            "rapid_length_mm": check["rapid_length_mm"],
+            "files": ["check.json", "preview.png"],
+        }
+        files = {"check.json": (check_path, "application/json"),
                  "preview.png": (png_path, "image/png")}
         return result, files
 

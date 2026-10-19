@@ -239,11 +239,13 @@ class Connector:
                 self.emit_state("busy", action, round(p, 2))
 
         try:
-            # download + verify inputs
+            # download + verify inputs (files and posted programs)
             step_path = None
+            program_path = None
             for name, spec in catalog_mod.get_action(action)["inputs"] \
                     ["properties"].items():
-                if spec.get("x-steve") != "file":
+                kind = spec.get("x-steve")
+                if kind not in ("file", "program"):
                     continue
                 inp = env.get("inputs", {}).get(name)
                 if inp is None:
@@ -257,9 +259,14 @@ class Connector:
                              "message": "download failed sha256/bytes check"})
                     self.emit_state("idle")
                     return
-                step_path = os.path.join(work, "input.step")
                 os.makedirs(work, exist_ok=True)
-                with open(step_path, "wb") as fh:
+                dest = (os.path.join(work, "program.nc") if kind == "program"
+                        else os.path.join(work, "input.step"))
+                if kind == "program":
+                    program_path = dest
+                else:
+                    step_path = dest
+                with open(dest, "wb") as fh:
                     fh.write(data)
             values_in = env.get("inputs", {})
             ok, code, values = catalog_mod.validate_inputs(values_in, action)
@@ -272,6 +279,11 @@ class Connector:
 
             if action == catalog_mod.ACTION:
                 result, files = engine.run(step_path, values, on_progress)
+            elif action == catalog_mod.CHECK_ACTION:
+                # task CP: judge a posted program; no .nc is uploaded or
+                # copied (the program came FROM STEVE and goes nowhere else)
+                result, files = engine.run_check_program(
+                    program_path, step_path, values, on_progress)
             else:
                 result, files = engine.run_slope_split_finish(
                     step_path, values, on_progress)
