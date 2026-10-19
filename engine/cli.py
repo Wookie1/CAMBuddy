@@ -20,6 +20,23 @@ def parse_tool(spec):
     return kind, dia, corner
 
 
+def stock_box(bbox, sx, sy, top, bottom):
+    """Stock box = part bbox plus per-axis stock allowances (mm): the box
+    is bbox extended by sx per side in X, sy per side in Y, top above and
+    bottom below (origin = stock bottom centre). Pure (no FreeCAD) so it is
+    unit-testable. A negative allowance is a mistake -> ValueError."""
+    if sx < 0 or sy < 0:
+        raise ValueError("stock allowance per side must be >= 0 mm "
+                         "(got --stock-x=%s --stock-y=%s)" % (sx, sy))
+    if top < 0 or bottom < 0:
+        raise ValueError("stock allowance in Z must be >= 0 mm "
+                         "(got --stock-top=%s --stock-bottom=%s)"
+                         % (top, bottom))
+    pxmin, pxmax, pymin, pymax, pzmin, pzmax = bbox
+    return [pxmin - sx, pxmax + sx, pymin - sy, pymax + sy,
+            pzmin - bottom, pzmax + top]
+
+
 def _run_post(a):
     """python -m engine.cli post --in <neutral/engine> --out F [options]"""
     from engine import post_lnc
@@ -77,12 +94,15 @@ def _run_prepare(a):
     with open(meta_out) as fh:
         bbox = json.load(fh)["bbox"]
 
-    # stock box first (bbox +- stock offsets): the heightfield grid must
-    # cover the stock + tool radius, never just a tight part bbox (Z5b)
-    pxmin, pxmax, pymin, pymax, pzmin, pzmax = bbox
-    stock = [pxmin - a.stock_xy, pxmax + a.stock_xy,
-             pymin - a.stock_xy, pymax + a.stock_xy,
-             pzmin - a.stock_bottom, pzmax + a.stock_top]
+    # stock box first (bbox +- per-axis stock offsets): the heightfield grid
+    # must cover the stock + tool radius, never just a tight part bbox (Z5b).
+    # --stock-x / --stock-y default to --stock-xy when not given (task SX).
+    sx = a.stock_x if a.stock_x is not None else a.stock_xy
+    sy = a.stock_y if a.stock_y is not None else a.stock_xy
+    try:
+        stock = stock_box(bbox, sx, sy, a.stock_top, a.stock_bottom)
+    except ValueError as e:
+        raise SystemExit(str(e))
 
     prog(0.4, "rasterising part heightfield")
     # task HC: never accept a stale part_hf.npy from a reused out dir -
@@ -212,6 +232,10 @@ def main(argv=None):
                            "flip_z_180"))
     pr.add_argument("--stock-xy", dest="stock_xy", type=float, default=1.0,
                    help="XY stock offset per side mm")
+    pr.add_argument("--stock-x", dest="stock_x", type=float, default=None,
+                   help="X stock offset per side mm (default: --stock-xy)")
+    pr.add_argument("--stock-y", dest="stock_y", type=float, default=None,
+                   help="Y stock offset per side mm (default: --stock-xy)")
     pr.add_argument("--stock-top", dest="stock_top", type=float, default=1.0)
     pr.add_argument("--stock-bottom", dest="stock_bottom", type=float,
                    default=1.0)

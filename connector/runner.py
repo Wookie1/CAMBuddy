@@ -24,6 +24,17 @@ class Cancelled(Exception):
     pass
 
 
+def _stock_args(values):
+    """prepare stock flags: always --stock-xy, plus --stock-x / --stock-y
+    only when the caller gave a per-axis value (task SX)."""
+    args = ["--stock-xy", "%.4f" % values["stock_xy"]]
+    if values.get("stock_x") is not None:
+        args += ["--stock-x", "%.4f" % values["stock_x"]]
+    if values.get("stock_y") is not None:
+        args += ["--stock-y", "%.4f" % values["stock_y"]]
+    return args
+
+
 class EngineError(Exception):
     pass
 
@@ -234,7 +245,7 @@ class EngineRun:
         self._spawn([py, "-m", "engine.cli", "prepare",
                     "--step", step_path, "--out-dir", self.work,
                     "--orient", values["orientation"],
-                    "--stock-xy", "%.4f" % values["stock_xy"],
+                    *_stock_args(values),
                     "--stock-top", "%.4f" % values["stock_top"],
                     "--stock-bottom", "%.4f" % values["stock_bottom"],
                     "--cell", str(cell),
@@ -410,7 +421,7 @@ class EngineRun:
         self._spawn([py, "-m", "engine.cli", "prepare",
                      "--step", step_path, "--out-dir", self.work,
                      "--orient", values["orientation"],
-                     "--stock-xy", "%.4f" % values["stock_xy"],
+                     *_stock_args(values),
                      "--stock-top", "%.4f" % values["stock_top"],
                      "--stock-bottom", "%.4f" % values["stock_bottom"],
                      "--cell", "0.5",
@@ -638,7 +649,7 @@ class EngineRun:
         self._spawn([py, "-m", "engine.cli", "prepare",
                     "--step", step_path, "--out-dir", self.work,
                     "--orient", values["orientation"],
-                    "--stock-xy", "%.4f" % values["stock_xy"],
+                    *_stock_args(values),
                     "--stock-top", "%.4f" % values["stock_top"],
                     "--stock-bottom", "%.4f" % values["stock_bottom"],
                     "--cell", "0.5",
