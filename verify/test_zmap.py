@@ -766,6 +766,69 @@ G1 X15. Y1.2 F500.
         "stepover engagement %.3f not within 1.0 +/- 0.3" % eng["max_mm"]
 
 
+def test_engagement_horizontal_distribution_straight_side_cut():
+    """Straight 1.5 mm side cut: horizontal p50 ~1.5 +/- 0.3, entry empty."""
+    part = block_part(hi=10.0, half=15.0)
+    ys = centers()[:, None]
+    xs = centers()[None, :]
+    # fresh material (height 10) in the band y >= 1.5, but the plunge zone
+    # (x < -16, fully covering the tool at the Z5 entry point) is cleared
+    # to 5 so the vertical entry cuts nothing and stays out of "entry"
+    stock_init = np.where((ys >= 1.5 - 1e-9) & (xs >= -16.0), 10.0, 5.0)
+    res = _run_engage("""
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""", part, dia=6.0, engage_max=2.0, stock_init=stock_init)
+    eng = res["engagement"]
+    assert eng is not None
+    horiz = eng["horizontal"]
+    assert horiz["n"] >= 1, "straight side cut not in horizontal bucket"
+    assert abs(horiz["p50"] - 1.5) <= 0.3, \
+        "horizontal p50 %.3f not within 1.5 +/- 0.3" % horiz["p50"]
+    for key in ("p95", "p99", "max"):
+        assert horiz[key] is not None and horiz[key] >= horiz["p50"] - 1e-9
+    assert eng["entry"]["n"] == 0, \
+        "entry bucket not empty for a horizontal cut (n=%d)" % eng["entry"]["n"]
+
+
+def test_engagement_ramp_entry_not_horizontal():
+    """Descending ramp into stock: lands in 'entry', not 'horizontal'."""
+    part = block_part(hi=10.0, half=15.0)
+    # ramp from Z12 down to Z8 across the block (top at 10): engages stock
+    # while descending -> entry bucket only
+    res = _run_engage("""
+G21 G90 F500
+G0 X-10. Y0. Z12.
+G1 X10. Y0. Z8. F100
+""", part, dia=6.0, engage_max=2.0)
+    eng = res["engagement"]
+    assert eng is not None
+    assert eng["entry"]["n"] >= 1, "ramp into stock not in entry bucket"
+    assert abs(eng["entry"]["max"] - 6.0) <= 0.5, \
+        "ramp entry max %.3f not ~full width" % eng["entry"]["max"]
+    assert eng["horizontal"]["n"] == 0, \
+        "descending ramp counted as horizontal (n=%d)" % eng["horizontal"]["n"]
+
+
+def test_engagement_spike_kind():
+    """Spike > engage_max carries kind: horizontal for level cuts, entry
+    for descending ones."""
+    part = block_part(hi=10.0, half=15.0)
+    res = _run_engage("""
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""", part, dia=6.0, engage_max=5.0)
+    spikes = res["engagement"]["spikes"]
+    assert len(spikes) >= 1
+    assert all(s["kind"] in ("horizontal", "entry") for s in spikes)
+    assert any(s["kind"] == "horizontal" for s in spikes), \
+        "level full-width slot spike not kind=horizontal"
+
+
 def test_plunge_helix_not_flagged():
     """Helix entry at 2 deg: NOT flagged as a plunge (below ramp_angle=3)."""
     part = block_part(hi=10.0, half=15.0)
