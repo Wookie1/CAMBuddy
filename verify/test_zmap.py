@@ -658,3 +658,260 @@ def test_vertical_wall_ball_gouge():
     res_b = run_wall(-R + 0.05)
     assert res_b["gouges"]["count"] > 0, "intruding ball not flagged"
     assert res_b["gouges"]["max_depth"] > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Engagement spikes and plunge detection (TASK_V1 items 1-4)
+# ---------------------------------------------------------------------------
+
+def _run_engage(gcode, part, dia=6.0, engage_max=None, ramp_angle=3.0,
+                stock=None, tool="flat"):
+    """Run simulate with engagement tracking."""
+    if stock is None:
+        stock = STOCK
+    moves = zmap.parse_gcode(gcode)
+    return zmap.simulate(moves, part, CELL, X0, Y0, stock, tool=tool,
+                         dia=dia, engage_max=engage_max,
+                         ramp_angle=ramp_angle)
+
+
+def test_engagement_full_width_slot_flagged():
+    """Straight full-width slot: engagement = D (tool diameter), flagged."""
+    part = block_part(hi=10.0, half=15.0)
+    # Cut a straight slot at full width (single pass, no stepover)
+    res = _run_engage("""
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""", part, dia=6.0, engage_max=5.0)
+    # engagement should be ~6 mm (full tool diameter)
+    assert res["engagement"] is not None
+    assert res["engagement"]["count"] >= 1, "full-width slot not flagged"
+    assert res["engagement"]["max_mm"] >= 5.5, \
+        "engagement %.3f < 5.5 for full-width slot" % res["engagement"]["max_mm"]
+    # spikes should carry line, XY, and engagement_mm
+    spike = res["engagement"]["spikes"][0]
+    assert "line" in spike and "x" in spike and "y" in spike
+    assert "engagement_mm" in spike and spike["engagement_mm"] >= 5.0
+
+
+def test_engagement_corner_spike():
+    """90-degree inside corner of a constant radial-engagement path:
+    spike flagged at the corner."""
+    part = block_part(hi=10.0, half=15.0)
+    # Light stepover path (half-width engagement ~3 mm) with a sharp corner
+    res = _run_engage("""
+G21 G90 F500
+G0 X-10. Y-3. Z20.
+G1 Z5. F100.
+G1 X10. Y-3. F500.
+G1 X10. Y3. F500.
+G1 X-10. Y3. F500.
+""", part, dia=6.0, engage_max=4.0)
+    # The corner (X10, Y-3) -> (X10, Y3) has higher engagement because the
+    # tool enters fresh material on the inside corner
+    assert res["engagement"] is not None
+    # At least the corner move should be flagged (engagement > 4 mm)
+    assert res["engagement"]["count"] >= 1, \
+        "corner spike not flagged: count=%d max=%.3f" % (
+            res["engagement"]["count"], res["engagement"]["max_mm"])
+
+
+def test_plunge_helix_not_flagged():
+    """Helix entry at 2 deg: NOT flagged as a plunge (below ramp_angle=3)."""
+    part = block_part(hi=10.0, half=15.0)
+    # Helical entry: descend 0.3 mm while traveling 14 mm in XY
+    # angle = atan(0.3/14) = 1.2 deg < 3.0 deg -> not flagged
+    # Start at Z=10.3 (above stock top 10), end at Z=10.0 (stock surface)
+    # Then a lateral cut at Z=5 (no descent, not a plunge)
+    res = _run_engage("""
+G21 G90 F500
+G0 X-7. Y0. Z15.
+G1 X7. Y0. Z10.0 F200.
+G0 Z15.
+G1 X-7. Y0. Z10.3 F200.
+G1 X7. Y0. Z10.0 F200.
+G1 Z5. F100.
+G1 X-7. Y0. F500.
+""", part, dia=6.0, ramp_angle=3.0)
+    plunge = res["plunge"]
+    # The helix (line 7: Z10.3->Z10.0 over 14 mm) is 1.2 deg < 3 deg -> not flagged
+    # The Z5 plunge (line 8) is vertical -> IS flagged
+    # So exactly 1 plunge (the vertical one), not the helix
+    assert plunge["count"] == 1, \
+        "expected 1 plunge (vertical only): got %d" % plunge["count"]
+    assert plunge["flags"][0]["angle_deg"] == 90.0
+
+
+def test_plunge_vertical_flagged():
+    """Straight vertical plunge into stock: flagged."""
+    part = block_part(hi=10.0, half=15.0)
+    res = _run_engage("""
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z5. F100.
+G1 X10. Y0. F500.
+""", part, dia=6.0)
+    plunge = res["plunge"]
+    assert plunge["count"] >= 1, "vertical plunge not flagged"
+    flag = plunge["flags"][0]
+    assert flag["angle_deg"] == 90.0, \
+        "vertical plunge angle %.1f != 90" % flag["angle_deg"]
+    assert flag["depth_mm"] > 0.0, "plunge depth should be positive"
+    assert flag["depth_mm"] >= 4.9, \
+        "plunge depth %.3f < 4.9" % flag["depth_mm"]
+
+
+def test_plunge_and_engagement_in_warnings():
+    """Both reports appear under 'warnings' in the CLI output."""
+    import tempfile, json, os
+    part = block_part(hi=10.0, half=15.0)
+    with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as hf:
+        np.save(hf, part)
+    sidecar = hf.name.replace(".npy", ".json")
+    with open(sidecar, "w") as f:
+        json.dump({"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}, f)
+    gcode = tempfile.NamedTemporaryFile(suffix=".ngc", delete=False, mode="w")
+    gcode.write("""
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""")
+    gcode.close()
+    out_json = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    out_json.close()
+    try:
+        stock_args = ["--stock"] + [str(v) for v in STOCK]
+        rc = zmap.main([gcode.name, "--part", hf.name] + stock_args
+                       + ["--engage-max", "4.0", "--out-json", out_json.name])
+        assert rc == 0
+        with open(out_json.name) as f:
+            report = json.load(f)
+        w = report["warnings"]
+        assert "engagement" in w and "plunge" in w
+        assert w["engagement"]["count"] >= 1
+        assert w["plunge"]["count"] >= 1
+    finally:
+        for p in (hf.name, sidecar, gcode.name, out_json.name):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+def test_cli_optimal_load_computes_engage_max():
+    """CLI --optimal-load computes engage_max as 1.5x the value."""
+    import tempfile, json, os
+    part = block_part(hi=10.0, half=15.0)
+    with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as hf:
+        np.save(hf, part)
+    sidecar = hf.name.replace(".npy", ".json")
+    with open(sidecar, "w") as f:
+        json.dump({"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}, f)
+    gcode = tempfile.NamedTemporaryFile(suffix=".ngc", delete=False, mode="w")
+    gcode.write("""
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""")
+    gcode.close()
+    out_json = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    out_json.close()
+    try:
+        stock_args = ["--stock"] + [str(v) for v in STOCK]
+        rc = zmap.main([gcode.name, "--part", hf.name] + stock_args
+                       + ["--optimal-load", "2.0", "--out-json", out_json.name])
+        assert rc == 0
+        with open(out_json.name) as f:
+            report = json.load(f)
+        eng = report["engagement"]
+        # threshold should be 1.5 * 2.0 = 3.0
+        assert eng is not None, "engagement should not be None"
+        assert eng["threshold_mm"] == 3.0,             "threshold %.3f != 3.0 (1.5 * 2.0)" % eng["threshold_mm"]
+        # The full-width cut should be flagged (engagement ~6 > 3)
+        assert eng["count"] >= 1, "full-width cut not flagged at threshold 3.0"
+    finally:
+        for p in (hf.name, sidecar, gcode.name, out_json.name):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+def test_cli_optimal_load_and_ramp_angle():
+    """CLI --optimal-load and --ramp-angle both work together."""
+    import tempfile, json, os
+    part = block_part(hi=10.0, half=15.0)
+    with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as hf:
+        np.save(hf, part)
+    sidecar = hf.name.replace(".npy", ".json")
+    with open(sidecar, "w") as f:
+        json.dump({"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}, f)
+    gcode = tempfile.NamedTemporaryFile(suffix=".ngc", delete=False, mode="w")
+    gcode.write("""
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""")
+    gcode.close()
+    out_json = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    out_json.close()
+    try:
+        stock_args = ["--stock"] + [str(v) for v in STOCK]
+        rc = zmap.main([gcode.name, "--part", hf.name] + stock_args
+                       + ["--optimal-load", "2.0", "--ramp-angle", "5.0",
+                          "--out-json", out_json.name])
+        assert rc == 0
+        with open(out_json.name) as f:
+            report = json.load(f)
+        eng = report["engagement"]
+        assert eng["threshold_mm"] == 3.0,             "threshold %.3f != 3.0" % eng["threshold_mm"]
+        plunge = report["plunge"]
+        assert plunge["ramp_angle_deg"] == 5.0,             "ramp_angle %.1f != 5.0" % plunge["ramp_angle_deg"]
+        # Both appear in warnings
+        w = report["warnings"]
+        assert w["engagement"]["threshold_mm"] == 3.0
+        assert w["plunge"]["ramp_angle_deg"] == 5.0
+    finally:
+        for p in (hf.name, sidecar, gcode.name, out_json.name):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+# ---------------------------------------------------------------------------
+# Review 2 (supervisor): engagement must be finite and bounded by D
+# ---------------------------------------------------------------------------
+
+def test_engagement_helix_finite():
+    """Helix entry: engagement must be finite and <= tool diameter."""
+    part = block_part(hi=10.0, half=15.0)
+    res = _run_engage("""
+G21 G90 F500
+G0 X-15. Y0. Z20.
+G1 X15. Y0. Z5. F200.
+G1 X-15. Y0. F500.
+""", part, dia=6.0, engage_max=5.0)
+    assert res["engagement"] is not None
+    assert math.isfinite(res["engagement"]["max_mm"]), \
+        "helix engagement is not finite"
+    assert res["engagement"]["max_mm"] <= 6.0 + 1e-6, \
+        "helix engagement %.3f > D=6.0" % res["engagement"]["max_mm"]
+    for sp in res["engagement"]["spikes"]:
+        assert math.isfinite(sp["engagement_mm"]), \
+            "spike engagement_mm is not finite"
+
+
+def test_engagement_pure_plunge_finite():
+    """Pure plunge (zero XY length): engagement must be finite and <= D."""
+    part = block_part(hi=10.0, half=15.0)
+    res = _run_engage("""
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z5. F100.
+G1 X10. Y0. F500.
+""", part, dia=6.0, engage_max=5.0)
+    assert res["engagement"] is not None
+    assert math.isfinite(res["engagement"]["max_mm"]), \
+        "plunge engagement is not finite"
+    assert res["engagement"]["max_mm"] <= 6.0 + 1e-6, \
+        "plunge engagement %.3f > D=6.0" % res["engagement"]["max_mm"]

@@ -568,7 +568,8 @@ def apply_cutter_comp(moves, radius):
 
 def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
              corner=0.0, stock_init=None, window=None, rapid_feed=RAPID_FEED,
-             start=None, flute=None, shank_dia=None):
+             start=None, flute=None, shank_dia=None, engage_max=None,
+             ramp_angle=3.0):
     """Run the toolpath over a stock heightfield.
 
     part      : (ny, nx) array of part top-Z heights
@@ -597,6 +598,13 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 tip + flute + 0.01 mm (the shank above the flutes rubs a
                 wall). Reported as over_flute: count of cutting moves with a
                 hit, max excess mm, worst xy, first line.
+    engage_max: optional threshold mm for radial engagement spikes. When set,
+                flag cutting moves whose max radial engagement (chord width of
+                the tool's engaged arc, measured perpendicular to travel)
+                exceeds this value. Default None = off.
+    ramp_angle: ramp/helix angle threshold in degrees (default 3.0). A plunge
+                (vertical feed into stock) is NOT flagged if it is a helix or
+                ramp at or below this angle.
     Returns dict with 'stock' array and report fields.
     """
     sxmin, sxmax, symin, symax, szmin, szmax = stock_box
@@ -681,6 +689,13 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     comp_first_line = None
     comp_last_line = None
     d_registers = set()
+    # engagement tracking
+    engage_spikes = []  # list of dicts: {line, x, y, engagement_mm}
+    engage_max_seen = 0.0
+    engage_count = 0
+    # plunge tracking
+    plunge_flags = []  # list of dicts: {line, x, y, z, angle_deg, depth_mm}
+    plunge_count = 0
 
     for mv in resolved:
         if mv.get("comp"):
@@ -702,6 +717,21 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         move_collided = False
         move_over_flute = False
         move_shank = False
+        move_max_engage = 0.0
+        # travel direction for engagement (perpendicular chord width)
+        dx_t = x1 - cur[0]
+        dy_t = y1 - cur[1]
+        tlen = math.hypot(dx_t, dy_t)
+        if tlen > 1e-9:
+            dx_t, dy_t = dx_t / tlen, dy_t / tlen
+        else:
+            dx_t, dy_t = 1.0, 0.0  # pure plunge: arbitrary perp direction
+        # save stock height at start position BEFORE this move cuts
+        stock_at_start = None
+        pi_s = int(math.floor((cur[0] - x0) / cell))
+        pj_s = int(math.floor((cur[1] - y0) / cell))
+        if 0 <= pi_s < nx and 0 <= pj_s < ny:
+            stock_at_start = float(stock[pj_s, pi_s])
         if cutting and flute is not None:
             # material surface under the move's start/end XY as it stands
             # BEFORE this move cuts (the footprint leads the centre by R, so
@@ -785,12 +815,30 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 msk_e = d <= R + 0.75 * cell
                 if window is not None:
                     msk_e &= window[jlo:jhi, ilo:ihi]
+                # engaged = any stock cell at/over the footprint edge above the
+                # tip. Must use msk_e-filtered max so that engaged=True implies
+                # msk_e has True cells (prevents inf/NaN in engagement width).
                 engaged = (msk_e.any() and
                          float(np.max(np.where(msk_e, win, -np.inf))) > sz + 1e-6)
-            if removed > REMOVE_EPS:
-                stock[jlo:jhi, ilo:ihi] = np.minimum(win, newv)
-            if cutting and not engaged:
-                air_length += seg_len
+                # radial engagement: chord width of engaged arc perpendicular to
+                # travel (dx_t, dy_t); equivalent radial width = 2*R*sin(theta/2)
+                if engaged and engage_max is not None:
+                    perp_x, perp_y = -dy_t, dx_t
+                    proj = (gx[None, :] * perp_x + gy[:, None] * perp_y)
+                    eproj = np.where(msk_e, proj, -np.inf)
+                    ew = float(eproj.max()) - float(eproj.min())
+                    # Clamp to [0, dia]: the padded mask (R + 0.75*cell) can
+                    # make ew slightly exceed the tool diameter; guard against
+                    # inf/NaN from degenerate masks (helix, pure plunge, arcs).
+                    ew = min(max(ew, 0.0), 2.0 * R)
+                    if not np.isfinite(ew):
+                        ew = 0.0
+                    if ew > move_max_engage:
+                        move_max_engage = ew
+                if removed > REMOVE_EPS:
+                    stock[jlo:jhi, ilo:ihi] = np.minimum(win, newv)
+                if not engaged:
+                    air_length += seg_len
             else:  # rapid
                 if np.any(np.where(msk, cut > REMOVE_EPS, False)):
                     move_collided = True
@@ -816,6 +864,44 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 rapid_collisions += 1
                 if first_rapid_line is None:
                     first_rapid_line = mv["line"]
+        # engagement spike: flag moves exceeding threshold
+        if cutting and engage_max is not None and move_max_engage > engage_max:
+            engage_count += 1
+            engage_spikes.append({
+                "line": mv["line"],
+                "x": round(x1, 4), "y": round(y1, 4),
+                "engagement_mm": round(move_max_engage, 4)})
+            if move_max_engage > engage_max_seen:
+                engage_max_seen = move_max_engage
+        # plunge detection: feed move descending into stock
+        if cutting and z1 < cur[2] - 1e-9:
+            dx_m = x1 - cur[0]
+            dy_m = y1 - cur[1]
+            dz_m = cur[2] - z1
+            xy_len = math.hypot(dx_m, dy_m)
+            # check if entering stock: stock at start XY > move's min Z
+            # (using pre-move stock height saved before the sample loop)
+            zmin_m = min(cur[2], z1)
+            enters = False
+            depth_m = 0.0
+            if stock_at_start is not None and np.isfinite(stock_at_start):
+                if stock_at_start > zmin_m:
+                    enters = True
+                    depth_m = stock_at_start - zmin_m
+            if enters:
+                # compute ramp angle
+                angle_deg = 90.0
+                if xy_len > 1e-9:
+                    angle_deg = math.degrees(math.atan2(dz_m, xy_len))
+                # flag unless helix/ramp at or under ramp_angle
+                if xy_len < 1e-9 or angle_deg > ramp_angle:
+                    plunge_count += 1
+                    plunge_flags.append({
+                        "line": mv["line"],
+                        "x": round(cur[0], 4), "y": round(cur[1], 4),
+                        "z": round(z1, 4),
+                        "angle_deg": round(angle_deg, 2),
+                        "depth_mm": round(depth_m, 4)})
         cur = [x1, y1, z1]
 
     result = {
@@ -839,6 +925,17 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                        "first_line": comp_first_line,
                        "last_line": comp_last_line,
                        "d_registers": sorted(d_registers)},
+        "engagement": {
+            "threshold_mm": engage_max,
+            "count": engage_count,
+            "max_mm": round(engage_max_seen, 4),
+            "spikes": engage_spikes,
+        } if engage_max is not None else None,
+        "plunge": {
+            "ramp_angle_deg": ramp_angle,
+            "count": plunge_count,
+            "flags": plunge_flags,
+        },
     }
     result.update(analyze(stock, part, cell, x0, y0,
                           restrict=window if window is not None else in_box))
@@ -873,12 +970,14 @@ def _chunk_worker(idx):
                     stock_init=g["stock_init_per"][idx],
                     window=g["window"], rapid_feed=g["rapid_feed"],
                     start=g["start_per"][idx], flute=g["flute"],
-                    shank_dia=g["shank_dia"])
+                    shank_dia=g["shank_dia"], engage_max=g["engage_max"],
+                    ramp_angle=g["ramp_angle"])
 
 
 def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                       dia=6.0, corner=0.0, stock_init=None, window=None,
-                      rapid_feed=RAPID_FEED, flute=None, shank_dia=None):
+                      rapid_feed=RAPID_FEED, flute=None, shank_dia=None,
+                      engage_max=None, ramp_angle=3.0):
     import multiprocessing as mp
     # leading moves without a Z word: Z unknown = above stock, not machine 0;
     # use the first explicit Z (as serial simulate does), else the stock top
@@ -893,7 +992,8 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                   y0=y0,
                   stock_box=stock_box, tool=tool, dia=dia, corner=corner,
                   window=window, rapid_feed=rapid_feed, flute=flute,
-                  shank_dia=shank_dia)
+                  shank_dia=shank_dia, engage_max=engage_max,
+                  ramp_angle=ramp_angle)
     # true machine position at each chunk start = end of the previous chunk's
     # last move (chunks must not simulate their first move from its own target)
     start_per = []
@@ -954,6 +1054,19 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
         "cutting_length_mm": sum(r["cutting_length_mm"] for r in results),
         "rapid_length_mm": sum(r["rapid_length_mm"] for r in results),
         "cycle_time_s": sum(r["cycle_time_s"] for r in results),
+        "engagement": (
+            {"threshold_mm": engage_max,
+             "count": sum(r["engagement"]["count"] for r in results),
+             "max_mm": round(max(r["engagement"]["max_mm"]
+                                for r in results), 4),
+             "spikes": [s for r in results
+                       for s in r["engagement"]["spikes"]],
+            } if engage_max is not None else None),
+        "plunge": {
+            "ramp_angle_deg": ramp_angle,
+            "count": sum(r["plunge"]["count"] for r in results),
+            "flags": [f for r in results for f in r["plunge"]["flags"]],
+        },
     }
     zbands = {}
     for r in results:
@@ -1058,6 +1171,17 @@ def load_part(path):
     return part, float(meta["cell"]), float(meta["x0"]), float(meta["y0"])
 
 
+def _sanitize(obj):
+    """Replace inf/NaN with None so json.dumps never fails."""
+    if isinstance(obj, float):
+        return None if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("gcode", help="input G-code file")
@@ -1102,7 +1226,25 @@ def main(argv=None):
     p.add_argument("--shank-dia", dest="shank_dia", type=float, default=None,
                   help="shank diameter mm for the over-flute shank rub check "
                        "(default: tool dia); used with --flute")
+    p.add_argument("--optimal-load", dest="optimal_load", type=float, default=None,
+                  help="optimal radial engagement load mm: when given and "
+                       "--engage-max is not set, the engagement threshold is "
+                       "1.5 x this value. Default off.")
+    p.add_argument("--engage-max", dest="engage_max", type=float, default=None,
+                  help="radial engagement threshold mm: flag cutting moves whose "
+                       "max engagement exceeds this (chord width of engaged arc "
+                       "perpendicular to travel). Default: 1.5 x --optimal-load "
+                       "when that is given, else off.")
+    p.add_argument("--ramp-angle", dest="ramp_angle", type=float, default=3.0,
+                  help="ramp/helix angle threshold deg for plunge detection "
+                       "(default 3.0). Descending feed moves into stock are "
+                       "flagged unless they are helix/ramp at or below this.")
     args = p.parse_args(argv)
+
+    # Derive engage_max from optimal_load when not explicitly given
+    engage_max = args.engage_max
+    if engage_max is None and args.optimal_load is not None:
+        engage_max = 1.5 * args.optimal_load
 
     if args.stock is None and not args.stock_in:
         p.error("--stock is required unless --stock-in provides the stock state")
@@ -1138,13 +1280,16 @@ def main(argv=None):
                                args.jobs, tool=args.tool, dia=args.dia,
                                corner=args.corner, stock_init=stock_init,
                                window=window, rapid_feed=args.rapid_feed,
-                               flute=args.flute, shank_dia=args.shank_dia)
+                               flute=args.flute, shank_dia=args.shank_dia,
+                               engage_max=engage_max,
+                               ramp_angle=args.ramp_angle)
     else:
         res = simulate(moves, part, cell, x0, y0, stock_box,
                        tool=args.tool, dia=args.dia, corner=args.corner,
                        stock_init=stock_init, window=window,
                        rapid_feed=args.rapid_feed, flute=args.flute,
-                       shank_dia=args.shank_dia)
+                       shank_dia=args.shank_dia, engage_max=engage_max,
+                       ramp_angle=args.ramp_angle)
 
     report = {
         "gcode": os.path.abspath(args.gcode),
@@ -1169,7 +1314,14 @@ def main(argv=None):
         "cycle_time_s": round(res["cycle_time_s"], 1),
         "cycle_time_note": ("feed moves at their F words; rapids assumed at "
                            "%.0f mm/min" % args.rapid_feed),
+        "engagement": res["engagement"],
+        "plunge": res["plunge"],
+        "warnings": {
+            "engagement": res["engagement"],
+            "plunge": res["plunge"],
+        },
     }
+    report = _sanitize(report)
     text = json.dumps(report, indent=2)
     if args.out_json:
         with open(args.out_json, "w") as f:
