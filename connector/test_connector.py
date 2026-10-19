@@ -883,6 +883,9 @@ class TestRestPass:
                    if "engine.cli" in a and a[
                        a.index("engine.cli") + 1] == "finish"][0]
         assert "--rest-from" not in fin_call
+        # the finish plans its rapids/holder against the roughing stock
+        rough_out = rough_call[rough_call.index("--stock-out") + 1]
+        assert fin_call[fin_call.index("--stock-from") + 1] == rough_out
 
         # three zmap calls, chained: rough -> finish -> rest
         zmaps = [a for a in calls if "verify.zmap" in a]
@@ -955,6 +958,20 @@ class TestRestPass:
         assert result["estimated_time_min"] == pytest.approx(3.0 / 60.0,
                                                             abs=0.01)
         assert result["cut_length_mm"] == pytest.approx(300.0)
+
+        # without a rest pass the finish still gets the roughing stock
+        # (regression: rapids were planned against the part + 1 mm only and
+        # crossed T13 roughing terraces on Core Front)
+        calls.clear()
+        run2 = runner_mod.EngineRun(cfg, str(tmp_path / "norest"))
+        run2.run_slope_split_finish(os.path.join(HERE, "unused.step"),
+                                    dict(SLOPE_GOOD_INPUTS))
+        r2 = [a for a in calls if "engine.cli" in a
+              and a[a.index("engine.cli") + 1] == "rough"][0]
+        f2 = [a for a in calls if "engine.cli" in a
+              and a[a.index("engine.cli") + 1] == "finish"][0]
+        assert f2[f2.index("--stock-from") + 1] == \
+            r2[r2.index("--stock-out") + 1]
 
     def test_rest_tool_unknown_fails_before_engine(self, tmp_path,
                                                    monkeypatch):

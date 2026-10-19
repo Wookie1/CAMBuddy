@@ -685,9 +685,9 @@ class EngineRun:
         except OSError as e:
             raise EngineError(str(e))
 
-        # 3) adaptive roughing (LNC post, full stock); the rest pass needs the
-        #    engine's own post-roughing stock for its rapid/lift clearance
-        #    (--stock-from), so the rough step exports it when a rest follows
+        # 3) adaptive roughing (LNC post, full stock); the finish and the rest
+        #    pass need the engine's own post-roughing stock for their rapid /
+        #    lift / holder clearance (--stock-from), so the rough exports it
         nc = os.path.join(self.work, "rough.nc")
         stats_path = os.path.join(self.work, "rough_stats.json")
         rough_stock_out = os.path.join(self.work, "stock_after_rough_engine.npy")
@@ -710,9 +710,11 @@ class EngineRun:
                 str(int(values["program_number"])),
                 "--tool-number", str(rough_number),
                 "--json-progress", "--stats-json", stats_path]
-        if rest:
-            fr.remove_stale(rough_stock_out)
-            argv += ["--stock-out", rough_stock_out]
+        # always: the finish (and any rest pass) plans its rapids, lifts and
+        # holder clearance against this stock - without it the engine only
+        # adds 1 mm over the part and rapids crossed roughing terraces
+        fr.remove_stale(rough_stock_out)
+        argv += ["--stock-out", rough_stock_out]
         self._spawn(argv, *P["rough"], on_progress)
 
         # 4) tessellate the oriented model (finish input + clcheck probe);
@@ -745,6 +747,7 @@ class EngineRun:
                     "--ramp-feed", "%.1f" % values["ramp_feed"],
                     "--spindle", str(int(values["rpm"])),
                     "--post-grid-mm", "0.001",
+                    "--stock-from", rough_stock_out,
                     "--stats-json", fin_stats], 0.50, 0.72, on_progress)
 
         # 6) post to LNC (metric: the posted artifact is what clcheck
