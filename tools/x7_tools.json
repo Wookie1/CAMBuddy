@@ -17,34 +17,38 @@
       "shank_note": "assumed = D (not necked)"
     },
     {
-      "number": 14,
+      "number": 31,
       "type": "ball",
-      "diameter_mm": 6.0,
-      "corner_radius_mm": 3.0,
-      "length_offset": "H14",
-      "diameter_offset": "D14",
-      "flute_mm": 15.0,
-      "flute_note": "2.5xD (James: normal flute length)",
-      "shank_diameter_mm": 6.0,
-      "shank_note": "assumed = D (not necked)",
-      "description": "6mm BALL END MILL",
-      "source": "James 2026-10-18",
-      "number_note": "programming number (>12) chosen per James 2026-10-19; he reassigns to 1-12 and loads the changer before running"
+      "diameter_mm": 5.958,
+      "corner_radius_mm": 2.979,
+      "length_offset": "H31",
+      "diameter_offset": "D31",
+      "flute_mm": 12.0,
+      "shank_diameter_mm": 5.958,
+      "necked": false,
+      "oal_mm": 30.0,
+      "flutes": 2,
+      "stickout_mm": 18.0,
+      "holder": "BT30-ER20-60",
+      "description": "6mm BALL END MILL (measured D 5.958)",
+      "source": "James's STEVE tool library (My shop rev 24)"
     },
     {
-      "number": 15,
+      "number": 20,
       "type": "ball",
       "diameter_mm": 9.525,
       "corner_radius_mm": 4.7625,
-      "length_offset": "H15",
-      "diameter_offset": "D15",
-      "flute_mm": 23.8125,
-      "flute_note": "2.5xD (James: normal flute length)",
+      "length_offset": "H20",
+      "diameter_offset": "D20",
+      "flute_mm": 22.225,
       "shank_diameter_mm": 9.525,
-      "shank_note": "assumed = D (not necked)",
+      "necked": false,
+      "oal_mm": 76.2,
+      "flutes": 4,
+      "stickout_mm": 46.2,
+      "holder": "BT30-ER20-60",
       "description": "3/8in BALL END MILL",
-      "source": "James 2026-10-18",
-      "number_note": "programming number (>12) chosen per James 2026-10-19; he reassigns to 1-12 and loads the changer before running"
+      "source": "James's STEVE tool library (My shop rev 24)"
     },
     {
       "number": null,
@@ -58,7 +62,8 @@
       "shank_diameter_mm": 19.05,
       "shank_note": "assumed = D (not necked)",
       "description": "3/4in BALL END MILL",
-      "source": "James 2026-10-18"
+      "source": "James 2026-10-18",
+      "necked": false
     },
     {
       "number": null,
@@ -72,22 +77,25 @@
       "shank_diameter_mm": 12.7,
       "shank_note": "assumed = D (not necked)",
       "description": "1/2in BALL END MILL",
-      "source": "James 2026-10-18"
+      "source": "James 2026-10-18",
+      "necked": false
     },
     {
-      "number": 16,
+      "number": 33,
       "type": "ball",
-      "diameter_mm": 3.175,
-      "corner_radius_mm": 1.5875,
-      "length_offset": "H16",
-      "diameter_offset": "D16",
-      "flute_mm": 7.9375,
-      "flute_note": "2.5xD (James: normal flute length)",
-      "shank_diameter_mm": 3.175,
-      "shank_note": "assumed = D (not necked)",
-      "description": "1/8in BALL END MILL",
-      "source": "James 2026-10-18",
-      "number_note": "programming number (>12) chosen per James 2026-10-19; he reassigns to 1-12 and loads the changer before running"
+      "diameter_mm": 3.142,
+      "corner_radius_mm": 1.571,
+      "length_offset": "H33",
+      "diameter_offset": "D33",
+      "flute_mm": 6.35,
+      "shank_diameter_mm": 3.142,
+      "necked": false,
+      "oal_mm": 50.8,
+      "flutes": 3,
+      "stickout_mm": 20.8,
+      "holder": "BT30-ER20-80",
+      "description": "1/8in BALL END MILL (measured D 3.142)",
+      "source": "James's STEVE tool library (My shop rev 24)"
     },
     {
       "number": null,
@@ -101,7 +109,8 @@
       "shank_diameter_mm": 1.5875,
       "shank_note": "assumed = D (not necked)",
       "description": "1/16in BALL END MILL",
-      "source": "James 2026-10-18"
+      "source": "James 2026-10-18",
+      "necked": false
     },
     {
       "number": null,
@@ -115,7 +124,8 @@
       "shank_diameter_mm": 0.79375,
       "shank_note": "assumed = D (not necked)",
       "description": "1/32in BALL END MILL",
-      "source": "James 2026-10-18"
+      "source": "James 2026-10-18",
+      "necked": false
     },
     {
       "number": 13,
@@ -132,5 +142,175 @@
       "source": "James's shop T13 via STEVE comparison 2026-10-18",
       "note": "T/H/D 13 assigned for the STEVE comparison only"
     }
-  ]
+  ],
+  "holders": {
+    "BT30-ER20-60": {
+      "note": "stack of frustums: [z_lo, z_hi, r_lo, r_hi] mm above the holder nose (nose at tool tip + stick-out)",
+      "source": "James's STEVE tool library (My shop rev 24)",
+      "segments": [
+        [
+          0,
+          2,
+          15,
+          16.9
+        ],
+        [
+          2,
+          21.946,
+          16.9,
+          16.9
+        ],
+        [
+          21.946,
+          24.218,
+          12.5,
+          12.5
+        ],
+        [
+          24.218,
+          28.587,
+          12.5,
+          16.891
+        ],
+        [
+          28.587,
+          37.186,
+          16.891,
+          16.891
+        ],
+        [
+          37.186,
+          38.774,
+          16.891,
+          18.517
+        ],
+        [
+          38.774,
+          42.774,
+          23,
+          23
+        ],
+        [
+          42.774,
+          45.112,
+          23,
+          18.95
+        ],
+        [
+          45.112,
+          48.436,
+          18.95,
+          18.95
+        ],
+        [
+          48.436,
+          50.774,
+          18.95,
+          23
+        ],
+        [
+          50.774,
+          58.374,
+          23,
+          23
+        ],
+        [
+          58.374,
+          58.774,
+          23,
+          22.6
+        ],
+        [
+          58.774,
+          60.774,
+          15.875,
+          15.875
+        ]
+      ]
+    },
+    "BT30-ER20-80": {
+      "note": "stack of frustums: [z_lo, z_hi, r_lo, r_hi] mm above the holder nose (nose at tool tip + stick-out)",
+      "source": "James's STEVE tool library (My shop rev 24)",
+      "segments": [
+        [
+          0,
+          2,
+          15,
+          16.9
+        ],
+        [
+          2,
+          21.946,
+          16.9,
+          16.9
+        ],
+        [
+          21.946,
+          24.218,
+          12.5,
+          12.5
+        ],
+        [
+          24.218,
+          28.587,
+          12.5,
+          16.891
+        ],
+        [
+          28.587,
+          57.186,
+          16.891,
+          16.891
+        ],
+        [
+          57.186,
+          58.774,
+          16.891,
+          18.517
+        ],
+        [
+          58.774,
+          62.774,
+          23,
+          23
+        ],
+        [
+          62.774,
+          65.112,
+          23,
+          18.95
+        ],
+        [
+          65.112,
+          68.436,
+          18.95,
+          18.95
+        ],
+        [
+          68.436,
+          70.774,
+          18.95,
+          23
+        ],
+        [
+          70.774,
+          78.374,
+          23,
+          23
+        ],
+        [
+          78.374,
+          78.774,
+          23,
+          22.6
+        ],
+        [
+          78.774,
+          80.774,
+          15.875,
+          15.875
+        ]
+      ]
+    }
+  }
 }
