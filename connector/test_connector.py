@@ -749,6 +749,334 @@ class TestSlopeSplitFinish:
         assert mock.file_names(803) == []
 
 
+class TestRestPass:
+    """Task CR: optional corner rest pass in slope_split_finish, reachable
+    from STEVE through the catalog (rest_tool_number + min_rest)."""
+
+    def test_catalog_rest_inputs(self):
+        a = catalog_mod.get_action(catalog_mod.SLOPE_ACTION)
+        p = a["inputs"]["properties"]
+        assert p["rest_tool_number"]["type"] == "integer"
+        assert p["rest_tool_number"]["minimum"] == 1
+        assert "default" not in p["rest_tool_number"]
+        assert p["min_rest"]["type"] == "number"
+        assert p["min_rest"]["minimum"] == 0.1
+        assert p["min_rest"]["default"] == 0.5
+        # absent rest_tool_number = today's behaviour exactly
+        ok, _, v = catalog_mod.validate_inputs(
+            {"model": "m"}, catalog_mod.SLOPE_ACTION)
+        assert ok and v["rest_tool_number"] is None
+        assert v["min_rest"] == 0.5
+        # rest_tool_number accepted, min_rest below 0.1 rejected
+        ok, _, v = catalog_mod.validate_inputs(
+            {"model": "m", "rest_tool_number": 31}, catalog_mod.SLOPE_ACTION)
+        assert ok and v["rest_tool_number"] == 31
+        ok, code, _ = catalog_mod.validate_inputs(
+            {"model": "m", "rest_tool_number": 31, "min_rest": 0.05},
+            catalog_mod.SLOPE_ACTION)
+        assert not ok and code == "input_out_of_range"
+
+    def test_rest_chain_argv(self, tmp_path, monkeypatch):
+        """Unit (no engine): with rest_tool_number the runner chains a third
+        program - rough exports its stock for --stock-from, the finish zmap
+        exports the stock after finishing, the rest finish runs --rest-from
+        that stock, rest.nc posts with program number +2 and the rest tool
+        number, clcheck runs with the rest ball diameter, and the rest zmap
+        is chained with --stock-in = the finish's --stock-out."""
+        import numpy as np
+        import runner as runner_mod
+
+        calls = []
+
+        def fake_spawn(self, argv, lo, hi, on_progress, json_out=None,
+                       extra_env=None):
+            a = list(argv)
+            calls.append(a)
+
+            def opt(flag):
+                return a[a.index(flag) + 1] if flag in a else None
+
+            if "verify.zmap" in a:
+                so = opt("--stock-out")
+                if so:
+                    np.save(so, np.full((8, 8), -1.0))
+                report = {
+                    "gouges": {"count": 0, "max_depth": 0.0,
+                              "worst_xy": None},
+                    "rapid_collisions": {"count": 0, "first_line": None},
+                    "outside_grid": {"count": 0, "first_line": None},
+                    "over_flute": {"count": 0, "max_depth": 0.0,
+                                   "worst_xy": None, "first_line": None},
+                    "holder": {"status": "checked", "name": "BT30-ER20-60",
+                              "stickout_mm": 60.0,
+                              "dimension_source": "drawing"},
+                    "holder_hits": {"count": 0, "max_intrusion": 0.0,
+                                    "worst_xy": None, "first_line": None},
+                    "leftover": {"max": 0.0, "mean": 0.0, "p95": 0.0},
+                    "within_0p5mm_fraction": 1.0,
+                    "cycle_time_s": 1.0,
+                    "cutting_length_mm": 100.0,
+                    "rapid_length_mm": 10.0,
+                    "engagement": {"threshold_mm": 0.45, "count": 0,
+                                   "max_mm": 0.0, "spikes": []},
+                    "plunge": {"ramp_angle_deg": 3.0, "count": 0,
+                               "flags": []},
+                }
+                with open(opt("--out-json"), "w") as fh:
+                    json.dump(report, fh)
+            elif any(tok.endswith("heightfield.py") for tok in a):
+                np.save(extra_env["HF_OUT"], np.full((8, 8), 0.4))
+                with open(os.path.splitext(extra_env["HF_OUT"])[0] + ".json",
+                          "w") as fh:
+                    json.dump({
+                        "step_sha256": hashlib.sha256(
+                            open(extra_env["STEP_IN"], "rb").read()
+                        ).hexdigest(),
+                        "x0": -12.0, "y0": -12.0,
+                        "cell": float(extra_env["CELL"]),
+                        "tess_tol": float(extra_env.get("TESS_TOL", 0.01)),
+                    }, fh)
+            elif any(tok.endswith("_tessellate.py") for tok in a):
+                with open(extra_env["STL_OUT"], "wb") as fh:
+                    fh.write(b"solid fake\nendsolid fake\n")
+            elif any(tok.endswith("probe_clcheck.py") for tok in a):
+                if json_out is not None:
+                    json_out.append({"below_cl": 0, "points": 42,
+                                     "max_depth_mm": 0.0})
+            elif "engine.cli" in a:
+                sub = a[a.index("engine.cli") + 1]
+                if sub == "prepare":
+                    with open(os.path.join(self.work, "o.step"), "w") as fh:
+                        fh.write("ISO-10303-21; fake oriented step\nEND;")
+                    with open(os.path.join(self.work, "prepare.json"),
+                             "w") as fh:
+                        json.dump({"step": os.path.join(self.work, "o.step"),
+                                   "hf": os.path.join(self.work, "hf.npz"),
+                                   "stock": [-10.0, 10.0, -10.0, 10.0,
+                                           -1.0, 0.4]}, fh)
+                else:
+                    out = opt("--out")
+                    if out:
+                        with open(out, "w") as fh:
+                            fh.write("G21 G90\nG0 X0. Y0. Z5.\n")
+                    sj = opt("--stats-json")
+                    if sj:
+                        with open(sj, "w") as fh:
+                            json.dump({"levels": [{"skipped": False}],
+                                       "n_moves": 10}, fh)
+            return None
+
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", fake_spawn)
+        cfg = {"engine_python": PY, "repo_root": REPO}
+        run = runner_mod.EngineRun(cfg, str(tmp_path))
+        values = dict(SLOPE_GOOD_INPUTS, rest_tool_number=31)
+        result, files = run.run_slope_split_finish(
+            os.path.join(HERE, "unused.step"), values)
+
+        # roughing exports its own stock for the rest pass's --stock-from
+        rough_call = [a for a in calls
+                      if "engine.cli" in a and "rough" in a[
+                          a.index("engine.cli") + 1]][0]
+        assert "--stock-out" in rough_call
+        # the finish pass itself is unchanged: no rest flags
+        fin_call = [a for a in calls
+                   if "engine.cli" in a and a[
+                       a.index("engine.cli") + 1] == "finish"][0]
+        assert "--rest-from" not in fin_call
+
+        # three zmap calls, chained: rough -> finish -> rest
+        zmaps = [a for a in calls if "verify.zmap" in a]
+        assert len(zmaps) == 3, zmaps
+        zf, zr = zmaps[1], zmaps[2]
+        assert "--stock-out" in zf
+        assert zf[zf.index("--stock-out") + 1].endswith(
+            "stock_after_finish.npy")
+        assert "--png" not in zf, "preview.png moves to the last program"
+        assert zr[zr.index("--stock-in") + 1].endswith(
+            "stock_after_finish.npy")
+        assert zr[zr.index("--dia") + 1] == "5.9580"
+        assert zr[zr.index("--tool-number") + 1] == "31"
+        assert zr[zr.index("--flute") + 1] == "12.0000"
+        assert zr[zr.index("--shank-dia") + 1] == "5.9580"
+        assert "--png" in zr
+
+        # the rest finish: rest-from the post-finish stock, rest-tool the
+        # smaller ball from the table, min_rest default 0.5, and it carries
+        # the rest tool's table geometry for the shank/holder rules
+        rest_fin = [a for a in calls
+                    if "engine.cli" in a and a[
+                        a.index("engine.cli") + 1] == "finish"
+                    and "--rest-from" in a][0]
+        assert rest_fin[rest_fin.index("--tool") + 1] == "ball:9.5250"
+        assert rest_fin[rest_fin.index("--out") + 1].endswith(
+            "rest_neutral.ngc")
+        assert rest_fin[rest_fin.index("--rest-tool") + 1] == "ball:5.9580"
+        assert rest_fin[rest_fin.index("--min-rest") + 1] == "0.5000"
+        assert rest_fin[rest_fin.index("--stock-from") + 1].endswith(
+            "stock_after_rough_engine.npy")
+        assert rest_fin[rest_fin.index("--flute") + 1] == "12.0000"
+        assert rest_fin[rest_fin.index("--holder") + 1] == "BT30-ER20-60"
+
+        # posted as rest.nc: program number +2, T = rest tool
+        post = [a for a in calls
+                if "engine.cli" in a and a[
+                    a.index("engine.cli") + 1] == "post"
+                and "--out" in a
+                and a[a.index("--out") + 1].endswith("rest.nc")][0]
+        assert post[post.index("--program") + 1] == \
+            str(SLOPE_GOOD_INPUTS["program_number"] + 2)
+        assert post[post.index("--tool-number") + 1] == "31"
+
+        # clcheck on rest.nc with the rest ball diameter
+        cls = [a for a in calls if any(t.endswith("probe_clcheck.py")
+                                       for t in a)]
+        assert len(cls) == 2
+        assert cls[1][2].endswith("rest.nc")
+        assert cls[1][4] == "5.9580"
+
+        # check.json: rest section alongside rough/finish
+        with open(os.path.join(str(tmp_path), "check.json")) as fh:
+            check = json.load(fh)
+        assert check["chain"] == ["rough", "finish", "rest"]
+        for k in ("gouges", "rapid_collisions", "over_flute", "holder_hits"):
+            assert k in check["rest"], "rest gate %s missing" % k
+        assert check["warnings"]["engagement"]["rest"] is not None
+        assert check["probe_clcheck_rest"]["gcode"] == "rest.nc"
+
+        # summary: rest cut length/time and the combined cycle time
+        assert result["programs"]["rest"]["file"] == "rest.nc"
+        assert result["programs"]["rest"]["tool"]["number"] == 31
+        assert result["programs"]["rest"]["cut_length_mm"] == 100.0
+        assert result["zmap"]["gouges"]["rest"] == 0
+        assert result["files"] == ["rough.nc", "finish.nc", "rest.nc",
+                                  "check.json", "preview.png"]
+        assert "rest.nc" in files
+        # combined = rough + finish + rest (each fake reports 1.0 s / 100 mm)
+        assert result["estimated_time_min"] == pytest.approx(3.0 / 60.0,
+                                                            abs=0.01)
+        assert result["cut_length_mm"] == pytest.approx(300.0)
+
+    def test_rest_tool_unknown_fails_before_engine(self, tmp_path,
+                                                   monkeypatch):
+        import runner as runner_mod
+        spawned = []
+        monkeypatch.setattr(
+            runner_mod.EngineRun, "_spawn",
+            lambda self, argv, lo, hi, on_progress, json_out=None,
+            extra_env=None: spawned.append(list(argv)))
+        cfg = {"engine_python": PY, "repo_root": REPO}
+        run = runner_mod.EngineRun(cfg, str(tmp_path))
+        with pytest.raises(runner_mod.EngineError) as e:
+            run.run_slope_split_finish(
+                os.path.join(HERE, "unused.step"),
+                dict(SLOPE_GOOD_INPUTS, rest_tool_number=999))
+        assert "x7_tools" in str(e.value)
+        assert spawned == [], "unknown rest tool must fail before any engine"
+
+    def test_rest_tool_without_holder_fails_before_engine(self, tmp_path,
+                                                           monkeypatch):
+        """T3 (bull 12.7) is in the table but has no holder: a rest pass is
+        never judged without the holder clearance check."""
+        import runner as runner_mod
+        spawned = []
+        monkeypatch.setattr(
+            runner_mod.EngineRun, "_spawn",
+            lambda self, argv, lo, hi, on_progress, json_out=None,
+            extra_env=None: spawned.append(list(argv)))
+        cfg = {"engine_python": PY, "repo_root": REPO}
+        run = runner_mod.EngineRun(cfg, str(tmp_path))
+        with pytest.raises(runner_mod.EngineError) as e:
+            run.run_slope_split_finish(
+                os.path.join(HERE, "unused.step"),
+                dict(SLOPE_GOOD_INPUTS, rest_tool_number=3))
+        assert "holder" in str(e.value)
+        assert spawned == []
+
+    def test_e2e_rest_pass(self, live):
+        """STEVE -> catalog -> three posted programs: rough.nc, finish.nc and
+        rest.nc, with the rest gates in check.json."""
+        mock, home, programs = live
+        mock.enqueue_run(920, action=catalog_mod.SLOPE_ACTION,
+                         inputs=dict(SLOPE_GOOD_INPUTS,
+                                     model=model_input(mock),
+                                     rest_tool_number=31))
+        assert mock.wait_state(920, "received", 30), \
+            "run never received: %s" % mock.states_for(920)
+        final = mock.wait_terminal(920, timeout=900)
+        assert final == "succeeded", \
+            "run ended %s: %s" % (final, mock.states_for(920))
+
+        # all three programs uploaded
+        names = mock.file_names(920)
+        for f in ("rough.nc", "finish.nc", "rest.nc", "check.json",
+                  "preview.png"):
+            assert f in names, "missing upload %s: %s" % (f, names)
+
+        reps = {r["body"]["state"]: r["body"] for r in mock.reports
+                if str(r["run_id"]) == "920"}
+        result = reps["succeeded"].get("result") or {}
+        assert result["programs"]["rest"]["tool"]["number"] == 31
+        assert result["programs"]["rest"]["cut_length_mm"] > 0
+        assert result["zmap"]["gouges"]["rest"] == 0
+        assert result["zmap"]["rapid_collisions"]["rest"] == 0
+        assert result["probe_clcheck_rest"]["below_cl"] == 0
+        # combined cycle time covers all three programs
+        p = result["programs"]
+        assert result["estimated_time_min"] >= \
+            p["rough"]["estimated_time_min"] + \
+            p["finish"]["estimated_time_min"]
+
+        with open(home / "runs" / "920" / "check.json") as fh:
+            check = json.load(fh)
+        assert check["chain"] == ["rough", "finish", "rest"]
+        for k in ("gouges", "rapid_collisions", "over_flute", "holder_hits"):
+            assert k in check["rest"], "rest gate %s missing" % k
+        assert check["rest"]["gouges"]["count"] == 0
+        assert check["rest"]["rapid_collisions"]["count"] == 0
+        assert check["rest"]["over_flute"]["count"] == 0
+        assert check["rest"]["holder_hits"]["count"] == 0
+
+        # rest.nc: program number +2, T31, metric
+        with open(home / "runs" / "920" / "rest.nc") as fh:
+            text = fh.read()
+        assert "O%d" % (SLOPE_GOOD_INPUTS["program_number"] + 2) in text
+        assert "T31 M06" in text
+
+        # the rest program is copied to the programs folder too
+        assert list(programs.glob("*_rest.nc"))
+
+    def test_e2e_unknown_rest_tool_fails(self, live):
+        mock, _, programs = live
+        mock.enqueue_run(921, action=catalog_mod.SLOPE_ACTION,
+                         inputs=dict(SLOPE_GOOD_INPUTS,
+                                     model=model_input(mock),
+                                     rest_tool_number=999))
+        assert mock.wait_state(921, "received", 30)
+        final = mock.wait_terminal(921, timeout=120)
+        assert final == "failed", mock.states_for(921)
+        rep = [r["body"] for r in mock.reports
+               if str(r["run_id"]) == "921"
+               and r["body"]["state"] == "failed"][-1]
+        assert "x7_tools" in rep.get("error", {}).get("message", "")
+        assert mock.file_names(921) == []
+        assert not list(programs.glob("O1004*"))
+
+    def test_e2e_rest_tool_without_holder_fails(self, live):
+        mock, _, programs = live
+        mock.enqueue_run(922, action=catalog_mod.SLOPE_ACTION,
+                         inputs=dict(SLOPE_GOOD_INPUTS,
+                                     model=model_input(mock),
+                                     rest_tool_number=3))
+        assert mock.wait_state(922, "received", 30)
+        final = mock.wait_terminal(922, timeout=120)
+        assert final == "failed", mock.states_for(922)
+        rep = [r["body"] for r in mock.reports
+               if str(r["run_id"]) == "922"
+               and r["body"]["state"] == "failed"][-1]
+        assert "holder" in rep.get("error", {}).get("message", "")
+        assert mock.file_names(922) == []
+
+
 class TestWarningsInCheckJson:
     """Review 2: check.json must contain warnings.engagement and warnings.plunge."""
 

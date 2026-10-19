@@ -19,7 +19,7 @@ MM_FIELDS = ("stock_xy", "stock_x", "stock_y", "stock_top", "stock_bottom",
              # slope_split_finish:
              "stepover", "rough_tool_diameter", "rough_corner_radius",
              "rough_flute_length", "rough_stepdown", "rough_optimal_load",
-             "rough_stock_to_leave", "rough_rest_stepup")
+             "rough_stock_to_leave", "rough_rest_stepup", "min_rest")
 
 _ORIENTATION = {"type": "string",
                 "enum": ["as_modeled", "flip_x_180", "flip_y_180",
@@ -133,7 +133,11 @@ SLOPE_ACTION_SPEC = {
                     "cut-length summary, the exact clcheck of the finish "
                     "program and a chained zmap check (roughing from full "
                     "stock, then the finish with the roughed stock as "
-                    "stock-in). Nothing is sent to the machine."),
+                    "stock-in). Optionally finishes again with a smaller "
+                    "ball over the corners the finish ball could not reach "
+                    "(rest_tool_number + min_rest): a third posted program "
+                    "(rest.nc) with its own clcheck and zmap, chained after "
+                    "the finish. Nothing is sent to the machine."),
     "confirm": False,
     "inputs": {
         "type": "object",
@@ -167,6 +171,23 @@ SLOPE_ACTION_SPEC = {
                                          "x7_tools.json is used - the run "
                                          "fails if the ball is not in the "
                                          "table and no number is given"},
+            # optional corner rest pass after the finish (task CR): a smaller
+            # ball from tools/x7_tools.json cuts only where the finish ball
+            # left more than min_rest mm standing; absent = no rest pass
+            "rest_tool_number": {"type": "integer", "minimum": 1,
+                                 "maximum": 999,
+                                 "description": "optional machine tool number "
+                                              "of a ball in tools/"
+                                              "x7_tools.json for a corner rest "
+                                              "pass after the finish (posted as "
+                                              "rest.nc, program number +2); "
+                                              "absent = no rest pass; an "
+                                              "unknown tool or a tool without "
+                                              "a holder fails the run"},
+            "min_rest": {"type": "number", "minimum": 0.1,
+                         "default": 0.5,
+                         "description": "rest the finish ball leaves (mm) that "
+                                        "triggers the rest pass; minimum 0.1"},
             # roughing tool + cutting data (defaults as in adaptive_rough)
             **{"rough_" + k: v for k, v in _ROUGHING_INPUTS.items()},
         },
@@ -175,7 +196,8 @@ SLOPE_ACTION_SPEC = {
     "result": ("Combined summary: estimated time and cut length for the "
                "chain, probe_clcheck count (0 required), chained zmap "
                "gouges / rapid collisions / leftover; files: rough.nc, "
-               "finish.nc, check.json, preview.png."),
+               "finish.nc, check.json, preview.png (plus rest.nc and a rest "
+               "section when a rest tool is given)."),
 }
 
 CHECK_ACTION_SPEC = {
