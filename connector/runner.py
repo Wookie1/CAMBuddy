@@ -586,6 +586,51 @@ class EngineRun:
             "tool_diameter": values["rough_tool_diameter"],
             "corner_radius": values["rough_corner_radius"]})
 
+        # 0b) optional corner rest pass (task CR): the rest tool must be a
+        #     ball in tools/x7_tools.json with a known holder - an unknown
+        #     tool or a missing holder fails the run before any engine work,
+        #     exactly like the finish tool. Absent rest_tool_number = the
+        #     rough + finish chain unchanged.
+        rest_number = values.get("rest_tool_number")
+        rest = None
+        if rest_number:
+            rest_number = int(rest_number)
+            rest = check_tool_entry(rest_number,
+                                   os.path.join(repo, "tools", "x7_tools.json"))
+            if not rest["holder"]:
+                raise EngineError(
+                    "rest tool T%d has no holder in tools/x7_tools.json: the "
+                    "rest pass is never judged without the holder clearance "
+                    "check" % rest_number)
+            if rest["type"] != "ball":
+                raise EngineError(
+                    "rest tool T%d is a %s, not a ball: the corner rest pass "
+                    "runs with a ball nose from tools/x7_tools.json"
+                    % (rest_number, rest["type"]))
+            if rest["diameter_mm"] >= values["tool_diameter"]:
+                raise EngineError(
+                    "rest tool T%d D=%.3f mm is not smaller than the finishing "
+                    "ball D=%.3f mm: the rest pass cuts with the smaller ball"
+                    % (rest_number, rest["diameter_mm"],
+                       values["tool_diameter"]))
+
+        # stage boundaries: with the rest pass the generation stages are
+        # squeezed so progress stays monotone and ends at 1.0
+        if rest:
+            P = {"prepare": (0.02, 0.10), "hf": (0.10, 0.14),
+                 "rough": (0.14, 0.38), "tess": (0.38, 0.42),
+                 "finish": (0.42, 0.60), "post": (0.60, 0.63),
+                 "clcheck": (0.63, 0.66), "zmap_rough": (0.66, 0.76),
+                 "zmap_finish": (0.76, 0.84), "rest": (0.84, 0.90),
+                 "post_rest": (0.90, 0.92), "clcheck_rest": (0.92, 0.94),
+                 "zmap_rest": (0.94, 0.995)}
+        else:
+            P = {"prepare": (0.02, 0.12), "hf": (0.12, 0.17),
+                 "rough": (0.17, 0.45), "tess": (0.45, 0.50),
+                 "finish": (0.50, 0.72), "post": (0.72, 0.76),
+                 "clcheck": (0.76, 0.80), "zmap_rough": (0.80, 0.90),
+                 "zmap_finish": (0.90, 0.97)}
+
         # 1) orient + stock box + part heightfield (for the roughing clip;
         #    grid covers stock + largest tool radius of the run + margin)
         max_tool_r = max(values["tool_diameter"],
@@ -597,7 +642,8 @@ class EngineRun:
                     "--stock-top", "%.4f" % values["stock_top"],
                     "--stock-bottom", "%.4f" % values["stock_bottom"],
                     "--cell", "0.5",
-                    "--tool-r", "%.4f" % max_tool_r], 0.02, 0.12, on_progress)
+                    "--tool-r", "%.4f" % max_tool_r], *P["prepare"],
+                    on_progress)
         with open(os.path.join(self.work, "prepare.json")) as fh:
             prep = json.load(fh)
         stock = prep["stock"]
@@ -628,29 +674,35 @@ class EngineRun:
         except OSError as e:
             raise EngineError(str(e))
 
-        # 3) adaptive roughing (LNC post, full stock)
+        # 3) adaptive roughing (LNC post, full stock); the rest pass needs the
+        #    engine's own post-roughing stock for its rapid/lift clearance
+        #    (--stock-from), so the rough step exports it when a rest follows
         nc = os.path.join(self.work, "rough.nc")
         stats_path = os.path.join(self.work, "rough_stats.json")
-        self._spawn([py, "-m", "engine.cli", "rough",
-                    "--step", prep["step"],
-                    "--stock", *[("%.4f" % v) for v in stock],
-                    "--tool", "%s:%.4f:%.4f" % (values["rough_tool_type"],
-                                               values["rough_tool_diameter"],
-                                               values["rough_corner_radius"]),
-                    "--out", nc, "--floor", "%.4f" % floor,
-                    "--leave", "%.4f" % values["rough_stock_to_leave"],
-                    "--stepdown", "%.4f" % values["rough_stepdown"],
-                    "--optimal-load-mm", "%.4f" % values["rough_optimal_load"],
-                    "--stepup", "%.4f" % values["rough_rest_stepup"],
-                    "--hf", prep["hf"], "--min-rest", "0.5",
-                    "--cut-feed", "%.1f" % values["feed"],
-                    "--ramp-feed", "%.1f" % values["ramp_feed"],
-                    "--spindle", str(int(values["rpm"])),
-                    "--post", "lnc", "--program",
-                    str(int(values["program_number"])),
-                    "--tool-number", str(rough_number),
-                    "--json-progress", "--stats-json", stats_path],
-                   0.17, 0.45, on_progress)
+        rough_stock_out = os.path.join(self.work, "stock_after_rough_engine.npy")
+        argv = [py, "-m", "engine.cli", "rough",
+                "--step", prep["step"],
+                "--stock", *[("%.4f" % v) for v in stock],
+                "--tool", "%s:%.4f:%.4f" % (values["rough_tool_type"],
+                                           values["rough_tool_diameter"],
+                                           values["rough_corner_radius"]),
+                "--out", nc, "--floor", "%.4f" % floor,
+                "--leave", "%.4f" % values["rough_stock_to_leave"],
+                "--stepdown", "%.4f" % values["rough_stepdown"],
+                "--optimal-load-mm", "%.4f" % values["rough_optimal_load"],
+                "--stepup", "%.4f" % values["rough_rest_stepup"],
+                "--hf", prep["hf"], "--min-rest", "0.5",
+                "--cut-feed", "%.1f" % values["feed"],
+                "--ramp-feed", "%.1f" % values["ramp_feed"],
+                "--spindle", str(int(values["rpm"])),
+                "--post", "lnc", "--program",
+                str(int(values["program_number"])),
+                "--tool-number", str(rough_number),
+                "--json-progress", "--stats-json", stats_path]
+        if rest:
+            fr.remove_stale(rough_stock_out)
+            argv += ["--stock-out", rough_stock_out]
+        self._spawn(argv, *P["rough"], on_progress)
 
         # 4) tessellate the oriented model (finish input + clcheck probe);
         #    stale model.stl removed first, fresh non-empty output asserted
@@ -723,24 +775,34 @@ class EngineRun:
                     % (ROUGH_ENGAGE_FACTOR * values["rough_optimal_load"]),
                     "--tool-number", str(rough_number),
                     "--out-json", check_rough,
-                    "--stock-out", stock_out], 0.80, 0.90, on_progress)
+                    "--stock-out", stock_out], *P["zmap_rough"], on_progress)
         check_finish = os.path.join(self.work, "check_finish.json")
         png_path = os.path.join(self.work, "preview.png")
         # Finish engagement threshold: 1.5 x the finish stepover (distance
         # between finish passes) rather than the roughing optimal load; finish
         # passes are much lighter and the roughing threshold would over-flag
         # them. Passed explicitly so zmap never derives a roughing threshold.
-        self._spawn([py, "-m", "verify.zmap", fin,
-                    "--part", hf01,
-                    "--tool", "ball",
-                    "--dia", "%.4f" % values["tool_diameter"],
-                    "--corner", "%.4f" % (values["tool_diameter"] / 2.0),
-                    "--stock-in", stock_out,
-                    "--engage-max", "%.4f"
-                    % (FINISH_ENGAGE_FACTOR * values["stepover"]),
-                    "--tool-number", str(finish_number),
-                    "--out-json", check_finish, "--png", png_path],
-                   0.90, 0.97, on_progress)
+        # With a rest pass, the finish also exports the stock it leaves: the
+        # rest toolpath is generated from it (--rest-from) and judged on it
+        # (--stock-in). zmap writes only the .npy, so the runner carries the
+        # grid geometry in the heightfield sidecar convention.
+        stock_finish = os.path.join(self.work, "stock_after_finish.npy")
+        argv_f = [py, "-m", "verify.zmap", fin,
+                  "--part", hf01,
+                  "--tool", "ball",
+                  "--dia", "%.4f" % values["tool_diameter"],
+                  "--corner", "%.4f" % (values["tool_diameter"] / 2.0),
+                  "--stock-in", stock_out,
+                  "--engage-max", "%.4f"
+                  % (FINISH_ENGAGE_FACTOR * values["stepover"]),
+                  "--tool-number", str(finish_number),
+                  "--out-json", check_finish]
+        if rest:
+            fr.remove_stale(stock_finish)
+            argv_f += ["--stock-out", stock_finish]
+        else:
+            argv_f += ["--png", png_path]
+        self._spawn(argv_f, *P["zmap_finish"], on_progress)
         with open(check_rough) as fh:
             check_r = json.load(fh)
         with open(check_finish) as fh:
@@ -748,9 +810,129 @@ class EngineRun:
         _check_zmap_gates(check_r)
         _check_zmap_gates(check_f)
 
-        # 9) combined check.json + result
+        # 9) optional corner rest pass (task CR): the smaller ball cuts only
+        #    where the finish left more than min_rest mm standing, working
+        #    from the stock the finish exported. Same gates as the finish:
+        #    LNC post (program number +2, rest tool number), probe_clcheck
+        #    with the rest ball diameter (0 below CL by >0.005 mm), chained
+        #    zmap with --stock-in = the finish's --stock-out and the rest
+        #    tool's flute/shank/tool-number/holder, then _check_zmap_gates.
+        check_rest_path = os.path.join(self.work, "check_rest.json")
+        rest_nc = os.path.join(self.work, "rest.nc")
+        cl_rest = check_s = None
+        if rest:
+            # zmap --stock-out writes only the .npy; the engine reads a
+            # heightfield's grid from its sidecar - the same geometry as the
+            # judge heightfield this stock was computed on
+            with open(os.path.splitext(hf01)[0] + ".json") as fh:
+                hf_meta = json.load(fh)
+            with open(os.path.splitext(stock_finish)[0] + ".json", "w") as fh:
+                json.dump({"x0": hf_meta["x0"], "y0": hf_meta["y0"],
+                          "cell": hf_meta["cell"]}, fh)
+
+            # 9a) rest finish (neutral G-code): --tool is the previous (finish)
+            #     ball, --rest-tool the smaller ball that does the cutting
+            rest_neutral = os.path.join(self.work, "rest_neutral.ngc")
+            rest_stats = os.path.join(self.work, "rest_stats.json")
+            argv_rest = [py, "-m", "engine.cli", "finish",
+                        "--stl", stl,
+                        "--out", rest_neutral,
+                        "--tool", "ball:%.4f" % values["tool_diameter"],
+                        "--rest-from", stock_finish,
+                        "--rest-tool", "ball:%.4f" % rest["diameter_mm"],
+                        "--min-rest", "%.4f" % (values.get("min_rest") or 0.5),
+                        "--stock-from", rough_stock_out,
+                        "--stepover", "%.4f" % values["stepover"],
+                        "--stepdown", "%.4f" % values["stepdown"],
+                        "--slope-threshold",
+                        "%.2f" % values["slope_threshold"],
+                        "--floor", "%.4f" % floor,
+                        "--cut-feed", "%.1f" % values["feed"],
+                        "--ramp-feed", "%.1f" % values["ramp_feed"],
+                        "--spindle", str(int(values["rpm"])),
+                        "--post-grid-mm", "0.001",
+                        "--stats-json", rest_stats]
+            if rest["flute_mm"] is not None:
+                argv_rest += ["--flute", "%.4f" % rest["flute_mm"]]
+            if rest["shank_diameter_mm"] is not None:
+                argv_rest += ["--shank", "%.4f" % rest["shank_diameter_mm"]]
+            if rest["stickout_mm"] is not None:
+                argv_rest += ["--stickout", "%.4f" % rest["stickout_mm"]]
+            if rest["holder"]:
+                argv_rest += ["--holder", rest["holder"]]
+            self._spawn(argv_rest, *P["rest"], on_progress)
+
+            # 9b) post to LNC: program number +2, the rest tool's T/H; the
+            #     neutral header names the rest tool, so carry its geometry
+            self._spawn([py, "-m", "engine.cli", "post",
+                        "--in", rest_neutral, "--out", rest_nc,
+                        "--program", str(int(values["program_number"]) + 2),
+                        "--op-name", "REST PASS (RUN AFTER FINISH)",
+                        "--tool-number", str(rest_number),
+                        "--tool-kind", "ball",
+                        "--dia", "%.4f" % rest["diameter_mm"],
+                        "--corner", "%.4f" % (rest["diameter_mm"] / 2.0),
+                        "--metric"], *P["post_rest"], on_progress)
+
+            # 9c) probe_clcheck on the posted rest output with the rest ball
+            #     (must be 0)
+            cl_rest_lines = []
+            self._spawn([py, os.path.join(repo, "engine",
+                                           "probe_clcheck.py"),
+                         rest_nc, stl, "%.4f" % rest["diameter_mm"]],
+                        *P["clcheck_rest"], on_progress,
+                        json_out=cl_rest_lines)
+            cl_rest = cl_rest_lines[-1] if cl_rest_lines else {}
+            if cl_rest.get("below_cl", 1) > 0:
+                raise EngineError(
+                    "probe_clcheck: %d points below CL by >0.005 mm in the "
+                    "rest program (max %.3f mm) - run failed"
+                    % (cl_rest["below_cl"], cl_rest.get("max_depth_mm", 0.0)))
+
+            # 9d) chained zmap of the rest program on the stock the finish
+            #     left, with the rest tool's geometry + holder; preview.png is
+            #     the leftover after the last program of the chain
+            argv_zr = [py, "-m", "verify.zmap", rest_nc,
+                       "--part", hf01,
+                       "--tool", "ball",
+                       "--dia", "%.4f" % rest["diameter_mm"],
+                       "--corner", "%.4f" % (rest["diameter_mm"] / 2.0),
+                       "--stock-in", stock_finish,
+                       "--engage-max", "%.4f"
+                       % (FINISH_ENGAGE_FACTOR * values["stepover"]),
+                       "--tool-number", str(rest_number),
+                       "--out-json", check_rest_path, "--png", png_path]
+            if rest["flute_mm"] is not None:
+                argv_zr += ["--flute", "%.4f" % rest["flute_mm"]]
+            if rest["shank_diameter_mm"] is not None:
+                argv_zr += ["--shank-dia", "%.4f" % rest["shank_diameter_mm"]]
+            self._spawn(argv_zr, *P["zmap_rest"], on_progress)
+            with open(check_rest_path) as fh:
+                check_s = json.load(fh)
+            _check_zmap_gates(check_s)
+
+        # 10) rest pass summary + combined check.json / result
+        if rest:
+            result_rest = {
+                "file": "rest.nc",
+                "run_after_finish": True,
+                "estimated_time_min": round(
+                    check_s["cycle_time_s"] / 60.0, 2),
+                "cut_length_mm": check_s["cutting_length_mm"],
+                "min_rest_mm": values.get("min_rest") or 0.5,
+                "tool": {"type": "ball",
+                        "diameter_mm": rest["diameter_mm"],
+                        "corner_radius_mm": rest["diameter_mm"] / 2.0,
+                        "flute_mm": rest["flute_mm"],
+                        "shank_diameter_mm": rest["shank_diameter_mm"],
+                        "holder": rest["holder"],
+                        "number": rest_number},
+                "over_flute": check_s["over_flute"],
+                "holder_hits": check_s.get("holder_hits"),
+            }
+        chain = ["rough", "finish"] + (["rest"] if rest else [])
         check = {
-            "chain": ["rough", "finish"],
+            "chain": chain,
             "part_hf": {"file": "part_hf01.npy", "cell_mm": 0.1,
                        "tess_tol_mm": 0.01},
             "probe_clcheck": {"gcode": "finish.nc", **cl},
@@ -767,21 +949,32 @@ class EngineRun:
                 },
             },
         }
+        if rest:
+            check["probe_clcheck_rest"] = {"gcode": "rest.nc", **cl_rest}
+            check["rest"] = check_s
+            check["warnings"]["engagement"]["rest"] = \
+                check_s.get("engagement")
+            check["warnings"]["plunge"]["rest"] = check_s.get("plunge")
         with open(os.path.join(self.work, "check.json"), "w") as fh:
             json.dump(check, fh, indent=2)
 
+        cycle_s = check_r["cycle_time_s"] + check_f["cycle_time_s"]
+        cut_mm = check_r["cutting_length_mm"] + check_f["cutting_length_mm"]
+        if rest:
+            cycle_s += check_s["cycle_time_s"]
+            cut_mm += check_s["cutting_length_mm"]
+        # the leftover that matters is what the LAST program of the chain
+        # leaves: the rest pass when there is one, the finish otherwise
+        final_check = check_s if rest else check_f
         result = {
             "units": "mm",
-            "estimated_time_min": round(
-                (check_r["cycle_time_s"] + check_f["cycle_time_s"]) / 60.0,
-                2),
-            "cut_length_mm": round(
-                check_r["cutting_length_mm"] + check_f["cutting_length_mm"],
-                1),
+            "estimated_time_min": round(cycle_s / 60.0, 2),
+            "cut_length_mm": round(cut_mm, 1),
             "probe_clcheck": cl,
             "zmap": {
                 # chained judgement: roughing from full stock, then the
-                # finish with the roughed stock as stock-in
+                # finish with the roughed stock as stock-in (then the rest
+                # pass with the finished stock as stock-in)
                 "stock_in": "roughing",
                 "cell_mm": 0.1,
                 "gouges": {"rough": check_r["gouges"]["count"],
@@ -790,11 +983,11 @@ class EngineRun:
                     "rough": check_r["rapid_collisions"]["count"],
                     "finish": check_f["rapid_collisions"]["count"]},
                 "leftover": {
-                    "mean_mm": check_f["leftover"]["mean"],
-                    "p95_mm": check_f["leftover"]["p95"],
-                    "max_mm": check_f["leftover"]["max"],
+                    "mean_mm": final_check["leftover"]["mean"],
+                    "p95_mm": final_check["leftover"]["p95"],
+                    "max_mm": final_check["leftover"]["max"],
                     "within_0p5mm_fraction":
-                        check_f["within_0p5mm_fraction"],
+                        final_check["within_0p5mm_fraction"],
                 },
             },
             "programs": {
@@ -833,4 +1026,13 @@ class EngineRun:
                  "check.json": (os.path.join(self.work, "check.json"),
                                "application/json"),
                  "preview.png": (png_path, "image/png")}
+        if rest:
+            result["zmap"]["gouges"]["rest"] = check_s["gouges"]["count"]
+            result["zmap"]["rapid_collisions"]["rest"] = \
+                check_s["rapid_collisions"]["count"]
+            result["probe_clcheck_rest"] = cl_rest
+            result["programs"]["rest"] = result_rest
+            result["rest_program_number"] = int(values["program_number"]) + 2
+            result["files"].insert(2, "rest.nc")
+            files["rest.nc"] = (rest_nc, "application/octet-stream")
         return result, files
