@@ -942,6 +942,10 @@ class TestRestPass:
                    if "engine.cli" in a and a[
                        a.index("engine.cli") + 1] == "finish"][0]
         assert "--rest-from" not in fin_call
+        # the finish judge checks its flute/shank from the X7 table (T20)
+        zf = [a for a in calls if "verify.zmap" in a][1]
+        assert float(zf[zf.index("--flute") + 1]) == pytest.approx(22.225)
+        assert float(zf[zf.index("--shank-dia") + 1]) == pytest.approx(9.525)
         # the finish plans its rapids/holder against the roughing stock
         rough_out = rough_call[rough_call.index("--stock-out") + 1]
         assert fin_call[fin_call.index("--stock-from") + 1] == rough_out
