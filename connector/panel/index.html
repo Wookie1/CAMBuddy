@@ -30,7 +30,10 @@
     subset (XY moves and arcs only, one tool) fails with the code and line.
     It does NOT check fixtures/vise, machine travel, multi-tool programs,
     cutter comp, canned cycles, other planes or feeds/speeds suitability -
-    the dry run above the part on the X7 is still yours to do.</p>
+    the dry run above the part on the X7 is still yours to do. Up to three
+    programs can be checked in one run, in order (e.g. rough, finish, rest):
+    each program is judged on the stock left by the previous one, and the
+    first failing program fails the run.</p>
 
   <form id="rough-form" autocomplete="off">
     <div class="grid">

@@ -81,6 +81,9 @@ def _tool_number(cfg, values):
 
 T_WORD_RE = re.compile(r"\bT\s*(\d+)", re.IGNORECASE)
 
+# task CPc: check_program input fields judged in this order
+CHECK_PROGRAM_FIELDS = ("program", "program_2", "program_3")
+
 
 def program_tool_numbers(text):
     """Distinct T word numbers in a posted program (comments stripped),
@@ -347,43 +350,62 @@ class EngineRun:
     # -------------------------------------------------- check_program ----
     def run_check_program(self, program_path, step_path, values,
                           on_progress=None):
-        """check_program (task CP): judge a STEVE-posted program with the
-        independent zmap --strict against the oriented part and the stock
-        box, using the program's T word from tools/x7_tools.json. One
-        program = one tool. Gates as adaptive_rough (gouges, rapid
-        collisions, over-flute/shank, holder, outside grid) plus a
-        report-only engagement summary. Returns check.json + preview.png;
-        nothing new is uploaded as .nc, nothing goes to the machine."""
+        """check_program (task CP / CPc): judge up to three posted programs
+        in sequence with the independent zmap --strict against the oriented
+        part and the stock box. Each program brings its own tool from its
+        own T word (one T per program, looked up in tools/x7_tools.json)
+        and its own holder; each is judged on the stock left by the previous
+        one (--stock-in = previous --stock-out; first program: full stock
+        box). The tool_number override applies to "program" only and must
+        match its T. Gates as adaptive_rough on EVERY program; the first
+        failing program fails the run and is named in the error. preview.png
+        is the leftover after the LAST program. Returns check.json +
+        preview.png; nothing new is uploaded as .nc, nothing goes to the
+        machine."""
         py = self.cfg["engine_python"]
         fc = os.path.join(os.path.dirname(py), "freecadcmd")
         repo = self.cfg["repo_root"]
 
-        # 1) tool up front: one T word, known in the X7 table (unknown tool
-        #    or holder fails the run, same as today)
-        with open(program_path) as fh:
-            ptext = fh.read()
-        numbers = program_tool_numbers(ptext)
-        if len(numbers) > 1:
-            raise EngineError("multi-tool programs not supported yet "
-                              "(T words: %s)" % ", ".join("T%d" % n
-                                                           for n in numbers))
-        number = (int(values["tool_number"]) if values.get("tool_number")
-                  else (numbers[0] if numbers else None))
-        if number is None:
-            raise EngineError("no T word in the program and no tool_number "
-                              "override: the tool cannot be resolved")
-        tool = check_tool_entry(number, os.path.join(repo, "tools",
-                                                     "x7_tools.json"))
-        if numbers and number != numbers[0]:
-            raise EngineError("tool_number T%d does not match the program's "
-                              "T%d: refusing to judge with a different tool"
-                              % (number, numbers[0]))
+        # 1) every program's own tool up front, in order: one T word each,
+        #    known in the X7 table (unknown tool or holder fails the run,
+        #    same as today)
+        programs = [("program", program_path)]
+        for pname in CHECK_PROGRAM_FIELDS[1:]:
+            extra = os.path.join(self.work, pname + ".nc")
+            if os.path.exists(extra):
+                programs.append((pname, extra))
+        resolved = []
+        for i, (pname, ppath) in enumerate(programs):
+            with open(ppath) as fh:
+                ptext = fh.read()
+            numbers = program_tool_numbers(ptext)
+            if len(numbers) > 1:
+                raise EngineError("multi-tool programs not supported yet "
+                                  "(%s T words: %s)"
+                                  % (pname, ", ".join("T%d" % n
+                                                   for n in numbers)))
+            number = (int(values["tool_number"])
+                     if i == 0 and values.get("tool_number")
+                     else (numbers[0] if numbers else None))
+            if number is None:
+                raise EngineError("no T word in the program and no "
+                                  "tool_number override: the tool cannot be "
+                                  "resolved")
+            tool = check_tool_entry(number, os.path.join(repo, "tools",
+                                                         "x7_tools.json"))
+            if numbers and number != numbers[0]:
+                raise EngineError("tool_number T%d does not match the "
+                                  "program's T%d: refusing to judge with a "
+                                  "different tool" % (number, numbers[0]))
+            resolved.append((pname, ppath, number, tool))
         cell = 0.1  # judge grid: same 0.1 mm as the finishing chain
 
         # 2) orient + stock box + part heightfield (shared builder grid:
-        #    STOCK_BOX + TOOL_R + margin, task Z5b)
+        #    STOCK_BOX + TOOL_R + margin, task Z5b; TOOL_R covers the
+        #    largest tool of the sequence)
         if on_progress:
             on_progress(0.05, "preparing part")
+        max_tool_r = max(t["diameter_mm"] for _, _, _, t in resolved) / 2.0
         self._spawn([py, "-m", "engine.cli", "prepare",
                      "--step", step_path, "--out-dir", self.work,
                      "--orient", values["orientation"],
@@ -391,7 +413,7 @@ class EngineRun:
                      "--stock-top", "%.4f" % values["stock_top"],
                      "--stock-bottom", "%.4f" % values["stock_bottom"],
                      "--cell", "0.5",
-                     "--tool-r", "%.4f" % (tool["diameter_mm"] / 2.0)],
+                     "--tool-r", "%.4f" % max_tool_r],
                     0.05, 0.35, on_progress)
         with open(os.path.join(self.work, "prepare.json")) as fh:
             prep = json.load(fh)
@@ -411,70 +433,112 @@ class EngineRun:
                               "CELL": str(cell), "TESS_TOL": "0.01",
                               "STOCK_BOX": " ".join("%.4f" % v
                                                     for v in stock[:4]),
-                              "TOOL_R": "%.4f" % (tool["diameter_mm"] / 2.0)})
+                              "TOOL_R": "%.4f" % max_tool_r})
         try:
             fr.require_fresh(hf_zmap, step_sha256=step_sha, cell=cell,
                              tess_tol=0.01)
         except OSError as e:
             raise EngineError(str(e))
 
-        # 4) zmap --strict: unsupported codes fail with the first offender
-        #    (full list in check json); gates as adaptive_rough. No optimal
-        #    load input for this action: engagement is report-only, no
-        #    threshold.
-        if on_progress:
-            on_progress(0.55, "checking program")
-        check_path = os.path.join(self.work, "check.json")
+        # 4) zmap --strict per program, in order, carrying the stock: each
+        #    program is judged with --stock-in = the previous program's
+        #    --stock-out (first program: the full stock box). Unsupported
+        #    codes fail with the first offender (full list in check json);
+        #    gates on EVERY program and the first failing program fails the
+        #    run and is named in the error. No optimal load input for this
+        #    action: engagement is report-only, no threshold. preview.png
+        #    is the leftover after the LAST program.
+        nprog = len(resolved)
         png_path = os.path.join(self.work, "preview.png")
-        argv = [py, "-m", "verify.zmap", program_path,
-                "--part", hf_zmap,
-                "--tool", tool["type"],
-                "--dia", "%.4f" % tool["diameter_mm"],
-                "--corner", "%.4f" % tool["corner_radius_mm"],
-                "--stock", *[("%.4f" % v) for v in stock],
-                "--tool-number", str(number),
-                "--strict", "--engage-report",
-                "--out-json", check_path, "--png", png_path]
-        if tool["flute_mm"] is not None:
-            argv += ["--flute", "%.4f" % tool["flute_mm"]]
-        if tool["shank_diameter_mm"] is not None:
-            argv += ["--shank-dia", "%.4f" % tool["shank_diameter_mm"]]
-        self._spawn(argv, 0.55, 0.95, on_progress)
-        with open(check_path) as fh:
-            check = json.load(fh)
-        _check_zmap_gates(check)
+        entries = []
+        stock_in = None  # None: the first program starts from full stock
+        for i, (pname, ppath, number, tool) in enumerate(resolved):
+            lo = 0.55 + 0.40 * i / nprog
+            hi = 0.55 + 0.40 * (i + 1) / nprog
+            if on_progress:
+                on_progress(lo, "checking %s" % pname)
+            out_json = os.path.join(self.work, "check_%d.json" % (i + 1))
+            argv = [py, "-m", "verify.zmap", ppath,
+                    "--part", hf_zmap,
+                    "--tool", tool["type"],
+                    "--dia", "%.4f" % tool["diameter_mm"],
+                    "--corner", "%.4f" % tool["corner_radius_mm"],
+                    "--tool-number", str(number),
+                    "--strict", "--engage-report",
+                    "--out-json", out_json]
+            if stock_in is None:
+                argv += ["--stock", *[("%.4f" % v) for v in stock]]
+            else:
+                argv += ["--stock-in", stock_in]
+            if i < nprog - 1:
+                stock_in = os.path.join(self.work,
+                                        "stock_after_%s.npy" % pname)
+                fr.remove_stale(stock_in)
+                argv += ["--stock-out", stock_in]
+            if i == nprog - 1:
+                argv += ["--png", png_path]
+            if tool["flute_mm"] is not None:
+                argv += ["--flute", "%.4f" % tool["flute_mm"]]
+            if tool["shank_diameter_mm"] is not None:
+                argv += ["--shank-dia", "%.4f" % tool["shank_diameter_mm"]]
+            try:
+                self._spawn(argv, lo, hi, on_progress)
+                with open(out_json) as fh:
+                    check = json.load(fh)
+                _check_zmap_gates(check)
+            except EngineError as e:
+                raise EngineError("%s failed: %s" % (pname, e))
+            entries.append({"name": pname,
+                            "tool": {"number": number, "type": tool["type"],
+                                     "diameter_mm": tool["diameter_mm"],
+                                     "corner_radius_mm":
+                                         tool["corner_radius_mm"],
+                                     "flute_mm": tool["flute_mm"],
+                                     "shank_diameter_mm":
+                                         tool["shank_diameter_mm"],
+                                     "holder": tool["holder"],
+                                     "stickout_mm": tool["stickout_mm"]},
+                            "check": check})
+
+        first = entries[0]
+        check = {"programs": entries}
+        # top-level keys for the first program kept exactly as they were
+        # (single-program callers see no change)
+        check.update(first["check"])
+        with open(os.path.join(self.work, "check.json"), "w") as fh:
+            json.dump(check, fh, indent=2)
 
         result = {
             "units": "mm",
             "program": os.path.basename(program_path),
-            "tool": {"number": number, "type": tool["type"],
-                     "diameter_mm": tool["diameter_mm"],
-                     "corner_radius_mm": tool["corner_radius_mm"],
-                     "flute_mm": tool["flute_mm"],
-                     "shank_diameter_mm": tool["shank_diameter_mm"],
-                     "holder": tool["holder"],
-                     "stickout_mm": tool["stickout_mm"]},
+            "programs": [{"name": e["name"],
+                          "tool_number": e["tool"]["number"]}
+                         for e in entries],
+            "tool": first["tool"],
             "orientation": values["orientation"],
             "stock_box_mm": stock,
             "strict": True,
-            "unsupported": check.get("unsupported", []),
-            "zmap_gouges": check["gouges"],
-            "rapid_collisions": check["rapid_collisions"],
-            "over_flute": check["over_flute"],
-            "holder_hits": check.get("holder_hits"),
-            "outside_grid": check.get("outside_grid"),
-            "engagement": check.get("engagement"),
+            "unsupported": first["check"].get("unsupported", []),
+            "zmap_gouges": first["check"]["gouges"],
+            "rapid_collisions": first["check"]["rapid_collisions"],
+            "over_flute": first["check"]["over_flute"],
+            "holder_hits": first["check"].get("holder_hits"),
+            "outside_grid": first["check"].get("outside_grid"),
+            "engagement": first["check"].get("engagement"),
             "leftover": {
-                "mean_mm": check["leftover"]["mean"],
-                "p95_mm": check["leftover"]["p95"],
-                "within_0p5mm_fraction": check["within_0p5mm_fraction"],
+                "mean_mm": first["check"]["leftover"]["mean"],
+                "p95_mm": first["check"]["leftover"]["p95"],
+                "within_0p5mm_fraction":
+                    first["check"]["within_0p5mm_fraction"],
             },
-            "estimated_time_min": round(check["cycle_time_s"] / 60.0, 2),
-            "cut_length_mm": check["cutting_length_mm"],
-            "rapid_length_mm": check["rapid_length_mm"],
+            "estimated_time_min": round(
+                first["check"]["cycle_time_s"] / 60.0, 2),
+            "cut_length_mm": first["check"]["cutting_length_mm"],
+            "rapid_length_mm": first["check"]["rapid_length_mm"],
             "files": ["check.json", "preview.png"],
         }
-        files = {"check.json": (check_path, "application/json"),
+        files = {"check.json": (os.path.join(self.work, "check.json"),
+                                 "application/json"),
                  "preview.png": (png_path, "image/png")}
         return result, files
 
