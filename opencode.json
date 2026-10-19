@@ -87,33 +87,6 @@
           }
         }
       }
-    },
-    "mtplx": {
-      "name": "MTPLX (M4)",
-      "package": "@opencode/ai/providers/openai-compatible",
-      "settings": {
-        "baseURL": "http://127.0.0.1:8005/v1",
-        "apiKey": "none"
-      },
-      "models": {
-        "mtplx-qwen36-27b-optimized-speed-v2": {
-          "name": "Qwen3.6-27B Optimized Speed V2 (MTPLX)",
-          "modelID": "mtplx-qwen36-27b-optimized-speed-v2",
-          "capabilities": {
-            "tools": true,
-            "input": [
-              "text"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 262144,
-            "output": 32768
-          }
-        }
-      }
     }
   }
 }
