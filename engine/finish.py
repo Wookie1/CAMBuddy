@@ -1095,10 +1095,13 @@ def shank_net(surf, paths, shank_dia, flute_mm, stock=None, band=0.3,
     shank radius <= tip_z + flute. `band` is the nominal cut band height
     (stepdown for steep levels, stepover for shallow rows) used to estimate
     the wall area left uncut by the removed points.
-    Returns (paths, {round(z, 3): n_removed}, removed_wall_mm2)."""
-    rpth = [pth for pth in paths if len(pth) >= 2]
+    Returns (paths, {round(z, 3): n_removed}, removed_wall_mm2, src) where
+    src[i] is the index in `paths` that output path i came from (splits keep
+    their source, so callers can remap per-path bookkeeping like row_of)."""
+    keep = [j for j, pth in enumerate(paths) if len(pth) >= 2]
+    rpth = [paths[j] for j in keep]
     if not rpth:
-        return [], {}, 0.0
+        return [], {}, 0.0, []
     flat = [p for pth in rpth for p in pth]
     xy = [(p[0], p[1]) for p in flat]
     zv = np.array([p[2] for p in flat])
@@ -1113,10 +1116,11 @@ def shank_net(surf, paths, shank_dia, flute_mm, stock=None, band=0.3,
                         np.array([p[1] for p in xy]))
         bad |= np.isfinite(s) & (s > zv + flute_mm)
     out = []
+    src = []
     by_level = {}
     area = 0.0
     off = 0
-    for pth in rpth:
+    for j, pth in zip(keep, rpth):
         m = len(pth)
         b = bad[off:off + m]
         off += m
@@ -1134,7 +1138,8 @@ def shank_net(surf, paths, shank_dia, flute_mm, stock=None, band=0.3,
         for i0, i1 in _runs_of_mask(~b):
             if i1 - i0 >= 2:
                 out.append(pth[i0:i1])
-    return out, by_level, area
+                src.append(j)
+    return out, by_level, area, src
 
 
 def box_max(A, k):
@@ -1501,15 +1506,16 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     shank_by_level = {}
     shank_wall_mm2 = 0.0
     if flute_mm is not None and shank_dia is not None:
-        steep_paths, bl, ar = shank_net(
+        steep_paths, bl, ar, _ = shank_net(
             surf, steep_paths, shank_dia, flute_mm, stock=link_stock,
             band=stepdown, threads=threads)
         for k, v in bl.items():
             shank_by_level[k] = shank_by_level.get(k, 0) + v
         shank_wall_mm2 += ar
-        shallow_paths, bl, ar = shank_net(
+        shallow_paths, bl, ar, src_sh = shank_net(
             surf, shallow_paths, shank_dia, flute_mm, stock=link_stock,
             band=stepover, threads=threads)
+        src_shallow = [src_shallow[j] for j in src_sh]  # keep row_of aligned
         for k, v in bl.items():
             shank_by_level[k] = shank_by_level.get(k, 0) + v
         shank_wall_mm2 += ar

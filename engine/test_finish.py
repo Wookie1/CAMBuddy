@@ -1142,6 +1142,23 @@ def test_rest_pass_table_tool():
             n_bad, mx)
 
 
+
+def test_shank_net_keeps_source_index():
+    """A path split by the shank net keeps its source index, so per-row bookkeeping
+    (row_of / run_i0 for serpentine ordering) stays aligned (Core Front 6 mm crash)."""
+    import numpy as np
+    from engine import finish as F
+    paths = [[(0, 0, 1.0), (1, 0, 1.0), (2, 0, 1.0), (3, 0, 1.0), (4, 0, 1.0)],
+             [(0, 1, 1.0), (1, 1, 1.0)]]
+    orig = F.batch_drop
+    F.batch_drop = lambda surf, cut, xy, threads=None: np.array(
+        [1.0, 1.0, 50.0, 1.0, 1.0, 1.0, 1.0])
+    try:
+        out, bl, ar, src = F.shank_net(None, paths, 6.0, 15.0)
+    finally:
+        F.batch_drop = orig
+    assert [len(p) for p in out] == [2, 2, 2] and src == [0, 0, 1], (out, src)
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -1158,7 +1175,7 @@ if __name__ == "__main__":
                test_stock_from_ridge_rapids,
                test_shank_deep_wall_short_flute,
                test_shank_deep_wall_long_flute,
-               test_rest_pass_table_tool):
+               test_rest_pass_table_tool, test_shank_net_keeps_source_index):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))
