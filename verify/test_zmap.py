@@ -1003,10 +1003,33 @@ def test_holder_resolve_from_table():
     assert name2 == "BT30-ER20-60" and st2 == 46.2
     segs3, st3, _ = zmap.resolve_holder(holder="BT30-ER20-80", stickout=9.0)
     assert st3 == 9.0 and segs3[1] == [2.0, 21.946, 16.9, 16.9]
+    # T13 now carries a holder (BT30-ER32-70, Steve catalogue estimate)
+    segs4, st4, name4 = zmap.resolve_holder(tool_number=13)
+    assert name4 == "BT30-ER32-70" and st4 == 71.6
+    assert segs4 == [[0.0, 35.0, 25.0, 25.0], [35.0, 70.0, 27.0, 23.0]]
     # tool without holder data / unknown number -> off, not an error
-    assert zmap.resolve_holder(tool_number=13) is None  # ER32: no segments
+    assert zmap.resolve_holder(tool_number=3) is None  # no holder in entry
     assert zmap.resolve_holder(tool_number=99) is None
     assert zmap.resolve_holder() is None
+
+    class _Args:
+        def __init__(self, tool_number=None, holder=None):
+            self.tool_number = tool_number
+            self.holder = holder
+            self.tools_json = zmap.TOOLS_JSON
+
+    # the report never skips silently: a tool number with no holder in the
+    # table is reported as "holder unknown" (the connector gate fails on it)
+    rep_unknown = zmap._holder_report(_Args(tool_number=99), None, None)
+    assert rep_unknown["status"] == "holder unknown"
+    assert "99" in rep_unknown["reason"]
+    # T13 checked: dimension_source is the Steve catalogue estimate
+    rep_t13 = zmap._holder_report(_Args(tool_number=13), name4, st4)
+    assert rep_t13 == {"status": "checked", "name": "BT30-ER32-70",
+                       "stickout_mm": 71.6, "dimension_source": "estimated"}
+    # nothing requested -> "not requested"
+    assert zmap._holder_report(_Args(), None, None) == \
+        {"status": "not requested"}
     try:
         zmap.resolve_holder(holder="NOPE", stickout=10.0)
         assert False, "unknown holder accepted"
@@ -1065,14 +1088,18 @@ def test_holder_cli_tool_number(tmp_path):
                     "--out-json", str(out)])
     assert rc == 0
     rep = json.loads(out.read_text())
-    assert rep["holder"] == {"name": "BT30-ER20-60", "stickout_mm": 18.0}
+    assert rep["holder"] == {"status": "checked", "name": "BT30-ER20-60",
+                             "stickout_mm": 18.0,
+                             "dimension_source": "drawing"}
     assert rep["holder_hits"]["count"] == 2
     assert abs(rep["holder_hits"]["max_intrusion"] - 2.0) < 1e-9
-    # unknown tool number -> holder check off, report key present as null
+    # unknown tool number -> holder check off, reported as "holder unknown"
     out2 = tmp_path / "rep2.json"
     rc = zmap.main([str(gc), "--part", str(npy), "--tool", "ball",
                     "--dia", "6.0", "--stock", "-25", "25", "-25", "25",
                     "0", "20", "--tool-number", "99",
                     "--out-json", str(out2)])
     assert rc == 0
-    assert json.loads(out2.read_text())["holder_hits"] is None
+    rep2 = json.loads(out2.read_text())
+    assert rep2["holder_hits"] is None
+    assert rep2["holder"]["status"] == "holder unknown"

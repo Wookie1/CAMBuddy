@@ -62,6 +62,24 @@ def resolve_holder(tool_number=None, holder=None, stickout=None, path=None):
         holder
 
 
+
+def _holder_report(args, name, stickout):
+    """Never skip silently: say which holder was checked, or that it is unknown."""
+    if name is not None:
+        src = None
+        try:
+            with open(args.tools_json) as fh:
+                src = json.load(fh).get("holders", {}).get(name, {}).get("dimension_source")
+        except (IOError, OSError, ValueError):
+            pass
+        return {"status": "checked", "name": name, "stickout_mm": stickout,
+                "dimension_source": src or "drawing"}
+    if args.tool_number is None and args.holder is None:
+        return {"status": "not requested"}
+    return {"status": "holder unknown",
+            "reason": "no holder outline/stick-out for tool %s in %s"
+                      % (args.tool_number, args.tools_json)}
+
 # --------------------------------------------------------------------------
 # G-code parsing
 # --------------------------------------------------------------------------
@@ -1465,6 +1483,7 @@ def main(argv=None):
         "tool": {"type": args.tool, "dia": args.dia, "corner": args.corner},
         "stock_box": [float(v) for v in stock_box],
         "stock_in": os.path.abspath(args.stock_in) if args.stock_in else None,
+        "holder": _holder_report(args, holder_name, holder_stick),
         "cell": cell,
         "window": ("steep walls |dZ|>1mm dilated 2mm" if args.window else None),
         "gouges": res["gouges"],
@@ -1474,8 +1493,6 @@ def main(argv=None):
         "plunge_over_flute": res["plunge_over_flute"],
         "over_flute": res["over_flute"],
         "holder_hits": res["holder_hits"],
-        "holder": ({"name": holder_name, "stickout_mm": holder_stick}
-                   if holder_segs is not None else None),
         "cutter_comp": res["cutter_comp"],
         "comp_radius_mm": args.comp_radius,
         "air_fraction": res["air_fraction"],
