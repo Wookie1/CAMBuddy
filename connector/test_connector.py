@@ -2181,3 +2181,25 @@ class TestPerAxisStockRunner:
         want = "-11.0000 11.0000 -21.0000 21.0000"
         for b in boxes:
             assert b == want, b
+
+
+def test_token_refresh_near_expiry_does_not_recurse():
+    """Regression: once the token was within 60 s of expiry, get_token ->
+    _request -> _maybe_refresh -> get_token recursed until RecursionError,
+    killing the connector ~12 min into any long run."""
+    import client as client_mod
+    sent = []
+
+    class Stub(client_mod.SteveClient):
+        def _send(self, req):
+            sent.append(req.full_url)
+            if req.full_url.endswith("/token"):
+                return {"token": "tok-new", "expires_in": 900}
+            return {"messages": []}
+
+    c = Stub("http://127.0.0.1:1/connect/v1", crypto.new_key())
+    c.token, c.token_exp = "tok-old", time.time() - 1   # already stale
+    c.messages(0, wait=0)
+    assert c.token == "tok-new"
+    assert [u.rsplit("/", 1)[-1].split("?")[0] for u in sent] == \
+        ["token", "messages"]
