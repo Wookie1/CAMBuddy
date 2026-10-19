@@ -41,7 +41,7 @@ function setDocument(doc) {
   openDoc = doc;
   $("doc-line").textContent = doc
     ? "Open document: " + doc.kind + " (id " + doc.id + ")"
-    : "No open document.";
+    : "No open document. Open a STEP model in STEVE to enable roughing.";
   updateButton();
 }
 
@@ -70,7 +70,7 @@ $("rough-form").addEventListener("submit", (event) => {
   // can send the open document without asking (when allowed):
   call("run", { action: "adaptive_rough", inputs, note: "from panel" })
     .then((run) => showRun(run))
-    .catch((err) => { $("run-message").textContent = "Error: " + (err.message || err.code); });
+    .catch((err) => { $("run-message").textContent = "Could not start the run: " + (err.message || err.code); });
 });
 
 $("cancel-btn").addEventListener("click", () => {
@@ -104,7 +104,7 @@ function showRun(run) {
     showPreview(run.id);
   } else if (run.error) {
     $("run-summary").textContent =
-      run.error.code + ": " + (run.error.message || "");
+      "Run failed (" + run.error.code + "): " + (run.error.message || "");
     $("run-summary").classList.remove("hidden");
   }
 }
@@ -148,6 +148,6 @@ function showEvent(name, data) {
       $("rough-open").title = "Not allowed for this panel";
     }
   } catch (err) {
-    $("doc-line").textContent = "Bridge unavailable: " + (err.message || err.code);
+    $("doc-line").textContent = "Not connected to STEVE: " + (err.message || err.code);
   }
 })();
