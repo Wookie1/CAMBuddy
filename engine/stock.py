@@ -166,7 +166,9 @@ class StockField:
         return float(mask.sum()) * self.cell * self.cell
 
     def dilate(self, mask, radius):
-        """Boolean dilation by a disk of `radius` (shift-OR trick)."""
+        """Boolean dilation by a disk of `radius` (shift-OR trick). Offsets
+        are clipped to the grid so a radius larger than the grid extent
+        (possible when inch inputs expand the stock box) never crashes."""
         k = int(math.ceil(radius / self.cell))
         offs = [(dj, di) for dj in range(-k, k + 1)
                 for di in range(-k, k + 1)
@@ -174,8 +176,12 @@ class StockField:
         out = np.zeros_like(mask, dtype=bool)
         m = mask.astype(np.uint8)
         for dj, di in offs:
-            j0, j1 = max(0, dj), min(self.ny, self.ny + dj)
-            i0, i1 = max(0, di), min(self.nx, self.nx + di)
+            j0 = max(0, dj, dj - self.ny)
+            j1 = min(self.ny, self.ny + dj)
+            i0 = max(0, di, di - self.nx)
+            i1 = min(self.nx, self.nx + di)
+            if j0 >= j1 or i0 >= i1:
+                continue  # this shifted copy lies entirely outside the grid
             out[j0:j1, i0:i1] |= m[j0 - dj:j1 - dj, i0 - di:i1 - di].astype(bool)
         return out
 

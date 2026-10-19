@@ -119,6 +119,23 @@ def program_tool_numbers(text):
     return out
 
 
+def posted_units(path, requested):
+    """Task UN: read the posted program back and FAIL the run unless its
+    G20/G21 matches the requested units ("mm" -> G21, "inch" -> G20).
+    Returns the units actually posted."""
+    want = "G21" if requested == "mm" else "G20"
+    other = "G20" if want == "G21" else "G21"
+    with open(path) as fh:
+        text = re.sub(r"\([^)]*\)", "", fh.read())  # comments never count
+    words = set(re.findall(r"\bG2[01]\b", text))
+    if words != {want}:
+        raise EngineError(
+            "posted units mismatch in %s: units %r was requested but the "
+            "program posts %s - the run failed"
+            % (os.path.basename(path), requested, other))
+    return requested
+
+
 def check_tool_entry(number, path=None):
     """check_program: the tools/x7_tools.json entry for tool `number`.
     Returns {type, diameter_mm, corner_radius_mm, flute_mm,
@@ -256,29 +273,34 @@ class EngineRun:
         stock = prep["stock"]
         floor = stock[4] + values["floor_z"]
 
-        # 2) rough (LNC post) with JSON progress
+        # 2) rough (LNC post) with JSON progress; task UN: the post honors
+        #    the requested units (--metric only for mm, else G20 inch)
+        metric = values["units"] == "mm"
         nc = os.path.join(self.work, "rough.nc")
         stats_path = os.path.join(self.work, "stats.json")
-        self._spawn([py, "-m", "engine.cli", "rough",
-                    "--step", prep["step"],
-                    "--stock", *[("%.4f" % v) for v in stock],
-                    "--tool", "%s:%.4f:%.4f" % (values["tool_type"],
-                                               values["tool_diameter"],
-                                               values["corner_radius"]),
-                    "--out", nc, "--floor", "%.4f" % floor,
-                    "--leave", "%.4f" % values["stock_to_leave"],
-                    "--stepdown", "%.4f" % values["stepdown"],
-                    "--optimal-load-mm", "%.4f" % values["optimal_load"],
-                    "--stepup", "%.4f" % values["rest_stepup"],
-                    "--hf", prep["hf"], "--min-rest", "0.5",
-                    "--cut-feed", "%.1f" % values["feed"],
-                    "--ramp-feed", "%.1f" % values["ramp_feed"],
-                    "--spindle", str(int(values["rpm"])),
-                    "--post", "lnc", "--program",
-                    str(int(values["program_number"])),
-                    "--tool-number", str(_tool_number(self.cfg, values)),
-                    "--json-progress", "--stats-json", stats_path],
-                   0.2, 0.85, on_progress)
+        argv_r = [py, "-m", "engine.cli", "rough",
+                 "--step", prep["step"],
+                 "--stock", *[("%.4f" % v) for v in stock],
+                 "--tool", "%s:%.4f:%.4f" % (values["tool_type"],
+                                            values["tool_diameter"],
+                                            values["corner_radius"]),
+                 "--out", nc, "--floor", "%.4f" % floor,
+                 "--leave", "%.4f" % values["stock_to_leave"],
+                 "--stepdown", "%.4f" % values["stepdown"],
+                 "--optimal-load-mm", "%.4f" % values["optimal_load"],
+                 "--stepup", "%.4f" % values["rest_stepup"],
+                 "--hf", prep["hf"], "--min-rest", "0.5",
+                 "--cut-feed", "%.1f" % values["feed"],
+                 "--ramp-feed", "%.1f" % values["ramp_feed"],
+                 "--spindle", str(int(values["rpm"])),
+                 "--post", "lnc", "--program",
+                 str(int(values["program_number"])),
+                 "--tool-number", str(_tool_number(self.cfg, values)),
+                 "--json-progress", "--stats-json", stats_path]
+        if metric:
+            argv_r += ["--metric"]
+        self._spawn(argv_r, 0.2, 0.85, on_progress)
+        posted = {"rough.nc": posted_units(nc, values["units"])}
         with open(stats_path) as fh:
             stats = json.load(fh)
 
@@ -329,7 +351,8 @@ class EngineRun:
         _check_zmap_gates(check)
 
         result = {
-            "units": "mm",
+            "units": values["units"],
+            "posted_units": posted,
             "estimated_time_min": round(check["cycle_time_s"] / 60.0, 2),
             "cut_length_mm": check["cutting_length_mm"],
             "rapid_length_mm": check["rapid_length_mm"],
@@ -687,7 +710,12 @@ class EngineRun:
 
         # 3) adaptive roughing (LNC post, full stock); the finish and the rest
         #    pass need the engine's own post-roughing stock for their rapid /
-        #    lift / holder clearance (--stock-from), so the rough exports it
+        #    lift / holder clearance (--stock-from), so the rough exports it.
+        #    Task UN: every post honors the requested units (--metric only
+        #    for mm; inch posts emit G20 with a matching 0.00254 post grid)
+        metric = values["units"] == "mm"
+        post_grid = "0.001" if metric else "0.00254"
+        posted = {}
         nc = os.path.join(self.work, "rough.nc")
         stats_path = os.path.join(self.work, "rough_stats.json")
         rough_stock_out = os.path.join(self.work, "stock_after_rough_engine.npy")
@@ -715,7 +743,10 @@ class EngineRun:
         # adds 1 mm over the part and rapids crossed roughing terraces
         fr.remove_stale(rough_stock_out)
         argv += ["--stock-out", rough_stock_out]
+        if metric:
+            argv += ["--metric"]
         self._spawn(argv, *P["rough"], on_progress)
+        posted["rough.nc"] = posted_units(nc, values["units"])
 
         # 4) tessellate the oriented model (finish input + clcheck probe);
         #    stale model.stl removed first, fresh non-empty output asserted
@@ -732,7 +763,8 @@ class EngineRun:
 
         # 5) slope-split finishing (neutral G-code). PQ: the engine snaps the
         #    emitted points to the output grid matching this op's post units
-        #    (step 6 posts metric -> 0.001 mm; an inch post would be 0.00254)
+        #    (metric post -> 0.001 mm; an inch post uses 0.00254 so PQ's
+        #    snap stays a no-op on posting)
         fin_neutral = os.path.join(self.work, "finish_neutral.ngc")
         fin_stats = os.path.join(self.work, "finish_stats.json")
         self._spawn([py, "-m", "engine.cli", "finish",
@@ -746,20 +778,23 @@ class EngineRun:
                     "--cut-feed", "%.1f" % values["feed"],
                     "--ramp-feed", "%.1f" % values["ramp_feed"],
                     "--spindle", str(int(values["rpm"])),
-                    "--post-grid-mm", "0.001",
+                    "--post-grid-mm", post_grid,
                     "--stock-from", rough_stock_out,
                     "--stats-json", fin_stats], 0.50, 0.72, on_progress)
 
-        # 6) post to LNC (metric: the posted artifact is what clcheck
-        #    judges, and inch rounding on the corner CL ridge would exceed
-        #    the 0.005 mm criterion); header carries run-after-roughing
+        # 6) post to LNC in the requested units (task UN: --metric only for
+        #    mm, inch posts emit G20; the posted artifact is what clcheck
+        #    judges); header carries run-after-roughing
         fin = os.path.join(self.work, "finish.nc")
-        self._spawn([py, "-m", "engine.cli", "post",
-                    "--in", fin_neutral, "--out", fin,
-                    "--program", str(int(values["program_number"])),
-                    "--op-name", "SLOPE SPLIT FINISH (RUN AFTER ROUGHING)",
-                    "--tool-number", str(finish_number),
-                    "--metric"], 0.72, 0.76, on_progress)
+        argv_fp = [py, "-m", "engine.cli", "post",
+                   "--in", fin_neutral, "--out", fin,
+                   "--program", str(int(values["program_number"])),
+                   "--op-name", "SLOPE SPLIT FINISH (RUN AFTER ROUGHING)",
+                   "--tool-number", str(finish_number)]
+        if metric:
+            argv_fp += ["--metric"]
+        self._spawn(argv_fp, 0.72, 0.76, on_progress)
+        posted["finish.nc"] = posted_units(fin, values["units"])
 
         # 7) probe_clcheck on the posted finish output (must be 0)
         cl_lines = []
@@ -864,7 +899,7 @@ class EngineRun:
                         "--cut-feed", "%.1f" % values["feed"],
                         "--ramp-feed", "%.1f" % values["ramp_feed"],
                         "--spindle", str(int(values["rpm"])),
-                        "--post-grid-mm", "0.001",
+                        "--post-grid-mm", post_grid,
                         "--stats-json", rest_stats]
             if rest["flute_mm"] is not None:
                 argv_rest += ["--flute", "%.4f" % rest["flute_mm"]]
@@ -877,16 +912,20 @@ class EngineRun:
             self._spawn(argv_rest, *P["rest"], on_progress)
 
             # 9b) post to LNC: program number +2, the rest tool's T/H; the
-            #     neutral header names the rest tool, so carry its geometry
-            self._spawn([py, "-m", "engine.cli", "post",
-                        "--in", rest_neutral, "--out", rest_nc,
-                        "--program", str(int(values["program_number"]) + 2),
-                        "--op-name", "REST PASS (RUN AFTER FINISH)",
-                        "--tool-number", str(rest_number),
-                        "--tool-kind", "ball",
-                        "--dia", "%.4f" % rest["diameter_mm"],
-                        "--corner", "%.4f" % (rest["diameter_mm"] / 2.0),
-                        "--metric"], *P["post_rest"], on_progress)
+            #     neutral header names the rest tool, so carry its geometry;
+            #     task UN: --metric only when mm is requested (else G20)
+            argv_rp = [py, "-m", "engine.cli", "post",
+                      "--in", rest_neutral, "--out", rest_nc,
+                      "--program", str(int(values["program_number"]) + 2),
+                      "--op-name", "REST PASS (RUN AFTER FINISH)",
+                      "--tool-number", str(rest_number),
+                      "--tool-kind", "ball",
+                      "--dia", "%.4f" % rest["diameter_mm"],
+                      "--corner", "%.4f" % (rest["diameter_mm"] / 2.0)]
+            if metric:
+                argv_rp += ["--metric"]
+            self._spawn(argv_rp, *P["post_rest"], on_progress)
+            posted["rest.nc"] = posted_units(rest_nc, values["units"])
 
             # 9c) probe_clcheck on the posted rest output with the rest ball
             #     (must be 0)
@@ -981,7 +1020,8 @@ class EngineRun:
         # leaves: the rest pass when there is one, the finish otherwise
         final_check = check_s if rest else check_f
         result = {
-            "units": "mm",
+            "units": values["units"],
+            "posted_units": posted,
             "estimated_time_min": round(cycle_s / 60.0, 2),
             "cut_length_mm": round(cut_mm, 1),
             "probe_clcheck": cl,

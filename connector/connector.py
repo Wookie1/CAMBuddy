@@ -281,13 +281,17 @@ class Connector:
                 with open(dest, "wb") as fh:
                     fh.write(data)
             values_in = env.get("inputs", {})
+            # task UN: convert inch inputs to mm FIRST, then validate the
+            # mm values against the catalog's mm ranges (unchanged) -- the
+            # ranges are mm-valued, so validating raw inch numbers would
+            # reject or misjudge sensible inch inputs
+            values_in = catalog_mod.to_mm(values_in)
             ok, code, values = catalog_mod.validate_inputs(values_in, action)
             if not ok:
                 self.client.report_run(run_id, "rejected",
                                      error={"code": code, "message": values})
                 self.emit_state("idle")
                 return
-            values = catalog_mod.to_mm(values)
 
             if action == catalog_mod.ACTION:
                 result, files = engine.run(step_path, values, on_progress)

@@ -347,6 +347,64 @@ class TestEndToEnd:
         assert 501 in led["runs"]
 
 
+# ==================================================== task UN: units ======
+
+class TestPostedUnitsE2E:
+    """adaptive_rough on the test block honors the requested units: mm
+    posts G21, inch posts G20; both pass every gate and the result JSON
+    reports the units that were actually posted."""
+
+    def _run(self, live, run_id, units):
+        mock, home, programs = live
+        inputs = dict(GOOD_INPUTS, units=units, model=model_input(mock))
+        if units == "inch":
+            # the SAME geometry expressed in inches (1 mm = 0.03937 in):
+            # to_mm turns these back into GOOD_INPUTS' mm values
+            inputs.update({"stock_xy": 1.0 / 25.4, "stock_top": 0.4 / 25.4,
+                           "stock_bottom": 1.0 / 25.4,
+                           "floor_z": GOOD_INPUTS["floor_z"] / 25.4,
+                           "tool_diameter": 0.5, "flute_length": 2.0,
+                           "stepdown": GOOD_INPUTS["stepdown"] / 25.4,
+                           "optimal_load":
+                               GOOD_INPUTS["optimal_load"] / 25.4,
+                           "stock_to_leave":
+                               GOOD_INPUTS["stock_to_leave"] / 25.4,
+                           "rest_stepup": GOOD_INPUTS["rest_stepup"] / 25.4,
+                           "feed": GOOD_INPUTS["feed"] / 25.4,
+                           "ramp_feed": GOOD_INPUTS["ramp_feed"] / 25.4})
+        mock.enqueue_run(run_id, inputs=inputs)
+        assert mock.wait_state(run_id, "received", 30), \
+            "run never received: %s" % mock.states_for(run_id)
+        final = mock.wait_terminal(run_id, timeout=600)
+        assert final == "succeeded", \
+            "run %s ended %s: %s" % (run_id, final,
+                                      mock.states_for(run_id))
+        reps = {r["body"]["state"]: r["body"] for r in mock.reports
+                if str(r["run_id"]) == str(run_id)}
+        result = reps["succeeded"].get("result") or {}
+        assert result["units"] == units
+        assert result["posted_units"] == {"rough.nc": units}
+        # every gate clean
+        assert result["zmap_gouges"]["count"] == 0
+        assert result["rapid_collisions"]["count"] == 0
+        assert result["over_flute"]["count"] == 0
+        assert result["holder_hits"]["count"] == 0
+        assert result["cut_length_mm"] > 100
+        # the program on disk carries the matching unit word
+        with open(home / "runs" / str(run_id) / "rough.nc") as fh:
+            text = fh.read()
+        assert ("G21" if units == "mm" else "G20") in text
+        assert ("G20" if units == "mm" else "G21") not in text
+        assert (programs / ("O%d_rough.nc"
+                            % GOOD_INPUTS["program_number"])).exists()
+
+    def test_rough_posts_mm_when_requested(self, live):
+        self._run(live, 510, "mm")
+
+    def test_rough_posts_inch_when_requested(self, live):
+        self._run(live, 511, "inch")
+
+
 # ======================================================= (c) negatives ====
 
 class TestNegatives:
@@ -858,7 +916,8 @@ class TestRestPass:
                     out = opt("--out")
                     if out:
                         with open(out, "w") as fh:
-                            fh.write("G21 G90\nG0 X0. Y0. Z5.\n")
+                            fh.write(("G21" if "--metric" in a else "G20") +
+                                     " G90\nG0 X0. Y0. Z5.\n")
                     sj = opt("--stats-json")
                     if sj:
                         with open(sj, "w") as fh:
@@ -1260,7 +1319,8 @@ class TestEngageThresholdArgs:
                     out = opt("--out")
                     if out:
                         with open(out, "w") as fh:
-                            fh.write("G21 G90\nG0 X0. Y0. Z5.\n")
+                            fh.write(("G21" if "--metric" in a else "G20") +
+                                     " G90\nG0 X0. Y0. Z5.\n")
                     sj = opt("--stats-json")
                     if sj:
                         with open(sj, "w") as fh:
@@ -1355,7 +1415,8 @@ class TestStaleArtifactsRejected:
                     out = opt("--out")
                     if out:
                         with open(out, "w") as fh:
-                            fh.write("G21 G90\nG0 X0. Y0. Z5.\n")
+                            fh.write(("G21" if "--metric" in a else "G20") +
+                                     " G90\nG0 X0. Y0. Z5.\n")
                     sj = opt("--stats-json")
                     if sj:
                         with open(sj, "w") as fh:
@@ -1422,6 +1483,269 @@ class TestStaleArtifactsRejected:
             fh.write(b"solid stale\nendsolid stale\n")
         self._run_expect_fail(
             tmp_path, monkeypatch, self._fake_spawn(stl_writes=False))
+
+
+class TestPostedUnitsRunner:
+    """Task UN (unit, no engine): rough, finish and rest posts honor the
+    requested units -- --metric (G21) only for mm, inch posts run without
+    it (G20) with the matching post grid 0.00254 so PQ's snap is a no-op
+    on posting. After every post the runner reads the program back and
+    FAILS the run when the posted G20/G21 differs from the request."""
+
+    def _spawn(self, tmp_path, monkeypatch):
+        """Unit fake: full slope-split chain with honest posted files; the
+        recorded argv list is returned alongside the runner."""
+        import numpy as np
+
+        import runner as runner_mod
+
+        fake = TestStaleArtifactsRejected._fake_spawn()
+        calls = []
+
+        def spawn(self, argv, lo, hi, on_progress, json_out=None,
+                  extra_env=None):
+            a = list(argv)
+            calls.append(a)
+            if any(tok.endswith("probe_clcheck.py") for tok in a):
+                if json_out is not None:
+                    json_out.append({"below_cl": 0, "points": 42,
+                                     "max_depth_mm": 0.0})
+            elif any(tok.endswith("heightfield.py") for tok in a):
+                pass  # handled by fake; x0/y0 added to the sidecar below
+            elif "verify.zmap" in a:
+
+                def opt(f):
+                    return a[a.index(f) + 1] if f in a else None
+
+                so = opt("--stock-out")
+                if so:
+                    np.save(so, np.full((8, 8), -1.0))
+                with open(opt("--out-json"), "w") as fh:
+                    json.dump({
+                        "gouges": {"count": 0, "max_depth": 0.0},
+                        "rapid_collisions": {"count": 0, "first_line": None},
+                        "outside_grid": {"count": 0},
+                        "over_flute": {"count": 0, "max_depth": 0.0},
+                        "holder": {"status": "checked"},
+                        "holder_hits": {"count": 0, "max_intrusion": 0.0},
+                        "leftover": {"mean": 0.0, "p95": 0.0, "max": 0.0},
+                        "within_0p5mm_fraction": 1.0,
+                        "cycle_time_s": 1.0,
+                        "cutting_length_mm": 100.0,
+                        "rapid_length_mm": 10.0,
+                    }, fh)
+            out = fake(self, argv, lo, hi, on_progress, json_out, extra_env)
+            if extra_env and "HF_OUT" in extra_env:
+                # the rest pass reads the grid from the sidecar: carry x0/y0
+                side = os.path.splitext(extra_env["HF_OUT"])[0] + ".json"
+                with open(side) as fh:
+                    meta = json.load(fh)
+                meta.setdefault("x0", -12.0)
+                meta.setdefault("y0", -12.0)
+                with open(side, "w") as fh:
+                    json.dump(meta, fh)
+            return out
+
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", spawn)
+        run = runner_mod.EngineRun({"engine_python": PY, "repo_root": REPO},
+                                    str(tmp_path))
+        return run, calls
+
+    def test_mm_run_carries_metric_and_fine_grid(self, tmp_path,
+                                                   monkeypatch):
+        run, calls = self._spawn(tmp_path, monkeypatch)
+        result, _files = run.run_slope_split_finish(
+            os.path.join(HERE, "unused.step"),
+            dict(SLOPE_GOOD_INPUTS, rest_tool_number=31))
+
+        def call(sub):
+            return [a for a in calls if "engine.cli" in a
+                    and a[a.index("engine.cli") + 1] == sub]
+
+        rough = call("rough")[0]
+        assert "--metric" in rough
+        fin = [a for a in call("finish") if "--rest-from" not in a][0]
+        assert "--post-grid-mm" in fin
+        assert float(fin[fin.index("--post-grid-mm") + 1]) == \
+            pytest.approx(0.001)
+        rest_fin = [a for a in call("finish") if "--rest-from" in a][0]
+        assert float(rest_fin[rest_fin.index("--post-grid-mm") + 1]) == \
+            pytest.approx(0.001)
+        posts = call("post")
+        assert len(posts) == 2, "finish and rest posts"
+        for a in posts:
+            assert "--metric" in a
+        assert result["units"] == "mm"
+        assert result["posted_units"] == {"rough.nc": "mm",
+                                           "finish.nc": "mm",
+                                           "rest.nc": "mm"}
+
+    def test_inch_run_posts_g20_with_inch_grid(self, tmp_path, monkeypatch):
+        run, calls = self._spawn(tmp_path, monkeypatch)
+        result, _files = run.run_slope_split_finish(
+            os.path.join(HERE, "unused.step"),
+            dict(SLOPE_GOOD_INPUTS, units="inch", rest_tool_number=31))
+
+        def call(sub):
+            return [a for a in calls if "engine.cli" in a
+                    and a[a.index("engine.cli") + 1] == sub]
+
+        rough = call("rough")[0]
+        assert "--metric" not in rough, "inch rough must not pass --metric"
+        for a in call("finish"):
+            assert float(a[a.index("--post-grid-mm") + 1]) == \
+                pytest.approx(0.00254)
+        posts = call("post")
+        assert len(posts) == 2, "finish and rest posts"
+        for a in posts:
+            assert "--metric" not in a, "inch post must not pass --metric"
+        for name in ("rough.nc", "finish.nc", "rest.nc"):
+            with open(os.path.join(str(tmp_path), name)) as fh:
+                text = fh.read()
+            assert "G20" in text and "G21" not in text, name
+        assert result["units"] == "inch"
+        assert result["posted_units"] == {"rough.nc": "inch",
+                                           "finish.nc": "inch",
+                                           "rest.nc": "inch"}
+
+    def test_adaptive_rough_inch_argv_and_post(self, tmp_path, monkeypatch):
+        run, calls = self._spawn(tmp_path, monkeypatch)
+        result, _files = run.run(os.path.join(HERE, "unused.step"),
+                                  dict(GOOD_INPUTS, units="inch"))
+        rough = [a for a in calls if "engine.cli" in a
+                 and a[a.index("engine.cli") + 1] == "rough"][0]
+        assert "--metric" not in rough
+        with open(os.path.join(str(tmp_path), "rough.nc")) as fh:
+            text = fh.read()
+        assert "G20" in text and "G21" not in text
+        assert result["units"] == "inch"
+        assert result["posted_units"] == {"rough.nc": "inch"}
+
+    def test_posted_units_mismatch_fails_run(self, tmp_path, monkeypatch):
+        """A post that ignores --metric (posted units differ from the
+        request) fails the run instead of reporting the requested units."""
+        import runner as runner_mod
+
+        def fake_spawn(self, argv, lo, hi, on_progress, json_out=None,
+                       extra_env=None):
+            import numpy as np
+            a = list(argv)
+
+            def opt(f):
+                return a[a.index(f) + 1] if f in a else None
+
+            if any(tok.endswith("heightfield.py") for tok in a):
+                np.save(extra_env["HF_OUT"], np.full((8, 8), 0.4))
+                with open(os.path.splitext(extra_env["HF_OUT"])[0]
+                          + ".json", "w") as fh:
+                    json.dump({"step_sha256": hashlib.sha256(
+                        open(extra_env["STEP_IN"], "rb").read()).hexdigest(),
+                        "cell": float(extra_env["CELL"]),
+                        "tess_tol": 0.01}, fh)
+            elif any(tok.endswith("_tessellate.py") for tok in a):
+                with open(extra_env["STL_OUT"], "wb") as fh:
+                    fh.write(b"solid fake\nendsolid fake\n")
+            elif "engine.cli" in a:
+                sub = a[a.index("engine.cli") + 1]
+                if sub == "prepare":
+                    with open(os.path.join(self.work, "o.step"), "w") as fh:
+                        fh.write("ISO-10303-21; fake oriented step\nEND;")
+                    with open(os.path.join(self.work, "prepare.json"),
+                              "w") as fh:
+                        json.dump({"step": os.path.join(self.work, "o.step"),
+                                   "hf": os.path.join(self.work, "hf.npz"),
+                                   "stock": [-10.0, 10.0, -10.0, 10.0,
+                                           -1.0, 0.4]}, fh)
+                else:
+                    out = opt("--out")
+                    if out:
+                        # always G21 no matter what was requested: an inch
+                        # run must now fail the posted-units check
+                        with open(out, "w") as fh:
+                            fh.write("G21 G90\nG0 X0. Y0. Z5.\n")
+                    sj = opt("--stats-json")
+                    if sj:
+                        with open(sj, "w") as fh:
+                            json.dump({"levels": [{"skipped": False}],
+                                       "n_moves": 10}, fh)
+            return None
+
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", fake_spawn)
+        run = runner_mod.EngineRun({"engine_python": PY, "repo_root": REPO},
+                                    str(tmp_path))
+        with pytest.raises(runner_mod.EngineError,
+                           match="posted units mismatch"):
+            run.run_slope_split_finish(
+                os.path.join(HERE, "unused.step"),
+                dict(SLOPE_GOOD_INPUTS, units="inch"))
+
+    def test_adaptive_rough_posted_mismatch_fails_run(self, tmp_path,
+                                                        monkeypatch):
+        """Same refusal for adaptive_rough: a rough that posts G20 while
+        mm was requested fails the run."""
+        import runner as runner_mod
+
+        def fake_spawn(self, argv, lo, hi, on_progress, json_out=None,
+                       extra_env=None):
+            import numpy as np
+            a = list(argv)
+
+            def opt(f):
+                return a[a.index(f) + 1] if f in a else None
+
+            if "verify.zmap" in a:
+                with open(opt("--out-json"), "w") as fh:
+                    json.dump({
+                        "gouges": {"count": 0, "max_depth": 0.0},
+                        "rapid_collisions": {"count": 0, "first_line": None},
+                        "outside_grid": {"count": 0},
+                        "over_flute": {"count": 0, "max_depth": 0.0},
+                        "holder": {"status": "checked"},
+                        "holder_hits": {"count": 0, "max_intrusion": 0.0},
+                        "leftover": {"mean": 0.0, "p95": 0.0, "max": 0.0},
+                        "within_0p5mm_fraction": 1.0,
+                        "cycle_time_s": 1.0,
+                        "cutting_length_mm": 100.0,
+                        "rapid_length_mm": 10.0,
+                    }, fh)
+            elif any(tok.endswith("heightfield.py") for tok in a):
+                np.save(extra_env["HF_OUT"], np.full((8, 8), 0.4))
+                with open(os.path.splitext(extra_env["HF_OUT"])[0]
+                          + ".json", "w") as fh:
+                    json.dump({"step_sha256": hashlib.sha256(
+                        open(extra_env["STEP_IN"], "rb").read()).hexdigest(),
+                        "cell": float(extra_env["CELL"]),
+                        "tess_tol": 0.01}, fh)
+            elif "engine.cli" in a:
+                sub = a[a.index("engine.cli") + 1]
+                if sub == "prepare":
+                    with open(os.path.join(self.work, "o.step"), "w") as fh:
+                        fh.write("ISO-10303-21; fake oriented step\nEND;")
+                    with open(os.path.join(self.work, "prepare.json"),
+                              "w") as fh:
+                        json.dump({"step": os.path.join(self.work, "o.step"),
+                                   "hf": os.path.join(self.work, "hf.npz"),
+                                   "stock": [-10.0, 10.0, -10.0, 10.0,
+                                           -1.0, 0.4]}, fh)
+                else:
+                    out = opt("--out")
+                    if out:
+                        with open(out, "w") as fh:
+                            # ignores --metric: mm requested, inch posted
+                            fh.write("G20 G90\nG0 X0. Y0. Z5.\n")
+                    sj = opt("--stats-json")
+                    if sj:
+                        with open(sj, "w") as fh:
+                            json.dump({"levels": [{"skipped": False}],
+                                       "n_moves": 10}, fh)
+            return None
+
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", fake_spawn)
+        run = runner_mod.EngineRun({"engine_python": PY, "repo_root": REPO},
+                                    str(tmp_path))
+        with pytest.raises(runner_mod.EngineError,
+                           match="posted units mismatch"):
+            run.run(os.path.join(HERE, "unused.step"), dict(GOOD_INPUTS))
 
 
 class TestHolderUnknownGate:
@@ -2110,7 +2434,8 @@ class TestPerAxisStockRunner:
                     out = opt("--out")
                     if out:
                         with open(out, "w") as fh:
-                            fh.write("G21 G90\nG0 X0. Y0. Z5.\n")
+                            fh.write(("G21" if "--metric" in a else "G20") +
+                                     " G90\nG0 X0. Y0. Z5.\n")
                     sj = opt("--stats-json")
                     if sj:
                         with open(sj, "w") as fh:
