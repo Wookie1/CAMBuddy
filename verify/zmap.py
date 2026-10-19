@@ -961,14 +961,23 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 if engaged and engage_max is not None:
                     perp_x, perp_y = -dy_t, dx_t
                     proj = (gx[None, :] * perp_x + gy[:, None] * perp_y)
-                    eproj = np.where(msk_e, proj, -np.inf)
-                    ew = float(eproj.max()) - float(eproj.min())
-                    # Clamp to [0, dia]: the padded mask (R + 0.75*cell) can
-                    # make ew slightly exceed the tool diameter; guard against
-                    # inf/NaN from degenerate masks (helix, pure plunge, arcs).
-                    ew = min(max(ew, 0.0), 2.0 * R)
+                    # Measure the chord over the cells THIS move actually cuts:
+                    # stock above the tip inside the padded footprint, before
+                    # the stock update. Using msk_e alone (or a -inf-filled
+                    # window) reads ~2R even for a light side cut.
+                    cells = msk_e & (win > sz + 1e-6)
+                    if cells.any():
+                        cproj = proj[cells]
+                        ew = float(cproj.max()) - float(cproj.min())
+                    else:
+                        ew = np.nan
+                    # Finite guard BEFORE the clamp: clamping first would turn
+                    # inf into 2R and the guard could never fire.
                     if not np.isfinite(ew):
                         ew = 0.0
+                    # Clamp to [0, dia]: the padded mask (R + 0.75*cell) can
+                    # make ew slightly exceed the tool diameter.
+                    ew = min(max(ew, 0.0), 2.0 * R)
                     if ew > move_max_engage:
                         move_max_engage = ew
                 if removed > REMOVE_EPS:
@@ -1004,15 +1013,17 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 rapid_collisions += 1
                 if first_rapid_line is None:
                     first_rapid_line = mv["line"]
-        # engagement spike: flag moves exceeding threshold
-        if cutting and engage_max is not None and move_max_engage > engage_max:
-            engage_count += 1
-            engage_spikes.append({
-                "line": mv["line"],
-                "x": round(x1, 4), "y": round(y1, 4),
-                "engagement_mm": round(move_max_engage, 4)})
+        # engagement: track the widest measured chord over all cutting moves;
+        # flag only those exceeding the threshold
+        if cutting and engage_max is not None:
             if move_max_engage > engage_max_seen:
                 engage_max_seen = move_max_engage
+            if move_max_engage > engage_max:
+                engage_count += 1
+                engage_spikes.append({
+                    "line": mv["line"],
+                    "x": round(x1, 4), "y": round(y1, 4),
+                    "engagement_mm": round(move_max_engage, 4)})
         # plunge detection: feed move descending into stock
         if cutting and z1 < cur[2] - 1e-9:
             dx_m = x1 - cur[0]
