@@ -34,7 +34,8 @@ class SteveClient:
     # ---------------------------------------------------------- plumbing --
     def _request(self, method, ep, query="", body=b"", media=None,
                  auth=True, extra_headers=None):
-        self._maybe_refresh()
+        if auth:  # never from get_token itself: that recursed forever
+            self._maybe_refresh()
         headers = crypto.sign_request(self.sk, method, self.base_path + ep,
                                      query, body)
         headers["Accept"] = "application/json"
