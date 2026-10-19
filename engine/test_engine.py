@@ -714,6 +714,69 @@ def _pocket_block_stl(path, half=14.0, ztop=8.0, pk_half=8.0, pk_floor=4.0):
     return path
 
 
+def test_rough_region_clipped_to_stock():
+    """Task RS: the roughing cutting region must come from the --stock box
+    (plus at most the tool radius for edge clean-up), never from the height-
+    field grid bounds. Rough the test block with its normal --hf and with a
+    copy of that hf padded by 20 mm of empty floor on every side (the
+    supervisor's prepare grid was stock + tool radius + 5 mm and roughing cut
+    over the whole grid: zmap outside_grid, 3,479 moves). Both outputs must
+    keep every cutter-centre XY within stock +- tool radius (+0.01), and the
+    cut length must differ by < 1 %."""
+    if not (HAVE_AREA and os.path.exists(TB_STL) and os.path.exists(TB_HF)):
+        print("SKIP test_rough_region_clipped_to_stock (no area or out/test_block.*)")
+        return
+    import json as _json
+    import numpy as np
+    from opencamlib import ocl
+    from engine.rough import rough
+    surf = ocl.STLSurf()
+    ocl.STLReader(TB_STL, surf)
+    part = np.load(TB_HF)
+    with open(TB_HF[:-4] + ".json") as fh:
+        meta = _json.load(fh)
+    hx0, hy0, hcell = float(meta["x0"]), float(meta["y0"]), float(meta["cell"])
+    stock_box = (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0)
+    tool_r = 6.343
+    kw = dict(leave=0.381, axial_leave=0.381, stepdown=19.05, stepover=0.16,
+              stl_path=TB_STL, workers=None, threads=4, stock_cell=0.5,
+              final_zmin=20.381)
+
+    def centres_outside(moves):
+        lo_x, hi_x = stock_box[0] - tool_r - 0.01, stock_box[1] + tool_r + 0.01
+        lo_y, hi_y = stock_box[2] - tool_r - 0.01, stock_box[3] + tool_r + 0.01
+        return [(m["x"], m["y"], m["z"]) for m in moves if m["g"] == 1
+                and not (lo_x <= m["x"] <= hi_x and lo_y <= m["y"] <= hi_y)]
+
+    moves_a, stats_a = rough(surf, stock_box, tool_r, 20.0,
+                            part_hf=(part, hx0, hy0, hcell), **kw)
+    # pad the hf grid by 20 mm of empty floor (zmin) on every side
+    pad_mm, fill = 20.0, float(meta.get("zmin", 0.0))
+    k = int(round(pad_mm / hcell))
+    padded = np.full((part.shape[0] + 2 * k, part.shape[1] + 2 * k), fill,
+                    dtype=part.dtype)
+    padded[k:k + part.shape[0], k:k + part.shape[1]] = part
+    moves_b, stats_b = rough(surf, stock_box, tool_r, 20.0,
+                            part_hf=(padded, hx0 - pad_mm, hy0 - pad_mm,
+                                    hcell), **kw)
+    bad_a = centres_outside(moves_a)
+    assert not bad_a, "normal --hf: %d cutter centres outside stock +- tool_r" \
+        " (first at %.2f, %.2f Z=%.3f)" % (len(bad_a), bad_a[0][0],
+                                           bad_a[0][1], bad_a[0][2])
+    bad_b = centres_outside(moves_b)
+    assert not bad_b, "padded --hf: %d cutter centres outside stock +- tool_r" \
+        " (first at %.2f, %.2f Z=%.3f)" % (len(bad_b), bad_b[0][0],
+                                           bad_b[0][1], bad_b[0][2])
+    la, lb = stats_a["cut_len"], stats_b["cut_len"]
+    assert la > 0 and lb > 0
+    rel = abs(la - lb) / max(la, lb)
+    assert rel < 0.01, "cut length differs by %.2f%% between normal and " \
+        "padded --hf (%.1f vs %.1f mm)" % (100.0 * rel, la, lb)
+    print("PASS rough region clipped to stock: normal %d moves / %.1f mm, "
+          "padded %d moves / %.1f mm, all centres within stock +- tool_r"
+          % (len(moves_a), la, len(moves_b), lb))
+
+
 def test_islands_grid_edge_parity():
     """R3 regression: when the forbidden region F reaches the CL grid border
     (grid does not cover the outer CL jump), level_islands must still EXCLUDE
@@ -1009,6 +1072,7 @@ def _main():
                test_island_clear_fn, test_allowance_violation_containment,
                test_rough_without_hf_safe, test_rough_testblock_r2,
                test_rough_testblock_r4,
+               test_rough_region_clipped_to_stock,
                test_islands_grid_edge_parity, test_rough_pocket_in_block,
                test_rough_synth_pocket_repro, test_rough_rapids_clear_stock,
                test_stl_cache_keyed_by_content):
