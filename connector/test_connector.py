@@ -884,6 +884,17 @@ class TestEngageThresholdArgs:
                     json.dump(report, fh)
             elif any(tok.endswith("heightfield.py") for tok in a):
                 np.save(extra_env["HF_OUT"], np.full((8, 8), 0.4))
+                # well-behaved build under task HC: sidecar pins the STEP,
+                # cell and tess tolerance of THIS build
+                with open(os.path.splitext(extra_env["HF_OUT"])[0] + ".json",
+                          "w") as fh:
+                    json.dump({
+                        "step_sha256": hashlib.sha256(
+                            open(extra_env["STEP_IN"], "rb").read()
+                        ).hexdigest(),
+                        "cell": float(extra_env["CELL"]),
+                        "tess_tol": float(extra_env.get("TESS_TOL", 0.01)),
+                    }, fh)
             elif any(tok.endswith("_tessellate.py") for tok in a):
                 with open(extra_env["STL_OUT"], "wb") as fh:
                     fh.write(b"solid fake\nendsolid fake\n")
@@ -894,6 +905,8 @@ class TestEngageThresholdArgs:
             elif "engine.cli" in a:
                 sub = a[a.index("engine.cli") + 1]
                 if sub == "prepare":
+                    with open(os.path.join(self.work, "o.step"), "w") as fh:
+                        fh.write("ISO-10303-21; fake oriented step\nEND;")
                     with open(os.path.join(self.work, "prepare.json"),
                              "w") as fh:
                         json.dump({"step": os.path.join(self.work, "o.step"),
@@ -941,6 +954,131 @@ class TestEngageThresholdArgs:
         assert w["finish"]["threshold_mm"] == pytest.approx(
             1.5 * values["stepover"]), \
             "check.json finish threshold is not 1.5x"
+
+
+class TestStaleArtifactsRejected:
+    """HC (unit, no FreeCAD): a reused run dir can never accept a stale
+    heightfield or STL. The runner removes the .npy + sidecar (and STL)
+    before each build, then requires both to exist and the sidecar to carry
+    step_sha256 / tess_tol / cell matching what was requested."""
+
+    @staticmethod
+    def _fake_spawn(hf_writes=True, hf_sidecar="ok", stl_writes=True):
+        """A fake EngineRun._spawn for the slope-split chain.
+
+        hf_sidecar: "ok" pins this build's STEP, "wrong" plants a bogus
+        step_sha256. hf_writes/stl_writes=False simulate a build that
+        fails silently (rc 0, no output)."""
+        import hashlib
+
+        import numpy as np
+
+        def fake_spawn(self, argv, lo, hi, on_progress, json_out=None,
+                       extra_env=None):
+            a = list(argv)
+
+            def opt(flag):
+                return a[a.index(flag) + 1] if flag in a else None
+
+            if any(tok.endswith("heightfield.py") for tok in a):
+                if hf_writes:
+                    np.save(extra_env["HF_OUT"], np.full((8, 8), 0.4))
+                    sha = ("deadbeef" * 8 if hf_sidecar == "wrong"
+                          else hashlib.sha256(
+                              open(extra_env["STEP_IN"], "rb").read()
+                          ).hexdigest())
+                    with open(os.path.splitext(extra_env["HF_OUT"])[0]
+                              + ".json", "w") as fh:
+                        json.dump({"step_sha256": sha,
+                                   "cell": float(extra_env["CELL"]),
+                                   "tess_tol": float(
+                                       extra_env.get("TESS_TOL", 0.01))}, fh)
+            elif any(tok.endswith("_tessellate.py") for tok in a):
+                if stl_writes:
+                    with open(extra_env["STL_OUT"], "wb") as fh:
+                        fh.write(b"solid fake\nendsolid fake\n")
+            elif "engine.cli" in a:
+                sub = a[a.index("engine.cli") + 1]
+                if sub == "prepare":
+                    with open(os.path.join(self.work, "o.step"), "w") as fh:
+                        fh.write("ISO-10303-21; fake oriented step\nEND;")
+                    with open(os.path.join(self.work, "prepare.json"),
+                             "w") as fh:
+                        json.dump({"step": os.path.join(self.work, "o.step"),
+                                   "hf": os.path.join(self.work, "hf.npz"),
+                                   "stock": [-10.0, 10.0, -10.0, 10.0,
+                                           -1.0, 0.4]}, fh)
+                else:
+                    out = opt("--out")
+                    if out:
+                        with open(out, "w") as fh:
+                            fh.write("G21 G90\nG0 X0. Y0. Z5.\n")
+                    sj = opt("--stats-json")
+                    if sj:
+                        with open(sj, "w") as fh:
+                            json.dump({"levels": [{"skipped": False}],
+                                       "n_moves": 10}, fh)
+            return None
+
+        return fake_spawn
+
+    def _run_expect_fail(self, tmp_path, monkeypatch, fake_spawn):
+        import runner as runner_mod
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", fake_spawn)
+        cfg = {"engine_python": PY, "repo_root": REPO}
+        run = runner_mod.EngineRun(cfg, str(tmp_path))
+        with pytest.raises(runner_mod.EngineError):
+            run.run_slope_split_finish(os.path.join(HERE, "unused.step"),
+                                        dict(SLOPE_GOOD_INPUTS))
+        return run
+
+    def test_stale_hf01_wrong_step_sha_rejected(self, tmp_path,
+                                                  monkeypatch):
+        """A planted part_hf01.json whose step_sha256 is not this run's
+        STEP fails the run even when the .npy rebuild 'succeeds'."""
+        import numpy as np
+        # plant stale outputs (a redelivered run id reuses this dir)
+        np.save(str(tmp_path / "part_hf01.npy"), np.full((8, 8), 9.9))
+        with open(str(tmp_path / "part_hf01.json"), "w") as fh:
+            json.dump({"step_sha256": "0" * 64, "cell": 0.1,
+                      "tess_tol": 0.01}, fh)
+        self._run_expect_fail(
+            tmp_path, monkeypatch, self._fake_spawn(hf_sidecar="wrong"))
+
+    def test_failing_hf_build_with_stale_file_fails_run(self, tmp_path,
+                                                          monkeypatch):
+        """The stale part_hf01.npy is removed BEFORE the build, so a build
+        that writes nothing cannot leave the old file to be accepted."""
+        import numpy as np
+        seen = []
+
+        def fake_spawn(self, argv, lo, hi, on_progress, json_out=None,
+                       extra_env=None):
+            a = list(argv)
+            if any(tok.endswith("heightfield.py") for tok in a):
+                # stale file must already be gone when the build starts
+                seen.append(os.path.exists(extra_env["HF_OUT"]))
+                return None  # build fails silently (rc 0, no output)
+            return TestStaleArtifactsRejected._fake_spawn(
+                hf_writes=False)(self, argv, lo, hi, on_progress,
+                                 json_out, extra_env)
+
+        np.save(str(tmp_path / "part_hf01.npy"), np.full((8, 8), 9.9))
+        with open(str(tmp_path / "part_hf01.json"), "w") as fh:
+            json.dump({"step_sha256": "0" * 64, "cell": 0.1,
+                      "tess_tol": 0.01}, fh)
+        self._run_expect_fail(tmp_path, monkeypatch, fake_spawn)
+        assert seen and all(gone is False for gone in seen), \
+            "stale part_hf01.npy was still present when the build ran"
+        assert not os.path.exists(str(tmp_path / "part_hf01.npy")), \
+            "stale part_hf01.npy survived the run"
+
+    def test_stale_model_stl_fails_run(self, tmp_path, monkeypatch):
+        """A planted model.stl cannot stand in for a failed tessellation."""
+        with open(str(tmp_path / "model.stl"), "wb") as fh:
+            fh.write(b"solid stale\nendsolid stale\n")
+        self._run_expect_fail(
+            tmp_path, monkeypatch, self._fake_spawn(stl_writes=False))
 
 
 class TestHolderUnknownGate:
