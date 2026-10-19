@@ -104,13 +104,14 @@ def finish_main(a):
     slope_split_finish), engine/finish.py."""
     from engine import finish as finishmod, model
     kind, dia, corner = parse_tool(a.tool)
+    big = (kind, dia, corner)  # previous finish tool for the rest mask (S4)
     rest_kw = {}
     if getattr(a, "rest_from", None):
-        # S3 item 3: corner rest pass with a PLACEHOLDER small ball; the
-        # leftover map is computed by the engine itself from its own
-        # drop-cutter CL (6 mm vs 3 mm) - see finish.compute_rest_mask.
+        # S3 item 3 / S4: corner rest pass; the leftover map is computed by
+        # the engine itself from its own drop-cutter CL (finish tool vs the
+        # rest tool) - see finish.compute_rest_mask.
         kind, dia, corner = parse_tool(a.rest_tool)
-        rest_kw = dict(rest_from=a.rest_from, big_tool=("ball", 6.0, 0.0),
+        rest_kw = dict(rest_from=a.rest_from, big_tool=big,
                        min_rest=a.min_rest)
     t0 = time.time()
     if a.stl:
@@ -146,12 +147,22 @@ def finish_main(a):
         stock_from=a.stock_from,
         stock_allow=(finishmod.RAPID_STOCK_ALLOW if a.stock_allow is None
                     else a.stock_allow),
+        flute_mm=getattr(a, "flute", None),
+        shank_dia=getattr(a, "shank", None),
+        stickout_mm=getattr(a, "stickout", None),
+        holder=getattr(a, "holder", None),
         **rest_kw)
     if rest_kw:
-        tool_comment = ("PLACEHOLDER %s D=%.3f CR=%.3f (not in "
-                        "tools/x7_tools.json - LNC post must refuse)"
-                        % (a.rest_tool, dia, corner))
-        stats["tool"] = "PLACEHOLDER %s" % a.rest_tool
+        if finishmod.tool_geometry(kind, dia) is None:
+            # S4: placeholder marker stays only for tools not in the table
+            tool_comment = ("PLACEHOLDER %s D=%.3f CR=%.3f (not in "
+                            "tools/x7_tools.json - LNC post must refuse)"
+                            % (a.rest_tool, dia, corner))
+            stats["tool"] = "PLACEHOLDER %s" % a.rest_tool
+        else:
+            tool_comment = ("REST %s D=%.3f CR=%.3f (tools/x7_tools.json)"
+                           % (a.rest_tool, dia, corner))
+            stats["tool"] = a.rest_tool
     else:
         tool_comment = "T1 %s D=%.3f CR=%.3f" % (kind, dia, corner)
     text = finishmod.finish_to_gcode(
@@ -219,7 +230,8 @@ def main(argv=None):
     r.add_argument("--hf", default=None,
                   help="part heightfield .npy (+ .json sidecar): clips step-up "
                        "levels to where remaining stock above the part is "
-                       "> --min-rest mm")
+                       "> --min-rest mm. When omitted the engine rasterises it "
+                       "itself from the STEP (same clips always apply).")
     r.add_argument("--min-rest", dest="min_rest", type=float, default=1.0,
                   help="min remaining stock above the part mm for a cell to "
                        "stay in a level's region")
@@ -229,6 +241,11 @@ def main(argv=None):
                        "than this mm^2")
     r.add_argument("--stock-cell", dest="stock_cell", type=float, default=0.5,
                   help="stock heightfield cell size mm")
+    r.add_argument("--rapid-margin", dest="rapid_margin", type=float,
+                   default=1.0,
+                   help="R5: every G0 must clear max(live stock top, part) "
+                        "within tool radius + this margin along the swept "
+                        "path by this margin (mm)")
     r.add_argument("--cut-feed", dest="cut_feed", type=float, default=3429.0,
                    help="cutting feed mm/min (James's cutting data)")
     r.add_argument("--ramp-feed", dest="ramp_feed", type=float, default=1270.0,
@@ -240,7 +257,8 @@ def main(argv=None):
     r.add_argument("--tolerance", type=float, default=0.05,
                   help="Adaptive2d path tolerance mm")
     r.add_argument("--wl-sampling", dest="wl_sampling", type=float, default=0.1,
-                  help="waterline sampling mm")
+                  help="(legacy, unused: R2 islands come from a drop-cutter "
+                       "CL grid, no waterlines)")
     r.add_argument("--stats-json", dest="stats_json", default=None)
     r.add_argument("--stock-out", dest="stock_out", default=None,
                    help="write the engine's final stock heightfield to this "
@@ -354,9 +372,26 @@ def main(argv=None):
                         "> --min-rest mm (PLACEHOLDER tool)")
     f.add_argument("--rest-tool", dest="rest_tool", default="ball:3",
                    help="tool spec for --rest-from passes (default ball:3; "
-                        "marked PLACEHOLDER, LNC post refuses it)")
+                        "tools listed in tools/x7_tools.json, e.g. "
+                        "ball:3.142, are real rest tools - only unlisted "
+                        "tools get the PLACEHOLDER marker)")
     f.add_argument("--min-rest", dest="min_rest", type=float, default=0.5,
                    help="rest-pass threshold mm (default 0.5)")
+    f.add_argument("--flute", type=float, default=None,
+                   help="flute length mm (S4 shank safety); default: read "
+                        "from tools/x7_tools.json by tool diameter (flute = "
+                        "2.5 x D, James); no table entry -> shank rule off")
+    f.add_argument("--shank", type=float, default=None,
+                   help="shank diameter mm (S4 shank safety); default: read "
+                        "from tools/x7_tools.json (assumed = D, not necked)")
+    f.add_argument("--stickout", type=float, default=None,
+                   help="tool stick-out mm, holder nose at tip + stick-out "
+                        "(S5 holder safety); default: read from "
+                        "tools/x7_tools.json by tool diameter")
+    f.add_argument("--holder", default=None,
+                   help="holder name in the tools/x7_tools.json \"holders\" "
+                        "map (S5 holder safety); default: read from the tool "
+                        "entry; needs a stick-out (table or --stickout)")
 
     a = p.parse_args(argv)
 
@@ -404,9 +439,9 @@ def main(argv=None):
     def prog(zi, z, islands, nreg, stats):
         lvl = next(l for l in reversed(stats["levels"]) if l["z"] == round(z, 3))
         print("level %2d Z=%7.3f area=%8.1f mm^2 islands=%2d regions=%d"
-              " (wl %.1fs a2d %.1fs)"
+              " (isl %.1fs a2d %.1fs)"
               % (zi, z, lvl.get("region_mm2", 0.0), len(islands), nreg,
-                 stats["t_waterline"], stats["t_adaptive"]), flush=True)
+                 stats["t_islands"], stats["t_adaptive"]), flush=True)
         if a.json_progress:
             print(json.dumps({
                 "progress": round(0.05 + 0.9 * zi / max(1, len(order)), 3),
@@ -424,6 +459,7 @@ def main(argv=None):
                                   part_hf=part_hf, stock_cell=a.stock_cell,
                                   stepup=a.stepup, min_rest=a.min_rest,
                                   min_level_area=a.min_level_area,
+                                  rapid_margin=a.rapid_margin,
                                    progress=prog, stock_out=a.stock_out)
     if a.post == "lnc":
         from engine import post_lnc

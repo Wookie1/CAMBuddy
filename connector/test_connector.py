@@ -962,6 +962,61 @@ class TestGateFail:
         finally:
             mock.stop()
 
+    def _fake_run_holder(self, step_path, values, on_progress=None):
+        """Fake EngineRun.run that simulates a gate failure (S5 holder
+        hits: the holder stack cannot keep 1.0 mm clearance)."""
+        if on_progress:
+            on_progress(0.02, "checking")
+        raise EngineError("zmap gate: 2 holder hits (max intrusion 4.000 mm, "
+                          "first line 30) - the holder cannot keep 1.0 mm "
+                          "clearance")
+
+    def test_holder_hit_run_failed_no_nc(self, tmp_path):
+        """S5: a deliberate holder hit (zmap gate) fails the run and no .nc
+        is uploaded."""
+        mock = MockSteve(code="PAIR-G4")
+        base = mock.serve_forever()
+        try:
+            mock.confirm()
+            c = _inproc_connector(tmp_path, mock, "PAIR-G4")
+            c.enroll()
+
+            from runner import EngineRun
+            orig_run = EngineRun.run
+            EngineRun.run = self._fake_run_holder
+            try:
+                env = {
+                    "id": 904, "action": catalog_mod.ACTION,
+                    "inputs": dict(GOOD_INPUTS, model=model_input(mock)),
+                    "connector": c.fingerprint,
+                    "issued_at": int(time.time()),
+                    "expires_at": int(time.time()) + 600,
+                    "nonce": "gate-fail-4",
+                }
+                msg = {
+                    "kind": "run", "envelope": env,
+                    "kid": "steve-2026-a",
+                    "sig": crypto.b64(mock.key.sign(
+                        crypto.canonical_json(env))),
+                }
+                c.handle_message(msg)
+
+                reports = [r for r in mock.reports
+                           if str(r["run_id"]) == "904"]
+                assert len(reports) >= 1
+                final = reports[-1]["body"]
+                assert final["state"] == "failed", final
+                msg_l = final.get("error", {}).get("message", "").lower()
+                assert "holder" in msg_l, msg_l
+
+                uploaded = mock.file_names(904)
+                assert not any(n.endswith(".nc") for n in uploaded), \
+                    "holder-hit run uploaded .nc: %s" % uploaded
+            finally:
+                EngineRun.run = orig_run
+        finally:
+            mock.stop()
+
 def test_zz_print_e2e_result(live):
     mock, _, _ = live
     print("\n==== end-to-end run result JSON ====")

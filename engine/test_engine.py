@@ -168,10 +168,12 @@ def test_allowance_violation():
     assert v is not None and abs(v[2] - 3.4) < 1e-9, "missed violation: %r" % (v,)
     assert abs(v[0] - 23.4) < 1e-9 and abs(v[1] - 15.0) < 1e-9
     # round-5 style: centre 6.277 from material vs intended 6.65
+    # (R1: points must be OUTSIDE the loop - inside is a containment
+    # violation, covered by test_allowance_violation_containment)
     big = [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]]
-    v2 = allowance_violation([(6.277, 50.0)], [big], 6.35, 0.3)
+    v2 = allowance_violation([(-6.277, 50.0)], [big], 6.35, 0.3)
     assert v2 is not None and abs(v2[2] - 6.277) < 1e-9
-    assert allowance_violation([(6.63, 50.0)], [big], 6.35, 0.3) is None
+    assert allowance_violation([(-6.63, 50.0)], [big], 6.35, 0.3) is None
     print("PASS allowance_violation")
 
 
@@ -298,17 +300,703 @@ def test_stock_links_and_stepups():
 def test_island_clear_fn():
     """island_clear_fn must return a per-point bool LIST (truthiness of the
     list itself once hid a clearance bug: `not isl_ok([p])` is always False).
-    Points within `req` of the loop fail, points farther away pass."""
+    Points within `req` of the loop fail, points farther away pass, and
+    points INSIDE an island loop always fail (R1: distance-only checks let
+    centres deep inside a loop through - the no-hf gouge)."""
     from engine.rough import island_clear_fn
     sq = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]
     f = island_clear_fn([sq], 2.0)
     out = f([(5.0, 5.0), (12.05, 5.0), (11.0, 5.0), (5.0, -1.9)])
     assert isinstance(out, list) and len(out) == 4
-    assert out == [True, True, False, False], out
+    assert out == [False, True, False, False], out   # (5,5) is inside: fail
+    # far outside passes
+    assert f([(20.0, 5.0)]) == [True]
     # empty island set -> everything clear
     g = island_clear_fn([], 2.0)
     assert all(g([(0.0, 0.0), (99.0, 99.0)]))
-    print("PASS island_clear_fn list semantics")
+    print("PASS island_clear_fn list semantics + containment")
+
+
+def test_allowance_violation_containment():
+    """R1: allowance_violation must flag centres INSIDE an island loop even
+    when they are far from the loop line (the original blind spot)."""
+    big = [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]]
+    v = allowance_violation([(50.0, 50.0)], [big], 3.0, 0.5)
+    assert v is not None and v[2] == 0.0, \
+        "centre inside island loop not flagged: %r" % (v,)
+    assert allowance_violation([(105.0, 50.0)], [big], 3.0, 0.5) is None
+    print("PASS allowance_violation containment")
+
+
+# ------------------------------------------- R1: rough without --hf is safe
+def _box_tris(x0, x1, y0, y1, z0, z1):
+    v = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+         (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
+    f = [(0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7),
+         (0, 1, 5), (0, 5, 4), (1, 2, 6), (1, 6, 5),
+         (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7)]
+    return [(v[a], v[b], v[c]) for a, b, c in f]
+
+
+def _write_stl(path, tris):
+    with open(path, "w") as fh:
+        fh.write("solid s\n")
+        for (p, q, r) in tris:
+            fh.write(" facet normal 0 0 0\n  outer loop\n")
+            for v in (p, q, r):
+                fh.write("   vertex %.4f %.4f %.4f\n" % v)
+            fh.write("  endloop\n endfacet\n")
+        fh.write("endsolid s\n")
+
+
+def test_rough_without_hf_safe():
+    """R1 supervisor bug: `rough` WITHOUT --hf gouged the part (no part
+    heightfield -> stock.part None -> every pz/min_rest clip and the
+    island punch-out silently degraded, and with the small feature's
+    waterline loop below min_perimeter the island post-check was blind).
+    Synthetic slab + small tall boss (loop perimeter < 20 mm): roughing
+    without hf must produce ZERO gouges under the engine's own drop-cutter
+    and output identical to passing --hf explicitly."""
+    if not HAVE_AREA:
+        print("SKIP test_rough_without_hf_safe (no area module)")
+        return
+    import tempfile
+    from opencamlib import ocl
+    from engine.rough import rough, build_part_hf
+    tris = _box_tris(-15.0, 15.0, -10.0, 10.0, 0.0, 8.0)
+    tris += _box_tris(-2.0, 2.0, -2.0, 2.0, 8.0, 20.0)
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "slab_boss.stl")
+        _write_stl(stl, tris)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        assert surf.size() == 24
+        stock_box = (-16.0, 16.0, -11.0, 11.0, 0.0, 21.0)
+        kw = dict(leave=0.381, axial_leave=0.381, stepdown=8.0, stepup=1.5,
+                  stl_path=stl, workers=None, threads=1, stock_cell=0.5)
+        moves_no, _ = rough(surf, stock_box, 3.175, 0.0, **kw)
+        sf = StockField(stock_box, cell=0.5)
+        hf = build_part_hf(surf, sf.x0, sf.y0, sf.cell, sf.nx, sf.ny,
+                           threads=1, drop_z=-1.0)
+        moves_hf, _ = rough(surf, stock_box, 3.175, 0.0,
+                            part_hf=(hf, sf.x0, sf.y0, sf.cell), **kw)
+        assert moves_no and len(moves_no) == len(moves_hf), \
+            "no-hf output differs in length from --hf output"
+        assert moves_no == moves_hf, "no-hf output differs from --hf output"
+        # gouge check with the engine's own drop-cutter (ocl), not verify/zmap
+        xs, ys, zs = [], [], []
+        prev = None
+        for mv in moves_no:
+            cur = (mv["x"], mv["y"], mv["z"])
+            if prev is not None and mv["g"] == 1:
+                n = max(1, int(math.dist(prev[:2], cur[:2]) / 0.5) + 1)
+                for t in range(1, n + 1):
+                    f = t / n
+                    xs.append(prev[0] + (cur[0] - prev[0]) * f)
+                    ys.append(prev[1] + (cur[1] - prev[1]) * f)
+                    zs.append(prev[2] + (cur[2] - prev[2]) * f)
+            prev = cur
+        cl = [None] * len(xs)
+        CH = 4000
+        for a in range(0, len(xs), CH):
+            bd = ocl.BatchDropCutter()
+            bd.setSTL(surf)
+            bd.setCutter(ocl.CylCutter(3.175, 50.0))
+            for i in range(a, min(a + CH, len(xs))):
+                bd.appendPoint(ocl.CLPoint(float(xs[i]), float(ys[i]), -50.0))
+            bd.run()
+            cl[a:a + CH] = [p.z for p in bd.getCLPoints()]
+        worst = max(c - z for c, z in zip(cl, zs))
+        assert worst <= 0.05, \
+            "no-hf roughing gouges %.3f mm below the part" % worst
+        print("PASS rough without hf: %d moves identical to --hf, "
+              "drop-cutter worst %.3f mm (no gouge)" % (len(moves_no), worst))
+
+
+# ------------------------------------------- R2: drop-cutter islands, clcheck
+TB_STL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      "out", "test_block.stl")
+TB_HF = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "out", "test_block_hf_0.5.npy")
+
+
+def test_rough_testblock_r2():
+    """R2 (safety-critical) on samples/test_block with James's cutting data:
+    * rough CLCHECK gate: actual-cutter drop-cutter on every cutting move
+      (sampled <= 0.1 mm) -> tip must stay >= CL + axial_leave - 0.005
+      (this also proves 0 gouges, axl 0 being the weaker check);
+    * the mandatory flat-floor level Z27 + leave = 27.381 is present and
+      runs, and the engine stock model shows that pocket floor ending
+      0.381 +- 0.02 mm high;
+    * regression for the fillet-meets-vertical-corner point (-17.56, 13.87)
+      where the old OCL-waterline islands let the level-29.906 path run
+      3.72 mm below CL: leave must be honoured there too."""
+    if not (HAVE_AREA and os.path.exists(TB_STL) and os.path.exists(TB_HF)):
+        print("SKIP test_rough_testblock_r2 (no area or out/test_block.*)")
+        return
+    import tempfile
+    import json as _json
+    import numpy as np
+    from opencamlib import ocl
+    from engine.rough import rough, actual_cutter
+    from engine.probe_rough_clcheck import clcheck_moves
+    surf = ocl.STLSurf()
+    ocl.STLReader(TB_STL, surf)
+    part = np.load(TB_HF)
+    with open(TB_HF[:-4] + ".json") as fh:
+        meta = _json.load(fh)
+    hx0, hy0, hcell = float(meta["x0"]), float(meta["y0"]), float(meta["cell"])
+    stock_box = (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0)
+    kw = dict(leave=0.381, axial_leave=0.381, stepdown=19.05, stepover=0.16,
+              stl_path=TB_STL, workers=None, threads=4, stock_cell=0.5,
+              final_zmin=20.381, part_hf=(part, hx0, hy0, hcell))
+    with tempfile.TemporaryDirectory() as td:
+        stock_out = os.path.join(td, "stock.npy")
+        moves, stats = rough(surf, stock_box, 6.343, 20.0,
+                            stock_out=stock_out, **kw)
+        assert moves, "no moves"
+        # 1. independent CLCHECK gate: 0 violations with leave, and the
+        # weaker axl=0 check proves zero gouges.
+        cutter = actual_cutter(6.343)
+        viol = clcheck_moves(surf, cutter, moves, 0.381, ss=0.1, tol=0.005)
+        assert not viol, "rough clcheck: %d violations, worst move %d at " \
+            "(%.2f, %.2f) Z=%.3f, %.3f mm below CL + axl" % (
+                len(viol), viol[0][0], viol[0][1], viol[0][2], viol[0][3],
+                viol[0][4])
+        gouge = clcheck_moves(surf, cutter, moves, 0.0, ss=0.1, tol=0.005)
+        assert not gouge, "gouges: %d samples below CL, worst move %d at " \
+            "(%.2f, %.2f) Z=%.3f, %.3f mm below CL" % (
+                len(gouge), gouge[0][0], gouge[0][1], gouge[0][2],
+                gouge[0][3], gouge[0][4])
+        # 2. mandatory Z27 pocket level present, ran, and floor ends 0.381
+        lvl27 = [l for l in stats["levels"] if l["z"] == 27.381]
+        assert lvl27 and not lvl27[0].get("skipped"), \
+            "Z27 pocket level 27.381 missing or skipped: %s" % stats["levels"]
+        assert 27.381 in [round(z, 3) for z in stats.get(
+            "mandatory_levels", [])], "27.381 not flagged mandatory"
+        st = np.load(stock_out)
+        with open(stock_out[:-4] + ".json") as fh:
+            sm = _json.load(fh)
+        sx0, sy0, scell = float(sm["x0"]), float(sm["y0"]), float(sm["cell"])
+        pj, pi = np.nonzero(np.abs(part - 27.0) < 0.01)
+        # plateau-27 cells the tool can actually reach at 27.381: no taller
+        # part (frame/boss > 27.01) within tool_r + leave + one cell, and
+        # >= tool_r + leave from the stock walls - there the floor must be
+        # flat at level Z; nearer the walls the corner band is rest material.
+        tall = (part > 27.01) & np.isfinite(part)
+        reach = int(math.ceil((6.343 + 0.381 + 0.5) / hcell))
+        offs = [(dj, di) for dj in range(-reach, reach + 1)
+                for di in range(-reach, reach + 1)
+                if (dj * dj + di * di) * hcell * hcell
+                <= (6.343 + 0.381 + 0.5) ** 2]
+        near_tall = np.zeros_like(tall)
+        for dj, di in offs:
+            js0, js1 = max(0, dj), min(part.shape[0], part.shape[0] + dj)
+            is0, is1 = max(0, di), min(part.shape[1], part.shape[1] + di)
+            near_tall[js0:js1, is0:is1] |= \
+                tall[js0 - dj:js1 - dj, is0 - di:is1 - di]
+        ok = []
+        for j, i in zip(pj, pi):
+            if near_tall[j, i]:
+                continue
+            x = hx0 + i * hcell
+            y = hy0 + j * hcell
+            if not (sx0 + 6.724 <= x <= sx0 + st.shape[1] * scell - 6.724
+                    and sy0 + 6.724 <= y <= sy0 + st.shape[0] * scell - 6.724):
+                continue
+            si = int(round((x - sx0) / scell))
+            sj = int(round((y - sy0) / scell))
+            if 0 <= si < st.shape[1] and 0 <= sj < st.shape[0]:
+                ok.append(st[sj, si])
+        assert ok, "no plateau-27 interior cells found"
+        med = float(np.median(ok))
+        assert abs(med - 27.381) <= 0.02, \
+            "Z27 pocket floor ends %.3f high (want 0.381 +- 0.02)" % (med - 27.0)
+        assert min(ok) >= 27.381 - 0.02, \
+            "Z27 pocket floor cut %.3f mm BELOW leave" % (27.381 - min(ok))
+        # 3. fillet-meets-vertical-corner regression at (-17.56, 13.87):
+        # the OLD waterline islands let the level-29.906 path put a cutter
+        # CENTRE there (G-code line 20741), tip 3.72 mm below the true CL
+        # (33.626). Now every horizontal cutting centre within 0.5 mm of
+        # that XY must have its tip >= CL(centre) + axial_leave - 0.005
+        # (and with CL ~33.6 here, that means no centre at all below 34.0).
+        rx, ry = -17.56, 13.87
+        pts_near = []
+        prev = None
+        for mv in moves:
+            cur = (mv["x"], mv["y"], mv["z"])
+            if prev is not None and mv["g"] == 1 and \
+                    abs(cur[2] - prev[2]) < 1e-9:   # horizontal cutting only
+                L = math.dist(prev[:2], cur[:2])
+                k = max(1, int(L / 0.1) + 1)
+                for t in range(1, k + 1):
+                    f = t / k
+                    px = prev[0] + (cur[0] - prev[0]) * f
+                    py = prev[1] + (cur[1] - prev[1]) * f
+                    if math.dist((px, py), (rx, ry)) <= 0.5:
+                        pts_near.append((px, py, cur[2]))
+            prev = cur
+        worst = -1e9
+        if pts_near:
+            bd = ocl.BatchDropCutter()
+            bd.setSTL(surf)
+            bd.setCutter(cutter)
+            for px, py, _z in pts_near:
+                bd.appendPoint(ocl.CLPoint(px, py, -50.0))
+            bd.run()
+            for p, (_px, _py, z) in zip(bd.getCLPoints(), pts_near):
+                worst = max(worst, float(p.z) + 0.381 - z)
+        assert worst <= 0.005, \
+            "leave violated near (-17.56, 13.87): %.3f mm below CL + axl " \
+            "(%d centres nearby)" % (worst, len(pts_near))
+        print("PASS rough test-block R2: %d moves, clcheck 0, floor Z27 "
+              "ends %.3f high, corner regression: %d centres near "
+              "(-17.56, 13.87), worst %.3f mm vs CL + axl"
+              % (len(moves), med - 27.0, len(pts_near), worst))
+
+
+def test_rough_testblock_r4():
+    """R4 (quality): pocket-corner reach on samples/test_block. In the four
+    R6 corner zones of the Z27 pocket (30x22 at centre (12,-2)) a
+    r 6.343 + 0.381 leave tool reaches everything except the crescent
+    between the R6 corner arc and the tool arc. On the engine's own stock
+    model every floor cell OUTSIDE the analytic crescent must end
+    0.381 +- 0.05 mm high, and the material that stays standing must be
+    ~the analytic crescent area (not the old margin-wide band)."""
+    if not (HAVE_AREA and os.path.exists(TB_STL) and os.path.exists(TB_HF)):
+        print("SKIP test_rough_testblock_r4 (no area or out/test_block.*)")
+        return
+    import tempfile
+    import json as _json
+    import numpy as np
+    from opencamlib import ocl
+    from engine.rough import rough
+    surf = ocl.STLSurf()
+    ocl.STLReader(TB_STL, surf)
+    part = np.load(TB_HF)
+    with open(TB_HF[:-4] + ".json") as fh:
+        meta = _json.load(fh)
+    hx0, hy0, hcell = float(meta["x0"]), float(meta["y0"]), float(meta["cell"])
+    stock_box = (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0)
+    kw = dict(leave=0.381, axial_leave=0.381, stepdown=19.05, stepover=0.16,
+              stl_path=TB_STL, workers=None, threads=4, stock_cell=0.5,
+              final_zmin=20.381, part_hf=(part, hx0, hy0, hcell))
+    with tempfile.TemporaryDirectory() as td:
+        stock_out = os.path.join(td, "stock.npy")
+        moves, stats = rough(surf, stock_box, 6.343, 20.0,
+                            stock_out=stock_out, **kw)
+        st = np.load(stock_out)
+        with open(stock_out[:-4] + ".json") as fh:
+            sm = _json.load(fh)
+        sx0, sy0, scell = float(sm["x0"]), float(sm["y0"]), float(sm["cell"])
+        X0, X1, Y0, Y1 = -3.0, 27.0, -13.0, 9.0     # pocket rect
+        Rc, r_t, lv = 6.0, 6.343, 0.381
+        R_eff = r_t + lv
+
+        def dist_wall(x, y):
+            d = np.minimum.reduce([x - X0, X1 - x, y - Y0, Y1 - y])
+            for cx, cy, sx, sy in ((X0 + Rc, Y0 + Rc, -1, -1),
+                                   (X1 - Rc, Y0 + Rc, 1, -1),
+                                   (X1 - Rc, Y1 - Rc, 1, 1),
+                                   (X0 + Rc, Y1 - Rc, -1, 1)):
+                m = ((x - cx) * sx > 0) & ((y - cy) * sy > 0)
+                d = np.where(m, np.minimum(d, Rc - np.hypot(x - cx, y - cy)), d)
+            return d
+
+        jj, ii = np.nonzero(np.isfinite(st))
+        sxx = sx0 + (ii + 0.5) * scell
+        syy = sy0 + (jj + 0.5) * scell
+        h = st[jj, ii] - 27.0
+
+        # analytic machinable set: legal centres C = {db >= R+leave+margin}.
+        # Since Rc(6) < R+leave(6.724) the centre set is a SHARP rectangle
+        # [X0+A, X1-A] x [Y0+A, Y1-A], A = R+leave+margin; a floor point is
+        # machinable iff its distance to that rectangle is <= r_t. Points at
+        # db >= leave but not machinable are the corner crescents.
+        # margin (0.05) is what the engine's HARD gates physically permit:
+        # the allowance post-check keeps every centre >= 0.025 mm outside the
+        # refined forbidden loop, refinement rounds the loop outward by a few
+        # microns and the ring's miter at the sharp centre-corner adds
+        # ~eps*(sqrt2-1). Cells whose only centres sit inside that band
+        # (reach margin < 0.05 mm at the R6 corners) count as crescent -
+        # cutting them would require weakening a safety gate.
+        ring_margin = 0.05
+        A = R_eff + ring_margin
+
+        def machinable(px, py):
+            dx = np.maximum(np.maximum(X0 + A - px, px - (X1 - A)), 0.0)
+            dy = np.maximum(np.maximum(Y0 + A - py, py - (Y1 - A)), 0.0)
+            return np.hypot(dx, dy) <= r_t
+
+        inside = (sxx > X0) & (sxx < X1) & (syy > Y0) & (syy < Y1)
+        reach = inside & machinable(sxx, syy)
+        bad_hi = reach & (h > 0.381 + 0.05)
+        bad_lo = reach & (h < 0.381 - 0.05)
+        # crescent area on a fine grid (margin-aware, matches what any legal
+        # program can reach); ideal crescent uses margin 0 (centres exactly
+        # at tool_r + leave from the walls).
+        hq = 0.05
+        gx = np.arange(X0 + hq / 2, X1, hq)
+        gy = np.arange(Y0 + hq / 2, Y1, hq)
+        GX, GY = np.meshgrid(gx, gy)
+        dG = dist_wall(GX, GY)
+        inQ = (GX > X0) & (GX < X1) & (GY > Y0) & (GY < Y1)
+        cres_mm2 = float((inQ & ~machinable(GX, GY)).sum()) * hq * hq
+
+        def mach_ideal(px, py):
+            dx = np.maximum(np.maximum(X0 + R_eff - px, px - (X1 - R_eff)),
+                           0.0)
+            dy = np.maximum(np.maximum(Y0 + R_eff - py, py - (Y1 - R_eff)),
+                           0.0)
+            return np.hypot(dx, dy) <= r_t
+
+        cres_ideal = float((inQ & ~mach_ideal(GX, GY)).sum()) * hq * hq
+        left_mm2 = float((~reach & inside & (h > 0.381 + 0.05)).sum()) \
+            * scell * scell
+        # corner zone report (8x8 squares at the pocket corners)
+        rep = []
+        for ax0, ay0 in ((X0, Y0), (X1 - 8, Y0), (X0, Y1 - 8),
+                         (X1 - 8, Y1 - 8)):
+            zc = inside & (sxx >= ax0) & (sxx <= ax0 + 8) \
+                & (syy >= ay0) & (syy <= ay0 + 8)
+            rep.append("%.1f" % float((zc & ~reach).sum()) )
+        assert not bad_hi.any(), \
+            "%d pocket-floor cells outside the crescent end %.3f mm high " \
+            "(want <= 0.431), worst at (%.2f, %.2f)" % (
+                int(bad_hi.sum()), h[bad_hi].max(),
+                sxx[bad_hi][int(np.argmax(h[bad_hi]))],
+                syy[bad_hi][int(np.argmax(h[bad_hi]))])
+        assert not bad_lo.any(), \
+            "%d pocket-floor cells cut below axial leave (min %.3f)" % (
+                int(bad_lo.sum()), h[bad_lo].min())
+        assert abs(left_mm2 - cres_mm2) <= 0.15 * cres_mm2, \
+            "leftover %.1f mm2 vs analytic crescent %.1f mm2" % (
+                left_mm2, cres_mm2)
+        print("PASS rough test-block R4: %d floor cells outside the crescent "
+              "all end 0.381 +- 0.05 mm; leftover %.1f mm2 vs crescent %.1f "
+              "mm2 (ideal %.1f); corner-zone rest cells [BL BR TL TR] = %s"
+              % (int(reach.sum()), left_mm2, cres_mm2, cres_ideal, rep))
+
+
+def _pocket_block_stl(path, half=14.0, ztop=8.0, pk_half=8.0, pk_floor=4.0):
+    """ASCII STL: block +-half x, +-half y, 0..ztop with an open-top square
+    pocket +-pk_half down to pk_floor (28 triangles, synth_pocket shape)."""
+    h, t, w, f = half, ztop, pk_half, pk_floor
+
+    def quad(a, b, c, d):
+        return [(a, b, c), (a, c, d)]
+
+    tris = []
+    tris += quad((-h, -h, 0), (-h, h, 0), (h, h, 0), (h, -h, 0))       # bottom
+    tris += quad((h, -h, 0), (h, h, 0), (h, h, t), (h, -h, t))         # +X wall
+    tris += quad((-h, -h, 0), (-h, -h, t), (-h, h, t), (-h, h, 0))     # -X wall
+    tris += quad((-h, h, 0), (-h, h, t), (h, h, t), (h, h, 0))         # +Y wall
+    tris += quad((-h, -h, 0), (-h, -h, t), (h, -h, t), (h, -h, 0))     # -Y wall
+    # top ring z=t between +-h and +-w, split into four trapezoids
+    tris += quad((-h, -h, t), (h, -h, t), (w, -w, t), (-w, -w, t))
+    tris += quad((h, -h, t), (h, h, t), (w, w, t), (w, -w, t))
+    tris += quad((h, h, t), (-h, h, t), (-w, w, t), (w, w, t))
+    tris += quad((-h, h, t), (-h, -h, t), (-w, -w, t), (-w, w, t))
+    tris += quad((-w, -w, f), (w, -w, f), (w, w, f), (-w, w, f))       # floor
+    # pocket walls
+    tris += quad((w, -w, f), (w, w, f), (w, w, t), (w, -w, t))
+    tris += quad((-w, -w, f), (-w, -w, t), (-w, w, t), (-w, w, f))
+    tris += quad((-w, w, f), (w, w, f), (w, w, t), (-w, w, t))
+    tris += quad((-w, -w, f), (-w, -w, t), (w, -w, t), (w, -w, f))
+    with open(path, "w") as fh:
+        fh.write("solid pocket_block\n")
+        for a, b, c in tris:
+            fh.write(" facet normal 0 0 0\n  outer loop\n")
+            for p in (a, b, c):
+                fh.write("   vertex %.4f %.4f %.4f\n" % p)
+            fh.write("  endloop\n endfacet\n")
+        fh.write("endsolid pocket_block\n")
+    return path
+
+
+def test_islands_grid_edge_parity():
+    """R3 regression: when the forbidden region F reaches the CL grid border
+    (grid does not cover the outer CL jump), level_islands must still EXCLUDE
+    cutter centres next to the pocket walls - silently dropping the open
+    circuit flipped even-odd parity and admitted them (synth_pocket failure:
+    centre at (-6.4, 23.508), 0.39 mm from the wall, at Z=4.381)."""
+    if not HAVE_AREA:
+        print("SKIP islands_grid_edge_parity (no area)")
+        return
+    import tempfile
+    import numpy as np
+    from opencamlib import ocl
+    from engine.rough import big_cutter, cl_island_grid, level_islands, \
+        _inside_loops
+    with tempfile.TemporaryDirectory() as td:
+        stl = _pocket_block_stl(os.path.join(td, "pb.stl"),
+                                half=14.0, ztop=8.0, pk_half=8.0, pk_floor=4.0)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        assert surf.size() >= 24, "pocket-block STL too small: %d" \
+            % surf.size()
+        cbig = big_cutter(3.0, 0.381)
+        # clipped grid: F's outer border (pk_half + R = 11.381) is outside
+        gxs, gys, Zg = cl_island_grid(surf, cbig, -10.0, -10.0, 10.0, 10.0,
+                                      0.5)
+        isl, Fm = level_islands(surf, cbig, Zg, gxs, gys, 4.381, 0.381)
+        assert isl, "no islands although F touches the clipped grid border"
+        P = np.array([[0.0, 0.0], [0.0, 6.0], [-6.4, 7.5]])
+        ins = _inside_loops(P, isl)
+        assert not ins[0], "pocket centre wrongly forbidden (parity inverted)"
+        assert ins[1:].all(), \
+            "centres 2 mm from the pocket wall admitted at clipped-grid edge"
+        # unclipped grid: F closes inside (outer jump at 14 + R = 17.381),
+        # no fence, parity unchanged
+        gxs, gys, Zg = cl_island_grid(surf, cbig, -18.0, -18.0, 18.0, 18.0,
+                                      0.5)
+        isl2, Fm2 = level_islands(surf, cbig, Zg, gxs, gys, 4.381, 0.381)
+        assert len(isl2) == 2, "unclipped islands: %d loops" % len(isl2)
+        ins = _inside_loops(P, isl2)
+        assert (not ins[0]) and ins[1:].all(), "unclipped parity wrong"
+        print("PASS islands grid-edge parity: clipped %d loops, unclipped "
+              "%d loops" % (len(isl), len(isl2)))
+
+
+def _check_pocket_block(pkl, label):
+    """rough() end-to-end on a pocket-in-block: no backstop/clcheck violation
+    (rough raises on any) and every horizontal cutting centre below the block
+    top sits >= tool_r + leave - 0.02 from the pocket walls."""
+    import numpy as np
+    import tempfile
+    from opencamlib import ocl
+    from engine.rough import rough, actual_cutter
+    from engine.probe_rough_clcheck import clcheck_moves
+    tool_r, leave = 3.0, 0.381
+    req = tool_r + leave - 0.02
+    with tempfile.TemporaryDirectory() as td:
+        stl = _pocket_block_stl(os.path.join(td, "pb.stl"), half=14.0,
+                                ztop=8.0, pk_half=pkl, pk_floor=4.0)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        box = (-14.2, 14.2, -14.2, 14.2, -1.0, 8.4)
+        moves, stats = rough(surf, box, tool_r, 4.0, leave=leave,
+                            axial_leave=leave, stepdown=4.0, stepup=1.905,
+                            stepover=2.0 / 6.0, tolerance=0.05, threads=4,
+                            stock_cell=0.5, min_rest=0.5, corner_r=0.0)
+        assert moves or label == "narrow", "no moves (%s)" % label
+        if not moves:
+            return 0, stats
+        bad = clcheck_moves(surf, actual_cutter(tool_r), moves, leave,
+                            ss=0.1, tol=0.005)
+        assert not bad, "%s clcheck: %d violations, worst move %d at " \
+            "(%.2f, %.2f) Z=%.3f" % (label, len(bad), bad[0][0], bad[0][1],
+                                     bad[0][2], bad[0][3])
+        prev = None
+        n_below = 0
+        for mv in moves:
+            cur = (mv["x"], mv["y"], mv["z"])
+            if prev is not None and mv["g"] == 1 and \
+                    abs(cur[2] - prev[2]) < 1e-9 and cur[2] < 8.0 - 0.02:
+                L = math.dist(prev[:2], cur[:2])
+                k = max(1, int(L / 0.1) + 1)
+                for t in range(1, k + 1):
+                    f = t / k
+                    px = prev[0] + (cur[0] - prev[0]) * f
+                    py = prev[1] + (cur[1] - prev[1]) * f
+                    n_below += 1
+                    assert pkl - max(abs(px), abs(py)) >= req, \
+                        "%s: centre (%.3f, %.3f) at Z=%.3f is %.3f mm from " \
+                        "the pocket wall, need >= %.3f" % (
+                            label, px, py, cur[2],
+                            pkl - max(abs(px), abs(py)), req)
+            prev = cur
+        return n_below, stats
+
+
+def test_rough_pocket_in_block():
+    """R3: synthetic pocket-in-block, wide and narrow pocket.
+    Wide (16 mm): the floor level runs and every cutter centre below the
+    block top keeps >= tool_r + leave from the pocket walls.
+    Narrow (5 mm < tool + 2x leave): the tool can never enter - no cutting
+    centres below the block top at all, and nothing raises the backstop."""
+    if not HAVE_AREA:
+        print("SKIP rough_pocket_in_block (no area)")
+        return
+    n_wide, stats_w = _check_pocket_block(8.0, "wide")
+    assert n_wide > 0, "wide pocket: no cutting below the block top"
+    floor_lvl = [l for l in stats_w["levels"] if l["z"] == 4.381]
+    assert floor_lvl and not floor_lvl[0].get("skipped"), \
+        "wide pocket floor level 4.381 skipped: %s" % stats_w["levels"]
+    n_narrow, _ = _check_pocket_block(2.5, "narrow")
+    assert n_narrow == 0, \
+        "narrow pocket admitted %d centres below the block top" % n_narrow
+    print("PASS rough pocket-in-block: wide %d sub-top centre samples, "
+          "narrow 0 (tool never enters)" % n_wide)
+
+
+def test_rough_synth_pocket_repro():
+    """R3 supervisor repro: connector/testdata/synth_pocket.step with James's
+    data must produce a program with 0 hf-backstop / clcheck violations (the
+    R2 islands admitted (-6.400, 23.508) at Z=4.381, 7.619 mm below the
+    part hf)."""
+    step = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "connector", "testdata",
+        "synth_pocket.step")
+    if not (HAVE_AREA and os.path.exists(step)):
+        print("SKIP rough_synth_pocket_repro (no area or synth_pocket.step)")
+        return
+    import tempfile
+    from opencamlib import ocl
+    from engine import model
+    from engine.rough import rough, actual_cutter
+    from engine.probe_rough_clcheck import clcheck_moves
+    stl = model.step_to_stl(step)
+    surf = ocl.STLSurf()
+    ocl.STLReader(stl, surf)
+    with tempfile.TemporaryDirectory() as td:
+        moves, stats = rough(surf, (-31.0, 31.0, -31.0, 31.0, -1.0, 12.4),
+                            3.0, 3.0, leave=0.381, axial_leave=0.381,
+                            stepdown=4.0, stepup=1.905, stepover=2.0 / 6.0,
+                            tolerance=0.05, threads=4, stock_cell=0.5,
+                            min_rest=0.5, corner_r=0.0, stl_path=stl,
+                            stock_out=os.path.join(td, "stock.npy"))
+        assert moves, "no moves"
+        bad = clcheck_moves(surf, actual_cutter(3.0), moves, 0.381, ss=0.1,
+                           tol=0.005)
+        assert not bad, "synth_pocket clcheck: %d violations, worst move %d " \
+            "at (%.2f, %.2f) Z=%.3f" % (len(bad), bad[0][0], bad[0][1],
+                                        bad[0][2], bad[0][3])
+        assert stats.get("clcheck_violations", 0) == 0
+        # R5: no rapid may pass through uncut stock (engine's own model)
+        n_bad, worst = _rapids_clear_stock(moves, os.path.join(td, "stock.npy"),
+                                           3.0, 1.0)
+        assert n_bad == 0, "synth_pocket rapids through stock: %d, worst %s" \
+            % (n_bad, worst)
+        assert stats.get("n_rapid_bumps", 0) > 0, \
+            "no rapid heights were lifted by the live-stock check - the " \
+            "R5 verification never engaged"
+    print("PASS rough synth_pocket repro: %d moves, backstop + clcheck 0, "
+          "rapids clear live stock (%d lifted)" % (len(moves), stats.get(
+              "n_rapid_bumps", 0)))
+
+
+def _rapids_clear_stock(moves, stock_npy, tool_r, margin=1.0, pad=1.0):
+    """R5 check with the ENGINE's own stock model (verify/zmap.py is NOT
+    used): every G0 must sit >= margin above max(stock top within
+    tool_r + pad of the swept path) in the final stock heightfield that
+    rough() exported (--stock-out). The final model is a LOWER bound on the
+    live model at emit time (stock only shrinks), so a violation here means
+    the rapid definitely passed through material that was never cut.
+    Returns (n_violations, worst_desc)."""
+    import json
+    import numpy as np
+    A = np.load(stock_npy)
+    with open(os.path.splitext(stock_npy)[0] + ".json") as fh:
+        meta = json.load(fh)
+    x0, y0, cell = meta["x0"], meta["y0"], meta["cell"]
+    ny, nx = A.shape
+    xs = x0 + (np.arange(nx) + 0.5) * cell
+    ys = y0 + (np.arange(ny) + 0.5) * cell
+    R = tool_r + pad
+    k = int(math.ceil(R / cell))
+    prev = (moves[0]["x"], moves[0]["y"], moves[0]["z"])
+    n_bad = 0
+    worst = None
+    for mv in moves:
+        cur = (mv.get("x", prev[0]), mv.get("y", prev[1]), mv.get("z", prev[2]))
+        if mv["g"] == 0:
+            L = math.hypot(cur[0] - prev[0], cur[1] - prev[1])
+            n = max(1, int(L / (0.5 * cell)) + 1)
+            for t in range(1, n + 1):          # skip start: validated before
+                sx = prev[0] + (cur[0] - prev[0]) * t / n
+                sy = prev[1] + (cur[1] - prev[1]) * t / n
+                i0 = int(math.floor((sx - x0) / cell))
+                j0 = int(math.floor((sy - y0) / cell))
+                ilo, ihi = max(0, i0 - k), min(nx, i0 + k + 1)
+                jlo, jhi = max(0, j0 - k), min(ny, j0 + k + 1)
+                if ilo >= ihi or jlo >= jhi:
+                    continue                   # outside tracked grid
+                win = A[jlo:jhi, ilo:ihi]
+                d = np.hypot(xs[ilo:ihi][None, :] - sx,
+                            ys[jlo:jhi][:, None] - sy)
+                m = (d <= R) & np.isfinite(win)
+                if not m.any():
+                    continue
+                mx = float(win[m].max())
+                if cur[2] < mx + margin - 1e-3:
+                    n_bad += 1
+                    desc = ("(%s) (%.3f, %.3f) Z%.3f over stock %.3f"
+                          % (mv.get("line", "?"), sx, sy, cur[2], mx))
+                    if worst is None or (mx + margin - cur[2]) > worst[1]:
+                        worst = (desc, mx + margin - cur[2])
+        prev = cur
+    return n_bad, (worst[0] if worst else None)
+
+
+def _two_level_stl(path, half=14.0, z_hi=8.0, z_lo=5.0):
+    """ASCII STL: block +-half x, +-half y, 0..z_hi with the half y<0 milled
+    down to a shelf at z_lo (single step wall at y=0) - two machining
+    levels, so roughing links must climb over the step."""
+    h, t, s = half, z_hi, z_lo
+
+    def quad(a, b, c, d):
+        return [(a, b, c), (a, c, d)]
+
+    tris = []
+    tris += quad((-h, -h, 0), (-h, h, 0), (h, h, 0), (h, -h, 0))   # bottom
+    tris += quad((h, -h, 0), (h, h, 0), (h, h, t), (h, -h, t))     # +X wall
+    tris += quad((-h, -h, 0), (-h, -h, t), (-h, h, t), (-h, h, 0))  # -X wall
+    tris += quad((-h, h, 0), (-h, h, t), (h, h, t), (h, h, 0))     # +Y wall
+    tris += quad((-h, -h, 0), (-h, -h, s), (h, -h, s), (h, -h, 0))  # -Y wall
+    tris += quad((-h, -h, s), (-h, 0, s), (h, 0, s), (h, -h, s))   # shelf
+    tris += quad((-h, 0, s), (-h, h, t), (h, h, t), (h, 0, s))      # top
+    tris += quad((-h, 0, s), (-h, 0, t), (-h, h, t), (-h, h, s))    # -X step
+    tris += quad((h, 0, s), (h, 0, t), (h, h, t), (h, h, s))        # +X step
+    tris += quad((-h, 0, s), (-h, 0, t), (h, 0, t), (h, 0, s))      # step
+    with open(path, "w") as fh:
+        fh.write("solid two_level\n")
+        for a, b, c in tris:
+            fh.write(" facet normal 0 0 0\n  outer loop\n")
+            for p in (a, b, c):
+                fh.write("   vertex %.4f %.4f %.4f\n" % p)
+            fh.write("  endloop\n endfacet\n")
+        fh.write("endsolid two_level\n")
+    return path
+
+
+def test_rough_rapids_clear_stock():
+    """R5: roughing rapids must clear the LIVE stock. Two-level synthetic
+    part (shelf 5 / top 8): the step stands above the lower level's lift
+    plane, so straight-over-it traverses must be lifted to a verified
+    height; no G0 may sit within margin of uncut stock (engine's own
+    --stock-out heightfield as the check, no verify/zmap import)."""
+    if not HAVE_AREA:
+        print("SKIP rough_rapids_clear_stock (no area)")
+        return
+    import tempfile
+    from opencamlib import ocl
+    from engine.rough import rough, actual_cutter
+    from engine.probe_rough_clcheck import clcheck_moves
+    with tempfile.TemporaryDirectory() as td:
+        stl = _two_level_stl(os.path.join(td, "two_level.stl"))
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        moves, stats = rough(surf, (-14.2, 14.2, -14.2, 14.2, -1.0, 8.0),
+                            3.0, 5.0, leave=0.381, axial_leave=0.381,
+                            stepdown=4.0, stepup=1.905, stepover=2.0 / 6.0,
+                            tolerance=0.05, threads=4, stock_cell=0.5,
+                            min_rest=0.5, corner_r=0.0, stl_path=stl,
+                            stock_out=os.path.join(td, "stock.npy"))
+        assert moves, "no moves"
+        bad = clcheck_moves(surf, actual_cutter(3.0), moves, 0.381, ss=0.1,
+                           tol=0.005)
+        assert not bad, "two-level clcheck: %d violations, worst move %d" % (
+            len(bad), bad[0][0] if bad else -1)
+        assert stats.get("n_rapid_bumps", 0) > 0, \
+            "step-up/lift rapids never verified against the step - no " \
+            "height was lifted"
+        n_bad, worst = _rapids_clear_stock(moves, os.path.join(td, "stock.npy"),
+                                           3.0, 1.0)
+        assert n_bad == 0, "two-level rapids through stock: %d, worst %s" \
+            % (n_bad, worst)
+    print("PASS rough rapids clear stock: two-level %d moves, %d rapids "
+          "lifted to verified heights" % (len(moves), stats["n_rapid_bumps"]))
 
 
 def _main():
@@ -318,7 +1006,12 @@ def _main():
                test_decimate, test_gcode_emit,
                test_stock_mill_and_region, test_stock_bull_footprint,
                test_stock_contours, test_stock_links_and_stepups,
-               test_island_clear_fn):
+               test_island_clear_fn, test_allowance_violation_containment,
+               test_rough_without_hf_safe, test_rough_testblock_r2,
+               test_rough_testblock_r4,
+               test_islands_grid_edge_parity, test_rough_pocket_in_block,
+               test_rough_synth_pocket_repro, test_rough_rapids_clear_stock,
+               test_stl_cache_keyed_by_content):
         try:
             fn()
         except AssertionError as e:
@@ -326,6 +1019,30 @@ def _main():
             print("FAIL %s: %s" % (fn.__name__, e))
     print("%d failure(s)" % fails)
     return 1 if fails else 0
+
+
+
+def test_stl_cache_keyed_by_content():
+    """Two different STEP files with the same name must never share a cached STL
+    (connector runs all name their part model.step)."""
+    import tempfile, shutil
+    from engine import model
+    here = os.path.dirname(os.path.abspath(__file__))
+    a = os.path.join(here, "testdata_synth_pocket.step")
+    b = os.path.join(os.path.dirname(here), "samples", "test_block.step")
+    if not (os.path.exists(a) and os.path.exists(b)):
+        print("SKIP stl cache test (sample STEPs missing)")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "out")
+        for src, sub in ((a, "r1"), (b, "r2")):
+            os.makedirs(os.path.join(td, sub))
+            shutil.copy(src, os.path.join(td, sub, "model.step"))
+        s1 = model.step_to_stl(os.path.join(td, "r1", "model.step"), out_dir=out)
+        s2 = model.step_to_stl(os.path.join(td, "r2", "model.step"), out_dir=out)
+        assert s1 != s2, "same-name different-content STEPs shared a cached STL"
+        assert model.step_to_stl(os.path.join(td, "r1", "model.step"), out_dir=out) == s1
+    print("PASS stl cache keyed by content")
 
 
 if __name__ == "__main__":

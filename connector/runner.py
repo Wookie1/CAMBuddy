@@ -22,7 +22,7 @@ class EngineError(Exception):
 
 def _check_zmap_gates(check):
     """Raise EngineError if any zmap gate fails: gouges, rapid collisions,
-    or shank/over-flute hits > 0."""
+    shank/over-flute hits > 0, or holder hits > 0 (S5)."""
     gouges = check.get("gouges", {})
     if isinstance(gouges, dict) and gouges.get("count", 0) > 0:
         raise EngineError(
@@ -38,6 +38,13 @@ def _check_zmap_gates(check):
         raise EngineError(
             "zmap gate: %d over-flute/shank hits (max %.3f mm)"
             % (of["count"], of.get("max_depth", 0.0)))
+    hh = check.get("holder_hits")
+    if isinstance(hh, dict) and hh.get("count", 0) > 0:
+        raise EngineError(
+            "zmap gate: %d holder hits (max intrusion %.3f mm, first line "
+            "%s) - the holder cannot keep 1.0 mm clearance"
+            % (hh["count"], hh.get("max_intrusion", 0.0),
+               hh.get("first_line", "?")))
 
 
 def _tool_number(cfg, values):
@@ -187,6 +194,7 @@ class EngineRun:
                     "--stock", *[("%.4f" % v) for v in stock],
                     "--flute", "%.1f" % values["flute_length"],
                     "--optimal-load", "%.4f" % values["optimal_load"],
+                    "--tool-number", str(_tool_number(self.cfg, values)),
                     "--out-json", check_path, "--png", png_path],
                    0.88, 0.95, on_progress)
         with open(check_path) as fh:
@@ -201,6 +209,7 @@ class EngineRun:
             "zmap_gouges": check["gouges"],
             "rapid_collisions": check["rapid_collisions"],
             "over_flute": check["over_flute"],
+            "holder_hits": check.get("holder_hits"),
             "leftover": {
                 "mean_mm": check["leftover"]["mean"],
                 "p95_mm": check["leftover"]["p95"],
@@ -369,6 +378,7 @@ class EngineRun:
                     "--stock", *[("%.4f" % v) for v in stock],
                     "--flute", "%.1f" % values["rough_flute_length"],
                     "--optimal-load", "%.4f" % values["rough_optimal_load"],
+                    "--tool-number", str(rough_number),
                     "--out-json", check_rough,
                     "--stock-out", stock_out], 0.80, 0.90, on_progress)
         check_finish = os.path.join(self.work, "check_finish.json")
@@ -383,6 +393,7 @@ class EngineRun:
                     "--corner", "%.4f" % (values["tool_diameter"] / 2.0),
                     "--stock-in", stock_out,
                     "--engage-max", "%.4f" % (1.5 * values["stepover"]),
+                    "--tool-number", str(finish_number),
                     "--out-json", check_finish, "--png", png_path],
                    0.90, 0.97, on_progress)
         with open(check_rough) as fh:
@@ -453,6 +464,7 @@ class EngineRun:
                                 values["rough_corner_radius"],
                             "number": rough_number},
                     "over_flute": check_r["over_flute"],
+                    "holder_hits": check_r.get("holder_hits"),
                 },
                 "finish": {
                     "file": "finish.nc",

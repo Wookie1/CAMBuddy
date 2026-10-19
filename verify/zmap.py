@@ -17,6 +17,49 @@ WORD_RE = re.compile(r"([A-Za-z])\s*([-+]?[0-9]*\.?[0-9]+)")
 GOUGE_TOL = 0.02  # mm below part surface before a cell counts as gouged
 REMOVE_EPS = 1e-9  # mm^3 of removal below which a sample counts as air
 RAPID_FEED = 15000.0  # mm/min assumed for G0 when estimating cycle time
+HOLDER_CLEAR = 1.0  # mm, S5: min clearance of the holder stack to material
+TOOLS_JSON = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "tools", "x7_tools.json")
+
+
+def resolve_holder(tool_number=None, holder=None, stickout=None, path=None):
+    """S5: resolve a holder frustum stack + stick-out (independent of the
+    engine: reads tools/x7_tools.json only). Explicit `holder` requires
+    `stickout`; otherwise the tool table entry with "number" == tool_number
+    supplies both ("holder" + "stickout_mm"). Segments are
+    [z_lo, z_hi, r_lo, r_hi] mm above the holder nose (nose at tool tip +
+    stick-out). Returns (segments, stickout_mm) or None when no holder
+    geometry applies (no args, tool not in the table, or the entry has no
+    holder/stick-out). Raises ValueError for an unknown holder name or a
+    holder without any stick-out. Returns (segments, stickout_mm, name)."""
+    if holder is None and tool_number is None:
+        return None
+    p = path or TOOLS_JSON
+    try:
+        with open(p) as fh:
+            data = json.load(fh)
+    except (IOError, OSError, ValueError):
+        return None
+    if holder is None:
+        e = next((t for t in data.get("tools", [])
+                  if t.get("number") == int(tool_number)), None)
+        if e is None or not e.get("holder") or e.get("stickout_mm") is None:
+            return None
+        holder = e["holder"]
+        if stickout is None:
+            stickout = float(e["stickout_mm"])
+        h = data.get("holders", {}).get(holder)
+        if not isinstance(h, dict) or not h.get("segments"):
+            return None  # table names a holder without geometry (e.g. the
+                        # ER32 collet chuck): check off, not an error
+    else:
+        if stickout is None:
+            raise ValueError("--holder %r given without --stickout" % holder)
+        h = data.get("holders", {}).get(holder)
+        if not isinstance(h, dict) or not h.get("segments"):
+            raise ValueError("holder %r has no segments in %s" % (holder, p))
+    return [[float(v) for v in s] for s in h["segments"]], float(stickout), \
+        holder
 
 
 # --------------------------------------------------------------------------
@@ -566,10 +609,22 @@ def apply_cutter_comp(moves, radius):
     return out
 
 
+def _box_max_np(A, k):
+    """Max filter over a (2k+1) square window per axis (non-finite = -inf);
+    conservative superset of a disc-radius footprint max (numpy only)."""
+    m = np.where(np.isfinite(A), A, -np.inf).astype(float)
+    for _ in range(k):
+        m[1:, :] = np.maximum(m[1:, :], m[:-1, :])
+        m[:-1, :] = np.maximum(m[:-1, :], m[1:, :])
+        m[:, 1:] = np.maximum(m[:, 1:], m[:, :-1])
+        m[:, :-1] = np.maximum(m[:, 1:], m[:, :-1])
+    return m
+
+
 def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
              corner=0.0, stock_init=None, window=None, rapid_feed=RAPID_FEED,
-             start=None, flute=None, shank_dia=None, engage_max=None,
-             ramp_angle=3.0):
+             start=None, flute=None, shank_dia=None, holder=None,
+             stickout=None, engage_max=None, ramp_angle=3.0):
     """Run the toolpath over a stock heightfield.
 
     part      : (ny, nx) array of part top-Z heights
@@ -605,6 +660,18 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     ramp_angle: ramp/helix angle threshold in degrees (default 3.0). A plunge
                 (vertical feed into stock) is NOT flagged if it is a helix or
                 ramp at or below this angle.
+    holder    : optional S5 holder frustum stack [[z_lo, z_hi, r_lo, r_hi],
+                ...] mm above the holder nose (see resolve_holder). When given
+                with stickout, every CUTTING sample checks the conservative
+                holder envelope: a cylinder of radius max(segment radii) +
+                HOLDER_CLEAR (1.0 mm) around the sample centre, from the nose
+                at tip + stickout upward (the stack is contiguous from
+                z_lo = 0, so material reaching above the nose inside the
+                envelope can come within 1.0 mm of some frustum surface). HIT
+                if max(current stock, part) inside that envelope stands above
+                the nose. Reported as holder_hits: count of cutting moves with
+                a hit, max intrusion mm above the nose, worst xy, first line.
+    stickout  : holder nose distance above the tool tip mm (with holder).
     Returns dict with 'stock' array and report fields.
     """
     sxmin, sxmax, symin, symax, szmin, szmax = stock_box
@@ -635,6 +702,18 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     shank_on = flute is not None
     Rs = (shank_dia if shank_dia else dia) / 2.0
     ks = int(math.ceil(Rs / cell)) + 1 if shank_on else k
+    # S5 holder check: conservative envelope cylinder (max segment radius +
+    # HOLDER_CLEAR) from the nose at tip + stick-out upward; Bstat is a
+    # static upper bound of max(stock, part) per neighbourhood (cutting only
+    # lowers the stock), so samples whose bound stays at/below the nose skip
+    # the window entirely.
+    holder_on = holder is not None and stickout is not None
+    if holder_on:
+        Rh = max(max(s[2], s[3]) for s in holder) + HOLDER_CLEAR
+        kH = int(math.ceil(Rh / cell))
+        Bstat = _box_max_np(
+            np.maximum(np.where(np.isfinite(stock), stock, -np.inf), part),
+            kH)
 
     if window is not None:
         # samples only matter within tool reach of the window; dilate once so
@@ -684,6 +763,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     first_shank_line = None
     shank_depth = 0.0
     shank_worst_xy = None
+    holder_hits = 0
+    first_holder_line = None
+    holder_intrusion = 0.0
+    holder_worst_xy = None
     zbands = {}
     comp_moves = 0
     comp_first_line = None
@@ -717,6 +800,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         move_collided = False
         move_over_flute = False
         move_shank = False
+        move_holder = False
         move_max_engage = 0.0
         # travel direction for engagement (perpendicular chord width)
         dx_t = x1 - cur[0]
@@ -785,6 +869,41 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                                                      cand.shape)
                             shank_worst_xy = [float(xs[slo + ti]),
                                             float(ys[tlo + tj])]
+            if cutting and holder_on:
+                # S5: material within the holder envelope (radius max_r + 1 mm)
+                # standing above the nose at tip + stick-out -> the holder stack
+                # cannot keep its 1.0 mm clearance
+                nose = sz + stickout
+                ioc = min(max(i0, 0), nx - 1)
+                joc = min(max(j0, 0), ny - 1)
+                if float(Bstat[joc, ioc]) > nose:
+                    slo, shi = max(0, i0 - kH), min(nx, i0 + kH + 1)
+                    tlo, thi = max(0, j0 - kH), min(ny, j0 + kH + 1)
+                    if slo < shi and tlo < thi:
+                        dsg = np.meshgrid(xs[slo:shi] - sx, ys[tlo:thi] - sy)
+                        dd = np.hypot(dsg[0], dsg[1])
+                        dH = dd <= Rh
+                        mat = np.maximum(
+                            np.where(np.isfinite(stock[tlo:thi, slo:shi]),
+                                   stock[tlo:thi, slo:shi], -np.inf),
+                            part[tlo:thi, slo:shi])
+                        vH = np.where(dH, mat, -np.inf)
+                        vtop = float(vH.max())
+                        if vtop > nose:
+                            move_holder = True
+                            intr = vtop - nose
+                            if intr > holder_intrusion:
+                                holder_intrusion = intr
+                                # among cells at the max height, report the one
+                                # whose PART is that high and closest to centre
+                                psl = part[tlo:thi, slo:shi]
+                                cand = dd + np.where(psl >= vtop - 1e-9,
+                                                   0.0, 1e6)
+                                cand = np.where(vH >= vtop - 1e-9, cand, np.inf)
+                                tj, ti = np.unravel_index(int(np.argmin(cand)),
+                                                        cand.shape)
+                                holder_worst_xy = [float(xs[slo + ti]),
+                                                float(ys[tlo + tj])]
             ilo, ihi = max(0, i0 - k), min(nx, i0 + k + 1)
             jlo, jhi = max(0, j0 - k), min(ny, j0 + k + 1)
             if ilo >= ihi or jlo >= jhi:
@@ -812,12 +931,11 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 # tip. The radius is padded by half a cell diagonal so that
                 # slivers of cells clipped by the disk edge still count (the
                 # cell-center mask alone would report false air while cutting).
+                # Must use msk_e-filtered max so that engaged=True implies
+                # msk_e has True cells (prevents inf/NaN in engagement width).
                 msk_e = d <= R + 0.75 * cell
                 if window is not None:
                     msk_e &= window[jlo:jhi, ilo:ihi]
-                # engaged = any stock cell at/over the footprint edge above the
-                # tip. Must use msk_e-filtered max so that engaged=True implies
-                # msk_e has True cells (prevents inf/NaN in engagement width).
                 engaged = (msk_e.any() and
                          float(np.max(np.where(msk_e, win, -np.inf))) > sz + 1e-6)
                 # radial engagement: chord width of engaged arc perpendicular to
@@ -855,6 +973,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 shank_hits += 1
                 if first_shank_line is None:
                     first_shank_line = mv["line"]
+            if holder_on and move_holder:
+                holder_hits += 1
+                if first_holder_line is None:
+                    first_holder_line = mv["line"]
             feed = mv.get("f")
             cycle_s += length / (feed if feed and feed > 0 else rapid_feed) * 60.0
         else:  # rapid
@@ -915,6 +1037,11 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                         "worst_xy": shank_worst_xy,
                         "first_line": first_shank_line}
                        if flute is not None else None),
+        "holder_hits": ({"count": holder_hits,
+                         "max_intrusion": holder_intrusion,
+                         "worst_xy": holder_worst_xy,
+                         "first_line": first_holder_line}
+                        if holder_on else None),
         "air_fraction": (air_length / cut_length) if cut_length > 0 else 0.0,
         "cutting_length_mm": cut_length,
         "cutting_length_by_zband": {k: round(v, 1)
@@ -929,12 +1056,16 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             "threshold_mm": engage_max,
             "count": engage_count,
             "max_mm": round(engage_max_seen, 4),
-            "spikes": engage_spikes,
+            # top 10 worst spots (line, XY, value)
+            "spikes": sorted(engage_spikes, key=lambda s: s["engagement_mm"],
+                             reverse=True)[:10],
         } if engage_max is not None else None,
         "plunge": {
             "ramp_angle_deg": ramp_angle,
             "count": plunge_count,
-            "flags": plunge_flags,
+            # top 10 deepest spots (line, XY, value)
+            "flags": sorted(plunge_flags, key=lambda f: f["depth_mm"],
+                           reverse=True)[:10],
         },
     }
     result.update(analyze(stock, part, cell, x0, y0,
@@ -970,14 +1101,16 @@ def _chunk_worker(idx):
                     stock_init=g["stock_init_per"][idx],
                     window=g["window"], rapid_feed=g["rapid_feed"],
                     start=g["start_per"][idx], flute=g["flute"],
-                    shank_dia=g["shank_dia"], engage_max=g["engage_max"],
+                    shank_dia=g["shank_dia"], holder=g["holder"],
+                    stickout=g["stickout"], engage_max=g["engage_max"],
                     ramp_angle=g["ramp_angle"])
 
 
 def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                       dia=6.0, corner=0.0, stock_init=None, window=None,
                       rapid_feed=RAPID_FEED, flute=None, shank_dia=None,
-                      engage_max=None, ramp_angle=3.0):
+                      holder=None, stickout=None, engage_max=None,
+                      ramp_angle=3.0):
     import multiprocessing as mp
     # leading moves without a Z word: Z unknown = above stock, not machine 0;
     # use the first explicit Z (as serial simulate does), else the stock top
@@ -992,8 +1125,8 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                   y0=y0,
                   stock_box=stock_box, tool=tool, dia=dia, corner=corner,
                   window=window, rapid_feed=rapid_feed, flute=flute,
-                  shank_dia=shank_dia, engage_max=engage_max,
-                  ramp_angle=ramp_angle)
+                  shank_dia=shank_dia, holder=holder, stickout=stickout,
+                  engage_max=engage_max, ramp_angle=ramp_angle)
     # true machine position at each chunk start = end of the previous chunk's
     # last move (chunks must not simulate their first move from its own target)
     start_per = []
@@ -1050,6 +1183,18 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                                if r["over_flute"]["first_line"]),
                               default=None)}
             if flute is not None else None),
+        "holder_hits": (
+            {"count": sum(r["holder_hits"]["count"] for r in results),
+             "max_intrusion": max(r["holder_hits"]["max_intrusion"]
+                                 for r in results),
+             "worst_xy": max(results,
+                            key=lambda r: r["holder_hits"]["max_intrusion"])[
+                                "holder_hits"]["worst_xy"],
+             "first_line": min((r["holder_hits"]["first_line"]
+                               for r in results
+                               if r["holder_hits"]["first_line"]),
+                              default=None)}
+            if holder is not None else None),
         "air_fraction": 0.0,
         "cutting_length_mm": sum(r["cutting_length_mm"] for r in results),
         "rapid_length_mm": sum(r["rapid_length_mm"] for r in results),
@@ -1059,13 +1204,17 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
              "count": sum(r["engagement"]["count"] for r in results),
              "max_mm": round(max(r["engagement"]["max_mm"]
                                 for r in results), 4),
-             "spikes": [s for r in results
-                       for s in r["engagement"]["spikes"]],
+             "spikes": sorted([s for r in results
+                              for s in r["engagement"]["spikes"]],
+                             key=lambda s: s["engagement_mm"],
+                             reverse=True)[:10],
             } if engage_max is not None else None),
         "plunge": {
             "ramp_angle_deg": ramp_angle,
             "count": sum(r["plunge"]["count"] for r in results),
-            "flags": [f for r in results for f in r["plunge"]["flags"]],
+            "flags": sorted([f for r in results
+                            for f in r["plunge"]["flags"]],
+                           key=lambda f: f["depth_mm"], reverse=True)[:10],
         },
     }
     zbands = {}
@@ -1239,6 +1388,19 @@ def main(argv=None):
                   help="ramp/helix angle threshold deg for plunge detection "
                        "(default 3.0). Descending feed moves into stock are "
                        "flagged unless they are helix/ramp at or below this.")
+    p.add_argument("--tool-number", dest="tool_number", type=int, default=None,
+                   help="S5: X7 tool number; resolves the holder frustum "
+                        "stack + stick-out from tools/x7_tools.json (entry "
+                        "needs holder + stickout_mm) for the holder-hit check")
+    p.add_argument("--holder", default=None,
+                   help="S5: holder name in the tools json \"holders\" map "
+                        "(requires --stickout); overrides --tool-number")
+    p.add_argument("--stickout", type=float, default=None,
+                   help="S5: holder nose distance above tool tip mm "
+                        "(with --holder, or overriding the table entry)")
+    p.add_argument("--tools-json", dest="tools_json", default=TOOLS_JSON,
+                   help="tool table JSON for --tool-number/--holder "
+                        "(default: tools/x7_tools.json)")
     args = p.parse_args(argv)
 
     # Derive engage_max from optimal_load when not explicitly given
@@ -1275,12 +1437,17 @@ def main(argv=None):
                     y0 + jj.min() * cell, y0 + (jj.max() + 1) * cell,
                     float(np.nanmin(stock_init)),
                     float(np.nanmax(stock_init)))
+    hg = resolve_holder(args.tool_number, args.holder, args.stickout,
+                       args.tools_json)
+    holder_segs, holder_stick, holder_name = \
+        hg if hg else (None, None, None)
     if args.jobs > 1:
         res = simulate_parallel(moves, part, cell, x0, y0, stock_box,
                                args.jobs, tool=args.tool, dia=args.dia,
                                corner=args.corner, stock_init=stock_init,
                                window=window, rapid_feed=args.rapid_feed,
                                flute=args.flute, shank_dia=args.shank_dia,
+                               holder=holder_segs, stickout=holder_stick,
                                engage_max=engage_max,
                                ramp_angle=args.ramp_angle)
     else:
@@ -1288,8 +1455,9 @@ def main(argv=None):
                        tool=args.tool, dia=args.dia, corner=args.corner,
                        stock_init=stock_init, window=window,
                        rapid_feed=args.rapid_feed, flute=args.flute,
-                       shank_dia=args.shank_dia, engage_max=engage_max,
-                       ramp_angle=args.ramp_angle)
+                       shank_dia=args.shank_dia,
+                       holder=holder_segs, stickout=holder_stick,
+                       engage_max=engage_max, ramp_angle=args.ramp_angle)
 
     report = {
         "gcode": os.path.abspath(args.gcode),
@@ -1305,6 +1473,9 @@ def main(argv=None):
         "rapid_collisions": res["rapid_collisions"],
         "plunge_over_flute": res["plunge_over_flute"],
         "over_flute": res["over_flute"],
+        "holder_hits": res["holder_hits"],
+        "holder": ({"name": holder_name, "stickout_mm": holder_stick}
+                   if holder_segs is not None else None),
         "cutter_comp": res["cutter_comp"],
         "comp_radius_mm": args.comp_radius,
         "air_fraction": res["air_fraction"],
