@@ -1276,6 +1276,99 @@ def test_holder_drop_tall_boss():
         print("boss-slot: zmap holder_hits 0 on the emitted program")
 
 
+def stock_ridge_pocket_stl(path, q=40.0, hy=20.0, top=10.0,
+                          pocket_half=6.0, floor_z=0.0):
+    """Plate [-q,q]x[-hy,hy] top `top` with a full-X deep pocket
+    (|y| < pocket_half, floor floor_z, vertical walls)."""
+    tris = _box(-q, q, -hy, -pocket_half, floor_z, top)
+    tris += _box(-q, q, pocket_half, hy, floor_z, top)
+    tris += _box(-q, q, -pocket_half, pocket_half, floor_z - 5.0, floor_z)
+    return write_stl(path, tris)
+
+
+def hf_stock_ridge_pocket(X, Y, top=10.0, pocket_half=6.0, floor_z=0.0):
+    return np.where(np.abs(Y) < pocket_half, floor_z, top)
+
+
+def ridge_stock_npy(path, q=40.0, hy=20.0, cell=0.5, top=10.0,
+                   pocket_half=6.0, rx=4.0, ry0=6.0, ry1=11.0, ridge_z=24.0):
+    """Post-roughing stock heightfield (engine .npy + sidecar): part + axial
+    leave everywhere, plus a leftover ridge (rx x [ry0,ry1]) standing at
+    ridge_z above the plate top - stock roughing could not reach."""
+    nx = int(round(2 * q / cell))
+    ny = int(round(2 * hy / cell))
+    cx = -q + (np.arange(nx) + 0.5) * cell
+    cy = -hy + (np.arange(ny) + 0.5) * cell
+    CX, CY = np.meshgrid(cx, cy)
+    A = np.where(np.abs(CY) < pocket_half, 0.381, top + 0.381)
+    A = np.where((np.abs(CX) <= rx) & (CY >= ry0) & (CY <= ry1),
+                ridge_z, A)
+    np.save(path, A)
+    with open(path[:-4] + ".json", "w") as fh:
+        json.dump({"x0": -q, "y0": -hy, "cell": cell}, fh)
+
+
+def test_holder_stock_ridge_along_path():
+    """Task HN: the engine holder net must be at least as conservative as
+    zmap. Deep pocket (floor z=0, PART walls only 10 mm high) with a
+    roughing STOCK ridge (z=24) along the pocket wall. Ball 5.958 = T31
+    (stick-out 18, holder BT30-ER20-60): on the pocket floor the holder
+    clears the PART (nose z=18 > wall top 10) - only the remaining STOCK
+    violates: nose 18 < ridge 24 within the envelope radius 23 + 1 mm.
+    The floor rows are long straight chords whose ENDPOINTS sit clear of
+    the ridge while the row INTERIOR passes within the envelope: a
+    vertex-only net keeps the row whole, but zmap samples along every
+    cutting move and counts holder hits there. The along-outline net must
+    drop the near-ridge samples (split, relink verified - links crossing
+    the ridge zone escalate to rapids), so zmap counts 0 holder_hits on
+    the emitted program; points are dropped, never lowered."""
+    q, hy, top, bh = 40.0, 20.0, 10.0, 24.0
+    dia = 5.958
+    stickout, hold_name = 18.0, "BT30-ER20-60"
+    with tempfile.TemporaryDirectory() as td:
+        stl = stock_ridge_pocket_stl(os.path.join(td, "srp.stl"), q, hy, top)
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock_rough.npy")
+        ridge_stock_npy(stockp, q, hy)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", dia, 0.0),
+                             floor_z=0.0, threads=4, stock_from=stockp)
+        assert stats.get("stock_from"), "stock_from not recorded"
+        assert stats["holder"] == hold_name and stats["stickout_mm"] == 18.0
+        zs_h = dict((z, n) for z, n in stats["holder_removed_by_level"])
+        assert zs_h.get(0.0, 0) > 0, \
+            "floor points beside the stock ridge not holder-dropped: %s" % \
+            (zs_h,)
+        zh = [z for z, n in stats["holder_removed_by_level"]]
+        assert max(zh) <= bh - stickout + SHANK_TOL + 1e-9, \
+            "holder-dropped point above the nose limit (max z %.2f)" % max(zh)
+        print("stock-ridge: holder dropped %d (levels %.2f..%.2f, wall=%.0fmm2)"
+              % (stats["n_holder_removed"], min(zh), max(zh),
+                 stats["holder_removed_wall_mm2"]))
+        # independent zmap judgement (stock_init = the same ridge model)
+        text = finish_to_gcode(moves)
+        gmv = zmap.parse_gcode(text)
+        X, Y, nx, ny = _grid((-q, q, -hy, hy))
+        part = hf_stock_ridge_pocket(X, Y, top=top)
+        ridge = (np.abs(X) <= 4.0) & (Y >= 6.0) & (Y <= 11.0)
+        stock_init = np.where(ridge, bh, np.minimum(bh, part + 0.381))
+        zsegs, zst, zname = zmap.resolve_holder(tool_number=31)
+        assert (zname, zst) == (hold_name, stickout)
+        res = zmap.simulate(gmv, part, CELL, -q, -hy,
+                            (-q, q, -hy, hy, 0.0, bh), tool="ball", dia=dia,
+                            stock_init=stock_init, holder=zsegs, stickout=zst)
+        assert res["holder_hits"]["count"] == 0, \
+            "zmap still counts %d holder hits (worst %s, %.3f mm)" % (
+                res["holder_hits"]["count"], res["holder_hits"]["worst_xy"],
+                res["holder_hits"]["max_intrusion"])
+        assert res["gouges"]["count"] == 0, \
+            "%d gouges, max %.3f at %s" % (res["gouges"]["count"],
+                                           res["gouges"]["max_depth"],
+                                           res["gouges"]["worst_xy"])
+        assert res["rapid_collisions"]["count"] == 0, \
+            "rapid collisions at line %s" % res["rapid_collisions"]["first_line"]
+        print("stock-ridge: zmap holder_hits 0, gouges 0, rapids clean")
+
+
 def test_shank_t31_wall_13mm():
     """S5 item 4 (real flute): T31 (ball 5.958, flute 12) next to a
     vertical wall 13 mm deep -> points within shank radius of the wall with
@@ -1333,6 +1426,7 @@ if __name__ == "__main__":
                test_shank_deep_wall_long_flute,
                test_rest_pass_table_tool, test_shank_net_keeps_source_index,
                test_holder_drop_tall_boss,
+               test_holder_stock_ridge_along_path,
                test_shank_t31_wall_13mm):
         t = __import__("time").time()
         fn()
