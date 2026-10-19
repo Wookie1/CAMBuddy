@@ -38,7 +38,9 @@ anything.
   and the vise, machine travel limits, multi-tool programs, cutter
   compensation, canned cycles, other motion planes, and whether the
   feeds/speeds suit the material — and it never replaces your dry run above
-  the part on the X7.
+  the part on the X7. Up to three programs can be checked in one run, in
+  order (e.g. rough, finish, rest): each program is judged on the stock left
+  by the previous one, and the first failing program fails the run.
 
 ## The gates — a run fails if any of these catch something
 

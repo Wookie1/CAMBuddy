@@ -1490,6 +1490,21 @@ class TestCheckProgramE2E:
         assert mock.file_names(910) == ["check.json", "preview.png"]
         assert not list(programs.glob("O4501*"))
 
+    def test_stale_program_2_in_reused_run_dir_is_not_judged(self, live):
+        """A program_2.nc left in a reused run dir must be removed, not
+        judged: the run sends only "program", so only it is checked."""
+        mock, home, _ = live
+        work = home / "runs" / "915"
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "program_2.nc").write_text(
+            open(os.path.join(HERE, "testdata", "check_g81.nc")).read())
+        mock.enqueue_run(915, action=catalog_mod.CHECK_ACTION,
+                         inputs=dict(CHECK_INPUTS, model=model_input(mock),
+                                    program=program_input(mock)))
+        final = mock.wait_terminal(915, timeout=600)
+        assert final == "succeeded", mock.states_for(915)
+        assert not (work / "program_2.nc").exists()
+
     def test_check_program_g81_fails_unsupported(self, live):
         mock, _, programs = live
         mock.enqueue_run(911, action=catalog_mod.CHECK_ACTION,
@@ -1537,3 +1552,131 @@ def test_check_program_tool_number_mismatch_refused(tmp_path):
                               {"tool_number": 31, "orientation": "Z+",
                                "stock_xy": 1.0, "stock_top": 1.0,
                                "stock_bottom": 0.0}, None)
+
+
+# ================= task CPc: check_program judges up to three programs ===
+
+class TestCheckProgramSequenceCatalog:
+    def test_optional_program_fields(self):
+        a = catalog_mod.get_action(catalog_mod.CHECK_ACTION)
+        props = a["inputs"]["properties"]
+        assert props["program_2"].get("x-steve") == "program"
+        assert props["program_3"].get("x-steve") == "program"
+        # plain optional fields: required stays program + model
+        assert a["inputs"]["required"] == ["program", "model"]
+
+    def test_validate_accepts_program_2_and_3(self):
+        ok, code, v = catalog_mod.validate_inputs(
+            {"program": {"url": "u"}, "model": {"url": "u"},
+             "program_2": {"url": "u"}, "program_3": {"url": "u"}},
+            catalog_mod.CHECK_ACTION)
+        assert ok, code
+        assert v["program_2"] == {"url": "u"}
+
+
+class TestCheckProgramSequenceE2E:
+    def test_two_programs_stock_carries_forward(self, live, tmp_path):
+        """rough-like program then a lighter pass: the second is judged on
+        the first's stock (--stock-in), and judging it alone from raw stock
+        gives a different leftover. Each program keeps its own tool, and
+        every program field is downloaded to its own file."""
+        mock, home, programs = live
+        mock.enqueue_run(913, action=catalog_mod.CHECK_ACTION,
+                         inputs=dict(CHECK_INPUTS, model=model_input(mock),
+                                    program=program_input(mock,
+                                                       "check_rough.nc"),
+                                    program_2=program_input(mock,
+                                                         "check_light.nc")))
+        assert mock.wait_state(913, "received", 30), \
+            "run never received: %s" % mock.states_for(913)
+        final = mock.wait_terminal(913, timeout=900)
+        assert final == "succeeded", \
+            "run ended %s: %s" % (final, mock.states_for(913))
+        reps = {r["body"]["state"]: r["body"] for r in mock.reports
+                if str(r["run_id"]) == "913"}
+        result = reps["succeeded"].get("result") or {}
+        # judged in order, each program with its own tool from its own T
+        assert [p["name"] for p in result["programs"]] == \
+            ["program", "program_2"]
+        assert result["programs"][0]["tool_number"] == 13
+        assert result["programs"][1]["tool_number"] == 20
+        # top-level keys unchanged for single-program callers: first program
+        assert result["tool"]["number"] == 13
+        assert result["strict"] is True and result["unsupported"] == []
+
+        run_dir = home / "runs" / "913"
+        # download loop: each program field saved to its own file, never
+        # overwriting another input; the model stays input.step
+        for dest, src in (("program.nc", "check_rough.nc"),
+                          ("program_2.nc", "check_light.nc")):
+            with open(os.path.join(HERE, "testdata", src), "rb") as fh:
+                want = fh.read()
+            with open(run_dir / dest, "rb") as fh:
+                assert fh.read() == want, dest
+        assert (run_dir / "input.step").stat().st_size > 0
+
+        with open(run_dir / "check.json") as fh:
+            cj = json.load(fh)
+        assert [e["name"] for e in cj["programs"]] == ["program",
+                                                        "program_2"]
+        e1, e2 = cj["programs"][0], cj["programs"][1]
+        assert e1["tool"]["number"] == 13 and e1["tool"]["holder"] == \
+            "BT30-ER32-70"
+        assert e2["tool"]["number"] == 20 and e2["tool"]["holder"] == \
+            "BT30-ER20-60"
+        # the second program was judged on the first program's stock-out
+        assert e2["check"]["stock_in"] and \
+            e2["check"]["stock_in"].endswith("stock_after_program.npy")
+        assert abs(e2["check"]["stock_box"][5] - 12.1) < 0.05, \
+            "second program must start from the roughed stock top (12.1)"
+        assert e2["check"]["gouges"]["count"] == 0
+        assert e2["check"]["rapid_collisions"]["count"] == 0
+        assert e2["check"]["holder_hits"]["count"] == 0
+
+        # judging program_2 alone from raw stock gives a DIFFERENT answer:
+        # rerun the same zmap from the full stock box and compare leftover
+        stock = e1["check"]["stock_box"]
+        solo = tmp_path / "solo.json"
+        subprocess.run([PY, "-m", "verify.zmap", str(run_dir /
+                                                     "program_2.nc"),
+                        "--part", str(run_dir / "part_hf_zmap.npy"),
+                        "--tool", "ball", "--dia", "9.525",
+                        "--corner", "4.7625",
+                        "--stock", *[("%.4f" % v) for v in stock],
+                        "--flute", "22.225", "--shank-dia", "9.525",
+                        "--tool-number", "20", "--strict", "--engage-report",
+                        "--out-json", str(solo)],
+                       cwd=REPO, check=True)
+        with open(solo) as fh:
+            solo = json.load(fh)
+        assert abs(solo["leftover"]["p95"] - e2["check"]["leftover"]
+                   ["p95"]) > 0.05
+        assert abs(solo["leftover"]["mean"] - e2["check"]["leftover"]
+                   ["mean"]) > 0.01
+
+        # no .nc upload, nothing to the programs folder
+        assert mock.file_names(913) == ["check.json", "preview.png"]
+        assert not list(programs.glob("O4510*"))
+        assert not list(programs.glob("O4511*"))
+
+    def test_failing_second_program_names_program_2(self, live):
+        """The first failing program fails the run and is named: a
+        gouging program_2 after a clean program must fail with program_2
+        in the error."""
+        mock, _, programs = live
+        mock.enqueue_run(914, action=catalog_mod.CHECK_ACTION,
+                         inputs=dict(CHECK_INPUTS, model=model_input(mock),
+                                    program=program_input(mock),
+                                    program_2=program_input(mock,
+                                                         "check_gouge.nc")))
+        assert mock.wait_state(914, "received", 30)
+        final = mock.wait_terminal(914, timeout=900)
+        assert final == "failed", \
+            "gouging program_2 must fail the run: %s" % mock.states_for(914)
+        rep = [r["body"] for r in mock.reports
+               if str(r["run_id"]) == "914"
+               and r["body"]["state"] == "failed"][-1]
+        msg = rep.get("error", {}).get("message", "")
+        assert "program_2" in msg, msg
+        assert not any(n.endswith(".nc") for n in mock.file_names(914))
+        assert not list(programs.glob("O4501*"))

@@ -183,12 +183,20 @@ CHECK_ACTION_SPEC = {
                     "moves and arcs (I/J or R), no cutter comp, no canned "
                     "cycles, no other planes - anything else fails with the "
                     "offending code and line. Gives back check.json and "
-                    "preview.png. Nothing is sent to the machine."),
+                    "preview.png. Up to three programs can be checked in "
+                    "order (e.g. rough, finish, rest): each program is "
+                    "judged on the stock left by the previous one, and the "
+                    "first failing program fails the run. Nothing is sent "
+                    "to the machine."),
     "confirm": False,
     "inputs": {
         "type": "object",
         "properties": {
             "program": {"x-steve": "program", "title": "Posted program"},
+            "program_2": {"x-steve": "program",
+                          "title": "Second program (optional)"},
+            "program_3": {"x-steve": "program",
+                          "title": "Third program (optional)"},
             "model": {"x-steve": "file", "format": "step",
                       "title": "STEP model"},
             "orientation": _ORIENTATION,

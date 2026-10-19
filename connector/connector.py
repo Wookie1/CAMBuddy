@@ -249,6 +249,13 @@ class Connector:
                     continue
                 inp = env.get("inputs", {}).get(name)
                 if inp is None:
+                    if kind == "program":
+                        # a reused run dir must never judge a program this
+                        # run did not send (runner picks up program_N.nc)
+                        try:
+                            os.remove(os.path.join(work, name + ".nc"))
+                        except FileNotFoundError:
+                            pass
                     continue
                 data = self.client.download(inp["url"], inp.get("headers"))
                 digest = hashlib.sha256(data).hexdigest()
@@ -260,10 +267,15 @@ class Connector:
                     self.emit_state("idle")
                     return
                 os.makedirs(work, exist_ok=True)
-                dest = (os.path.join(work, "program.nc") if kind == "program"
+                # each program field keeps its own file (program.nc,
+                # program_2.nc, program_3.nc) - never overwrite another input
+                dest = (os.path.join(work, name + ".nc") if kind == "program"
                         else os.path.join(work, "input.step"))
                 if kind == "program":
-                    program_path = dest
+                    if name == "program":
+                        program_path = dest
+                    # program_2/program_3 sit next to it in the run dir; the
+                    # runner picks them up from there in order
                 else:
                     step_path = dest
                 with open(dest, "wb") as fh:
