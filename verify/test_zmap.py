@@ -665,14 +665,14 @@ def test_vertical_wall_ball_gouge():
 # ---------------------------------------------------------------------------
 
 def _run_engage(gcode, part, dia=6.0, engage_max=None, ramp_angle=3.0,
-                stock=None, tool="flat"):
+                stock=None, tool="flat", stock_init=None):
     """Run simulate with engagement tracking."""
     if stock is None:
         stock = STOCK
     moves = zmap.parse_gcode(gcode)
     return zmap.simulate(moves, part, CELL, X0, Y0, stock, tool=tool,
                          dia=dia, engage_max=engage_max,
-                         ramp_angle=ramp_angle)
+                         ramp_angle=ramp_angle, stock_init=stock_init)
 
 
 def test_engagement_full_width_slot_flagged():
@@ -716,6 +716,54 @@ G1 X-10. Y3. F500.
     assert res["engagement"]["count"] >= 1, \
         "corner spike not flagged: count=%d max=%.3f" % (
             res["engagement"]["count"], res["engagement"]["max_mm"])
+
+
+def test_engagement_side_cut_stepover_1_5():
+    """Side cut with 1.5 mm of stock under one side of the tool (rest
+    already cleared): engagement reads the cut band (~1.5), not 2R."""
+    part = block_part(hi=10.0, half=15.0)
+    ys = centers()[:, None]
+    # pre-cleared to Z5 everywhere except material at y >= 1.5 (height 10);
+    # tool at Y0 R3 cuts the band y in [1.5, 3.0] -> chord ~1.5 mm
+    stock_init = np.broadcast_to(
+        np.where(ys >= 1.5 - 1e-9, 10.0, 5.0), (N, N)).copy()
+    res = _run_engage("""
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""", part, dia=6.0, engage_max=2.0, stock_init=stock_init)
+    eng = res["engagement"]
+    assert eng is not None
+    assert abs(eng["max_mm"] - 1.5) <= 0.3, \
+        "side-cut engagement %.3f not within 1.5 +/- 0.3" % eng["max_mm"]
+    assert eng["count"] == 0, \
+        "1.5 mm side cut flagged at engage_max=2.0 (max %.3f)" % eng["max_mm"]
+
+
+def test_engagement_second_pass_stepover_1_0():
+    """Second parallel pass at 1.0 mm stepover over a cleared band:
+    engagement reads ~1.0 mm."""
+    part = block_part(hi=10.0, half=15.0)
+    # pass 1: clears a band centered at Y0.2 (tool edge reaches Y3.2)
+    res1 = _run_engage("""
+G21 G90 F500
+G0 X-20. Y0.2 Z20.
+G1 Z5. F100.
+G1 X20. Y0.2 F500.
+""", part, dia=6.0)
+    # pass 2: centerline at Y1.2 -> 1.0 mm stepover into fresh material;
+    # stay inside pass 1's X range so its round end-cap sliver is not cut
+    res2 = _run_engage("""
+G21 G90 F500
+G0 X-15. Y1.2 Z20.
+G1 Z5. F100.
+G1 X15. Y1.2 F500.
+""", part, dia=6.0, engage_max=2.0, stock_init=res1["stock"])
+    eng = res2["engagement"]
+    assert eng is not None
+    assert abs(eng["max_mm"] - 1.0) <= 0.3, \
+        "stepover engagement %.3f not within 1.0 +/- 0.3" % eng["max_mm"]
 
 
 def test_plunge_helix_not_flagged():
