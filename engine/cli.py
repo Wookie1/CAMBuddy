@@ -77,9 +77,18 @@ def _run_prepare(a):
     with open(meta_out) as fh:
         bbox = json.load(fh)["bbox"]
 
+    # stock box first (bbox +- stock offsets): the heightfield grid must
+    # cover the stock + tool radius, never just a tight part bbox (Z5b)
+    pxmin, pxmax, pymin, pymax, pzmin, pzmax = bbox
+    stock = [pxmin - a.stock_xy, pxmax + a.stock_xy,
+             pymin - a.stock_xy, pymax + a.stock_xy,
+             pzmin - a.stock_bottom, pzmax + a.stock_top]
+
     prog(0.4, "rasterising part heightfield")
     env = dict(os.environ, STEP_IN=step_out, HF_OUT=hf_out,
-               CELL=str(a.cell), PAD="0")
+               CELL=str(a.cell), PAD="0",
+               STOCK_BOX=" ".join("%.4f" % v for v in stock[:4]),
+               TOOL_R="%.4f" % a.tool_r)
     r = subprocess.run([model.freecadcmd(),
                        os.path.join(repo, "verify", "heightfield.py")],
                       env=env, capture_output=True, text=True)
@@ -87,10 +96,6 @@ def _run_prepare(a):
         raise SystemExit("heightfield failed: %s\n%s" % (r.stdout[-1500:],
                                                          r.stderr[-1500:]))
 
-    pxmin, pxmax, pymin, pymax, pzmin, pzmax = bbox
-    stock = [pxmin - a.stock_xy, pxmax + a.stock_xy,
-             pymin - a.stock_xy, pymax + a.stock_xy,
-             pzmin - a.stock_bottom, pzmax + a.stock_top]
     out = {"step": step_out, "hf": hf_out, "bbox": bbox, "stock": stock,
            "orient": a.orient}
     with open(os.path.join(a.out_dir, "prepare.json"), "w") as fh:
@@ -198,6 +203,9 @@ def main(argv=None):
                    default=1.0)
     pr.add_argument("--cell", type=float, default=0.5,
                    help="part heightfield cell size mm")
+    pr.add_argument("--tool-r", dest="tool_r", type=float, default=0.0,
+                   help="largest tool radius mm the grid will judge; the "
+                        "heightfield grid covers stock + this + 5 mm margin")
 
     r = sub.add_parser("rough")
     r.add_argument("--step", required=True)

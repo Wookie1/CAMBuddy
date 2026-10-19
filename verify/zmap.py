@@ -707,6 +707,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     """
     sxmin, sxmax, symin, symax, szmin, szmax = stock_box
     ny, nx = part.shape
+    # part grid bounds in mm: cells outside them are never evaluated, so a
+    # move whose footprint (XY +- tool radius) leaves the grid is unjudged
+    gxmin, gxmax = x0, x0 + nx * cell
+    gymin, gymax = y0, y0 + ny * cell
     if stock_init is not None:
         stock = np.array(stock_init, dtype=float)
         if stock.shape != (ny, nx):
@@ -812,6 +816,9 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     # plunge tracking
     plunge_flags = []  # list of dicts: {line, x, y, z, angle_deg, depth_mm}
     plunge_count = 0
+    # footprint-outside-grid tracking (cells outside the grid are unjudged)
+    outside_grid = 0
+    first_outside_line = None
 
     for mv in resolved:
         if mv.get("comp"):
@@ -829,6 +836,20 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         m = dict(mv)
         m["x"], m["y"], m["z"] = x1, y1, z1
         samples, length = _move_samples(m, cur, cell)
+        # footprint check: any move (rapid or cutting) whose tool footprint
+        # (XY +- R) leaves the part grid counts -- cells outside the grid
+        # are never simulated, so such a move is only partially judged.
+        # Air moves outside the STOCK box are NOT exempt unless they stay
+        # inside the grid.
+        fxmin = min(s[0] for s in samples) - R
+        fxmax = max(s[0] for s in samples) + R
+        fymin = min(s[1] for s in samples) - R
+        fymax = max(s[1] for s in samples) + R
+        if (fxmin < gxmin - 1e-9 or fxmax > gxmax + 1e-9 or
+                fymin < gymin - 1e-9 or fymax > gymax + 1e-9):
+            outside_grid += 1
+            if first_outside_line is None:
+                first_outside_line = mv["line"]
         cutting = mv["motion"] in ("G1", "G2", "G3")
         move_collided = False
         move_over_flute = False
@@ -1083,6 +1104,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         "stock": stock,
         "rapid_collisions": {"count": rapid_collisions,
                             "first_line": first_rapid_line},
+        "outside_grid": {"count": outside_grid,
+                         "first_line": first_outside_line},
         "plunge_over_flute": ({"count": over_flute, "flute_mm": flute,
                                "first_line": first_over_flute_line}
                               if flute is not None else None),
@@ -1220,6 +1243,13 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                               if r["rapid_collisions"]["first_line"]),
                              default=None),
             "note": "exact under --jobs (two-pass prefix stock + chunk starts)",
+        },
+        "outside_grid": {
+            "count": sum(r["outside_grid"]["count"] for r in results),
+            "first_line": min((r["outside_grid"]["first_line"]
+                              for r in results
+                              if r["outside_grid"]["first_line"]),
+                             default=None),
         },
         "plunge_over_flute": (
             {"count": sum(r["plunge_over_flute"]["count"] for r in results),
@@ -1376,9 +1406,11 @@ def load_part(path):
         meta = json.load(f)
     tess = meta.get("tess_tol")
     if tess is None or float(tess) > 0.02:
-        print("warning: part sidecar tess_tol missing or > 0.02 mm "
-              "(vertical walls carry chord error); regenerate the heightfield "
-              "with TESS_TOL=0.01", file=sys.stderr)
+        raise ValueError(
+            "part sidecar %s tess_tol is missing or > 0.02 mm (got %r): "
+            "vertical walls carry unbounded chord error and the judgement "
+            "would be silently optimistic. Regenerate the heightfield with "
+            "TESS_TOL=0.01." % (sidecar, tess))
     return part, float(meta["cell"]), float(meta["x0"]), float(meta["y0"])
 
 
@@ -1482,7 +1514,11 @@ def main(argv=None):
         moves = parse_gcode(f.read())
     if args.comp_radius > 0:
         moves = apply_cutter_comp(resolve_moves(moves), args.comp_radius)
-    part, cell, x0, y0 = load_part(args.part)
+    try:
+        part, cell, x0, y0 = load_part(args.part)
+    except ValueError as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 1
     window = steep_window(part, cell) if args.window else None
 
     stock_init = None
@@ -1499,6 +1535,22 @@ def main(argv=None):
                     y0 + jj.min() * cell, y0 + (jj.max() + 1) * cell,
                     float(np.nanmin(stock_init)),
                     float(np.nanmax(stock_init)))
+    # a judge must never silently judge less than the whole stock: the part
+    # grid has to cover the stock box (within half a cell per side), or the
+    # moves out there are unjudged. No option to skip this.
+    gxmin, gxmax = x0, x0 + part.shape[1] * cell
+    gymin, gymax = y0, y0 + part.shape[0] * cell
+    half = cell / 2.0
+    if (stock_box[0] < gxmin - half or stock_box[1] > gxmax + half or
+            stock_box[2] < gymin - half or stock_box[3] > gymax + half):
+        print("error: stock box [X %.3f..%.3f, Y %.3f..%.3f] extends beyond "
+              "the part grid [X %.3f..%.3f, Y %.3f..%.3f] (cell %.3f mm) by "
+              "more than half a cell -- moves over the uncovered stock would "
+              "be silently unjudged. Regenerate the part heightfield with "
+              "enough PAD to cover stock + tool radius." % (
+                  stock_box[0], stock_box[1], stock_box[2], stock_box[3],
+                  gxmin, gxmax, gymin, gymax, cell), file=sys.stderr)
+        return 1
     hg = resolve_holder(args.tool_number, args.holder, args.stickout,
                        args.tools_json)
     holder_segs, holder_stick, holder_name = \
@@ -1526,11 +1578,13 @@ def main(argv=None):
         "part": os.path.abspath(args.part),
         "tool": {"type": args.tool, "dia": args.dia, "corner": args.corner},
         "stock_box": [float(v) for v in stock_box],
+        "part_grid": [gxmin, gxmax, gymin, gymax],
         "stock_in": os.path.abspath(args.stock_in) if args.stock_in else None,
         "holder": _holder_report(args, holder_name, holder_stick),
         "cell": cell,
         "window": ("steep walls |dZ|>1mm dilated 2mm" if args.window else None),
         "gouges": res["gouges"],
+        "outside_grid": res["outside_grid"],
         "leftover": res["leftover"],
         "within_0p5mm_fraction": res["within_0p5mm_fraction"],
         "rapid_collisions": res["rapid_collisions"],
@@ -1566,6 +1620,16 @@ def main(argv=None):
         ok = write_png(res["stock"], part, cell, x0, y0, args.png)
         if not ok:
             print("PNG skipped (matplotlib unavailable)", file=sys.stderr)
+    if res["outside_grid"]["count"] > 0:
+        print("error: %d move(s) have a tool footprint (XY +- %.3f mm) "
+              "outside the part grid [X %.3f..%.3f, Y %.3f..%.3f] (first "
+              "line %s): cells outside the grid are unjudged, so the whole "
+              "toolpath was never judged. Fix the heightfield (PAD) or the "
+              "toolpath." % (
+                  res["outside_grid"]["count"], args.dia / 2.0,
+                  gxmin, gxmax, gymin, gymax,
+                  res["outside_grid"]["first_line"]), file=sys.stderr)
+        return 1
     return 0
 
 
