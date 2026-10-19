@@ -846,6 +846,14 @@ class EngineRun:
                   % (FINISH_ENGAGE_FACTOR * values["stepover"]),
                   "--tool-number", str(finish_number),
                   "--out-json", check_finish]
+        # the judge also checks the finish's flute/shank (over_flute), from
+        # the same X7 table entry the engine's shank rule used
+        fin_tool = check_tool_entry(finish_number,
+                                    os.path.join(repo, "tools", "x7_tools.json"))
+        if fin_tool["flute_mm"] is not None:
+            argv_f += ["--flute", "%.4f" % fin_tool["flute_mm"]]
+        if fin_tool["shank_diameter_mm"] is not None:
+            argv_f += ["--shank-dia", "%.4f" % fin_tool["shank_diameter_mm"]]
         if rest:
             fr.remove_stale(stock_finish)
             argv_f += ["--stock-out", stock_finish]
