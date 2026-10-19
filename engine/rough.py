@@ -922,6 +922,11 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                       fill=-1e9)
     stock.set_tool(tool_r)
 
+    # Task RS: the cutting region comes from the STOCK box, never from the
+    # heightfield / CL grid extent: cutter centres may pass a stock face by
+    # at most the tool radius (edge clean-up), whatever the --hf grid bounds.
+    centre_zone = stock.dilate(stock.inb, tool_r)
+
     order = plan_stepup_levels(szmax, final, stepdown=stepdown, stepup=stepup,
                               axial_leave=axl)
     # R2 item 3: mandatory flat-floor levels (up-facing flat faces + axl)
@@ -1050,6 +1055,9 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             z_top = min(clearance_z, z + stepdown)
             emit({"g": 1, "x": x, "y": y, "z": z_top, "f": ramp_feed})
             mill_now(x, y, z_top)
+            # a helix arc swinging past stock + R is in air (never replace it
+            # with a straight plunge into stock); zmap's outside_grid gate
+            # still fails loudly if it ever leaves the judged grid
             for hv in _helix_moves(hc[0], hc[1], x, y, z_top, z, ramp_feed):
                 emit(hv)
         else:
@@ -1074,6 +1082,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                    "region_mm2": round(area_mm2, 1)})
             continue
         grown = stock.dilate(mask, tool_r + leave + 0.5)
+        # Task RS: territory (and with it the Adaptive2d outers and the
+        # hug-ring filter) is clipped to the stock box + tool radius, so no
+        # level region can follow a padded --hf / CL grid past the stock.
+        grown &= centre_zone
         # NB: do NOT pre-carve the part footprint (pz) out of `grown`:
         # Adaptive2d offsets the outer inward by tool_r + leave AND the island
         # loops outward by the same amount; carving pz by tool_r + leave as
