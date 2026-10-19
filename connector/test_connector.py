@@ -1678,3 +1678,178 @@ class TestCheckProgramSequenceE2E:
         assert "program_2" in msg, msg
         assert not any(n.endswith(".nc") for n in mock.file_names(914))
         assert not list(programs.glob("O4501*"))
+
+
+# ============================================ task SX: per-axis stock ========
+
+class TestPerAxisStockCatalog:
+    """catalog: optional stock_x / stock_y (number, minimum 0) on all three
+    actions; accepts >= 0, rejects negative."""
+
+    def test_present_on_all_actions(self):
+        for act in catalog_mod.ACTIONS:
+            p = catalog_mod.get_action(act)["inputs"]["properties"]
+            assert "stock_x" in p and "stock_y" in p, act
+            assert p["stock_x"]["type"] == "number" and \
+                p["stock_y"]["type"] == "number", act
+            assert p["stock_x"]["minimum"] == 0 and \
+                p["stock_y"]["minimum"] == 0, act
+            assert "default" not in p["stock_x"], \
+                "stock_x must be optional (no default)"
+            assert "default" not in p["stock_y"], \
+                "stock_y must be optional (no default)"
+            assert "X" in p["stock_x"]["description"]
+            assert "Y" in p["stock_y"]["description"]
+
+    def test_accepts_per_axis(self):
+        ok, code, v = catalog_mod.validate_inputs(
+            {"model": "m", "stock_xy": 1.0, "stock_x": 2.286,
+             "stock_y": 12.7}, catalog_mod.ACTION)
+        assert ok, code
+        assert v["stock_x"] == 2.286 and v["stock_y"] == 12.7
+
+    def test_rejects_negative(self):
+        for bad in ("stock_x", "stock_y"):
+            ok, code, _ = catalog_mod.validate_inputs(
+                {"model": "m", bad: -0.1}, catalog_mod.ACTION)
+            assert not ok and code == "input_out_of_range", (bad, code)
+
+
+class TestPerAxisStockRunner:
+    """runner: passes --stock-x/--stock-y to prepare only when given, and
+    every judge heightfield STOCK_BOX reflects the resulting per-axis box."""
+
+    BBOX = [-10.0, 10.0, -20.0, 20.0, -1.0, 0.4]
+
+    def _fake(self):
+        import hashlib
+
+        import numpy as np
+        sys.path.insert(0, REPO)
+        from engine.cli import stock_box
+
+        rec = {"calls": [], "envs": []}
+        bbox = self.BBOX
+
+        def fake_spawn(self, argv, lo, hi, on_progress, json_out=None,
+                       extra_env=None):
+            a = list(argv)
+            rec["calls"].append(a)
+            if extra_env:
+                rec["envs"].append(dict(extra_env))
+
+            def opt(flag):
+                return a[a.index(flag) + 1] if flag in a else None
+
+            if "engine.cli" in a:
+                sub = a[a.index("engine.cli") + 1]
+                if sub == "prepare":
+                    step_out = os.path.join(self.work, "o.step")
+                    with open(step_out, "w") as fh:
+                        fh.write("ISO-10303-21; fake oriented step\nEND;")
+                    sx = float(opt("--stock-x")) \
+                        if opt("--stock-x") is not None else \
+                        float(opt("--stock-xy"))
+                    sy = float(opt("--stock-y")) \
+                        if opt("--stock-y") is not None else \
+                        float(opt("--stock-xy"))
+                    box = stock_box(bbox, sx, sy,
+                                    float(opt("--stock-top")),
+                                    float(opt("--stock-bottom")))
+                    with open(os.path.join(self.work, "prepare.json"),
+                             "w") as fh:
+                        json.dump({"step": step_out,
+                                   "hf": os.path.join(self.work, "hf.npz"),
+                                   "stock": box}, fh)
+                else:  # rough / post
+                    out = opt("--out")
+                    if out:
+                        with open(out, "w") as fh:
+                            fh.write("G21 G90\nG0 X0. Y0. Z5.\n")
+                    sj = opt("--stats-json")
+                    if sj:
+                        with open(sj, "w") as fh:
+                            json.dump({"levels": [{"skipped": False}],
+                                       "n_moves": 10}, fh)
+            elif any(tok.endswith("heightfield.py") for tok in a):
+                np.save(extra_env["HF_OUT"], np.full((8, 8), 0.4))
+                with open(os.path.splitext(extra_env["HF_OUT"])[0] + ".json",
+                          "w") as fh:
+                    json.dump({"step_sha256": hashlib.sha256(
+                        open(extra_env["STEP_IN"], "rb").read()).hexdigest(),
+                        "cell": float(extra_env["CELL"]),
+                        "tess_tol": float(extra_env.get("TESS_TOL", 0.01))},
+                        fh)
+            elif "verify.zmap" in a:
+                with open(opt("--out-json"), "w") as fh:
+                    json.dump({
+                        "gouges": {"count": 0, "max_depth": 0.0},
+                        "rapid_collisions": {"count": 0, "first_line": None},
+                        "outside_grid": {"count": 0},
+                        "over_flute": {"count": 0, "max_depth": 0.0},
+                        "holder": {"status": "checked"},
+                        "holder_hits": {"count": 0, "max_intrusion": 0.0},
+                        "leftover": {"mean": 0.0, "p95": 0.0, "max": 0.0},
+                        "within_0p5mm_fraction": 1.0,
+                        "cycle_time_s": 1.0,
+                        "cutting_length_mm": 1.0,
+                        "rapid_length_mm": 1.0,
+                    }, fh)
+            return None
+
+        return fake_spawn, rec
+
+    def _prepare_call(self, rec):
+        return next(a for a in rec["calls"]
+                    if "engine.cli" in a and "prepare" in a)
+
+    def test_passes_flags_only_when_given(self, tmp_path, monkeypatch):
+        import runner as runner_mod
+        fake, rec = self._fake()
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", fake)
+        run = runner_mod.EngineRun({"engine_python": PY, "repo_root": REPO},
+                                    str(tmp_path))
+        values = dict(GOOD_INPUTS)
+        values.update({"stock_xy": 1.0, "stock_x": 2.286, "stock_y": 12.7})
+        run.run(os.path.join(HERE, "unused.step"), values)
+
+        prep = self._prepare_call(rec)
+        assert "--stock-x" in prep and "--stock-y" in prep
+        assert float(prep[prep.index("--stock-x") + 1]) == \
+            pytest.approx(2.286)
+        assert float(prep[prep.index("--stock-y") + 1]) == \
+            pytest.approx(12.7)
+
+    def test_judge_heightfield_stock_box_is_per_axis(self, tmp_path,
+                                                      monkeypatch):
+        import runner as runner_mod
+        fake, rec = self._fake()
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", fake)
+        run = runner_mod.EngineRun({"engine_python": PY, "repo_root": REPO},
+                                    str(tmp_path))
+        values = dict(GOOD_INPUTS)
+        values.update({"stock_xy": 1.0, "stock_x": 2.286, "stock_y": 12.7})
+        run.run(os.path.join(HERE, "unused.step"), values)
+
+        boxes = [e["STOCK_BOX"] for e in rec["envs"] if "STOCK_BOX" in e]
+        assert boxes, "no judge heightfield STOCK_BOX env was set"
+        want = "-12.2860 12.2860 -32.7000 32.7000"
+        for b in boxes:
+            assert b == want, b
+
+    def test_absent_flags_use_xy_only(self, tmp_path, monkeypatch):
+        import runner as runner_mod
+        fake, rec = self._fake()
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", fake)
+        run = runner_mod.EngineRun({"engine_python": PY, "repo_root": REPO},
+                                    str(tmp_path))
+        values = dict(GOOD_INPUTS)
+        values["stock_xy"] = 1.0
+        run.run(os.path.join(HERE, "unused.step"), values)
+
+        prep = self._prepare_call(rec)
+        assert "--stock-x" not in prep and "--stock-y" not in prep
+        boxes = [e["STOCK_BOX"] for e in rec["envs"] if "STOCK_BOX" in e]
+        want = "-11.0000 11.0000 -21.0000 21.0000"
+        for b in boxes:
+            assert b == want, b

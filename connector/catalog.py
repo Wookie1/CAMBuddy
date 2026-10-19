@@ -11,7 +11,8 @@ ACTIONS = (ACTION, SLOPE_ACTION, CHECK_ACTION)
 EVENT = "engine_state"
 
 # inputs whose numeric value is a length/feeds in mm (or mm/min):
-MM_FIELDS = ("stock_xy", "stock_top", "stock_bottom", "floor_z",
+MM_FIELDS = ("stock_xy", "stock_x", "stock_y", "stock_top", "stock_bottom",
+             "floor_z",
              "tool_diameter", "corner_radius", "flute_length", "stepdown",
              "optimal_load", "stock_to_leave", "rest_stepup", "feed",
              "ramp_feed",
@@ -31,6 +32,12 @@ _STOCK_INPUTS = {
                  "default": 1.0,
                  "description": "extra material left around the part, per "
                                 "side, mm"},
+    "stock_x": {"type": "number", "minimum": 0.0,
+                "description": "Extra stock on each side in X (defaults to "
+                               "the XY value)"},
+    "stock_y": {"type": "number", "minimum": 0.0,
+                "description": "Extra stock on each side in Y (defaults to "
+                               "the XY value)"},
     "stock_top": {"type": "number", "minimum": 0.0,
                   "maximum": 25.4, "default": 1.0,
                   "description": "extra material above the top of the part, "

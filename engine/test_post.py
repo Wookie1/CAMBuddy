@@ -26,6 +26,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, "/Applications/VibeCAD.app/Contents/Resources/lib")
 
 from engine import post_lnc  # noqa: E402
+from engine.cli import stock_box  # noqa: E402
 
 NEUTRAL = os.path.join(ROOT, "out", "core_front_roughG.ngc")
 PART_HF = os.path.join(ROOT, "out", "core_front_setup_hf.npy")
@@ -497,3 +498,39 @@ def test_ball_without_number_refused():
         post(moves, tool_kind="ball", dia_mm=6.0, corner_mm=3.0)
     for bad in ("T14 M06", "T15 M06", "T16 M06"):
         assert bad not in post(moves, tool_kind="ball", dia_mm=9.525, corner_mm=4.7625)
+
+
+# ---------------------------------------------------------------------------
+# task SX: stock_box per-axis stock margins (pure, no FreeCAD)
+# ---------------------------------------------------------------------------
+
+_CORE_FRONT_BBOX = [-126.365, 126.365, -69.85, 69.85, 0.0, 47.06239]
+
+
+def test_stock_box_core_front_per_axis_exact():
+    """James's real Core Front blank: 2.286 mm per side in X, 12.7 mm in Y,
+    top 13.89761, bottom 0 -> the exact stock box (to 1e-6)."""
+    got = stock_box(_CORE_FRONT_BBOX, 2.286, 12.7, 13.89761, 0.0)
+    want = [-128.651, 128.651, -82.55, 82.55, 0.0, 60.96]
+    assert len(got) == 6
+    for g, w in zip(got, want):
+        assert abs(g - w) < 1e-6, (got, want)
+
+
+def test_stock_box_absent_axes_default_to_xy_identical():
+    """stock_x/stock_y absent (both = stock_xy) gives exactly the same box
+    as the old stock_xy-only arithmetic - identical floats, not just close."""
+    sxy = 1.0
+    pxmin, pxmax, pymin, pymax, pzmin, pzmax = _CORE_FRONT_BBOX
+    legacy = [pxmin - sxy, pxmax + sxy, pymin - sxy, pymax + sxy,
+              pzmin - 1.0, pzmax + 1.0]
+    got = stock_box(_CORE_FRONT_BBOX, sxy, sxy, 1.0, 1.0)
+    assert got == legacy, (got, legacy)
+
+
+def test_stock_box_negative_is_error():
+    import pytest
+    with pytest.raises(ValueError):
+        stock_box(_CORE_FRONT_BBOX, -0.1, 12.7, 1.0, 0.0)
+    with pytest.raises(ValueError):
+        stock_box(_CORE_FRONT_BBOX, 2.286, -0.1, 1.0, 0.0)

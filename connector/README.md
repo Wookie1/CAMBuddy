@@ -15,7 +15,9 @@ anything.
   pass (the "optimal load"), and leaves a skin of stock (the "leave") for
   finishing. When big levels leave material in corners, rest passes step back
   up in small cuts (about the "stepup" distance) to clean out any leftover
-  deeper than half a millimetre.
+  deeper than half a millimetre. You can give the stock box a different extra
+  allowance on each side in X and Y (stock_x and stock_y); either one you
+  leave blank falls back to the XY value.
 
 - **slope_split_finish** — ball-end finishing split by how steep the surface
   is (default split: 40 degrees). Steep walls get contour-style passes
