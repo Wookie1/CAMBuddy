@@ -36,6 +36,25 @@ TOOL = dict(tool="bull", dia=12.7, corner=0.127, flute=25.4)
 _POSTED_CACHE = {}
 
 
+
+def _need(*paths):
+    """A real-file fixture or tracked input is missing: FAIL (never skip) with the
+    regenerate hint from fixtures/manifest.json."""
+    import json as _json
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        man = {f["path"]: f["regenerate"] for f in _json.load(
+            open(os.path.join(root, "fixtures", "manifest.json")))["fixtures"]}
+    except OSError:
+        man = {}
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        raise AssertionError("missing fixture(s): " + "; ".join(
+            "%s (regenerate: %s)" % (p, man.get(os.path.relpath(p, root),
+                                               "tracked in git - restore it"))
+            for p in missing))
+
+
 def _read(path):
     with open(path, newline="") as fh:
         return fh.read()
@@ -277,9 +296,7 @@ def test_unknown_tool_refused():
 
 def test_posted_x7_file_reads_T3():
     path = os.path.join(ROOT, "out", "core_front_rough_X7.nc")
-    if not os.path.exists(path):
-        print("SKIP X7 file check: %s missing" % path)
-        return
+    _need(path)
     txt = _read(path)
     assert "T3 M06" in txt, "out/core_front_rough_X7.nc must read T3 M06"
     assert re.search(r"G43 Z\S+ H03", txt), \
@@ -306,17 +323,10 @@ def _zmap_stats(moves, jobs):
 
 
 def test_zmap_matches_neutral():
-    missing = [p for p in (NEUTRAL, PART_HF) if not os.path.exists(p)]
-    if missing:
-        print("SKIP zmap equivalence: missing %s" % missing)
-        return
-    try:
-        sys.path.insert(0, os.path.join(ROOT, "verify"))
-        import zmap  # noqa: F401
-        import numpy  # noqa: F401
-    except ImportError as e:
-        print("SKIP zmap equivalence: %s" % e)
-        return
+    _need(NEUTRAL, PART_HF)
+    sys.path.insert(0, os.path.join(ROOT, "verify"))
+    import zmap  # noqa: F401  (an ImportError here is a real failure)
+    import numpy  # noqa: F401
 
     neutral_moves = zmap.parse_gcode(_read(NEUTRAL))
     inch_moves = zmap.parse_gcode(_posted_inch_text())
@@ -470,12 +480,8 @@ def test_comment_style_slashstar():
     """P3: with LNC parameter 42 = 0 comments must be /*...*/; default stays ( )."""
     from engine.post_lnc import post
     moves = [{"g": 0, "x": 0.0, "y": 0.0, "z": 10.0}, {"g": 1, "x": 5.0, "y": 0.0, "z": 10.0, "f": 1000.0}]
-    try:
-        paren = post(moves, tool_number=3).splitlines()
-        slash = post(moves, tool_number=3, comment_style="slashstar").splitlines()
-    except (KeyError, TypeError):
-        import pytest
-        pytest.skip("synthetic move shape differs from the engine's")
+    paren = post(moves, tool_number=3).splitlines()
+    slash = post(moves, tool_number=3, comment_style="slashstar").splitlines()
     assert any(l.startswith("(") for l in paren)
     assert not any(l.startswith("(") for l in slash)
     assert any(l.startswith("/*") and l.endswith("*/") for l in slash)
