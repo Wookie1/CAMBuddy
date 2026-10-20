@@ -1,0 +1,55 @@
+{
+ "note": "Real-file test fixtures, derived from James's parts: kept OUT of git (out/ is ignored). scripts/check_fixtures.py verifies each by sha256; gate fails if any is missing or differs.",
+ "fixtures": [
+  {
+   "path": "out/core_front_roughG.ngc",
+   "sha256": "a9825948b17f84025d38231f21258d9ddeb5080d1066beeae3f84c1de3750c0e",
+   "regenerate": "frozen golden neutral rough (round 7, commit 7f3e54a, T3 bull 12.7). Regenerate only from that commit: git worktree add /tmp/r7 7f3e54a, then its engine.cli rough of samples/core_front_setup.step (see engine/bench_engine_rough3.json there)."
+  },
+  {
+   "path": "out/core_front_rough_X7.nc",
+   "sha256": "129a49de155f7b7a298b82654213d7663b6d38a44938065906ab9abc5067cc0a",
+   "regenerate": "LNC post of core_front_roughG.ngc for the X7 (T3, H03): engine.cli post --in out/core_front_roughG.ngc --out out/core_front_rough_X7.nc --tool-number 3 (inch)."
+  },
+  {
+   "path": "out/core_front_setup_hf.npy",
+   "sha256": "ab5f9b35f70d68135db93800b6c9ee81f9e7da0dc7acaf97103388e88eb7a73c",
+   "regenerate": "STEP_IN=samples/core_front_setup.step HF_OUT=out/core_front_setup_hf.npy CELL=0.5 TESS_TOL=0.01 STOCK_BOX='-128.651 128.651 -82.55 82.55' TOOL_R=6.35 freecadcmd verify/heightfield.py"
+  },
+  {
+   "path": "out/core_front_setup_hf.json",
+   "sha256": "1da575f52d8964c4e2ad934cd394e4a5a7a27b0b0d56580c19a64f77ac41adbf",
+   "regenerate": "sidecar written with core_front_setup_hf.npy"
+  },
+  {
+   "path": "out/cf_hf01_z5b.npy",
+   "sha256": "eb795ee75893bb70f4b49244b55af6978f36f7c293a33570f530611879dbf35f",
+   "regenerate": "STEP_IN=samples/core_front_setup.step HF_OUT=out/cf_hf01_z5b.npy CELL=0.1 TESS_TOL=0.01 STOCK_BOX='-128.651 128.651 -82.55 82.55' TOOL_R=6.35 freecadcmd verify/heightfield.py"
+  },
+  {
+   "path": "out/cf_hf01_z5b.json",
+   "sha256": "47f8baaeb3b4403905257e3dc7dd99f30dffcfba9d688046464f07489b99de87",
+   "regenerate": "sidecar written with cf_hf01_z5b.npy"
+  },
+  {
+   "path": "out/core_front_roughRT_before.ngc",
+   "sha256": "e1096fe5c55249466c3300daaf4fe9fd47942c70e3906e8bbed7e8e5dfea53f4",
+   "regenerate": "frozen pre-RT rough (main 5326ad5): engine.cli rough --step samples/core_front_setup.step --stock -128.651 128.651 -82.55 82.55 0.0 60.96 --tool flat:12.686:0.0 --floor 24.765 --leave 0.381 --stepdown 19.05 --optimal-load-mm 2.032 --stepup 1.905 --hf out/core_front_setup_hf.npy --min-rest 0.5 at commit 5326ad5 (engine/RT_BEFORE.md)."
+  },
+  {
+   "path": "out/test_block.stl",
+   "sha256": "1210a800fcdce1dc4eb276952944a13be1f210e4d3a5e747aaf6e290c953d1b1",
+   "regenerate": "engine.model.step_to_stl('samples/test_block.step', tol=0.01) copied to out/test_block.stl"
+  },
+  {
+   "path": "out/test_block_hf_0.5.npy",
+   "sha256": "bc1dcf2c6ac15af7f63fff513e30b261add01a7c55d6fd8fd02ffc426e0e92f7",
+   "regenerate": "STEP_IN=samples/test_block.step HF_OUT=out/test_block_hf_0.5.npy CELL=0.5 TESS_TOL=0.01 freecadcmd verify/heightfield.py"
+  },
+  {
+   "path": "out/test_block_hf_0.5.json",
+   "sha256": "b9bd4a45a5be92afd038b68aa535dcebcaf45a7cef77c26b8e914b9c13ba3f6c",
+   "regenerate": "sidecar written with test_block_hf_0.5.npy"
+  }
+ ]
+}
