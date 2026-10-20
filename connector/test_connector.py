@@ -2549,3 +2549,126 @@ def test_token_refresh_near_expiry_does_not_recurse():
     assert c.token == "tok-new"
     assert [u.rsplit("/", 1)[-1].split("?")[0] for u in sent] == \
         ["token", "messages"]
+
+
+# =================================================== task ZA: axial plunges ==
+
+
+class TestAxialPlungeGate:
+    """Task ZA: a straight flat/bull descent driving its bottom into solid
+    stock (axial_plunges.count > 0) FAILS the connector gate; a ball is
+    report-only (count + depths, never fails)."""
+
+    def _passing_check(self, tool="flat"):
+        return {
+            "tool": {"type": tool, "dia": 12.686, "corner": 0.0},
+            "gouges": {"count": 0, "max_depth": 0.0},
+            "rapid_collisions": {"count": 0, "first_line": None},
+            "over_flute": {"count": 0, "max_depth": 0.0},
+            "holder": {"status": "checked"},
+            "holder_hits": {"count": 0, "max_intrusion": 0.0},
+            "axial_plunges": {"count": 0, "max_depth_mm": 0.0,
+                              "first_line": None, "worst_xy": None},
+        }
+
+    def test_flat_axial_plunge_fails_gate(self):
+        from runner import _check_zmap_gates, EngineError
+        c = self._passing_check("flat")
+        c["axial_plunges"] = {"count": 475, "max_depth_mm": 25.654,
+                               "first_line": 63675,
+                               "worst_xy": [-2.593, -52.230]}
+        with pytest.raises(EngineError) as ei:
+            _check_zmap_gates(c)
+        assert "axial plunges" in str(ei.value)
+
+    def test_bull_axial_plunge_fails_gate(self):
+        from runner import _check_zmap_gates, EngineError
+        c = self._passing_check("bull")
+        c["axial_plunges"] = {"count": 3, "max_depth_mm": 4.0,
+                               "first_line": 12, "worst_xy": [1.0, 2.0]}
+        with pytest.raises(EngineError) as ei:
+            _check_zmap_gates(c)
+        assert "axial plunges" in str(ei.value)
+
+    def test_ball_axial_plunge_report_only(self):
+        from runner import _check_zmap_gates
+        c = self._passing_check("ball")
+        c["axial_plunges"] = {"count": 475, "max_depth_mm": 25.654,
+                               "first_line": 63675,
+                               "worst_xy": [-2.593, -52.230]}
+        _check_zmap_gates(c)  # must NOT raise for a ball
+
+    def test_flat_zero_axial_passes(self):
+        from runner import _check_zmap_gates
+        _check_zmap_gates(self._passing_check("flat"))  # count 0 -> passes
+
+    def test_check_program_plunging_flat_fails(self, tmp_path, monkeypatch):
+        """check_program on a flat program that axial-plunges fails, naming
+        axial plunges (the zmap report carries tool.type + axial_plunges)."""
+        import hashlib
+
+        import numpy as np
+
+        import runner as runner_mod
+
+        def spawn(self, argv, lo, hi, on_progress, json_out=None,
+                  extra_env=None):
+            a = list(argv)
+
+            def opt(flag):
+                return a[a.index(flag) + 1] if flag in a else None
+
+            if any(t.endswith("heightfield.py") for t in a):
+                np.save(extra_env["HF_OUT"], np.full((8, 8), 0.4))
+                sha = hashlib.sha256(
+                    open(extra_env["STEP_IN"], "rb").read()).hexdigest()
+                with open(os.path.splitext(extra_env["HF_OUT"])[0] + ".json",
+                         "w") as fh:
+                    json.dump({"step_sha256": sha,
+                               "cell": float(extra_env["CELL"]),
+                               "tess_tol": float(extra_env.get("TESS_TOL",
+                                                             0.01))}, fh)
+            elif "engine.cli" in a:
+                sub = a[a.index("engine.cli") + 1]
+                if sub == "prepare":
+                    with open(os.path.join(self.work, "o.step"), "w") as fh:
+                        fh.write("ISO-10303-21; fake oriented step\nEND;")
+                    with open(os.path.join(self.work, "prepare.json"),
+                             "w") as fh:
+                        json.dump({"step": os.path.join(self.work, "o.step"),
+                                   "hf": os.path.join(self.work, "hf.npz"),
+                                   "stock": [-10.0, 10.0, -10.0, 10.0,
+                                           -1.0, 0.4]}, fh)
+            elif "verify.zmap" in a:
+                ttype = opt("--tool") or "flat"
+                with open(opt("--out-json"), "w") as fh:
+                    json.dump({
+                        "tool": {"type": ttype, "dia": 12.686, "corner": 0.0},
+                        "gouges": {"count": 0, "max_depth": 0.0},
+                        "rapid_collisions": {"count": 0, "first_line": None},
+                        "outside_grid": {"count": 0},
+                        "over_flute": {"count": 0, "max_depth": 0.0},
+                        "holder": {"status": "checked"},
+                        "holder_hits": {"count": 0, "max_intrusion": 0.0},
+                        "leftover": {"mean": 0.0, "p95": 0.0, "max": 0.0},
+                        "within_0p5mm_fraction": 1.0,
+                        "cycle_time_s": 1.0,
+                        "cutting_length_mm": 100.0,
+                        "rapid_length_mm": 10.0,
+                        "axial_plunges": {"count": 475,
+                                           "max_depth_mm": 25.654,
+                                           "first_line": 63675,
+                                           "worst_xy": [-2.593, -52.230]},
+                    }, fh)
+            return None
+
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", spawn)
+        run = runner_mod.EngineRun({"engine_python": PY, "repo_root": REPO},
+                                    str(tmp_path))
+        prog = tmp_path / "plunge.nc"
+        prog.write_text("G21 G90\nT13 M06\nG0 X0. Y0. Z5.\nG1 Z-2. F100.\n")
+        with pytest.raises(runner_mod.EngineError) as ei:
+            run.run_check_program(str(prog), str(tmp_path / "m.step"),
+                                  dict(CHECK_INPUTS))
+        msg = str(ei.value)
+        assert "axial plunges" in msg, msg

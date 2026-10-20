@@ -41,7 +41,10 @@ class EngineError(Exception):
 
 def _check_zmap_gates(check):
     """Raise EngineError if any zmap gate fails: gouges, rapid collisions,
-    shank/over-flute hits > 0, or holder hits > 0 (S5)."""
+    shank/over-flute hits > 0, holder hits > 0 (S5), or - task ZA - axial
+    plunges > 0 for a flat/bull roughing tool (a straight feed descent
+    driving the flat bottom into solid stock). Ball programs: axial plunges
+    are report-only."""
     gouges = check.get("gouges", {})
     if isinstance(gouges, dict) and gouges.get("count", 0) > 0:
         raise EngineError(
@@ -69,6 +72,17 @@ def _check_zmap_gates(check):
             "%s) - the holder cannot keep 1.0 mm clearance"
             % (hh["count"], hh.get("max_intrusion", 0.0),
                hh.get("first_line", "?")))
+    # task ZA: axial plunges fail flat/bull roughing programs; for a ball
+    # they stay report-only (count + depths in check.json)
+    ap = check.get("axial_plunges")
+    ttype = (check.get("tool") or {}).get("type")
+    if ttype in ("flat", "bull") and isinstance(ap, dict) \
+            and ap.get("count", 0) > 0:
+        raise EngineError(
+            "zmap gate: %d axial plunges (max %.3f mm, first line %s) - a "
+            "%s program must not drive its flat bottom straight into solid "
+            "stock" % (ap["count"], ap.get("max_depth_mm", 0.0),
+                       ap.get("first_line", "?"), ttype))
 
 
 def _tool_number(cfg, values):

@@ -296,6 +296,11 @@ def main(argv=None):
                    help="cutting feed mm/min (James's cutting data)")
     r.add_argument("--ramp-feed", dest="ramp_feed", type=float, default=1270.0,
                    help="ramp/plunge feed mm/min (James's cutting data)")
+    r.add_argument("--ramp-angle-deg", dest="ramp_angle_deg", type=float,
+                   default=2.0,
+                   help="max descent angle into stock in deg (helix pitch and "
+                        "straight ramps); default 2.0, clamped [0.5, 15], "
+                        "<= 0 rejected")
     r.add_argument("--spindle", type=int, default=7500,
                    help="spindle rpm (James's cutting data)")
     r.add_argument("--workers", type=int, default=None,
@@ -511,7 +516,8 @@ def main(argv=None):
                                   stepup=a.stepup, min_rest=a.min_rest,
                                   min_level_area=a.min_level_area,
                                   rapid_margin=a.rapid_margin,
-                                   progress=prog, stock_out=a.stock_out)
+                                   progress=prog, stock_out=a.stock_out,
+                                    ramp_angle_deg=a.ramp_angle_deg)
     if a.post == "lnc":
         from engine import post_lnc
         text = post_lnc.post(moves, metric=a.metric, program=a.program,
