@@ -38,6 +38,25 @@ from engine.stock import StockField  # noqa: E402
 from engine.gcode import moves_to_gcode  # noqa: E402
 
 
+
+def _need(*paths):
+    """A real-file fixture or tracked input is missing: FAIL (never skip) with the
+    regenerate hint from fixtures/manifest.json."""
+    import json as _json
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        man = {f["path"]: f["regenerate"] for f in _json.load(
+            open(os.path.join(root, "fixtures", "manifest.json")))["fixtures"]}
+    except OSError:
+        man = {}
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        raise AssertionError("missing fixture(s): " + "; ".join(
+            "%s (regenerate: %s)" % (p, man.get(os.path.relpath(p, root),
+                                               "tracked in git - restore it"))
+            for p in missing))
+
+
 def _dist_pt_seg(px, py, ax, ay, bx, by):
     dx, dy = bx - ax, by - ay
     L2 = dx * dx + dy * dy
@@ -58,9 +77,7 @@ def _grow_rect(r, d):
 def test_adaptive2d_offset_convention():
     """Square boss in a box: tool centre stays exactly tool_r + allowance from
     the boss, and reaches exactly the stock edge on the outside."""
-    if not HAVE_AREA:
-        print("SKIP test_adaptive2d_offset_convention (no area module)")
-        return
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
     box = (0.0, 0.0, 40.0, 40.0)
     boss = (10.0, 10.0, 30.0, 30.0)
     tool_d, leave = 6.0, 0.5
@@ -357,9 +374,7 @@ def test_rough_without_hf_safe():
     Synthetic slab + small tall boss (loop perimeter < 20 mm): roughing
     without hf must produce ZERO gouges under the engine's own drop-cutter
     and output identical to passing --hf explicitly."""
-    if not HAVE_AREA:
-        print("SKIP test_rough_without_hf_safe (no area module)")
-        return
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
     import tempfile
     from opencamlib import ocl
     from engine.rough import rough, build_part_hf
@@ -431,9 +446,8 @@ def test_rough_testblock_r2():
     * regression for the fillet-meets-vertical-corner point (-17.56, 13.87)
       where the old OCL-waterline islands let the level-29.906 path run
       3.72 mm below CL: leave must be honoured there too."""
-    if not (HAVE_AREA and os.path.exists(TB_STL) and os.path.exists(TB_HF)):
-        print("SKIP test_rough_testblock_r2 (no area or out/test_block.*)")
-        return
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    _need(TB_STL, TB_HF)
     import tempfile
     import json as _json
     import numpy as np
@@ -563,9 +577,8 @@ def test_rough_testblock_r4():
     model every floor cell OUTSIDE the analytic crescent must end
     0.381 +- 0.05 mm high, and the material that stays standing must be
     ~the analytic crescent area (not the old margin-wide band)."""
-    if not (HAVE_AREA and os.path.exists(TB_STL) and os.path.exists(TB_HF)):
-        print("SKIP test_rough_testblock_r4 (no area or out/test_block.*)")
-        return
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    _need(TB_STL, TB_HF)
     import tempfile
     import json as _json
     import numpy as np
@@ -723,9 +736,8 @@ def test_rough_region_clipped_to_stock():
     over the whole grid: zmap outside_grid, 3,479 moves). Both outputs must
     keep every cutter-centre XY within stock +- tool radius (+0.01), and the
     cut length must differ by < 1 %."""
-    if not (HAVE_AREA and os.path.exists(TB_STL) and os.path.exists(TB_HF)):
-        print("SKIP test_rough_region_clipped_to_stock (no area or out/test_block.*)")
-        return
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    _need(TB_STL, TB_HF)
     import json as _json
     import numpy as np
     from opencamlib import ocl
@@ -783,9 +795,7 @@ def test_islands_grid_edge_parity():
     cutter centres next to the pocket walls - silently dropping the open
     circuit flipped even-odd parity and admitted them (synth_pocket failure:
     centre at (-6.4, 23.508), 0.39 mm from the wall, at Z=4.381)."""
-    if not HAVE_AREA:
-        print("SKIP islands_grid_edge_parity (no area)")
-        return
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
     import tempfile
     import numpy as np
     from opencamlib import ocl
@@ -878,9 +888,7 @@ def test_rough_pocket_in_block():
     block top keeps >= tool_r + leave from the pocket walls.
     Narrow (5 mm < tool + 2x leave): the tool can never enter - no cutting
     centres below the block top at all, and nothing raises the backstop."""
-    if not HAVE_AREA:
-        print("SKIP rough_pocket_in_block (no area)")
-        return
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
     n_wide, stats_w = _check_pocket_block(8.0, "wide")
     assert n_wide > 0, "wide pocket: no cutting below the block top"
     floor_lvl = [l for l in stats_w["levels"] if l["z"] == 4.381]
@@ -901,9 +909,8 @@ def test_rough_synth_pocket_repro():
     step = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "connector", "testdata",
         "synth_pocket.step")
-    if not (HAVE_AREA and os.path.exists(step)):
-        print("SKIP rough_synth_pocket_repro (no area or synth_pocket.step)")
-        return
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    _need(step)
     import tempfile
     from opencamlib import ocl
     from engine import model
@@ -1029,9 +1036,7 @@ def test_rough_rapids_clear_stock():
     plane, so straight-over-it traverses must be lifted to a verified
     height; no G0 may sit within margin of uncut stock (engine's own
     --stock-out heightfield as the check, no verify/zmap import)."""
-    if not HAVE_AREA:
-        print("SKIP rough_rapids_clear_stock (no area)")
-        return
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
     import tempfile
     from opencamlib import ocl
     from engine.rough import rough, actual_cutter
@@ -1095,9 +1100,7 @@ def test_stl_cache_keyed_by_content():
     here = os.path.dirname(os.path.abspath(__file__))
     a = os.path.join(here, "testdata_synth_pocket.step")
     b = os.path.join(os.path.dirname(here), "samples", "test_block.step")
-    if not (os.path.exists(a) and os.path.exists(b)):
-        print("SKIP stl cache test (sample STEPs missing)")
-        return
+    _need(a, b)
     with tempfile.TemporaryDirectory() as td:
         out = os.path.join(td, "out")
         for src, sub in ((a, "r1"), (b, "r2")):
@@ -1117,9 +1120,8 @@ def test_rough_rt_entries():
     step = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "connector", "testdata",
         "synth_pocket.step")
-    if not (HAVE_AREA and os.path.exists(step)):
-        print("SKIP rough_rt_entries (no area or synth_pocket.step)")
-        return
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    _need(step)
     import subprocess
     import tempfile
     import numpy as np
