@@ -67,11 +67,14 @@ def test_ball_profile_and_cusp():
     ys = centers()
 
     # Single pass at y = 0: cross-section must match the circle.
+    # Task ZB honest entry: descend to the stock top (removes nothing),
+    # ramp in at ~14.7 deg (<= MAX_RAMP_DEG), then the lateral cut.
     res = run("""
 G21 G90 F500
 G0 X-20. Y0. Z20.
-G1 Z5. F100.
-G1 X20. F500.
+G1 Z10. F100.
+G1 X-1.2 Y0. Z5. F100.
+G1 X20. Y0. F500.
 """, part, tool="ball", dia=2 * R)
     stock = res["stock"]
     i0 = int(np.argmin(np.abs(centers())))  # column nearest x = 0
@@ -83,15 +86,19 @@ G1 X20. F500.
     assert res["gouges"]["count"] == 0
 
     # Two passes at stepover s = 3 -> cusp h = R - sqrt(R^2 - (s/2)^2).
+    # Task ZB honest entries: descend to the stock top (removes nothing),
+    # ramp in at ~14.7 deg, then the lateral cuts unchanged.
     s = 3.0
     res2 = run("""
 G21 G90 F500
 G0 X-20. Y-1.5 Z20.
-G1 Z5. F100.
+G1 Z10. F100.
+G1 X-1.2 Y-1.5 Z5. F100.
 G1 X20. Y-1.5 F500.
-G0 X-20. Y-1.5 Z20.
+G0 Z20.
 G0 X-20. Y1.5 Z20.
-G1 Z5. F100.
+G1 Z10. F100.
+G1 X-1.2 Y1.5 Z5. F100.
 G1 X20. Y1.5 F500.
 """, flat_part(band_top=tip, band_halfwidth=5.0), tool="ball", dia=2 * R)
     stock2 = res2["stock"]
@@ -647,8 +654,16 @@ def test_vertical_wall_ball_gouge():
     sb = (-5.0, 5.0, -5.0, 5.0, 0.0, 10.0)
 
     def run_wall(xc):
-        gcode = "G21 G90 F500\nG0 X%.4f Y-3. Z20.\nG1 Z0. F100.\n" \
-                "G1 X%.4f Y3. F500.\n" % (xc, xc)
+        # Task ZB honest entry: descend to the stock top (removes nothing),
+        # then a 4-turn helical G3 (r=1.5, 2.5 mm/turn: atan(2.5/(2*pi*1.5))
+        # = 14.9 deg <= MAX_RAMP_DEG) down to Z0, then the original
+        # traverse unchanged. The tip circle stays at x <= xc, so the ball
+        # (R=1) never reaches a wall cell centre: gouge readings unchanged.
+        gcode = "G21 G90 G17 F500\nG0 X%.4f Y-3. Z20.\nG1 Z10. F100.\n" % (xc,)
+        for k in range(1, 5):
+            gcode += ("G3 X%.4f Y-3. Z%.1f I-1.5 J0. F100.\n"
+                     % (xc, 10.0 - 2.5 * k))
+        gcode += "G1 X%.4f Y3. F500.\n" % (xc,)
         moves = zmap.parse_gcode(gcode)
         return zmap.simulate(moves, part, cell, x0, -5.0, sb, tool="ball",
                             dia=2 * R)
@@ -1241,10 +1256,15 @@ def test_holder_cli_tool_number(tmp_path):
     import json
     (tmp_path / "part.json").write_text(json.dumps(
         {"x0": X0, "y0": Y0, "cell": CELL, "tess_tol": 0.01}))
+    # ZB: the slot is already cleared down to the part (stock-in = part), so
+    # HOLDER_GCODE's descent enters cleared stock, not an axial plunge; the
+    # holder still meets the part's walls - the scenario under test
+    cleared = tmp_path / "cleared.npy"
+    np.save(cleared, holder_part())
     out = tmp_path / "rep.json"
     rc = zmap.main([str(gc), "--part", str(npy), "--tool", "ball",
-                    "--dia", "6.0", "--stock", "-25", "25", "-25", "25",
-                    "0", "20", "--tool-number", "31",
+                    "--dia", "6.0", "--stock-in", str(cleared),
+                    "--tool-number", "31",
                     "--out-json", str(out)])
     assert rc == 0
     rep = json.loads(out.read_text())
@@ -1256,8 +1276,8 @@ def test_holder_cli_tool_number(tmp_path):
     # unknown tool number -> holder check off, reported as "holder unknown"
     out2 = tmp_path / "rep2.json"
     rc = zmap.main([str(gc), "--part", str(npy), "--tool", "ball",
-                    "--dia", "6.0", "--stock", "-25", "25", "-25", "25",
-                    "0", "20", "--tool-number", "99",
+                    "--dia", "6.0", "--stock-in", str(cleared),
+                    "--tool-number", "99",
                     "--out-json", str(out2)])
     assert rc == 0
     rep2 = json.loads(out2.read_text())
@@ -1945,9 +1965,10 @@ def test_axial_helix_g1_segments_2deg_passes(tmp_path):
     assert rc == 0, "2 deg helix of short G1 segments must pass"
 
 
-def test_axial_ball_plunge_counted_not_failing(tmp_path):
-    """A ball plunge into solid stock is counted (report-only) but does not
-    fail the run: zmap exits 0 for ball."""
+def test_axial_ball_plunge_fails(tmp_path):
+    """Task ZB: a ball plunge into solid stock is counted AND fails the run
+    at the fixed BALL_AXIAL_FLOOR=0.5 mm: zmap exits non-zero for ball too,
+    exactly like flat/bull; the report carries floor_mm per tool type."""
     part = block_part(hi=10.0, half=15.0)
     res = run("""
 G21 G90 F500
@@ -1957,6 +1978,7 @@ G1 X10. Y0. F500.
 """, part, tool="ball", dia=6.0, corner=3.0)
     ap = res["axial_plunges"]
     assert ap["count"] == 1, ap
+    assert ap["floor_mm"] == zmap.BALL_AXIAL_FLOOR == 0.5, ap
     assert ap["max_depth_mm"] > 9.0, ap
     rc = _axial_cli(tmp_path, part, tool="ball", dia=6.0, corner=3.0, body="""
 G21 G90 F500
@@ -1964,7 +1986,70 @@ G0 X0. Y0. Z20.
 G1 Z0.5 F100.
 G1 X10. Y0. F500.
 """)
-    assert rc == 0, "ball axial plunge is report-only, never fails"
+    assert rc == 1, "ball axial plunge deeper than 0.5 mm must FAIL (ZB)"
+
+
+def test_axial_ball_1mm_straight_plunge_into_block_fails(tmp_path):
+    """Task ZB must-fail: a 1.0 mm straight ball plunge into a block
+    (stock top Z10, ball tip driven to Z9.0) removes 1.0 mm deeper than
+    BALL_AXIAL_FLOOR=0.5 under the ball: counted, exit non-zero."""
+    part = block_part(hi=10.0, half=15.0)
+    body = """
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z9.0 F100.
+G1 X10. Y0. F500.
+"""
+    res = run(body, part, tool="ball", dia=6.0)
+    ap = res["axial_plunges"]
+    assert ap["count"] == 1, ap
+    # deepest removed column over CELL-centered cells: nearest cell centres
+    # sit at d = sqrt(2)*(CELL/2); depth = 1.0 - dz(d) on the R=3 sphere
+    d0 = math.hypot(CELL / 2.0, CELL / 2.0)
+    expected = 1.0 - (3.0 - math.sqrt(9.0 - d0 * d0))
+    assert abs(ap["max_depth_mm"] - expected) < 1e-3, ap
+    assert ap["floor_mm"] == 0.5, ap
+    assert ap["first_line"] == 4, ap
+    rc = _axial_cli(tmp_path, part, tool="ball", dia=6.0, body=body)
+    assert rc == 1, "1.0 mm straight ball plunge into a block must FAIL"
+
+
+def test_axial_ball_descent_onto_0381_leave_passes(tmp_path):
+    """Task ZB must-pass: a ball descending onto 0.381 mm of leave (tip
+    ends 0.381 mm below the stock top) removes less than BALL_AXIAL_FLOOR
+    = 0.5 mm under the ball: no axial plunge, exit 0."""
+    part = block_part(hi=10.0, half=15.0)
+    body = """
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z9.619 F100.
+G1 X10. Y0. F500.
+"""
+    res = run(body, part, tool="ball", dia=6.0)
+    ap = res["axial_plunges"]
+    assert ap["count"] == 0, ap
+    assert abs(ap["max_depth_mm"]) < 1e-9, ap
+    rc = _axial_cli(tmp_path, part, tool="ball", dia=6.0, body=body)
+    assert rc == 0, "ball descent onto 0.381 mm of leave must PASS"
+
+
+def test_axial_ball_ramp_entry_into_block_passes(tmp_path):
+    """Task ZB must-pass: a ramped ball entry into the block at ~14.9 deg
+    (<= MAX_RAMP_DEG=15, straight G1 diagonal) is a legitimate ramped
+    entry: no axial plunge, exit 0."""
+    part = block_part(hi=10.0, half=15.0)
+    body = """
+G21 G90 F500
+G0 X-20. Y0. Z10.
+G1 X-1.2 Y0. Z5. F100.
+G1 X10. Y0. F500.
+"""
+    res = run(body, part, tool="ball", dia=6.0)
+    ap = res["axial_plunges"]
+    assert ap["count"] == 0, ap  # atan(5/18.8) = 14.9 deg <= 15
+    assert res["stock"].min() < 10.0 - 1e-6  # really entered the block
+    rc = _axial_cli(tmp_path, part, tool="ball", dia=6.0, body=body)
+    assert rc == 0, "ramped (<= 15 deg) ball entry into the block must PASS"
 
 
 def _axial_cli(tmp_path, part, tool, dia, body, corner=0.0, stock=None):

@@ -41,10 +41,11 @@ class EngineError(Exception):
 
 def _check_zmap_gates(check):
     """Raise EngineError if any zmap gate fails: gouges, rapid collisions,
-    shank/over-flute hits > 0, holder hits > 0 (S5), or - task ZA - axial
-    plunges > 0 for a flat/bull roughing tool (a straight feed descent
-    driving the flat bottom into solid stock). Ball programs: axial plunges
-    are report-only."""
+    shank/over-flute hits > 0, holder hits > 0 (S5), or axial plunges > 0
+    for ANY tool type (task ZA/ZB): a flat/bull descent driving its flat
+    bottom into solid stock fails at AXIAL_FLOOR=0.2; a ball axial plunge
+    (finish/rest programs) fails at its own fixed BALL_AXIAL_FLOOR=0.5 mm
+    floor - zmap applies the floor and reports floor_mm per tool type."""
     gouges = check.get("gouges", {})
     if isinstance(gouges, dict) and gouges.get("count", 0) > 0:
         raise EngineError(
@@ -72,17 +73,22 @@ def _check_zmap_gates(check):
             "%s) - the holder cannot keep 1.0 mm clearance"
             % (hh["count"], hh.get("max_intrusion", 0.0),
                hh.get("first_line", "?")))
-    # task ZA: axial plunges fail flat/bull roughing programs; for a ball
-    # they stay report-only (count + depths in check.json)
+    # task ZA/ZB: axial plunges fail EVERY tool type at its own floor
+    # (flat/bull: AXIAL_FLOOR=0.2, ball: BALL_AXIAL_FLOOR=0.5 - zmap
+    # applies the floor per tool type and reports floor_mm in check.json)
     ap = check.get("axial_plunges")
     ttype = (check.get("tool") or {}).get("type")
-    if ttype in ("flat", "bull") and isinstance(ap, dict) \
-            and ap.get("count", 0) > 0:
+    if isinstance(ap, dict) and ap.get("count", 0) > 0:
+        floor = ap.get("floor_mm")
+        if floor is None:
+            floor = 0.5 if ttype == "ball" else 0.2
         raise EngineError(
             "zmap gate: %d axial plunges (max %.3f mm, first line %s) - a "
-            "%s program must not drive its flat bottom straight into solid "
-            "stock" % (ap["count"], ap.get("max_depth_mm", 0.0),
-                       ap.get("first_line", "?"), ttype))
+            "%s program must not drive its bottom deeper than the %.3f mm "
+            "axial floor into solid stock" % (ap["count"],
+                                               ap.get("max_depth_mm", 0.0),
+                                               ap.get("first_line", "?"),
+                                               ttype, floor))
 
 
 def _tool_number(cfg, values):
