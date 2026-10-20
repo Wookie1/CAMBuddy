@@ -685,6 +685,39 @@ def _helix_turns(r, dz, angle_deg=2.0):
 
 
 
+def _rp2_offsets(cell, radius):
+    """Disk cell offsets for RP2_0 diagnosis (same shift trick as stock)."""
+    k = int(math.ceil(radius / cell))
+    return [(dj, di) for dj in range(-k, k + 1) for di in range(-k, k + 1)
+            if (dj * dj + di * di) * cell * cell <= radius * radius]
+
+
+def _rp2_dilate(mask, offs):
+    out = np.zeros_like(mask)
+    m = mask.astype(np.uint8)
+    ny, nx = mask.shape
+    for dj, di in offs:
+        j0, j1 = max(0, dj), min(ny, ny + dj)
+        i0, i1 = max(0, di), min(nx, nx + di)
+        if j0 >= j1 or i0 >= i1:
+            continue
+        out[j0:j1, i0:i1] |= m[j0 - dj:j1 - dj, i0 - di:i1 - di].astype(bool)
+    return out
+
+
+def _rp2_shiftmax(arr, offs):
+    out = np.full_like(arr, -np.inf)
+    ny, nx = arr.shape
+    for dj, di in offs:
+        j0, j1 = max(0, dj), min(ny, ny + dj)
+        i0, i1 = max(0, di), min(nx, nx + di)
+        if j0 >= j1 or i0 >= i1:
+            continue
+        np.maximum(out[j0:j1, i0:i1], arr[j0 - dj:j1 - dj, i0 - di:i1 - di],
+                   out=out[j0:j1, i0:i1])
+    return out
+
+
 def rapid_swept_clear(stock, p0, p1, reach, margin, step=None):
     """True if a straight G0 from p0 to p1 ((x, y, z) tip positions) keeps the
     tip at least `margin` above the highest material (max of live stock top
@@ -1061,6 +1094,16 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     # behavior change when RT_RP is unset.
     _RP = bool(os.environ.get("RT_RP"))
     rp_levels = []
+    # RP2_0 diagnosis (engine/TASK_RP2_0.md): per-region OPEN/CLOSED side-
+    # entry classification on the LIVE stock model. Instrumentation only.
+    _RP2 = bool(os.environ.get("RT_RP2"))
+    rp2_regions = []
+    rp2_lv_sum = []
+    if _RP2:
+        _c0 = stock.cell
+        RP2_OFF_U = _rp2_offsets(_c0, tool_r)          # swept cutting disk
+        RP2_OFF_C = _rp2_offsets(_c0, tool_r + 2.0)     # contact/reach band
+        RP2_OFF_D = _rp2_offsets(_c0, tool_r + 0.5)      # descent clearance
 
     # R2 item 1: ONE batched drop-cutter CL grid with the ACTUAL cutter
     # grown by 2x the radial allowance; per-level islands threshold this grid
@@ -1562,6 +1605,65 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # tool_r + leave offset Adaptive2d applies keeps centres outside F
         isl_in = _loops_from_mask(_erode(Fm, erode_r, pitch), gxs, gys) \
             if Fm.any() else []
+        if _RP2:
+            def rp2_open(res):
+                """RP2_0: OPEN iff a cutter centre q exists with (a) the full
+                tool disk + 0.5 mm margin over already-cleared/air material at
+                level Z (max(top, part) <= Z + 0.05 within tool_r + 0.5: the
+                tool descends in cleared air/stock, no axial removal, contact
+                gap >= tool dia + 2 x 0.5), (b) this region's still-standing
+                cutting material (within tool_r of its cutting paths, top >
+                Z + 0.05 in the LIVE model) within tool_r + 2.0 mm of q, so a
+                short sideways feed engages it with the tool flank only, and
+                (c) q island-legal at 0.03. Returns (open, n_candidates)."""
+                pts2 = [p for (k, p) in res["paths"]
+                        if k == "cutting" for p in p]
+                if len(pts2) < 2:
+                    return False, 0
+                xs = [p[0] for p in pts2]
+                ys = [p[1] for p in pts2]
+                mgn = tool_r + 3.5
+                i0 = max(stock._ci(min(xs) - mgn), 0)
+                i1 = min(stock._ci(max(xs) + mgn) + 2, stock.nx)
+                j0 = max(stock._cj(min(ys) - mgn), 0)
+                j1 = min(stock._cj(max(ys) + mgn) + 2, stock.ny)
+                if i0 >= i1 or j0 >= j1:
+                    return False, 0
+                Ms = np.maximum(stock.top[j0:j1, i0:i1],
+                               stock.part[j0:j1, i0:i1])
+                pm = np.zeros(Ms.shape, dtype=bool)
+                iiL, jjL = [], []
+                for (kind, pp) in res["paths"]:
+                    if kind != "cutting" or not pp:
+                        continue
+                    for (xa, ya), (xb, yb) in zip(pp[:-1], pp[1:]):
+                        n = max(1, int(math.hypot(xb - xa, yb - ya) / 0.4))
+                        for t in range(n + 1):
+                            iiL.append(int((xa + (xb - xa) * t / n
+                                          - stock.x0) / c_sc))
+                            jjL.append(int((ya + (yb - ya) * t / n
+                                          - stock.y0) / c_sc))
+                iiA = np.clip(np.asarray(iiL, dtype=int) - i0,
+                              0, Ms.shape[1] - 1)
+                jjA = np.clip(np.asarray(jjL, dtype=int) - j0,
+                              0, Ms.shape[0] - 1)
+                pm[jjA, iiA] = True
+                U = _rp2_dilate(pm, RP2_OFF_U) & (Ms > z + 0.05)
+                if not U.any():
+                    return True, 1   # region cuts nothing standing: open
+                band = _rp2_dilate(U, RP2_OFF_C)
+                T = _rp2_shiftmax(Ms, RP2_OFF_D) <= z + 0.05
+                cand = band & T
+                nq = int(cand.sum())
+                if not nq:
+                    return False, 0
+                jjc, iic = np.nonzero(cand)
+                stq = max(1, nq // 400)
+                qs = [(stock.x0 + (int(iic[t]) + i0 + 0.5) * c_sc,
+                      stock.y0 + (int(jjc[t]) + j0 + 0.5) * c_sc)
+                      for t in range(0, nq, stq)]
+                return any(isl_ok3(qs)), nq
+
         # ---- RP0 instrumentation (RT_RP=1): safe region vs Adaptive2d input
         rp = None
         if _RP:
@@ -1791,7 +1893,30 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             else:
                 entry = min(cand[k], key=lambda p:
                           math.dist((prev[0], prev[1]), p))
+            rp2_flag = rp2_cand = None
+            if _RP2:
+                rp2_flag, rp2_cand = rp2_open(res)
+            pxy0 = (prev[0], prev[1])
+            pz0 = prev[2]
+            i0m = len(moves)
             enter_at(round(entry[0], 4), round(entry[1], 4), z, res["helix"])
+            if _RP2:
+                seq = [pxy0 + (pz0, 0)] + [(mv["x"], mv["y"], mv["z"],
+                                           mv["g"]) for mv in moves[i0m:]]
+                L2 = 0.0
+                zhi = -1e9
+                for a, b in zip(seq[:-1], seq[1:]):
+                    if None not in (a[0], a[1], a[2], b[0], b[1], b[2]):
+                        if b[3] == 1 and b[2] < a[2] - 1e-9:
+                            L2 += math.dist(a, b)
+                        zhi = max(zhi, a[2], b[2])
+                    if b[3] == 1 and abs(b[2] - z) <= 1e-6:
+                        break      # first horizontal cut at Z: entry done
+                rp2_regions.append({"z": round(z, 3), "r": nreg,
+                                   "open": bool(rp2_flag), "cand": rp2_cand,
+                                   "entry_mm": round(L2, 1),
+                                   "dz_mm": round(max(zhi - z, 0.0), 2)})
+
             level_pts.append((round(entry[0], 4), round(entry[1], 4),
                              "start r%d" % nreg))
             region_dump.append({"start": entry, "helix": res["helix"],
@@ -2091,6 +2216,14 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                  "mandatory": bool(mandatory),
                                  "t_islands_s": round(t_isl, 1),
                                  "t_adaptive_s": round(t_a2d, 1)})
+        if _RP2:
+            lv = [r for r in rp2_regions if r["z"] == round(z, 3)]
+            no = sum(1 for r in lv if r["open"])
+            rp2_lv_sum.append({"z": round(z, 3), "n_open": no,
+                              "n_closed": len(lv) - no,
+                              "entry_mm_closed": round(sum(
+                                  r["entry_mm"] for r in lv
+                                  if not r["open"]), 1)})
         if _RP:
             rp["n_regions"] = nreg
             rp["n_clip_breaks"] = stats["n_clip_breaks"] - cb0
@@ -2158,4 +2291,34 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                        "a2d_cut_len_mm": round(sum(r["a2d_cut_len_mm"]
                                                   for r in rp_levels), 1),
                        "levels": rp_levels}, fh, indent=1)
+    if _RP2:
+        import json as _json
+        def _rp2_helix_len(dz, ang):
+            r_h = helix_dia / 2.0
+            if dz <= 0:
+                return 0.0
+            turns = _helix_turns(r_h, dz, ang)
+            return turns * math.hypot(2.0 * math.pi * r_h, dz / turns)
+        closed = [r for r in rp2_regions if not r["open"]]
+        remaining = {}
+        for ang in (2.0, 5.0, 10.0, 15.0):
+            s = 0.0
+            for r in closed:
+                rest = max(r["entry_mm"] - _rp2_helix_len(r["dz_mm"], 2.0),
+                          0.0)
+                s += rest + _rp2_helix_len(r["dz_mm"], ang)
+            remaining[str(ang)] = round(s, 1)
+        with open(os.environ.get("RT_RP2_OUT", "out/rp2_0.json"),
+                  "w") as fh:
+            _json.dump({
+                "n_regions": len(rp2_regions),
+                "n_open": sum(1 for r in rp2_regions if r["open"]),
+                "n_closed": len(closed),
+                "entry_feed_all_mm": round(sum(r["entry_mm"]
+                                             for r in rp2_regions), 1),
+                "entry_feed_closed_mm": round(sum(r["entry_mm"]
+                                                for r in closed), 1),
+                "remaining_if_only_closed_helix_mm": remaining,
+                "levels": rp2_lv_sum,
+                "regions": rp2_regions}, fh)
     return moves, stats
