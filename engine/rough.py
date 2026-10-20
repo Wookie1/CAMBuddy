@@ -661,17 +661,29 @@ def hf_gouge_violation(points, stock, tool_r, tol=0.02):
     return None
 
 
+def _helix_turns(r, dz):
+    """Integer turn count so the LAST turn runs a full circle at the bottom
+    and completes the bore at exactly z_bot (no separate depth circle needed:
+    every point within r + tool_r is swept by the bottom turn). The pitch is
+    capped so no segment descends steeper than ~14 deg (zmap's axial-plunge
+    gate is 15 deg)."""
+    if dz <= 0:
+        return 1.0
+    pitch_max = 2 * math.pi * r * math.tan(math.radians(14.0))
+    return max(1, int(math.ceil(dz / pitch_max)))
+
+
 def _helix_moves(cx, cy, sx, sy, z_top, z_bot, feed, r):
     """Downward CCW helix at FIXED radius r (the ONE helix entry diameter /
     2, same centre Adaptive2d ramped against) starting at the angle of
-    (sx,sy), descending z_top->z_bot, finished with one full circle at
-    depth so the bore cut equals the bore Adaptive2d assumed."""
+    (sx,sy), descending z_top->z_bot in an integer number of turns; the
+    bottom turn is the bore-completing circle."""
     if r < 0.05:
         return [{"g": 1, "x": sx, "y": sy, "z": z_bot, "f": feed}]
     a0 = math.atan2(sy - cy, sx - cx)
-    turns = max(1.0, (z_top - z_bot) / max(0.2 * r, 0.5))
-    turns = min(turns, (z_top - z_bot) / (2 * math.pi * r) * 4 + 1)
-    n = max(8, int(turns * 36))
+    turns = _helix_turns(r, z_top - z_bot)
+    seg_per_turn = max(8, int(2 * math.pi * r / 1.0))
+    n = max(8, int(turns * seg_per_turn))
     out = []
     for i in range(1, n + 1):
         t = i / n
@@ -679,13 +691,44 @@ def _helix_moves(cx, cy, sx, sy, z_top, z_bot, feed, r):
         out.append({"g": 1, "x": round(cx + r * math.cos(a), 4),
                     "y": round(cy + r * math.sin(a), 4),
                     "z": round(z_top + t * (z_bot - z_top), 4), "f": feed})
-    # one full circle at depth to complete the entry bore
-    for i in range(1, 37):
-        a = a0 + turns * 2 * math.pi + i / 36.0 * 2 * math.pi
-        out.append({"g": 1, "x": round(cx + r * math.cos(a), 4),
-                    "y": round(cy + r * math.sin(a), 4),
-                    "z": round(z_bot, 4), "f": feed})
     return out
+
+
+def _strip_engage(stock, pts, z, R):
+    """RT2: max perpendicular chord of stock standing above Z within the tool
+    footprint along a corridor (same measure zmap uses for radial engagement).
+    Used to keep at-cut-height feed links to thin strips: a link that would
+    cross a broad face at cutting height is a full-width horizontal move."""
+    if len(pts) < 2:
+        return 0.0
+    dx = pts[-1][0] - pts[0][0]
+    dy = pts[-1][1] - pts[0][1]
+    L = math.hypot(dx, dy)
+    if L < 1e-9:
+        return 0.0
+    px, py = -dy / L, dx / L
+    cell = stock.cell
+    k = int(math.ceil(R / cell))
+    step = max(1, int(0.5 / cell))
+    best = 0.0
+    for (cx, cy) in pts[::step]:
+        i0, j0 = stock._ci(cx), stock._cj(cy)
+        ilo, ihi = max(0, i0 - k), min(stock.nx, i0 + k + 1)
+        jlo, jhi = max(0, j0 - k), min(stock.ny, j0 + k + 1)
+        if ilo >= ihi or jlo >= jhi:
+            continue
+        gx = (np.arange(ilo, ihi) - i0) * cell
+        gy = (np.arange(jlo, jhi) - j0) * cell
+        d = np.hypot(*np.meshgrid(gx, gy))
+        win = stock.top[jlo:jhi, ilo:ihi]
+        cells = (d <= R + 0.75 * cell) & (win > z + 0.05)
+        if not cells.any():
+            continue
+        proj = gx[None, :] * px + gy[:, None] * py
+        w = float(proj[cells].max()) - float(proj[cells].min())
+        if w > best:
+            best = w
+    return best
 
 
 def _hug_offset(L, eps):
@@ -873,7 +916,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           axial_leave=None, final_zmin=None, allowance_check=True,
           corner_r=0.127, part_hf=None, stock_cell=0.5, stepup=1.905,
           min_rest=1.0, min_level_area=20.0, rapid_margin=1.0,
-          clip_bridge_mm=2.0, feed_link_max=40.0,
+          clip_bridge_mm=5.0, feed_link_max=40.0,
           progress=None, stock_out=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
@@ -1041,7 +1084,12 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     # its disk at descent. Verify straight feed-down against the full tool
     # radius + half a cell diagonal; anything there goes to helix or to the
     # offset-descent corridor instead of a straight feed plunge.
-    r_wide = tool_r - corner_r + c_sc / math.sqrt(2.0)
+    # RT2: the engine's own mill kernel lowers a 0.5 mm cell once its centre
+    # is inside the tool disk, so a cell at the disk edge is cleared more
+    # optimistically than the judge's 0.1 mm grid ever cuts it - add one full
+    # cell beyond the phase-shift margin so those rim slivers still trigger a
+    # helix/offset descent.
+    r_wide = tool_r - corner_r + c_sc / math.sqrt(2.0) + c_sc
     k_wide = int(math.ceil(r_wide / c_sc)) if r_wide > 0 else -1
     offs_wide = [(dj, di) for dj in range(-k_wide, k_wide + 1)
                  for di in range(-k_wide, k_wide + 1)
@@ -1091,9 +1139,16 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
 
         def try_cand(cx, cy, r):
             """emit helix around (cx,cy) radius r through/near the entry;
-            return True on success."""
+            return True on success. RT2: the circle is VALIDATED at exactly
+            the radius we EMIT (the old code checked a candidate radius but
+            emitted helix_dia/2, so the real path could cross islands and
+            leave uncut stock under the flat bottom)."""
             circ = circle_ok(cx, cy, r)
             if circ is None:
+                if os.environ.get("RT2_DEBUG"):
+                    print("  helix cand (%.2f,%.2f,r=%.2f) for entry (%.3f,"
+                          "%.3f,%.3f): circle bad" % (cx, cy, r, x, y, z),
+                          flush=True)
                 return False
             # start point on the circle nearest the current XY (short rapid
             # across at z_top), bore down, then feed back to the entry
@@ -1101,8 +1156,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # helix end point (same turn count as _helix_moves) - validate
             # the return segment to the entry BEFORE emitting anything
             a0s = math.atan2(s[1] - cy, s[0] - cx)
-            turns = max(1.0, (z_top - z) / max(0.2 * r, 0.5))
-            turns = min(turns, (z_top - z) / (2 * math.pi * r) * 4 + 1)
+            turns = _helix_turns(r, z_top - z)
             ea = a0s + turns * 2 * math.pi
             e = (round(cx + r * math.cos(ea), 4),
                  round(cy + r * math.sin(ea), 4))
@@ -1111,16 +1165,59 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     round(e[1] + (y - e[1]) * t / (seg_n - 1), 4))
                    for t in range(seg_n)]
             if not all(isl_ok(seg)):
+                if os.environ.get("RT2_DEBUG"):
+                    print("  helix cand (%.2f,%.2f,r=%.2f): seg bad"
+                          % (cx, cy, r), flush=True)
                 return False          # caller falls back (counts axial)
-            if prev[2] is not None and prev[2] > z_top + 1e-6:
+            # RT2: the return feed runs at cutting Z, entirely inside the
+            # bore the helix + depth circle just cut (disk r + tool_r about
+            # the centre) - its floor is at Z there. Requiring containment
+            # keeps the flat bottom from dragging over uncleared stock at
+            # full width (the horizontal engagement spikes zmap reports).
+            if any(math.dist(p, (cx, cy)) > r + tool_r - corner_r - 0.25
+                   for p in seg):
+                if os.environ.get("RT2_DEBUG"):
+                    print("  helix cand (%.2f,%.2f,r=%.2f): entry outside bore"
+                          % (cx, cy, r), flush=True)
+                return False
+            # RT2: the traverse height must clear BOTH the entry column and
+            # the corridor from the entry to the helix start. The old code
+            # descended at the entry to z_top (column-clear only) and then ran
+            # diagonally to s: emit()'s rapid bump lifted the END point over
+            # the corridor's tall stock but the diagonal sweep still rode
+            # below it near the start - a rapid collision zmap flags.
+            zh = z_top
+            reqc = stock.link_top_max([(x, y), (s[0], s[1])],
+                                     tool_r + rapid_margin)
+            if reqc > -1e8:
+                zh = min(clearance_z, max(zh, reqc + rapid_margin))
+            if prev[2] is not None and prev[2] > zh + 1e-6:
                 emit({"g": 0, "x": prev[0] if prev[0] is not None else x,
                       "y": prev[1] if prev[1] is not None else y,
-                      "z": round(z_top, 4)})
-            emit({"g": 0, "x": s[0], "y": s[1], "z": round(z_top, 4)})
-            stock.mill_segment(x, y, s[0], s[1], z_top, tool_r, corner_r)
-            for hv in _helix_moves(cx, cy, s[0], s[1], z_top, z, ramp_feed, helix_dia / 2.0):
+                      "z": round(zh, 4)})
+            emit({"g": 0, "x": s[0], "y": s[1], "z": round(zh, 4)})
+            # RT2: do NOT pre-write the entry corridor at z_top - nothing has
+            # cut it yet (the G0 into the helix start is a rapid; the corridor
+            # is really cleared by the return feed at Z below, which writes it
+            # honestly). Claiming it early let a later rapid ride at height
+            # z_top+margin into stock zmap still saw standing.
+            # RT2: mill the helix segment-by-segment at each segment's START
+            # z. Milling the ideal circle at z_bot (the old model) claimed the
+            # bore was complete at full radius, but a point on the ring is only
+            # under the disk during part of each turn: where that angular
+            # window closes above z_bot, a crescent of stock really remains
+            # (zmap replays the emitted segments and sees it). Modelling the
+            # conservative start height keeps feed_down's axial checks honest.
+            # Also, if the rapid to the helix start was lifted above zh (R5
+            # verified-clear bump), descend from the ACTUAL height: otherwise
+            # the first helix segment bridges the lift at ~90 deg - a plunge.
+            zt = prev[2] if (prev[2] is not None and prev[2] > zh) else zh
+            hx, hy, hz = s[0], s[1], zt
+            for hv in _helix_moves(cx, cy, s[0], s[1], zt, z, ramp_feed, r):
                 emit(hv)
-            stock.mill_path(circ, z, tool_r, corner_r)
+                stock.mill_segment(hx, hy, hv["x"], hv["y"], hz, tool_r,
+                                  corner_r)
+                hx, hy, hz = hv["x"], hv["y"], hv["z"]
             emit({"g": 1, "x": x, "y": y, "z": z, "f": cut_feed})
             stock.mill_path(seg, z, tool_r, corner_r)
             mill_now(x, y, z)
@@ -1130,15 +1227,16 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             r0 = math.dist((hc[0], hc[1]), (x, y))
             if r0 > 0.05 and try_cand(hc[0], hc[1], r0):
                 return True
+        # RT2: every tier now EMITS at the validated radius and the pitch is
+        # capped so no segment descends steeper than ~12 deg (zmap's axial
+        # gate is 15): the old tiers descended at 0.5 mm/turn regardless of
+        # radius, which at r <= 0.5 is ~22 deg - an axial plunge by the
+        # judge's own angle criterion.
         for d in (1.5, 3.0, 4.5, 6.0, 8.0):
             for q in range(16):
                 a = q * math.pi / 8.0
                 nx_, ny_ = math.cos(a), math.sin(a)
                 px_, py_ = x + d * nx_, y + d * ny_
-                i = int(math.floor((px_ - stock.x0) / c_sc))
-                j = int(math.floor((py_ - stock.y0) / c_sc))
-                if not (0 <= i < stock.nx and 0 <= j < stock.ny and grown[j, i]):
-                    continue
                 for fr in (0.5, 0.8, 0.3):
                     rh = fr * tool_r
                     if rh < 0.15:
@@ -1147,16 +1245,15 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     if try_cand(px_ + rh * nx_, py_ + rh * ny_, rh):
                         return True
         # fine tier: narrow edge-cleanup bands (stock face + tool reach) are
-        # too tight for a full-size helix - bore with a small eccentricity
+        # too tight for a full-size helix - bore with a small eccentricity.
+        # RT2: no `grown` prefilter on p - the entry candidate itself can sit
+        # at the territory edge (a2d fallback points); circle_ok (isl_ok +
+        # centre_zone) plus bore containment are the real guards.
         for d in (0.0, 0.3, 0.6, 1.0):
             for q in range(16):
                 a = q * math.pi / 8.0
                 nx_, ny_ = math.cos(a), math.sin(a)
                 px_, py_ = x + d * nx_, y + d * ny_
-                i = int(math.floor((px_ - stock.x0) / c_sc))
-                j = int(math.floor((py_ - stock.y0) / c_sc))
-                if not (0 <= i < stock.nx and 0 <= j < stock.ny and grown[j, i]):
-                    continue
                 for rh in (0.5, 0.35, 0.2):
                     if try_cand(px_ + rh * nx_, py_ + rh * ny_, rh):
                         return True
@@ -1181,7 +1278,12 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                         and stock_box[2] + tool_r <= sy
                         <= stock_box[3] - tool_r):
                     continue     # footprint must stay inside the stock box
-                if disk_top(sx, sy, offs_rt) > z + 0.04:
+                # RT2: judge-disk clearance (not the wider R5 pad) makes far
+                # more columns available near walls; a straight descent there is
+                # still axial-safe because no material stands above Z+0.04
+                # within the judge's own disk, and the horizontal feed-in is
+                # floor-checked below.
+                if disk_top(sx, sy, offs_wide) > z + 0.04:
                     continue
                 n = max(2, int(dist / 0.4))
                 path = [(round(sx + (x - sx) * t / n, 4),
@@ -1214,6 +1316,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 return
             if ax_hard:
                 stats["n_axial_plunge"] += 1
+                stats.setdefault("axial_pts", []).append(
+                    ("hard", round(x, 3), round(y, 3), round(z, 3)))
             else:
                 # material only inside the judge-phase disk (a rim sliver the
                 # judge MIGHT see, but not under the true flat bottom): try an
@@ -1248,6 +1352,14 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 mill_now(x, y, z)
                 stats["n_offset_descends"] += 1
                 return
+        if wide_fail:
+            # RT2: neither a full-size helix nor a verified-clear column was
+            # available where the judge's disk sees stock above Z - a straight
+            # feed-down here WOULD be an axial plunge. Count it (the run
+            # aborts on n_axial_plunge) instead of emitting a judged plunge.
+            stats["n_axial_plunge"] += 1
+            stats.setdefault("axial_pts", []).append(
+                ("wide", round(x, 3), round(y, 3), round(z, 3)))
         if prev[2] is not None and prev[2] > h + 1e-6:
             emit({"g": 0, "x": x, "y": y, "z": round(h, 4)})
         if h > z + 1e-6:
@@ -1595,18 +1707,26 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                         _r[3] += _cl
                         if _ok and _dd <= stepover * tool_r * 2 * 6.0 / 6.0 + 0.5:
                             _r[4] += _dd
+                    top = (stock.link_top_max(corridor, tool_r)
+                          if prev[2] is not None else -1e9)
+                    wide = (top > z + 0.05 and _strip_engage(
+                        stock, corridor, z, tool_r) > 2.438)
                     if prev[2] is not None and abs(prev[2] - z) <= 1e-6 and \
                             all(isl_ok(corridor)) and \
                             stock.link_clear(corridor, z + lift) and \
-                            math.dist(corridor[0], land) <= feed_link_max:
+                            math.dist(corridor[0], land) <= feed_link_max \
+                            and not wide:
                         # RT items 1+2: the corridor is island-clear and no
-                        # material stands above z + lift. Where it shears a
-                        # strip of stock this level may remove, feed across at
-                        # cutting height (no lift at all); where it spans only
-                        # already-cut ground, traverse at G0 just above the
-                        # floor - emit()'s R5 check still raises it to the
-                        # verified pad-clear height wherever a wall is near.
-                        if stock.link_top_max(corridor, tool_r) > z + 0.05:
+                        # material stands above z + lift. Where it shears only
+                        # a THIN strip of stock this level may remove, feed
+                        # across at cutting height (no lift at all); where it
+                        # spans only already-cut ground, traverse at G0 just
+                        # above the floor - emit()'s R5 check still raises it
+                        # to the verified pad-clear height wherever a wall is
+                        # near. RT2: a corridor crossing a WIDE face at z is a
+                        # run of full-width horizontal moves (p99 spike) - it
+                        # fails the `not wide` gate above and takes the lift.
+                        if top > z + 0.05:
                             stats["n_feed_links"] += 1
                             for (x, y) in corridor:
                                 if x == prev[0] and y == prev[1]:
@@ -1765,7 +1885,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         raise RuntimeError(
             "rough axial-plunge FAILED: %d straight feed-down move(s) would "
             "cut stock axially under the flat bottom disk and no helix/ramp "
-            "entry was possible" % stats["n_axial_plunge"])
+            "entry was possible; points: %s"
+            % (stats["n_axial_plunge"], stats.get("axial_pts", [])[:12]))
     if stock_out:
         # S3b: the engine's own final stock heightfield (after all levels),
         # for finish --stock-from rapid verification
