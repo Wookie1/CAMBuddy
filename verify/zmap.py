@@ -18,6 +18,22 @@ GOUGE_TOL = 0.02  # mm below part surface before a cell counts as gouged
 REMOVE_EPS = 1e-9  # mm^3 of removal below which a sample counts as air
 RAPID_FEED = 15000.0  # mm/min assumed for G0 when estimating cycle time
 HOLDER_CLEAR = 1.0  # mm, S5: min clearance of the holder stack to material
+# Task ZA: an AXIAL PLUNGE is a descending feed move (G1) steeper than
+# MAX_RAMP_DEG whose flat tool bottom (radius R, bull: R - corner) removes
+# stock deeper than AXIAL_FLOOR under its end-point disk (deepest removed
+# column, read before the move cuts). Flat/bull: failing gate; ball: report.
+# MAX_RAMP_DEG = 15 = the engine's maximum ramp/helix angle: helixes and ramps
+# at or below it are legitimate entries; anything steeper into stock - a true
+# vertical (90 deg) or a disguised steep diagonal - is a plunge.
+# AXIAL_FLOOR = 0.2 mm is a measurement noise floor (2 x the 0.1 mm judge
+# cell), NOT a tolerated depth. Measured on out/core_front_roughRT_before.ngc
+# (flat 12.686): 489 straight descents remove stock - 14 stepdown re-entries
+# of 1.12-1.62 mm and 475 solid-stock plunges of 10.16-25.65 mm (worst at
+# XY (-2.593,-52.230), line 63675). Both groups are axial removal under a
+# flat bottom and both fail; no tolerated axial depth for flat/bull tools.
+# Constants: never raise either later; fix the measurement instead.
+MAX_RAMP_DEG = 15.0
+AXIAL_FLOOR = 0.2  # mm: noise floor, constant, never raise it later
 TOOLS_JSON = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "tools", "x7_tools.json")
 
@@ -826,6 +842,20 @@ def _engage_stats(vals):
             "max": round(float(a.max()), 4)}
 
 
+def _axial_report(raw):
+    """Task ZA: summarize axial plunges (descents steeper than MAX_RAMP_DEG) that removed
+    more than AXIAL_FLOOR mm under the tool's flat bottom:
+    {count, max_depth_mm, first_line, worst_xy, floor_mm}."""
+    ax = [e for e in raw if e["depth_mm"] > AXIAL_FLOOR]
+    if not ax:
+        return {"count": 0, "max_depth_mm": 0.0, "first_line": None,
+                "worst_xy": None, "floor_mm": AXIAL_FLOOR}
+    worst = max(ax, key=lambda e: e["depth_mm"])
+    return {"count": len(ax), "max_depth_mm": worst["depth_mm"],
+            "first_line": min(e["line"] for e in ax),
+            "worst_xy": [worst["x"], worst["y"]], "floor_mm": AXIAL_FLOOR}
+
+
 def _box_max_np(A, k):
     """Max filter over a (2k+1) square window per axis (non-finite = -inf);
     conservative superset of a disc-radius footprint max (numpy only)."""
@@ -923,6 +953,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         stock[~window] = -np.inf
     R = dia / 2.0
     dz = tool_dz(tool, dia, corner)
+    # task ZA: bottom disk radius for the axial plunge check -- the flat part
+    # of the tool's bottom: R for flat, R - corner for bull; a ball has no
+    # flat bottom, so its full disk is judged against the spherical surface
+    bottom_r = R - corner if tool == "bull" else R
     engage_track = engage_max is not None or engage_report
     k = int(math.ceil(R / cell)) + 1  # +1 so the padded engagement mask fits
     # shank/over-flute check (only with flute): radius S/2, its own window
@@ -1008,17 +1042,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     # plunge tracking
     plunge_flags = []  # list of dicts: {line, x, y, z, angle_deg, depth_mm}
     plunge_count = 0
-    # RT (report-only, no gate): axial plunges - straight feed-down moves
-    # that remove stock UNDER the flat bottom disk (radius R - corner) at
-    # the move's end, i.e. material above z_end + corner within the flat.
-    axial_count = 0
-    axial_worst = 0.0
-    axial_first_line = None
-    axial_flags = []
-    r_flat_ax = R - corner - cell   # flat bottom disk minus one cell of
-                                    # raster quantisation (same convention as
-                                    # the engine's axial-plunge enforcement)
-    k_ax = int(math.ceil(r_flat_ax / cell)) if r_flat_ax > 1e-9 else -1
+    # axial plunge tracking (task ZA): every straight vertical feed descent
+    # that removed >0 stock under the bottom disk, with its deepest removed
+    # column (raw; the report filters by AXIAL_FLOOR)
+    axial_raw = []  # list of dicts: {line, x, y, depth_mm}
     # footprint-outside-grid tracking (cells outside the grid are unjudged)
     outside_grid = 0
     first_outside_line = None
@@ -1073,20 +1100,33 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         pj_s = int(math.floor((cur[1] - y0) / cell))
         if 0 <= pi_s < nx and 0 <= pj_s < ny:
             stock_at_start = float(stock[pj_s, pi_s])
-        # RT (report-only): flat-bottom disk stock at the END XY BEFORE the
-        # move cuts, for straight descending feed moves (axial plunge check)
-        axial_at_end = None
-        if (k_ax >= 0 and cutting and z1 < cur[2] - 1e-9
-                and math.hypot(x1 - cur[0], y1 - cur[1]) < 0.01):
-            pia = int(math.floor((x1 - x0) / cell))
-            pja = int(math.floor((y1 - y0) / cell))
-            alo, ahi = max(0, pia - k_ax), min(nx, pia + k_ax + 1)
-            blo, bhi = max(0, pja - k_ax), min(ny, pja + k_ax + 1)
-            if alo < ahi and blo < bhi:
-                dsg = np.meshgrid(xs[alo:ahi] - x1, ys[blo:bhi] - y1)
-                msk_ax = np.hypot(dsg[0], dsg[1]) <= r_flat_ax
-                vax = np.where(msk_ax, stock[blo:bhi, alo:ahi], -np.inf)
-                axial_at_end = float(vax.max())
+        # task ZA: axial plunge -- a straight downward feed move (G1,
+        # |dXY| <= 1e-6, dz < 0). Deepest stock column removed under the
+        # tool's flat bottom disk (radius bottom_r), read BEFORE this move
+        # cuts: depth = max(stock - (z1 + dz(d))) over cells in the disk.
+        axial_depth = 0.0
+        # horizontal path length: the chord for G1, the arc length R*|sweep|
+        # for a G17 helical G2/G3 (a full-circle helix has a zero chord and
+        # would otherwise read as 90 deg)
+        horiz = math.hypot(x1 - cur[0], y1 - cur[1])
+        if mv["motion"] in ("G2", "G3") and mv.get("arc") \
+                and mv["arc"][3] == 2:
+            horiz = mv["arc"][4] * abs(mv["arc"][6])
+        if (cutting and mv["motion"] in ("G1", "G2", "G3") and z1 < cur[2]
+                and math.degrees(math.atan2(cur[2] - z1, horiz))
+                > MAX_RAMP_DEG):
+            ia = int(math.floor((x1 - x0) / cell))
+            ja = int(math.floor((y1 - y0) / cell))
+            ilo, ihi = max(0, ia - k), min(nx, ia + k + 1)
+            jlo, jhi = max(0, ja - k), min(ny, ja + k + 1)
+            if ilo < ihi and jlo < jhi:
+                dxa = xs[ilo:ihi] - x1
+                dya = ys[jlo:jhi] - y1
+                da = np.hypot(*np.meshgrid(dxa, dya))
+                win_a = stock[jlo:jhi, ilo:ihi]
+                keep = (da <= bottom_r + 1e-9) & np.isfinite(win_a)
+                if keep.any():
+                    axial_depth = float(np.max(win_a[keep] - (z1 + dz(da))[keep]))
         if cutting and flute is not None:
             # material surface under the move's start/end XY as it stands
             # BEFORE this move cuts (the footprint leads the centre by R, so
@@ -1242,6 +1282,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     move_collided = True
         if cutting:
             cut_length += length
+            if axial_depth > 0.0:
+                axial_raw.append({"line": mv["line"], "x": round(x1, 4),
+                                  "y": round(y1, 4),
+                                  "depth_mm": round(axial_depth, 4)})
             lo = int(math.floor(0.5 * (cur[2] + z1) / 5.0)) * 5
             lbl = "%d-%d" % (lo, lo + 5)
             zbands[lbl] = zbands.get(lbl, 0.0) + length
@@ -1315,22 +1359,6 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                         "z": round(z1, 4),
                         "angle_deg": round(angle_deg, 2),
                         "depth_mm": round(depth_m, 4)})
-        # RT (report-only, NO gate): axial plunge = straight feed-down move
-        # removing stock under the flat bottom disk (material above
-        # z_end + corner within radius R - corner). Helix/ramp entries have
-        # xy travel per move and never match.
-        if (axial_at_end is not None and np.isfinite(axial_at_end)
-                and axial_at_end > z1 + corner + 0.05):
-            axial_count += 1
-            d_ax = axial_at_end - z1
-            if d_ax > axial_worst:
-                axial_worst = d_ax
-            if axial_first_line is None:
-                axial_first_line = mv["line"]
-            axial_flags.append({
-                "line": mv["line"],
-                "x": round(x1, 4), "y": round(y1, 4), "z": round(z1, 4),
-                "depth_mm": round(d_ax, 4)})
         cur = [x1, y1, z1]
 
     result = {
@@ -1374,19 +1402,15 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         } if engage_track else None,
         # raw per-bucket values for exact parallel merging (not reported)
         "_engage_raw": {"horizontal": engage_horiz, "entry": engage_entry},
+        # task ZA: report-only for every tool; a FAILING gate for flat/bull
+        # (CLI exit code + connector _check_zmap_gates)
+        "axial_plunges": _axial_report(axial_raw),
+        "_axial_raw": axial_raw,
         "plunge": {
             "ramp_angle_deg": ramp_angle,
             "count": plunge_count,
             # top 10 deepest spots (line, XY, value)
             "flags": sorted(plunge_flags, key=lambda f: f["depth_mm"],
-                           reverse=True)[:10],
-        },
-        # RT: report-only axial-plunge count (no gate reads this)
-        "axial_plunges": {
-            "count": axial_count,
-            "worst_depth_mm": round(axial_worst, 4),
-            "first_line": axial_first_line,
-            "flags": sorted(axial_flags, key=lambda f: f["depth_mm"],
                            reverse=True)[:10],
         },
     }
@@ -1550,19 +1574,9 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                             for f in r["plunge"]["flags"]],
                            key=lambda f: f["depth_mm"], reverse=True)[:10],
         },
-        # RT: report-only axial-plunge merge (no gate reads this)
-        "axial_plunges": {
-            "count": sum(r["axial_plunges"]["count"] for r in results),
-            "worst_depth_mm": round(max((r["axial_plunges"]["worst_depth_mm"]
-                                        for r in results), default=0.0), 4),
-            "first_line": min((r["axial_plunges"]["first_line"]
-                              for r in results
-                              if r["axial_plunges"]["first_line"]),
-                             default=None),
-            "flags": sorted([f for r in results
-                            for f in r["axial_plunges"]["flags"]],
-                           key=lambda f: f["depth_mm"], reverse=True)[:10],
-        },
+        "axial_plunges": _axial_report(
+            [e for r in results for e in r["_axial_raw"]]),
+        "_axial_raw": [e for r in results for e in r["_axial_raw"]],
     }
     zbands = {}
     for r in results:
@@ -1901,7 +1915,6 @@ def main(argv=None):
                            "%.0f mm/min" % args.rapid_feed),
         "engagement": res["engagement"],
         "plunge": res["plunge"],
-        # RT: report-only axial-plunge count (no gate reads this)
         "axial_plunges": res["axial_plunges"],
         "warnings": {
             "engagement": res["engagement"],
@@ -1933,6 +1946,16 @@ def main(argv=None):
                   res["outside_grid"]["count"], args.dia / 2.0,
                   gxmin, gxmax, gymin, gymax,
                   res["outside_grid"]["first_line"]), file=sys.stderr)
+        return 1
+    ap = res["axial_plunges"]
+    if args.tool != "ball" and ap["count"] > 0:
+        wx = ap["worst_xy"] or [float("nan"), float("nan")]
+        print("error: %d axial plunge(s): straight feed descents driving the "
+              "%s bottom deeper than %.3f mm into stock under the flat bottom "
+              "(max %.3f mm at XY %.3f, %.3f, first line %s)" % (
+                  ap["count"], args.tool, AXIAL_FLOOR,
+                  ap["max_depth_mm"], wx[0], wx[1],
+                  ap["first_line"]), file=sys.stderr)
         return 1
     return 0
 
