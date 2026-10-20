@@ -1089,21 +1089,25 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
              "helix_dia_mm": round(helix_dia, 4),
              "ramp_angle_deg": round(ramp_angle_deg, 3),
              "n_tooldown_links": 0, "levels_planned": [round(z, 3) for z in order],
+             "n_entry_descends": 0, "entry_feed_mm": 0.0,
+             "n_reentry_descends": 0, "reentry_feed_mm": 0.0,
+             "n_side_entries": 0, "side_entry_feed_mm": 0.0,
              "mandatory_levels": sorted(round(z, 3) for z in mand)}
     # RP0 diagnosis (engine/TASK_RP0.md): env-gated instrumentation only, no
     # behavior change when RT_RP is unset.
     _RP = bool(os.environ.get("RT_RP"))
     rp_levels = []
     # RP2_0 diagnosis (engine/TASK_RP2_0.md): per-region OPEN/CLOSED side-
-    # entry classification on the LIVE stock model. Instrumentation only.
+    # entry classification on the LIVE stock model. RP2_1: the classification
+    # now DRIVES entry selection (open regions try the verified offset/side
+    # descent before any helix); the per-region dump stays env-gated.
     _RP2 = bool(os.environ.get("RT_RP2"))
     rp2_regions = []
     rp2_lv_sum = []
-    if _RP2:
-        _c0 = stock.cell
-        RP2_OFF_U = _rp2_offsets(_c0, tool_r)          # swept cutting disk
-        RP2_OFF_C = _rp2_offsets(_c0, tool_r + 2.0)     # contact/reach band
-        RP2_OFF_D = _rp2_offsets(_c0, tool_r + 0.5)      # descent clearance
+    _c0 = stock.cell
+    RP2_OFF_U = _rp2_offsets(_c0, tool_r)          # swept cutting disk
+    RP2_OFF_C = _rp2_offsets(_c0, tool_r + 2.0)     # contact/reach band
+    RP2_OFF_D = _rp2_offsets(_c0, tool_r + 0.5)      # descent clearance
 
     # R2 item 1: ONE batched drop-cutter CL grid with the ACTUAL cutter
     # grown by 2x the radial allowance; per-level islands threshold this grid
@@ -1344,15 +1348,23 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                         return True
         return False
 
-    def find_shift(x, y, z, force=False):
+    def find_shift(x, y, z, force=False, flank=False):
         """RT item 1: when the descent column at (x, y) has tall material in
         its R5 pad ring beside it (long feed stretch), find a nearby point
         whose FULL pad column is clear down to just above Z. The tool G0s
         down there and feeds the last bit horizontally at depth - side
         engagement only, no axial drag (floor under the feed-in path must be
-        at/below Z)."""
+        at/below Z).
+        RP2_1 flank=True (OPEN region side entry): the feed-in at depth is
+        allowed to engage THIS level's standing stock with the tool flank -
+        that is the material the region exists to remove. What stays checked
+        exactly as today: judge-disk-clear descent column (no axial removal),
+        island legality of the whole feed path, and the part heightfield
+        backstop (hf_gouge_violation) so the flank never crosses finished
+        geometry; only the live-stock floor test is replaced by the part test.
+        """
         req = disk_top(x, y, offs_rt)
-        if not force and req <= z + 3.0:
+        if not force and not flank and req <= z + 3.0:
             return None          # the vertical feed stretch is short anyway
         for dist in (2.0, 3.5, 5.0, 7.0, 9.0, 11.0, 13.0):
             for q in range(16):
@@ -1376,20 +1388,58 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                        for t in range(n + 1)]
                 if not all(isl_ok3(path)):
                     continue
-                if stock.link_top_max(path,
-                                     max(tool_r - corner_r - 0.5, 0.1)) \
+                if flank:
+                    if hf_gouge_violation([(px, py, z) for (px, py) in path],
+                                         stock, tool_r) is not None:
+                        continue     # feed-in would take the flank over part
+                    # the G0 descent at (sx, sy) must itself be rapid-clear
+                    # down to Z: max(stock, part) within tool_r + margin at the
+                    # column <= Z + 0.05, else emit()'s R5 bump lifts the
+                    # descent back to the traverse height and the feed-in
+                    # becomes a diagonal plunge (zmap axial gate).
+                    if stock.link_top_max([(sx, sy), (sx, sy)],
+                                         tool_r + rapid_margin) > z + 0.05:
+                        continue
+                elif stock.link_top_max(path,
+                                       max(tool_r - corner_r - 0.5, 0.1)) \
                         > z + 0.05:
                     continue     # would drag the flat bottom over stock
                 return (sx, sy)
         return None
 
-    def feed_down(x, y, z, hc=None):
+    def offset_down(x, y, z, off):
+        """RT item 1 / RP2_1: descend on the verified-clear column at off and
+        feed the last bit horizontally at depth onto (x, y, Z)."""
+        sx, sy = off
+        emit({"g": 0, "x": sx, "y": sy, "z": round(prev[2], 4)})
+        # The column at (sx, sy) is judge-disk-clear + part-pad-clear down to
+        # Z, so the descent there removes nothing axially: feed it at ramp
+        # feed rather than rapid - a G0 descent could be R5-bumped back up by
+        # pad material, stranding the tool at traverse height and turning the
+        # feed-in into a diagonal plunge.
+        if prev[2] > z + 1e-6:
+            emit({"g": 1, "x": sx, "y": sy, "z": z, "f": ramp_feed})
+        mill_now(sx, sy, z)
+        emit({"g": 1, "x": x, "y": y, "z": z, "f": cut_feed})
+        n = max(2, int(math.dist((sx, sy), (x, y)) / 0.4))
+        stock.mill_path([(round(sx + (x - sx) * t / n, 4),
+                         round(sy + (y - sy) * t / n, 4))
+                        for t in range(n + 1)], z, tool_r, corner_r)
+        mill_now(x, y, z)
+        stats["n_offset_descends"] += 1
+
+    def feed_down(x, y, z, hc=None, side=False):
         """RT item 1+3: reach (x, y, Z) from directly above. Straight feed is
         only allowed where the flat bottom cuts already-cleared ground: any
         stock under the footprint goes through a helix/ramp entry; the air
         stretch above a verified-clear height (max live material within the
         tool radius + margin along the column, R5 criterion) travels at G0,
-        and only the remaining stretch feeds at ramp feed."""
+        and only the remaining stretch feeds at ramp feed.
+        RP2_1 side=True (OPEN region entry / re-entry): try the verified
+        offset descent FIRST - G0 down beside the target in cleared stock or
+        air (judge-disk + island + part checks as today), then feed in
+        sideways at depth with flank-only engagement - and only fall back to
+        the 2-deg helix when no such column passes its checks."""
         ax_hard = disk_top(x, y, offs_fl) > z + corner_r + 0.05
         ax_judge = (k_ax >= 0 and disk_top(x, y, offs_ax) > z + corner_r
                     + 0.05)
@@ -1397,6 +1447,13 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                    + 0.05)
         wide_fail = False
         if ax_hard or ax_judge or ax_wide:
+            if side and prev[2] is not None:
+                off = find_shift(x, y, z, force=True, flank=True)
+                if off is not None:
+                    offset_down(x, y, z, off)
+                    stats["n_side_entries"] += 1
+                    stats["side_entry_feed_mm"] += math.dist(off, (x, y))
+                    return
             if helix_entry(x, y, z, hc):
                 return
             if ax_hard:
@@ -1419,23 +1476,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         if prev[2] is not None and (h - z > 3.0 or wide_fail):
             off = find_shift(x, y, z, force=wide_fail)
             if off is not None:
-                sx, sy = off
-                emit({"g": 0, "x": sx, "y": sy, "z": round(prev[2], 4)})
-                req_s = disk_top(sx, sy, offs_rt)
-                hs = z if req_s <= -1e8 else max(
-                    z, min(req_s + rapid_margin, prev[2]))
-                if prev[2] > hs + 1e-6:
-                    emit({"g": 0, "x": sx, "y": sy, "z": round(hs, 4)})
-                if hs > z + 1e-6:
-                    emit({"g": 1, "x": sx, "y": sy, "z": z, "f": ramp_feed})
-                mill_now(sx, sy, z)
-                emit({"g": 1, "x": x, "y": y, "z": z, "f": cut_feed})
-                n = max(2, int(math.dist((sx, sy), (x, y)) / 0.4))
-                stock.mill_path([(round(sx + (x - sx) * t / n, 4),
-                                 round(sy + (y - sy) * t / n, 4))
-                                for t in range(n + 1)], z, tool_r, corner_r)
-                mill_now(x, y, z)
-                stats["n_offset_descends"] += 1
+                offset_down(x, y, z, off)
                 return
         if wide_fail:
             # RT2: neither a full-size helix nor a verified-clear column was
@@ -1522,9 +1563,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         emit({"g": 0, "x": px, "y": py, "z": round(h, 4)})
         emit({"g": 0, "x": x, "y": y, "z": round(h, 4)})
 
-    def enter_at(x, y, z, hc):
+    def enter_at(x, y, z, hc, side=False):
         """Get the tool to (x, y, Z) cutting depth, keeping it down when the
-        stock model says the way is clear."""
+        stock model says the way is clear. RP2_1 side=True: OPEN region -
+        feed_down tries the verified side entry before any helix."""
         px = prev[0] if prev[0] is not None else x
         py = prev[1] if prev[1] is not None else y
         pz = prev[2]
@@ -1547,10 +1589,26 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     emit({"g": 1, "x": px, "y": py, "z": z + lift,
                           "f": ramp_feed})
             emit({"g": 0, "x": x, "y": y, "z": z + lift})
-            feed_down(x, y, z)
+            feed_down(x, y, z, side=side)
             stats["n_tooldown_links"] += 1
             return
-        # 3) retract (minimum verified-clear height), then helix or a
+        # 3) RP2_1 side-first (OPEN region): find the verified clear column
+        # BEFORE retracting, then lift straight up at the current point and
+        # traverse directly to it - no detour over (x, y) first; the entry
+        # descent + sideways feed-in happen at depth in offset_down.
+        if side:
+            off = find_shift(x, y, z, force=True, flank=True)
+            if off is not None:
+                req = stock.link_top_max([(px, py), off],
+                                        tool_r + rapid_margin)
+                h = clearance_z if req <= -1e8 else min(
+                    clearance_z, max(req + rapid_margin, pz if pz else
+                                    clearance_z))
+                emit({"g": 0, "x": px, "y": py, "z": round(h, 4)})
+                offset_down(x, y, z, off)
+                stats["n_side_entries"] += 1
+                return
+        # 4) retract (minimum verified-clear height), then helix or a
         # G0-shortened descent; never an axial plunge into stock (RT item 3).
         # feed_down itself diverts long air descents to a nearby clear column.
         retract_to(x, y)
@@ -1561,6 +1619,18 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         z_bot, so update the stock model immediately at the LOW end - the
         next link check in the same region sees the real floor."""
         stock.mill_segment(x, y, x, y, z_bot, tool_r, corner_r)
+
+    def descend_feed(p0, i0):
+        """RP2_1 reporting: descending G1 feed length (mm) emitted since move
+        index i0, starting at point p0=(x, y, z) (None-safe)."""
+        tot = 0.0
+        a = p0
+        for mv in moves[i0:]:
+            b = (mv["x"], mv["y"], mv["z"])
+            if None not in a and mv["g"] == 1 and b[2] < a[2] - 1e-9:
+                tot += math.dist(a, b)
+            a = b
+        return tot
 
     zi = 0
     for z in order:
@@ -1605,64 +1675,63 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # tool_r + leave offset Adaptive2d applies keeps centres outside F
         isl_in = _loops_from_mask(_erode(Fm, erode_r, pitch), gxs, gys) \
             if Fm.any() else []
-        if _RP2:
-            def rp2_open(res):
-                """RP2_0: OPEN iff a cutter centre q exists with (a) the full
-                tool disk + 0.5 mm margin over already-cleared/air material at
-                level Z (max(top, part) <= Z + 0.05 within tool_r + 0.5: the
-                tool descends in cleared air/stock, no axial removal, contact
-                gap >= tool dia + 2 x 0.5), (b) this region's still-standing
-                cutting material (within tool_r of its cutting paths, top >
-                Z + 0.05 in the LIVE model) within tool_r + 2.0 mm of q, so a
-                short sideways feed engages it with the tool flank only, and
-                (c) q island-legal at 0.03. Returns (open, n_candidates)."""
-                pts2 = [p for (k, p) in res["paths"]
-                        if k == "cutting" for p in p]
-                if len(pts2) < 2:
-                    return False, 0
-                xs = [p[0] for p in pts2]
-                ys = [p[1] for p in pts2]
-                mgn = tool_r + 3.5
-                i0 = max(stock._ci(min(xs) - mgn), 0)
-                i1 = min(stock._ci(max(xs) + mgn) + 2, stock.nx)
-                j0 = max(stock._cj(min(ys) - mgn), 0)
-                j1 = min(stock._cj(max(ys) + mgn) + 2, stock.ny)
-                if i0 >= i1 or j0 >= j1:
-                    return False, 0
-                Ms = np.maximum(stock.top[j0:j1, i0:i1],
-                               stock.part[j0:j1, i0:i1])
-                pm = np.zeros(Ms.shape, dtype=bool)
-                iiL, jjL = [], []
-                for (kind, pp) in res["paths"]:
-                    if kind != "cutting" or not pp:
-                        continue
-                    for (xa, ya), (xb, yb) in zip(pp[:-1], pp[1:]):
-                        n = max(1, int(math.hypot(xb - xa, yb - ya) / 0.4))
-                        for t in range(n + 1):
-                            iiL.append(int((xa + (xb - xa) * t / n
-                                          - stock.x0) / c_sc))
-                            jjL.append(int((ya + (yb - ya) * t / n
-                                          - stock.y0) / c_sc))
-                iiA = np.clip(np.asarray(iiL, dtype=int) - i0,
-                              0, Ms.shape[1] - 1)
-                jjA = np.clip(np.asarray(jjL, dtype=int) - j0,
-                              0, Ms.shape[0] - 1)
-                pm[jjA, iiA] = True
-                U = _rp2_dilate(pm, RP2_OFF_U) & (Ms > z + 0.05)
-                if not U.any():
-                    return True, 1   # region cuts nothing standing: open
-                band = _rp2_dilate(U, RP2_OFF_C)
-                T = _rp2_shiftmax(Ms, RP2_OFF_D) <= z + 0.05
-                cand = band & T
-                nq = int(cand.sum())
-                if not nq:
-                    return False, 0
-                jjc, iic = np.nonzero(cand)
-                stq = max(1, nq // 400)
-                qs = [(stock.x0 + (int(iic[t]) + i0 + 0.5) * c_sc,
-                      stock.y0 + (int(jjc[t]) + j0 + 0.5) * c_sc)
-                      for t in range(0, nq, stq)]
-                return any(isl_ok3(qs)), nq
+        def rp2_open(res):
+            """RP2_0: OPEN iff a cutter centre q exists with (a) the full
+            tool disk + 0.5 mm margin over already-cleared/air material at
+            level Z (max(top, part) <= Z + 0.05 within tool_r + 0.5: the
+            tool descends in cleared air/stock, no axial removal, contact
+            gap >= tool dia + 2 x 0.5), (b) this region's still-standing
+            cutting material (within tool_r of its cutting paths, top >
+            Z + 0.05 in the LIVE model) within tool_r + 2.0 mm of q, so a
+            short sideways feed engages it with the tool flank only, and
+            (c) q island-legal at 0.03. Returns (open, n_candidates)."""
+            pts2 = [p for (k, p) in res["paths"]
+                    if k == "cutting" for p in p]
+            if len(pts2) < 2:
+                return False, 0
+            xs = [p[0] for p in pts2]
+            ys = [p[1] for p in pts2]
+            mgn = tool_r + 3.5
+            i0 = max(stock._ci(min(xs) - mgn), 0)
+            i1 = min(stock._ci(max(xs) + mgn) + 2, stock.nx)
+            j0 = max(stock._cj(min(ys) - mgn), 0)
+            j1 = min(stock._cj(max(ys) + mgn) + 2, stock.ny)
+            if i0 >= i1 or j0 >= j1:
+                return False, 0
+            Ms = np.maximum(stock.top[j0:j1, i0:i1],
+                           stock.part[j0:j1, i0:i1])
+            pm = np.zeros(Ms.shape, dtype=bool)
+            iiL, jjL = [], []
+            for (kind, pp) in res["paths"]:
+                if kind != "cutting" or not pp:
+                    continue
+                for (xa, ya), (xb, yb) in zip(pp[:-1], pp[1:]):
+                    n = max(1, int(math.hypot(xb - xa, yb - ya) / 0.4))
+                    for t in range(n + 1):
+                        iiL.append(int((xa + (xb - xa) * t / n
+                                      - stock.x0) / c_sc))
+                        jjL.append(int((ya + (yb - ya) * t / n
+                                      - stock.y0) / c_sc))
+            iiA = np.clip(np.asarray(iiL, dtype=int) - i0,
+                          0, Ms.shape[1] - 1)
+            jjA = np.clip(np.asarray(jjL, dtype=int) - j0,
+                          0, Ms.shape[0] - 1)
+            pm[jjA, iiA] = True
+            U = _rp2_dilate(pm, RP2_OFF_U) & (Ms > z + 0.05)
+            if not U.any():
+                return True, 1   # region cuts nothing standing: open
+            band = _rp2_dilate(U, RP2_OFF_C)
+            T = _rp2_shiftmax(Ms, RP2_OFF_D) <= z + 0.05
+            cand = band & T
+            nq = int(cand.sum())
+            if not nq:
+                return False, 0
+            jjc, iic = np.nonzero(cand)
+            stq = max(1, nq // 400)
+            qs = [(stock.x0 + (int(iic[t]) + i0 + 0.5) * c_sc,
+                  stock.y0 + (int(jjc[t]) + j0 + 0.5) * c_sc)
+                  for t in range(0, nq, stq)]
+            return any(isl_ok3(qs)), nq
 
         # ---- RP0 instrumentation (RT_RP=1): safe region vs Adaptive2d input
         rp = None
@@ -1893,13 +1962,16 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             else:
                 entry = min(cand[k], key=lambda p:
                           math.dist((prev[0], prev[1]), p))
-            rp2_flag = rp2_cand = None
-            if _RP2:
-                rp2_flag, rp2_cand = rp2_open(res)
+            rp2_flag, rp2_cand = rp2_open(res)
             pxy0 = (prev[0], prev[1])
             pz0 = prev[2]
             i0m = len(moves)
-            enter_at(round(entry[0], 4), round(entry[1], 4), z, res["helix"])
+            enter_at(round(entry[0], 4), round(entry[1], 4), z, res["helix"],
+                     side=bool(rp2_flag))
+            de = descend_feed(pxy0 + (pz0,), i0m)
+            stats["entry_feed_mm"] += de
+            if de > 1e-6:
+                stats["n_entry_descends"] += 1
             if _RP2:
                 seq = [pxy0 + (pz0, 0)] + [(mv["x"], mv["y"], mv["z"],
                                            mv["g"]) for mv in moves[i0m:]]
@@ -2001,8 +2073,15 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                 rp_g0 = None
                                 if prev[2] is None or abs(prev[2] - z) > 1e-6 or \
                                         d_chord is None or d_chord > 0.6:
+                                    p0r = (prev[0], prev[1], prev[2])
+                                    i0r = len(moves)
                                     enter_at(round(pts[i][0], 4),
-                                           round(pts[i][1], 4), z, None)
+                                           round(pts[i][1], 4), z, None,
+                                           side=bool(rp2_flag))
+                                    der = descend_feed(p0r, i0r)
+                                    stats["reentry_feed_mm"] += der
+                                    if der > 1e-6:
+                                        stats["n_reentry_descends"] += 1
                                     level_pts.append((round(pts[i][0], 4),
                                                     round(pts[i][1], 4),
                                                     "reentry r%d" % nreg))
@@ -2130,7 +2209,14 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                               "z": round(lift_h, 4)})
                     emit({"g": 0, "x": round(pts[-1][0], 4),
                           "y": round(pts[-1][1], 4), "z": round(lift_h, 4)})
-                    feed_down(round(pts[-1][0], 4), round(pts[-1][1], 4), z)
+                    p0l = (prev[0], prev[1], prev[2])
+                    i0l = len(moves)
+                    feed_down(round(pts[-1][0], 4), round(pts[-1][1], 4), z,
+                             side=bool(rp2_flag))
+                    del_ = descend_feed(p0l, i0l)
+                    stats["reentry_feed_mm"] += del_
+                    if del_ > 1e-6:
+                        stats["n_reentry_descends"] += 1
                     level_pts.append((round(pts[-1][0], 4),
                                      round(pts[-1][1], 4),
                                      "liftland r%d" % nreg))
