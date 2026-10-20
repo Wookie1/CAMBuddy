@@ -661,19 +661,30 @@ def hf_gouge_violation(points, stock, tool_r, tol=0.02):
     return None
 
 
-def _helix_turns(r, dz):
+def _helix_turns(r, dz, angle_deg=2.0):
     """Integer turn count so the LAST turn runs a full circle at the bottom
     and completes the bore at exactly z_bot (no separate depth circle needed:
-    every point within r + tool_r is swept by the bottom turn). The pitch is
-    capped so no segment descends steeper than ~14 deg (zmap's axial-plunge
-    gate is 15 deg)."""
+    every point within r + tool_r is swept by the bottom turn). RT2a: the
+    pitch honors the ramp angle - turns round UP so the pitch per turn is
+    <= 2*pi*r*tan(angle) at the helix radius, and so no emitted G1 segment
+    (which travels a chord, slightly shorter than the arc) descends steeper
+    than angle + 0.05 deg."""
     if dz <= 0:
         return 1.0
-    pitch_max = 2 * math.pi * r * math.tan(math.radians(14.0))
-    return max(1, int(math.ceil(dz / pitch_max)))
+    turns = max(1, int(math.ceil(dz / (2.0 * math.pi * r *
+                                       math.tan(math.radians(angle_deg))))))
+    seg_per_turn = max(8, int(2 * math.pi * r / 1.0))
+    while True:
+        n = max(8, int(turns * seg_per_turn))
+        chord = 2.0 * r * math.sin(turns * math.pi / n)
+        # +/-(1e-4) worst-case jitter from rounding the emitted coords to 4 dp
+        if (dz / n + 1e-4) <= (chord - 1e-4) \
+                * math.tan(math.radians(angle_deg + 0.04)):
+            return turns
+        turns += 1
 
 
-def _helix_moves(cx, cy, sx, sy, z_top, z_bot, feed, r):
+def _helix_moves(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg=2.0):
     """Downward CCW helix at FIXED radius r (the ONE helix entry diameter /
     2, same centre Adaptive2d ramped against) starting at the angle of
     (sx,sy), descending z_top->z_bot in an integer number of turns; the
@@ -681,7 +692,7 @@ def _helix_moves(cx, cy, sx, sy, z_top, z_bot, feed, r):
     if r < 0.05:
         return [{"g": 1, "x": sx, "y": sy, "z": z_bot, "f": feed}]
     a0 = math.atan2(sy - cy, sx - cx)
-    turns = _helix_turns(r, z_top - z_bot)
+    turns = _helix_turns(r, z_top - z_bot, angle_deg)
     seg_per_turn = max(8, int(2 * math.pi * r / 1.0))
     n = max(8, int(turns * seg_per_turn))
     out = []
@@ -917,7 +928,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           corner_r=0.127, part_hf=None, stock_cell=0.5, stepup=1.905,
           min_rest=1.0, min_level_area=20.0, rapid_margin=1.0,
           clip_bridge_mm=5.0, feed_link_max=40.0,
-          progress=None, stock_out=None):
+          progress=None, stock_out=None, ramp_angle_deg=2.0):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -956,6 +967,11 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
       rapids against it (finish --stock-from, S3b).
     """
     sxmin, sxmax, symin, symax, szmin, szmax = stock_box
+    # RT2a: the ramp angle is the parameter the generator honors (helix pitch
+    # and straight ramps); <= 0 is rejected, out-of-range clamps to [0.5, 15].
+    if ramp_angle_deg <= 0:
+        raise ValueError("ramp angle must be > 0 deg")
+    ramp_angle_deg = min(max(float(ramp_angle_deg), 0.5), 15.0)
     if clearance_z is None:
         clearance_z = szmax + 2.0
     axl = leave if axial_leave is None else axial_leave
@@ -1018,6 +1034,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
              "n_offset_descends": 0, "n_axial_suspect": 0,
              "n_feed_links": 0, "n_air_links": 0,
              "helix_dia_mm": round(helix_dia, 4),
+             "ramp_angle_deg": round(ramp_angle_deg, 3),
              "n_tooldown_links": 0, "levels_planned": [round(z, 3) for z in order],
              "mandatory_levels": sorted(round(z, 3) for z in mand)}
 
@@ -1156,7 +1173,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # helix end point (same turn count as _helix_moves) - validate
             # the return segment to the entry BEFORE emitting anything
             a0s = math.atan2(s[1] - cy, s[0] - cx)
-            turns = _helix_turns(r, z_top - z)
+            turns = _helix_turns(r, z_top - z, ramp_angle_deg)
             ea = a0s + turns * 2 * math.pi
             e = (round(cx + r * math.cos(ea), 4),
                  round(cy + r * math.sin(ea), 4))
@@ -1213,7 +1230,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # the first helix segment bridges the lift at ~90 deg - a plunge.
             zt = prev[2] if (prev[2] is not None and prev[2] > zh) else zh
             hx, hy, hz = s[0], s[1], zt
-            for hv in _helix_moves(cx, cy, s[0], s[1], zt, z, ramp_feed, r):
+            for hv in _helix_moves(cx, cy, s[0], s[1], zt, z, ramp_feed, r,
+                                  ramp_angle_deg):
                 emit(hv)
                 stock.mill_segment(hx, hy, hv["x"], hv["y"], hz, tool_r,
                                   corner_r)
