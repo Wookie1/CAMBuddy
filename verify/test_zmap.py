@@ -244,14 +244,16 @@ def test_stock_chain_cli(tmp_path):
     g2 = tmp_path / "s2.ngc"
     g1.write_text("""
 G21 G90 F500
-G0 X-8. Y0. Z20.
-G1 Z6. F100.
+G0 X-22. Y0. Z20.
+G1 Z10. F100.
+G1 X-4. Y0. Z6. F100.
 G1 X8. F500.
 """)
     g2.write_text("""
 G21 G90 F500
-G0 X-4. Y0. Z20.
-G1 Z4.5 F100.
+G0 X-22. Y0. Z20.
+G1 Z10. F100.
+G1 X0. Y0. Z4.5 F100.
 G1 X4. F500.
 """)
     out1 = tmp_path / "stock1.npy"
@@ -888,9 +890,10 @@ def test_plunge_and_engagement_in_warnings():
     gcode = tempfile.NamedTemporaryFile(suffix=".ngc", delete=False, mode="w")
     gcode.write("""
 G21 G90 F500
-G0 X0. Y0. Z20.
-G1 Z5. F100.
-G1 X20. Y0. F500.
+G0 X-20. Y0. Z20.
+G1 Z10. F100.
+G1 X20. Y0. Z5. F100.
+G1 X-20. Y0. F500.
 """)
     gcode.close()
     out_json = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
@@ -924,9 +927,10 @@ def test_cli_optimal_load_computes_engage_max():
     gcode = tempfile.NamedTemporaryFile(suffix=".ngc", delete=False, mode="w")
     gcode.write("""
 G21 G90 F500
-G0 X0. Y0. Z20.
-G1 Z5. F100.
-G1 X20. Y0. F500.
+G0 X-20. Y0. Z20.
+G1 Z10. F100.
+G1 X20. Y0. Z5. F100.
+G1 X-20. Y0. F500.
 """)
     gcode.close()
     out_json = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
@@ -963,9 +967,10 @@ def test_cli_optimal_load_2p032_threshold_2p4384():
     gcode = tempfile.NamedTemporaryFile(suffix=".ngc", delete=False, mode="w")
     gcode.write("""
 G21 G90 F500
-G0 X0. Y0. Z20.
-G1 Z5. F100.
-G1 X20. Y0. F500.
+G0 X-20. Y0. Z20.
+G1 Z10. F100.
+G1 X20. Y0. Z5. F100.
+G1 X-20. Y0. F500.
 """)
     gcode.close()
     out_json = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
@@ -1002,9 +1007,10 @@ def test_cli_optimal_load_and_ramp_angle():
     gcode = tempfile.NamedTemporaryFile(suffix=".ngc", delete=False, mode="w")
     gcode.write("""
 G21 G90 F500
-G0 X0. Y0. Z20.
-G1 Z5. F100.
-G1 X20. Y0. F500.
+G0 X-20. Y0. Z20.
+G1 Z10. F100.
+G1 X20. Y0. Z5. F100.
+G1 X-20. Y0. F500.
 """)
     gcode.close()
     out_json = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
@@ -1043,14 +1049,15 @@ def test_cli_report_strict_json(tmp_path):
     gc = tmp_path / "sample.ngc"
     gc.write_text("""
 G21 G90 F500
-G0 X-10. Y0. Z20.
-G1 Z5. F100.
+G0 X-20. Y0. Z20.
+G1 Z10. F100.
+G1 X0. Y0. Z5. F100.
 G1 X10. Y0. F500.
 G2 X10. Y6. R3. F500.
 G1 X-10. Y6. F500.
-G0 X0. Y0. Z20.
-G1 Z4. F100.
-G3 X10. Y0. R5. Z2. F500.
+G0 X20. Y0. Z15.
+G1 Z10. F100.
+G3 X10. Y0. R5. Z6. F500.
 G0 Z20.
 """)
     out = tmp_path / "report.json"
@@ -1301,8 +1308,8 @@ def test_z5_stock_within_half_cell_ok(tmp_path):
     """A stock box overhanging the grid by at most half a cell per side is
     within rounding and must pass."""
     npy = _z5_hf(tmp_path)
-    gc = _z5_gcode(tmp_path, "G0 X0. Y0. Z20.\nG1 Z5. F100.\n"
-                              "G1 X10. Y0. F500.\n")
+    gc = _z5_gcode(tmp_path, "G0 X22. Y0. Z10.\nG1 X0. Y0. Z5. F100.\n"
+                             "G1 X10. Y0. F500.\n")
     out = tmp_path / "rep.json"
     rc = zmap.main([str(gc), "--part", str(npy), "--stock",
                     "-25.25", "25.25", "-25.25", "25.25", "0", "10",
@@ -1354,7 +1361,7 @@ def test_z5_air_rapid_outside_stock_box_counts_when_off_grid(tmp_path):
     (tmp_path / "part.json").write_text(json.dumps(
         {"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}))
     # stock box inset 5 mm inside the grid in +X: rapids over it are air
-    gc = _z5_gcode(tmp_path, "G0 X-20. Y0. Z20.\nG1 Z5. F100.\n"
+    gc = _z5_gcode(tmp_path, "G0 X-20. Y0. Z10.\nG1 X0. Y0. Z5. F100.\n"
                               "G1 X10. Y0. F500.\n"     # cuts, all in grid
                               "G0 Z20.\n"
                               "G0 X27. Y0.\n")           # air, off grid (R3 -> 30)
@@ -1368,7 +1375,7 @@ def test_z5_air_rapid_outside_stock_box_counts_when_off_grid(tmp_path):
     assert rep["outside_grid"]["first_line"] == 6
     # the same rapid staying inside the grid (X22: footprint to exactly 25)
     # is air outside... still inside the grid -> passes
-    gc2 = _z5_gcode(tmp_path, "G0 X-20. Y0. Z20.\nG1 Z5. F100.\n"
+    gc2 = _z5_gcode(tmp_path, "G0 X-20. Y0. Z10.\nG1 X0. Y0. Z5. F100.\n"
                                "G1 X10. Y0. F500.\n"
                                "G0 Z20.\n"
                                "G0 X22. Y0.\n")
@@ -1383,8 +1390,8 @@ def test_z5_air_rapid_outside_stock_box_counts_when_off_grid(tmp_path):
 def test_z5_tess_tol_gate(tmp_path, capsys):
     """tess_tol missing or > 0.02 in the part sidecar is a hard failure;
     0.01 passes."""
-    gc = _z5_gcode(tmp_path, "G0 X0. Y0. Z20.\nG1 Z5. F100.\n"
-                              "G1 X10. Y0. F500.\n")
+    gc = _z5_gcode(tmp_path, "G0 X22. Y0. Z10.\nG1 X0. Y0. Z5. F100.\n"
+                             "G1 X10. Y0. F500.\n")
     stock = ["--stock", "-25", "25", "-25", "25", "0", "10"]
     rc = zmap.main([str(gc), "--part", str(_z5_hf(tmp_path, None))] + stock)
     assert rc != 0, "missing tess_tol accepted"
@@ -1560,7 +1567,7 @@ def test_z5b_builder_grid_satisfies_zmap_stock_gate(tmp_path):
     un-grown grid still fails (the zmap gate itself is untouched)."""
     import json
     part = block_part(hi=10.0, half=15.0)  # part bbox [-25,25]^2 on std grid
-    gc = _z5_gcode(tmp_path, "G0 X-20. Y0. Z20.\nG1 Z5. F100.\n"
+    gc = _z5_gcode(tmp_path, "G0 X-15. Y0. Z10.\nG1 X5. Y0. Z5. F100.\n"
                               "G1 X23. Y0. F500.\n")
     stock = [-25.0, 25.0, -25.0, 28.0, 0.0, 10.0]  # 3 mm past the std grid
     stock_args = ["--stock"] + [str(v) for v in stock]
@@ -1605,8 +1612,9 @@ G21 G90 G17 G40 G80 G49 G94
 G54
 T13 M06
 G43 Z25. H13 M03 S7500 M08
-G0 X-20. Y0.
-G1 Z5. F300.
+G0 X-15. Y0. Z10.
+G1 X5. Y0. Z5. F300.
+G1 X-20. Y0. F1500.
 G2 X0. Y20. I20. J0. F1500.
 G3 X20. Y0. R20.
 G04 P2000.
@@ -1805,3 +1813,222 @@ def test_strict_skips_home_and_dwell_moves():
     # default behaviour unchanged: home line still parses as before
     dflt = zmap.parse_gcode("G91 G28 X0. Y0.\n")
     assert len(dflt) == 1
+
+
+# =========================================================== task ZA: axial plunges ==
+
+def test_axial_flat_plunge_into_solid_fails(tmp_path):
+    """A straight vertical G1 descent driving a flat bottom into solid stock
+    is an axial plunge: counted, and the CLI exits non-zero for flat/bull."""
+    part = block_part(hi=10.0, half=15.0)
+    res = run("""
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z0.5 F100.
+G1 X10. Y0. F500.
+""", part, tool="flat", dia=6.0)
+    ap = res["axial_plunges"]
+    assert ap["count"] == 1, ap
+    assert abs(ap["max_depth_mm"] - 9.5) < 1e-6, ap
+    assert ap["first_line"] == 4, ap
+    assert ap["worst_xy"] == [0.0, 0.0], ap
+
+    rc = _axial_cli(tmp_path, part, tool="flat", dia=6.0, body="""
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z0.5 F100.
+G1 X10. Y0. F500.
+""")
+    assert rc == 1, "flat plunge must fail the run"
+
+
+def test_axial_steep_diagonal_entry_into_solid_fails(tmp_path):
+    """Task ZA2: a 71 deg straight diagonal into the block (G0 X5 Y0 Z20
+    then G1 X0 Y0 Z5) is a disguised plunge (steeper than MAX_RAMP_DEG):
+    counted, and the flat run FAILS."""
+    part = block_part(hi=10.0, half=15.0)
+    body = """
+G21 G90 F500
+G0 X5. Y0. Z20.
+G1 X0. Y0. Z5. F100.
+"""
+    res = run(body, part, tool="flat", dia=6.0)
+    ap = res["axial_plunges"]
+    assert ap["count"] == 1, ap  # atan(15/5) = 71.6 deg > 15
+    assert abs(ap["max_depth_mm"] - 5.0) < 1e-6, ap
+    assert ap["first_line"] == 4, ap  # G21 line 2, G0 line 3, G1 line 4
+    rc = _axial_cli(tmp_path, part, tool="flat", dia=6.0, body=body)
+    assert rc == 1, "steep diagonal entry into solid stock must FAIL"
+
+
+def test_axial_descent_into_cleared_pocket_passes(tmp_path):
+    """Task ZA2: a straight descent into an area already cleared by an
+    earlier side-entry pass (stock down to the floor there) removes nothing
+    under the flat bottom: no axial plunge, exit 0."""
+    part = block_part(hi=10.0, half=15.0)
+    sb = (-15.0, 15.0, -15.0, 15.0, 0.0, 10.0)  # stock = part footprint
+    body = """
+G21 G90 F500
+G0 X20. Y0. Z20.
+G1 Z4. F100.
+G1 X-12. Y0. Z4. F500.
+G0 Z20.
+G0 X0. Y0.
+G1 Z4. F100.
+G1 X6. Y0. F500.
+"""
+    moves = zmap.parse_gcode(body)
+    res = zmap.simulate(moves, part, CELL, X0, Y0, sb, tool="flat",
+                        dia=6.0)
+    assert res["axial_plunges"]["count"] == 0, res["axial_plunges"]
+    rc = _axial_cli(tmp_path, part, tool="flat", dia=6.0, body=body,
+                    stock=sb)
+    assert rc == 0, "descent into an already-cleared area must pass"
+
+
+def test_axial_helix_entry_into_solid_passes(tmp_path):
+    """Task ZA2: a 2 deg helical G2 full circle (I/J form, Z drop over one
+    turn) into the solid block is a legitimate ramped entry (<= MAX_RAMP_DEG,
+    angle measured from the arc length): no axial plunge, exit 0."""
+    part = block_part(hi=10.0, half=15.0)
+    drop = 2.0 * math.pi * 10.0 * math.tan(math.radians(2.0))  # 2.195 mm
+    body = """
+G21 G90 G17 F500
+G0 X-10. Y0. Z11.5.
+G2 X-10. Y0. Z%.3f I10. J0. F200.
+G1 X10. Y0. F500.
+""" % (11.5 - drop)
+    res = run(body, part, tool="flat", dia=6.0)
+    assert res["axial_plunges"]["count"] == 0, res["axial_plunges"]
+    # the helix really cut into the block (not an air move)
+    assert res["stock"].min() < 10.0 - 1e-6
+    rc = _axial_cli(tmp_path, part, tool="flat", dia=6.0, body=body)
+    assert rc == 0, "helical entry at 2 deg must pass the axial gate"
+
+
+def test_axial_helix_30deg_into_solid_fails(tmp_path):
+    """Task ZA2: a 30 deg helical arc into the block is steeper than
+    MAX_RAMP_DEG=15: counted as an axial plunge, the flat run FAILS."""
+    part = block_part(hi=10.0, half=15.0)
+    drop = math.tan(math.radians(30.0)) * math.pi * 10.0 / 2.0  # 9.063 mm
+    body = """
+G21 G90 G17 F500
+G0 X-10. Y0. Z10.5.
+G2 X0. Y10. Z%.3f I10. J0. F200.
+""" % (10.5 - drop)
+    res = run(body, part, tool="flat", dia=6.0)
+    ap = res["axial_plunges"]
+    assert ap["count"] == 1, ap
+    assert ap["first_line"] == 4, ap
+    rc = _axial_cli(tmp_path, part, tool="flat", dia=6.0, body=body)
+    assert rc == 1, "30 deg helix into solid stock must FAIL"
+
+
+def test_axial_helix_g1_segments_2deg_passes(tmp_path):
+    """Task ZA2: a 2 deg helix linearized into short G1 segments into the
+    block: every segment is a ramp at 2 deg <= MAX_RAMP_DEG, so no axial
+    plunge even though it descends into solid stock."""
+    part = block_part(hi=10.0, half=15.0)
+    drop = 2.0 * math.pi * 10.0 * math.tan(math.radians(2.0))
+    lines = ["G21 G90 F500", "G0 X-10. Y0. Z11.5."]
+    n = 36
+    for k in range(1, n + 1):
+        a = math.pi + 2.0 * math.pi * k / n
+        lines.append("G1 X%.4f Y%.4f Z%.4f F200."
+                     % (10.0 * math.cos(a), 10.0 * math.sin(a),
+                       11.5 - drop * k / n))
+    body = "\n".join(lines) + "\n"
+    res = run(body, part, tool="flat", dia=6.0)
+    assert res["axial_plunges"]["count"] == 0, res["axial_plunges"]
+    assert res["stock"].min() < 10.0 - 1e-6  # really entered the block
+    rc = _axial_cli(tmp_path, part, tool="flat", dia=6.0, body=body)
+    assert rc == 0, "2 deg helix of short G1 segments must pass"
+
+
+def test_axial_ball_plunge_counted_not_failing(tmp_path):
+    """A ball plunge into solid stock is counted (report-only) but does not
+    fail the run: zmap exits 0 for ball."""
+    part = block_part(hi=10.0, half=15.0)
+    res = run("""
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z0.5 F100.
+G1 X10. Y0. F500.
+""", part, tool="ball", dia=6.0, corner=3.0)
+    ap = res["axial_plunges"]
+    assert ap["count"] == 1, ap
+    assert ap["max_depth_mm"] > 9.0, ap
+    rc = _axial_cli(tmp_path, part, tool="ball", dia=6.0, corner=3.0, body="""
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z0.5 F100.
+G1 X10. Y0. F500.
+""")
+    assert rc == 0, "ball axial plunge is report-only, never fails"
+
+
+def _axial_cli(tmp_path, part, tool, dia, body, corner=0.0, stock=None):
+    """Write a part heightfield + gcode and run zmap.main; return its code."""
+    import tempfile
+    hf = tmp_path / "part.npy"
+    np.save(hf, part)
+    with open(tmp_path / "part.json", "w") as f:
+        json.dump({"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}, f)
+    gc = tmp_path / "prog.ngc"
+    gc.write_text(body)
+    out = tmp_path / "check.json"
+    return zmap.main([str(gc), "--part", str(hf), "--tool", tool,
+                      "--dia", "%.4f" % dia, "--corner", "%.4f" % corner,
+                      "--stock", *[str(v) for v in (stock or STOCK)],
+                      "--out-json", str(out)])
+
+
+def test_axial_parallel_matches_serial_count():
+    """--jobs merges axial plunges exactly like the serial run."""
+    part = block_part(hi=10.0, half=15.0)
+    gcode = """
+G21 G90 F500
+G0 X0. Y0. Z20.
+G1 Z0.5 F100.
+G1 X10. Y0. F500.
+G0 X10. Y10. Z20.
+G1 Z0.2 F100.
+"""
+    moves = zmap.parse_gcode(gcode)
+    serial = zmap.simulate(moves, part, CELL, X0, Y0, STOCK, tool="flat",
+                          dia=6.0)
+    par = zmap.simulate_parallel(zmap.parse_gcode(gcode), part, CELL, X0,
+                                 Y0, STOCK, 4, tool="flat", dia=6.0)
+    assert par["axial_plunges"]["count"] == serial["axial_plunges"]["count"]
+    assert abs(par["axial_plunges"]["max_depth_mm"]
+              - serial["axial_plunges"]["max_depth_mm"]) < 1e-9
+
+
+def test_axial_real_core_front_rough_fails():
+    """Task ZA/ZA2 real case: zmap on out/core_front_roughRT_before.ngc (the
+    current Core Front T13 flat rough, D=12.686) FAILS with 489 axial
+    plunges (worst 25.654 mm at XY -2.593, -52.230, first line 63675).
+    The measured removed-depth distribution is bimodal: 14 stepdown
+    re-entries of 1.12-1.62 mm and 475 solid-stock plunges of 10.16-25.65
+    mm; both are axial removal under the flat bottom and both exceed
+    AXIAL_FLOOR=0.2, so the 1.1-1.6 mm re-entries count too (489 total;
+    see zmap.py)."""
+    import json
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    gc = os.path.join(repo, "out", "core_front_roughRT_before.ngc")
+    part = os.path.join(repo, "out", "cf_hf01_z5b.npy")
+    out = os.path.join(repo, "out", "_za_check.json")
+    try:
+        rc = zmap.main([gc, "--part", part, "--tool", "flat",
+                        "--dia", "12.686", "--stock",
+                        "-128.651", "128.651", "-82.55", "82.55",
+                        "0", "60.96", "--jobs", "8", "--out-json", out])
+        assert rc == 1, "flat rough plunging into solid stock must FAIL"
+        rep = json.load(open(out))
+        ap = rep["axial_plunges"]
+        assert ap["count"] == 489, "exact axial plunge count: %r" % (ap,)
+        assert abs(ap["max_depth_mm"] - 25.654) < 1e-3, ap
+        assert ap["first_line"] == 63675, ap
+    finally:
+        if os.path.exists(out):
+            os.unlink(out)
