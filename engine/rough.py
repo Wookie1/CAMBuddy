@@ -684,6 +684,26 @@ def _helix_turns(r, dz, angle_deg=2.0):
         turns += 1
 
 
+
+def rapid_swept_clear(stock, p0, p1, reach, margin, step=None):
+    """True if a straight G0 from p0 to p1 ((x, y, z) tip positions) keeps the
+    tip at least `margin` above the highest material (max of live stock top
+    and part) within `reach` of the tool axis at EVERY point along the move -
+    sampled at the stock cell pitch - not only at its end height. A diagonal
+    climb that starts low beside a wall fails here."""
+    c = stock.cell if step is None else step
+    L = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+    n = max(1, int(math.ceil(L / c)))
+    for i in range(n + 1):
+        t = i / n
+        x = p0[0] + (p1[0] - p0[0]) * t
+        y = p0[1] + (p1[1] - p0[1]) * t
+        z = p0[2] + (p1[2] - p0[2]) * t
+        m = stock.link_top_max([(x, y), (x, y)], reach)
+        if m > -1e8 and z < m + margin - 1e-3:
+            return False
+    return True
+
 def _helix_moves(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg=2.0):
     """Downward CCW helix at FIXED radius r (the ONE helix entry diameter /
     2, same centre Adaptive2d ramped against) starting at the angle of
@@ -1402,6 +1422,26 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             if req > -1e8 and mv["z"] < req + rapid_margin:
                 mv = dict(mv, z=round(max(mv["z"], req + rapid_margin), 4))
                 stats["n_rapid_bumps"] += 1
+            # a rapid that moves in XY while starting BELOW the verified height
+            # would climb diagonally through the material it is clearing
+            # (Core Front: 1.8 mm into stock); rise vertically first - straight
+            # up out of the cut is always clear - then traverse at height
+            if (req > -1e8 and z0 < req + rapid_margin - 1e-9
+                    and (abs(mv["x"] - x0) > 1e-9 or abs(mv["y"] - y0) > 1e-9)):
+                stats["n_rapid_rises"] = stats.get("n_rapid_rises", 0) + 1
+                emit({"g": 0, "x": x0, "y": y0, "z": mv["z"]})
+                x0, y0, z0 = prev
+            # engine-side swept check (never only the end height): a rapid
+            # that moves in XY must clear live stock + part by the margin along
+            # its whole length, or the run fails here rather than in the judge
+            if (abs(mv["x"] - x0) > 1e-9 or abs(mv["y"] - y0) > 1e-9) and \
+                    not rapid_swept_clear(stock, (x0, y0, z0),
+                                          (mv["x"], mv["y"], mv["z"]),
+                                          tool_r + rapid_margin, rapid_margin):
+                raise RuntimeError(
+                    "rapid from (%.3f, %.3f, %.3f) to (%.3f, %.3f, %.3f) does "
+                    "not clear live stock/part by %.2f mm along its length"
+                    % (x0, y0, z0, mv["x"], mv["y"], mv["z"], rapid_margin))
         if (mv.get("x") is not None and mv.get("y") is not None
                 and mv.get("z") is not None
                 and abs(mv["x"] - x0) < 1e-9 and abs(mv["y"] - y0) < 1e-9
