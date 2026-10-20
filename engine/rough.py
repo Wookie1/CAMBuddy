@@ -1402,6 +1402,15 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             if req > -1e8 and mv["z"] < req + rapid_margin:
                 mv = dict(mv, z=round(max(mv["z"], req + rapid_margin), 4))
                 stats["n_rapid_bumps"] += 1
+            # a rapid that moves in XY while starting BELOW the verified height
+            # would climb diagonally through the material it is clearing
+            # (Core Front: 1.8 mm into stock); rise vertically first - straight
+            # up out of the cut is always clear - then traverse at height
+            if (req > -1e8 and z0 < req + rapid_margin - 1e-9
+                    and (abs(mv["x"] - x0) > 1e-9 or abs(mv["y"] - y0) > 1e-9)):
+                stats["n_rapid_rises"] = stats.get("n_rapid_rises", 0) + 1
+                emit({"g": 0, "x": x0, "y": y0, "z": mv["z"]})
+                x0, y0, z0 = prev
         if (mv.get("x") is not None and mv.get("y") is not None
                 and mv.get("z") is not None
                 and abs(mv["x"] - x0) < 1e-9 and abs(mv["y"] - y0) < 1e-9
