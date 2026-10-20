@@ -1032,7 +1032,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
              "n_retracts": 0, "n_lifts": 0, "n_notclear_links": 0,
              "n_clip_breaks": 0, "n_axial_plunge": 0, "n_clip_bridges": 0,
              "n_offset_descends": 0, "n_axial_suspect": 0,
-             "n_feed_links": 0, "n_air_links": 0,
+             "n_feed_links": 0, "n_air_links": 0, "n_deep_links": 0,
              "helix_dia_mm": round(helix_dia, 4),
              "ramp_angle_deg": round(ramp_angle_deg, 3),
              "n_tooldown_links": 0, "levels_planned": [round(z, 3) for z in order],
@@ -1739,7 +1739,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         cb0 = stats["n_clip_breaks"]
         rp_lk0 = ({k: stats[k] for k in ("n_lifts", "n_notclear_links",
                                          "n_feed_links", "n_air_links",
-                                         "n_retracts")} if _RP else None)
+                                         "n_deep_links", "n_retracts")}
+                  if _RP else None)
         level_pts = []  # (x, y, tag) cutter centres cutting at this level's Z
         region_dump = []
         for k in order:
@@ -1861,6 +1862,31 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 elif kind == "linkclear":
                     land = (round(pts[-1][0], 4), round(pts[-1][1], 4))
                     corridor = [(round(x, 4), round(y, 4)) for (x, y) in pts]
+                    # RP1(a): an Adaptive2d link that stays over CLEARED stock
+                    # at cutting depth is an at-depth link: verified against the
+                    # LIVE stock model (link_clear at z, dense cell sampling) and
+                    # the part (corridor_ok: this level's refined forbidden loops,
+                    # 0.4 mm samples + midpoints). Emit it as a feed traverse at
+                    # Z - the tool stays down, no R5 rapid bump can leave it up,
+                    # and the next cutting run continues without a link split or
+                    # a re-entry descent. Anything failing these checks takes the
+                    # lift/retract path exactly as before.
+                    if prev[2] is not None and abs(prev[2] - z) <= 1e-6 and \
+                            all(isl_ok3(corridor)) and \
+                            all(corridor_ok(a, b) for a, b
+                                in zip(corridor[:-1], corridor[1:])) and \
+                            stock.link_clear(corridor, z) and \
+                            stock.link_clear(corridor, z + lift) and \
+                            not _strip_engage(stock, corridor, z, tool_r) > 2.438:
+                        stats["n_deep_links"] += 1
+                        for (x, y) in corridor:
+                            if x == prev[0] and y == prev[1]:
+                                continue
+                            emit({"g": 1, "x": x, "y": y,
+                                  "z": round(z, 4), "f": cut_feed})
+                            level_pts.append((x, y, "dlink r%d" % nreg))
+                        stock.mill_path(corridor, z, tool_r, corner_r)
+                        continue
                     if os.environ.get("RT_DEBUG"):
                         _dd = math.dist((prev[0], prev[1]), land)
                         _cl = sum(math.dist(corridor[i], corridor[i + 1])

@@ -307,6 +307,10 @@ def main(argv=None):
                   help="parallel waterline workers (default $ENGINE_WORKERS or 4)")
     r.add_argument("--tolerance", type=float, default=0.05,
                   help="Adaptive2d path tolerance mm")
+    r.add_argument("--keep-tool-down", dest="keep_tool_down", type=float,
+                   default=3.0,
+                   help="a2d keepToolDownDistRatio: max link length (x tool "
+                        "diameter) Adaptive2d keeps the tool down between paths")
     r.add_argument("--wl-sampling", dest="wl_sampling", type=float, default=0.1,
                   help="(legacy, unused: R2 islands come from a drop-cutter "
                        "CL grid, no waterlines)")
@@ -516,6 +520,7 @@ def main(argv=None):
                                   stepup=a.stepup, min_rest=a.min_rest,
                                   min_level_area=a.min_level_area,
                                   rapid_margin=a.rapid_margin,
+                                  keep_tool_down=a.keep_tool_down,
                                    progress=prog, stock_out=a.stock_out,
                                     ramp_angle_deg=a.ramp_angle_deg)
     if a.post == "lnc":
