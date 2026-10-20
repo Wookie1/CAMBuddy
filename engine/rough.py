@@ -1037,6 +1037,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
              "ramp_angle_deg": round(ramp_angle_deg, 3),
              "n_tooldown_links": 0, "levels_planned": [round(z, 3) for z in order],
              "mandatory_levels": sorted(round(z, 3) for z in mand)}
+    # RP0 diagnosis (engine/TASK_RP0.md): env-gated instrumentation only, no
+    # behavior change when RT_RP is unset.
+    _RP = bool(os.environ.get("RT_RP"))
+    rp_levels = []
 
     # R2 item 1: ONE batched drop-cutter CL grid with the ACTUAL cutter
     # grown by 2x the radial allowance; per-level islands threshold this grid
@@ -1518,6 +1522,95 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # tool_r + leave offset Adaptive2d applies keeps centres outside F
         isl_in = _loops_from_mask(_erode(Fm, erode_r, pitch), gxs, gys) \
             if Fm.any() else []
+        # ---- RP0 instrumentation (RT_RP=1): safe region vs Adaptive2d input
+        rp = None
+        if _RP:
+            c_sc0 = stock.cell
+            xs_s = stock.x0 + (np.arange(stock.nx) + 0.5) * c_sc0
+            ys_s = stock.y0 + (np.arange(stock.ny) + 0.5) * c_sc0
+            ii_s = np.floor((xs_s - gxs[0]) / pitch + 0.5).astype(int)
+            jj_s = np.floor((ys_s - gys[0]) / pitch + 0.5).astype(int)
+            Fs = np.zeros((stock.ny, stock.nx), dtype=bool)
+            sel_i = (xs_s >= gxs[0] - 0.5 * pitch) & \
+                    (xs_s <= gxs[-1] + 0.5 * pitch)
+            sel_j = (ys_s >= gys[0] - 0.5 * pitch) & \
+                    (ys_s <= gys[-1] + 0.5 * pitch)
+            if sel_i.any() and sel_j.any():
+                Fs[np.ix_(sel_j, sel_i)] = \
+                    (np.isfinite(Zg) & (Zg > z - axl + 0.005))[
+                        np.ix_(jj_s[sel_j], ii_s[sel_i])]
+            SAFE0 = centre_zone & ~Fs           # legal centres (raw)
+            MAT = stock.dilate(mask, tool_r)    # centres reaching this level
+            SAFE = SAFE0 & MAT                  # legal AND relevant
+
+            def _ero(m, r):
+                return ~stock.dilate(~m, r)
+            inp_c = _ero(grown, tool_r + leave)  # centres allowed by the outer
+            over = inp_c & ~SAFE0                # planned but illegal -> clips
+            under = SAFE & ~inp_c                # legal+relevant, outer misses
+            per_s = float((SAFE & ~_ero(SAFE, c_sc0)).sum()) * c_sc0
+            per_i = float((inp_c & ~_ero(inp_c, c_sc0)).sum()) * c_sc0
+            if os.environ.get("RT_RP_DBG"):
+                _jj, _ii = np.nonzero(SAFE)
+                _bj, _bi = np.nonzero(inp_c)
+                print("RPDBG z=%.3f SAFE n=%d x[%.1f,%.1f] y[%.1f,%.1f]"
+                      " INP n=%d x[%.1f,%.1f] y[%.1f,%.1f] Fm n=%d"
+                      " overlap=%d" % (
+                          z, _jj.size, xs_s[_ii].min() if _ii.size else 0,
+                          xs_s[_ii].max() if _ii.size else 0,
+                          ys_s[_jj].min() if _jj.size else 0,
+                          ys_s[_jj].max() if _jj.size else 0,
+                          _bi.size, xs_s[_bi].min() if _bi.size else 0,
+                          xs_s[_bi].max() if _bi.size else 0,
+                          ys_s[_bj].min() if _bj.size else 0,
+                          ys_s[_bj].max() if _bj.size else 0,
+                          int(Fm.sum()), int((inp_c & SAFE).sum())),
+                      flush=True)
+                _f = 8
+                for _j in range(0, stock.ny, _f):
+                    print("".join(" SF*"[
+                        (2 if SAFE[_j, _i] else 0) + (1 if inp_c[_j, _i]
+                                                      else 0)]
+                        for _i in range(0, stock.nx, _f))
+                                  .rstrip("*"), flush=True)
+            rp = {"z": round(z, 3), "n_islands": len(islands),
+                  "safe_mm2": round(float(SAFE.sum()) * c_sc0 * c_sc0, 1),
+                  "safe_per_mm": round(per_s, 1),
+                  "input_c_mm2": round(float(inp_c.sum()) * c_sc0 * c_sc0, 1),
+                  "input_c_per_mm": round(per_i, 1),
+                  "over_mm2": round(float(over.sum()) * c_sc0 * c_sc0, 1),
+                  "under_mm2": round(float(under.sum()) * c_sc0 * c_sc0, 1),
+                  "breaks": {}, "bridged": {}, "break_len": {},
+                  "bridge_len": {}, "clip_len_mm": 0.0,
+                  "bridge_len_mm": 0.0, "n_hug": 0, "a2d_cut_len_mm": 0.0,
+                  "n_links_in": 0, "dropped_outers": 0, "dropped_holes": 0}
+            rp_il = [lp for lp in islands
+                     if not (len(lp) == 4 and abs(lp[0][0] - gxs[0]) < 1e-6
+                             and abs(lp[0][1] - gys[0]) < 1e-6)]
+            rp_ok0 = island_clear_fn(rp_il, 0.0)
+
+            def rp_cat(bad):
+                """classify a run of clipped points -> category string"""
+                P = np.asarray(bad, dtype=float)
+                ii = np.clip(((P[:, 0] - stock.x0) / c_sc0).astype(int),
+                             0, stock.nx - 1)
+                jj = np.clip(((P[:, 1] - stock.y0) / c_sc0).astype(int),
+                             0, stock.ny - 1)
+                outside_box = ~centre_zone[jj, ii]
+                inside_il = [not v for v in rp_ok0(bad)]
+                n_in = sum(1 for a, b2 in zip(inside_il, outside_box)
+                          if a and not b2)
+                n_box = int(outside_box.sum())
+                n_m = len(bad) - n_in - n_box
+                if n_in >= max(n_box, n_m):
+                    return "island/part-offset"
+                if n_box >= n_m:
+                    return "stock box/RS"
+                return "allowance margin(<0.01)"
+
+            def rp_poly(pl):
+                return sum(math.dist(pl[k], pl[k + 1])
+                          for k in range(len(pl) - 1))
 
         def corridor_ok(p0, p1):
             if not islands:
@@ -1545,6 +1638,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # clearance ring clips one edge must still get its floor machined -
         # the Z27 pocket at 27.381). Cells beyond the CL grid have no islands
         # (F closes strictly inside the padded grid), so they count as usable.
+        rp_n_out0 = len(outers) if _RP else 0
         if isl_in and outers:
             ip = np.asarray([p for lp in isl_in for p in lp], dtype=float)
             min_d = tool_r + leave + 0.5
@@ -1566,6 +1660,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 if _usable_area(lp, Fm, gxs, gys) >= min_usable:
                     keep.append(lp)
             outers = keep
+            if _RP:
+                rp["dropped_outers"] = rp_n_out0 - len(outers)
         # keep only genuine cleared-pocket holes: a hole whose interior still
         # has stock above the level is a part footprint (excluded cells with
         # part > Z) - passing it next to the coincident island loop breaks
@@ -1577,6 +1673,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             cy = sum(p[1] for p in hp) / len(hp)
             if stock.top_at(cx, cy) <= z + axl + 0.05:
                 keep_holes.append(hp)
+        if _RP:
+            rp["dropped_holes"] = len(holes) - len(keep_holes)
         holes = keep_holes
         if not outers:
             stats["levels"].append({"z": round(z, 3), "skipped": True,
@@ -1586,10 +1684,20 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         t0 = time.time()
         regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
                            tolerance, keep_tool_down, helix_dia)
+        if _RP:
+            rp["a2d_cut_len_mm"] = round(sum(
+                rp_poly(p) for res in regions for (k, p) in res["paths"]
+                if k == "cutting"), 1)
+            rp["n_links_in"] = sum(
+                1 for res in regions for (k, _p) in res["paths"]
+                if k != "cutting")
+            rp["_n_a2d"] = len(regions)
         # R4: wall-hugging rings close the margin-wide rest band + corner
         # chunks Adaptive2d cannot reach (its islands are pre-eroded).
         regions.extend(hug_regions(islands, grown, stock, isl_ok,
                                   eps=max(0.5 * tolerance, 0.03)))
+        if _RP:
+            rp["n_hug"] = len(regions) - rp.pop("_n_a2d")
         t_a2d = time.time() - t0
         stats["t_adaptive"] += t_a2d
         if not regions:
@@ -1629,6 +1737,9 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 if pos is not None else cand[k][0]
         nreg = 0
         cb0 = stats["n_clip_breaks"]
+        rp_lk0 = ({k: stats[k] for k in ("n_lifts", "n_notclear_links",
+                                         "n_feed_links", "n_air_links",
+                                         "n_retracts")} if _RP else None)
         level_pts = []  # (x, y, tag) cutter centres cutting at this level's Z
         region_dump = []
         for k in order:
@@ -1650,9 +1761,12 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     i = 0
                     gap = False
                     bridge = None
+                    rp_g0 = None
                     while i < len(pts):
                         if not good[i]:
                             gap = True
+                            if _RP and rp_g0 is None:
+                                rp_g0 = i
                             i += 1
                             continue
                         if prev[2] is None or abs(prev[2] - z) > 1e-6 or gap:
@@ -1682,9 +1796,43 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                     bridge = chord
                             if bridge is not None:
                                 stats["n_clip_bridges"] += 1
+                                if _RP and rp_g0 is not None:
+                                    _bad = pts[rp_g0:i]
+                                    _cat = rp_cat(_bad)
+                                    _rem = rp_poly([(prev[0], prev[1])] + _bad +
+                                                [tuple(pts[i])]) - d_chord
+                                    rp["bridged"][_cat] = \
+                                        rp["bridged"].get(_cat, 0) + 1
+                                    rp["bridge_len"][_cat] = \
+                                        round(rp["bridge_len"].get(_cat, 0.0) +
+                                              _rem, 2)
+                                    rp["bridge_len_mm"] += _rem
+                                rp_g0 = None
                                 gap = False
                             else:
                                 stats["n_clip_breaks"] += 1
+                                if _RP:
+                                    if rp_g0 is not None:
+                                        _bad = pts[rp_g0:i]
+                                        _cat = rp_cat(_bad)
+                                        if prev[2] is None or \
+                                                abs(prev[2] - z) > 1e-6:
+                                            _cat += " + tool up"
+                                        _rem = rp_poly([(prev[0], prev[1])] +
+                                                    _bad + [tuple(pts[i])]) - \
+                                            (d_chord if d_chord is not None
+                                             else math.dist((prev[0], prev[1]),
+                                                          pts[i]))
+                                    else:
+                                        _cat = "link split (tool up, no clip)"
+                                        _rem = 0.0
+                                    rp["breaks"][_cat] = \
+                                        rp["breaks"].get(_cat, 0) + 1
+                                    rp["break_len"][_cat] = \
+                                        round(rp["break_len"].get(_cat, 0.0) +
+                                              _rem, 2)
+                                    rp["clip_len_mm"] += _rem
+                                rp_g0 = None
                                 if prev[2] is None or abs(prev[2] - z) > 1e-6 or \
                                         d_chord is None or d_chord > 0.6:
                                     enter_at(round(pts[i][0], 4),
@@ -1706,6 +1854,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                             level_pts.append((x, y, "cut r%d" % nreg))
                         stock.mill_path(run, z, tool_r, corner_r)
                         i = j + 1
+                    if _RP and rp_g0 is not None:
+                        _cat = rp_cat(pts[rp_g0:]) + " (tail dropped)"
+                        rp["breaks"][_cat] = rp["breaks"].get(_cat, 0) + 1
+                        rp_g0 = None
                 elif kind == "linkclear":
                     land = (round(pts[-1][0], 4), round(pts[-1][1], 4))
                     corridor = [(round(x, 4), round(y, 4)) for (x, y) in pts]
@@ -1873,6 +2025,14 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                  "mandatory": bool(mandatory),
                                  "t_islands_s": round(t_isl, 1),
                                  "t_adaptive_s": round(t_a2d, 1)})
+        if _RP:
+            rp["n_regions"] = nreg
+            rp["n_clip_breaks"] = stats["n_clip_breaks"] - cb0
+            rp["link_splits"] = {k: stats[k] - v
+                                for k, v in rp_lk0.items()}
+            rp["clip_len_mm"] = round(rp["clip_len_mm"], 1)
+            rp["bridge_len_mm"] = round(rp["bridge_len_mm"], 1)
+            rp_levels.append(rp)
         stats["n_regions"] += nreg
         zi += 1
         if progress:
@@ -1909,4 +2069,27 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # S3b: the engine's own final stock heightfield (after all levels),
         # for finish --stock-from rapid verification
         save_stock_npy(stock, stock_out)
+    if _RP:
+        import json as _json
+        tot, btot, ltot, btt = {}, {}, {}, {}
+        for r in rp_levels:
+            for k, v in r["breaks"].items():
+                tot[k] = tot.get(k, 0) + v
+            for k, v in r["bridged"].items():
+                btot[k] = btot.get(k, 0) + v
+            for k, v in r["break_len"].items():
+                ltot[k] = round(ltot.get(k, 0.0) + v, 1)
+            for k, v in r["bridge_len"].items():
+                btt[k] = round(btt.get(k, 0.0) + v, 1)
+        with open(os.environ.get("RT_RP_OUT", "out/rp0_probe.json"),
+                  "w") as fh:
+            _json.dump({"totals_breaks": tot, "totals_bridged": btot,
+                       "break_len_mm": ltot, "bridge_len_mm": btt,
+                       "clip_len_mm": round(sum(r["clip_len_mm"]
+                                               for r in rp_levels), 1),
+                       "bridge_len_mm_total": round(sum(r["bridge_len_mm"]
+                                                       for r in rp_levels), 1),
+                       "a2d_cut_len_mm": round(sum(r["a2d_cut_len_mm"]
+                                                  for r in rp_levels), 1),
+                       "levels": rp_levels}, fh, indent=1)
     return moves, stats
