@@ -1075,6 +1075,7 @@ def _main():
                test_rough_region_clipped_to_stock,
                test_islands_grid_edge_parity, test_rough_pocket_in_block,
                test_rough_synth_pocket_repro, test_rough_rapids_clear_stock,
+               test_rough_rt_entries,
                test_stl_cache_keyed_by_content):
         try:
             fn()
@@ -1107,6 +1108,127 @@ def test_stl_cache_keyed_by_content():
         assert s1 != s2, "same-name different-content STEPs shared a cached STL"
         assert model.step_to_stl(os.path.join(td, "r1", "model.step"), out_dir=out) == s1
     print("PASS stl cache keyed by content")
+
+
+def test_rough_rt_entries():
+    """Task RT: no axial plunges, short feed descents (G0 does the air),
+    per-level region/clip-break stats, and zmap's report-only axial_plunges
+    stays 0 on the same program."""
+    step = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "connector", "testdata",
+        "synth_pocket.step")
+    if not (HAVE_AREA and os.path.exists(step)):
+        print("SKIP rough_rt_entries (no area or synth_pocket.step)")
+        return
+    import subprocess
+    import tempfile
+    import numpy as np
+    from opencamlib import ocl
+    from engine import model
+    from engine.gcode import moves_to_gcode
+    from engine.rough import rough, build_part_hf
+    from engine.stock import StockField
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    stl = model.step_to_stl(step)
+    surf = ocl.STLSurf()
+    ocl.STLReader(stl, surf)
+    stock_box = (-31.0, 31.0, -31.0, 31.0, -1.0, 12.4)
+    tool_r = 3.0
+    with tempfile.TemporaryDirectory() as td:
+        moves, stats = rough(surf, stock_box, tool_r, 3.0, leave=0.381,
+                            axial_leave=0.381, stepdown=4.0, stepup=1.905,
+                            stepover=2.0 / 6.0, tolerance=0.05, threads=4,
+                            stock_cell=0.5, min_rest=0.5, corner_r=0.0,
+                            stl_path=stl)
+        # engine enforcement + per-level stats (RT item 4)
+        assert stats["n_axial_plunge"] == 0, "engine counted axial plunges"
+        assert stats["levels"], "no levels planned"
+        for lvl in stats["levels"]:
+            assert "n_regions" in lvl and "n_clip_breaks" in lvl, \
+                "level stats missing regions/clip breaks: %s" % lvl
+        # replay: every straight vertical G1 descent is short (air travels
+        # at G0) and removes NO stock under the flat bottom disk
+        sf = StockField(stock_box, cell=0.5)
+        hf = build_part_hf(surf, sf.x0, sf.y0, sf.cell, sf.nx, sf.ny,
+                           threads=4, drop_z=-1.0)
+        sf.set_part_from_other_grid(hf, sf.x0, sf.y0, sf.cell, fill=-1e9)
+        r_ax = tool_r - 0.5          # flat disk minus one quantisation cell
+        k_ax = int(math.ceil(r_ax / 0.5))
+        offs = [(dj, di) for dj in range(-k_ax, k_ax + 1)
+                for di in range(-k_ax, k_ax + 1) if dj * dj + di * di <= 36]
+        prev = None
+        n_plane, n_axial = 0, 0
+        max_dz = 0.0
+        clearance = stock_box[5] + 2.0
+        for mv in moves:
+            cur = (mv["x"], mv["y"], mv["z"])
+            if prev is not None:
+                if mv["g"] == 1 and abs(cur[0] - prev[0]) < 1e-9 \
+                        and abs(cur[1] - prev[1]) < 1e-9 and cur[2] < prev[2]:
+                    dz = prev[2] - cur[2]
+                    max_dz = max(max_dz, dz)
+                    # RT item 1: air travels at G0 - no feed descent may
+                    # start at the clearance plane any more
+                    if prev[2] >= clearance - 0.05:
+                        n_plane += 1
+                    i0 = int(math.floor((cur[0] - sf.x0) / 0.5))
+                    j0 = int(math.floor((cur[1] - sf.y0) / 0.5))
+                    mx = -np.inf
+                    for dj, di in offs:
+                        a, b = i0 + di, j0 + dj
+                        if 0 <= a < sf.nx and 0 <= b < sf.ny:
+                            d = math.hypot(sf.x0 + (a + 0.5) * 0.5 - cur[0],
+                                         sf.y0 + (b + 0.5) * 0.5 - cur[1])
+                            if d <= r_ax:
+                                mx = max(mx, float(sf.top[b, a]))
+                    if mx > cur[2] + 0.05:
+                        n_axial += 1
+                    sf.mill_segment(prev[0], prev[1], cur[0], cur[1], cur[2],
+                                   tool_r)
+                elif mv["g"] == 1:
+                    sf.mill_segment(prev[0], prev[1], cur[0], cur[1],
+                                   min(prev[2], cur[2]), tool_r)
+            prev = cur
+        assert n_axial == 0, "%d straight feed-downs cut stock axially" % n_axial
+        assert n_plane == 0, "%d vertical feed descents start at the " \
+            "clearance plane (max descent %.2f mm)" % (n_plane, max_dz)
+        # zmap (the judge): report-only axial_plunges present and 0
+        ngc = os.path.join(td, "rt.ngc")
+        with open(ngc, "w") as fh:
+            fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+        hf_p = os.path.join(td, "part_hf.npy")
+        # judge grid = stock + tool_r + 5 mm of empty floor (the connector's
+        # prepare convention): footprints of legitimate centres at the stock
+        # edge must stay inside the measured grid, or outside_grid fires for
+        # moves that are fully inside the working envelope.
+        pad = tool_r + 5.0
+        kpad = int(math.ceil(pad / 0.5))
+        raw = np.where(np.isfinite(hf), hf, np.nan)
+        padded = np.full((raw.shape[0] + 2 * kpad, raw.shape[1] + 2 * kpad),
+                        np.nan, dtype=raw.dtype)
+        padded[kpad:kpad + raw.shape[0], kpad:kpad + raw.shape[1]] = raw
+        np.save(hf_p, padded)
+        import json as _json
+        with open(hf_p[:-4] + ".json", "w") as fh:
+            _json.dump({"x0": sf.x0 - kpad * 0.5, "y0": sf.y0 - kpad * 0.5,
+                       "cell": 0.5, "tess_tol": 0.01}, fh)
+        rj = os.path.join(td, "zmap.json")
+        rr = subprocess.run(
+            [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+             "--part", hf_p, "--tool", "flat", "--dia", "6.0",
+             "--stock", *[str(v) for v in stock_box],
+             "--out-json", rj], capture_output=True, text=True, cwd=repo)
+        assert rr.returncode == 0, "zmap failed: %s | %s" % (rr.stdout[-600:], rr.stderr[-600:])
+        rep = _json.load(open(rj))
+        assert rep["gouges"]["count"] == 0
+        assert rep["rapid_collisions"]["count"] == 0
+        assert rep["outside_grid"]["count"] == 0, \
+            "zmap outside_grid: %s" % rep["outside_grid"]["first_line"]
+        assert rep["axial_plunges"]["count"] == 0, \
+            "zmap axial_plunges: %s" % rep["axial_plunges"]["flags"][:3]
+    print("PASS rough rt entries: axial 0 (engine + zmap), all vertical "
+          "feed descents short, per-level region/clip stats present")
 
 
 if __name__ == "__main__":
