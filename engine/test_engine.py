@@ -1080,7 +1080,7 @@ def _main():
                test_rough_region_clipped_to_stock,
                test_islands_grid_edge_parity, test_rough_pocket_in_block,
                test_rough_synth_pocket_repro, test_rough_rapids_clear_stock,
-               test_rough_rt_entries,
+               test_rough_rt_entries, test_rapid_swept_clear_catches_diagonal_climb,
                test_stl_cache_keyed_by_content):
         try:
             fn()
@@ -1231,6 +1231,23 @@ def test_rough_rt_entries():
             "zmap axial_plunges: %s" % rep["axial_plunges"]["flags"][:3]
     print("PASS rough rt entries: axial 0 (engine + zmap), all vertical "
           "feed descents short, per-level region/clip stats present")
+
+
+def test_rapid_swept_clear_catches_diagonal_climb():
+    """Must-fail: a diagonal G0 climbing out of a slot through the stock wall
+    clears at its END height but not along its length; the swept check rejects
+    it, and rise-then-traverse (vertical up, then across at height) passes."""
+    from engine.rough import rapid_swept_clear
+    sf = StockField(SB, cell=0.5)                 # stock top 10
+    sf.mill_path([(-15.0, 10.0), (-5.0, 10.0)], 4.0, SR)   # slot floor at 4
+    p0 = (-10.0, 10.0, 4.0)                       # tool in the slot
+    p1 = (-10.0, 18.0, 11.5)                      # above the wall, 8 mm over
+    assert not rapid_swept_clear(sf, p0, p1, SR + 1.0, 1.0), \
+        "diagonal climb through the slot wall must fail the swept check"
+    rise = (p0[0], p0[1], p1[2])
+    assert rapid_swept_clear(sf, rise, p1, SR + 1.0, 1.0), \
+        "the traverse at height after a vertical rise must pass"
+    print("PASS rapid swept check catches a diagonal climb")
 
 
 if __name__ == "__main__":
