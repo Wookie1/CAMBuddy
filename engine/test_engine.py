@@ -1083,6 +1083,7 @@ def _main():
                test_rough_rt_entries, test_rapid_swept_clear_catches_diagonal_climb,
                test_se2_side_entries_only_through_cleared,
                test_hr1_rings_after_a2d,
+               test_hb1v2_flat_floor_circle_after_helix,
                test_stl_cache_keyed_by_content):
         try:
             fn()
@@ -1432,6 +1433,92 @@ def test_hr1_rings_after_a2d():
             "no level had both a2d and hug-ring cutting moves: test vacuous"
     print("PASS hr1 rings after a2d: %d level(s) with ring+a2d moves, every "
           "ring follows all a2d at its Z" % n_both)
+
+
+def test_hb1v2_flat_floor_circle_after_helix():
+    """HB1v2: after EVERY helix entry the next emitted moves are ONE full flat
+    circle at the helix bottom Z - same centre and radius as the helix, at the
+    ramp feed - before any cutting-feed move. On main's code the move right
+    after the helix is the return feed at the cutting feed, so this fails."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    import numpy as np
+    from opencamlib import ocl
+    from engine.rough import rough
+    CUT, RAMP = 3429.0, 1270.0
+    with tempfile.TemporaryDirectory() as td:
+        stl = _two_floor_pocket_stl(os.path.join(td, "hb1v2.stl"))
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        moves, stats = rough(surf, (-16.2, 16.2, -16.2, 16.2, -1.0, 12.4),
+                            3.0, 6.0, leave=0.381, axial_leave=0.381,
+                            stepdown=19.05, stepup=1.905, stepover=2.0 / 6.0,
+                            tolerance=0.05, threads=4, stock_cell=0.5,
+                            min_rest=0.5, corner_r=0.0)
+
+    def fit(pts):
+        A = np.array([[p[0], p[1], 1.0] for p in pts])
+        b = np.array([-(p[0] ** 2 + p[1] ** 2) for p in pts])
+        s, *_ = np.linalg.lstsq(A, b, rcond=None)
+        cx, cy = -s[0] / 2.0, -s[1] / 2.0
+        return cx, cy, math.sqrt(s[2] + cx * cx + cy * cy)
+
+    n_helix = 0
+    i = 0
+    while i + 1 < len(moves):
+        a, b = moves[i], moves[i + 1]
+        if (a["g"] == 1 and b["g"] == 1 and a.get("f") == RAMP
+                and b.get("f") == RAMP and a["z"] is not None
+                and b["z"] is not None and b["z"] < a["z"] - 1e-9):
+            j = i + 1
+            while (j + 1 < len(moves) and moves[j + 1]["g"] == 1
+                   and moves[j + 1].get("f") == RAMP
+                   and moves[j + 1]["z"] is not None
+                   and moves[j]["z"] is not None
+                   and moves[j + 1]["z"] < moves[j]["z"] - 1e-9):
+                j += 1
+            helix = [m for m in moves[i:j + 1]]
+            i = j + 1
+            hx, hy, hr = fit([(m["x"], m["y"]) for m in helix])
+            if hr < 0.2:  # degenerate micro-bore: no floor circle required
+                continue
+            n_helix += 1
+            zb = helix[-1]["z"]
+            circ = []
+            for m in moves[i:]:
+                if (m["g"] == 1 and m.get("f") == RAMP
+                        and m["z"] is not None and abs(m["z"] - zb) < 1e-6):
+                    circ.append(m)
+                else:
+                    break
+            assert circ, \
+                "helix at (%.2f,%.2f) Z %.3f: no ramp-feed floor circle after " \
+                "the helix bottom (next move f=%r)" % (hx, hy, zb,
+                                                      moves[i].get("f"))
+            cx, cy, cr = fit([(m["x"], m["y"]) for m in circ])
+            assert abs(cx - hx) < 0.05 and abs(cy - hy) < 0.05 \
+                and abs(cr - hr) < 0.05, \
+                "floor circle centre/radius (%.3f,%.3f,r=%.3f) != helix " \
+                "(%.3f,%.3f,r=%.3f)" % (cx, cy, cr, hx, hy, hr)
+            pts = [(m["x"], m["y"]) for m in helix[-1:]] + \
+                  [(m["x"], m["y"]) for m in circ]
+            sweep = 0.0
+            for (p, q) in zip(pts, pts[1:]):
+                da = math.atan2(q[1] - cy, q[0] - cx) \
+                    - math.atan2(p[1] - cy, p[0] - cx)
+                sweep += (da - 2 * math.pi) if da > math.pi else \
+                    ((da + 2 * math.pi) if da < -math.pi else da)
+            assert sweep >= 2 * math.pi - 1.0 and len(circ) >= 8, \
+                "floor circle at Z %.3f is not one full turn (%.2f rad, %d " \
+                "moves)" % (zb, sweep, len(circ))
+            nxt = moves[i + len(circ)]
+            assert nxt["g"] == 1 and nxt.get("f") == CUT, \
+                "floor circle must be followed by the cutting-feed return"
+        else:
+            i += 1
+    assert n_helix >= 1, "no helix entry emitted on the synthetic part: vacuous"
+    print("PASS hb1v2 floor circle: %d helix entry/entries each followed by "
+          "one full flat circle at the helix bottom Z, ramp feed" % n_helix)
 
 
 if __name__ == "__main__":
