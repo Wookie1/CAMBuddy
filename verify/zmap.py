@@ -69,6 +69,13 @@ AE2_PITCH_TOL = 0.05
 # Task ZE2F2: the helix pitch carries along the contiguous entry-feed run at
 # the helix-bottom Z for at most one circumference of the helix path plus this
 AE2_CARRY_EXTRA_MM = 1.0
+# Task ZE2D (report-only): full_width_depth of an ae2 window = the largest h for
+# which (plan area of cells removed at least h deep) / travel >= 0.9 x dia.
+# Separates a genuinely deep full-width slot from a wide shallow cut joined to
+# a thin deep graze (where a = max removed height alone reads "deep slot").
+# Removed heights are binned per move at FWD_BIN_MM (resolution of the result).
+FWD_BIN_MM = 0.25
+FWD_NBINS = 100
 TOOLS_JSON = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "tools", "x7_tools.json")
 
@@ -997,6 +1004,8 @@ def _ae2_windows(moves):
                    "dx": e["dx"], "dy": e["dy"],
                    "area_mm2": e["area_mm2"], "length_mm": e["length_mm"],
                    "a": e["depth_mm"], "width_mm": e["width_mm"],
+                   "hist": (None if e.get("hist") is None
+                            else e["hist"].copy()),
                    "n_moves": 1, "feed": e.get("feed"),
                    "helix_pitch": e.get("helix_pitch")}
         else:
@@ -1007,6 +1016,9 @@ def _ae2_windows(moves):
             cur["area_mm2"] += e["area_mm2"]
             cur["length_mm"] += e["length_mm"]
             cur["a"] = max(cur["a"], e["depth_mm"])
+            if e.get("hist") is not None:
+                cur["hist"] = (e["hist"].copy() if cur["hist"] is None
+                               else cur["hist"] + e["hist"])
             cur["width_mm"] = max(cur["width_mm"], e["width_mm"])
             cur["n_moves"] += 1
         if cur["length_mm"] >= AE2_WINDOW_MM:
@@ -1072,6 +1084,16 @@ def _ae2_engagement_keys(win_recs, dia):
         hp = w.get("helix_pitch")
         return hp is not None and w["a"] <= hp + AE2_PITCH_TOL
 
+    # task ZE2D: full_width_depth per window (then drop the histograms)
+    for w in win_recs:
+        h = w.pop("hist", None)
+        fwd = 0.0
+        if h is not None and w["length_mm"] > 0:
+            cum = np.cumsum(h[::-1])[::-1]       # area removed >= each bin edge
+            ok = np.nonzero(cum / w["length_mm"] >= FULL_WIDTH_FRAC * dia)[0]
+            if ok.size:
+                fwd = round(float(ok.max()) * FWD_BIN_MM, 3)
+        w["full_width_depth"] = fwd
     fws = sorted([w for w in win_recs
                   if w["ae_eff"] >= FULL_WIDTH_FRAC * dia
                   and w["a"] > SLOT_AXIAL_MM],
@@ -1089,7 +1111,18 @@ def _ae2_engagement_keys(win_recs, dia):
                 "worst": [dict(brief(w), feed=w.get("feed"),
                                helix_pitch=w.get("helix_pitch"))
                           for w in ws[:10]]}
+    def bands(ws):
+        out = {}
+        for lo, hi, name in ((0.0, 0.5, "<0.5"), (0.5, 2.0, "0.5-2"),
+                             (2.0, 5.0, "2-5"), (5.0, 1e9, ">5")):
+            sel = [w for w in ws if lo <= w["full_width_depth"] < hi]
+            out[name] = {"count": len(sel), "total_length_mm":
+                         round(sum(w["length_mm"] for w in sel), 1)}
+        return out
     return {
+        "full_width_depth_bands_ae2": {
+            "cutting_feed": bands([w for w in fws if not entry_feed(w)]),
+            "entry_feed": bands([w for w in fws if entry_feed(w)])},
         "ae2_cutting_feed": cut_feed,
         "full_width_slots_ae2_cutting_feed": fw_class(fw_cut),
         "full_width_slots_ae2_entry_feed": dict(
@@ -1378,6 +1411,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         # footprint during this move (max over removed cells of
         # stock_before - cut surface)
         move_max_depth = 0.0
+        move_hist = None  # task ZE2D: histogram of removed cell heights
         # task ZE2: plan area of the cells this move removes material from
         # (cells counted once: stock update makes later samples cut 0 there)
         move_area = 0.0
@@ -1538,6 +1572,11 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 # the stock update drops it to the cut surface below
                 nrem = int(np.count_nonzero(cut > REMOVE_EPS))
                 move_area += nrem * cell * cell
+                if nrem:
+                    hb = np.minimum((cut[cut > REMOVE_EPS] / FWD_BIN_MM)
+                                    .astype(np.int64), FWD_NBINS - 1)
+                    hh = np.bincount(hb, minlength=FWD_NBINS).astype(np.uint32)
+                    move_hist = hh if move_hist is None else move_hist + hh
             if cutting and engage_track:
                 # task ZE: axial depth at this sample = deepest column of
                 # stock removed above the tool surface under the footprint
@@ -1681,6 +1720,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     "dx": dx_t, "dy": dy_t,
                     "length_mm": length,
                     "area_mm2": move_area,
+                    "hist": (None if move_hist is None
+                             else move_hist.astype(np.float32) * np.float32(cell * cell)),
                     "depth_mm": round(max(move_max_depth, 0.0), 4),
                     "width_mm": round(move_max_engage, 4),
                 })
