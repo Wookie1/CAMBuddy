@@ -1476,6 +1476,65 @@ def test_shank_t31_wall_13mm():
                                          max(zl)))
 
 
+def floor_dip_stl(path, half_x=15.0, half_y=10.0, top=10.0, slot_half=6.0,
+                  deep_z=2.0, shelf_z=7.0, step_y=4.0):
+    """Block with a slot along Y (walls at x=+-slot_half, mouth at z=top):
+    floor at deep_z for |y| < step_y (BELOW the requested floor_z) and at
+    shelf_z > floor_z outside - the FL1 dip: passes must split at the dip,
+    never feed below the floor and never be dropped wholesale."""
+    tris = []
+    tris += _box(-half_x, -slot_half, -half_y, half_y, 0.0, top)
+    tris += _box(slot_half, half_x, -half_y, half_y, 0.0, top)
+    tris += _box(-slot_half, slot_half, step_y, half_y, 0.0, shelf_z)
+    tris += _box(-slot_half, slot_half, -half_y, -step_y, 0.0, shelf_z)
+    tris += _box(-slot_half, slot_half, -step_y, step_y, 0.0, deep_z)
+    return write_stl(path, tris)
+
+
+def test_floor_dip_split_finish_and_rest():
+    """FL1: part surface dips below floor_z (deep slot floor z=2 <
+    floor_z=5; shelf z=7 stays above). In BOTH the finish and the rest
+    pass no feed move may run below the floor, points above the floor must
+    still be cut (pass split at the dip, not dropped wholesale), and
+    n_floor_dropped > 0. Fails on main's code: floor_z was only the steep
+    waterline bottom, so shallow rows crossed the dip at z=2."""
+    floor_z = 5.0
+    with tempfile.TemporaryDirectory() as td:
+        stl = floor_dip_stl(os.path.join(td, "dip.stl"))
+        surf = model.load_surf(stl)
+        X, Y, nx, ny = _grid((-15.0, 15.0, -10.0, 10.0))
+        stock = np.full(X.shape, 10.381)
+        np.save(os.path.join(td, "stock.npy"), stock)
+        with open(os.path.join(td, "stock.json"), "w") as fh:
+            json.dump({"x0": -15.0, "y0": -10.0, "cell": CELL}, fh)
+        cases = (("finish", dict(tool=("ball", 6.0, 0.0))),
+                 ("rest", dict(tool=("ball", 3.0, 0.0),
+                              rest_from=os.path.join(td, "stock.npy"),
+                              big_tool=("ball", 6.0, 0.0), min_rest=0.5)))
+        for name, kw in cases:
+            moves, stats = finish(surf, stl_path=stl, floor_z=floor_z,
+                                  threads=4, **kw)
+            # inside the part bbox (outside it the raster pads half a
+            # stepover: stock-edge air passes, not governed by floor_z)
+            feed = [(mv["x"], mv["y"], mv["z"]) for mv in moves
+                    if mv["g"] == 1 and mv.get("z") is not None
+                    and abs(mv["x"]) <= 15.0 and abs(mv["y"]) <= 10.0]
+            assert feed, "%s: no feed moves" % name
+            below = [t for t in feed if t[2] < floor_z - 1e-6]
+            assert not below, \
+                "%s: %d feed moves below floor_z (min %.3f)" % (
+                    name, len(below), min(t[2] for t in below))
+            assert stats.get("n_floor_dropped", 0) > 0, \
+                "%s: n_floor_dropped=0 (dip never reached / no split)" % name
+            # split, not wholesale: the shelf above the floor is still cut
+            kept = [t for t in feed if abs(t[0]) < 5.0 and abs(t[1]) > 4.5
+                    and abs(t[2] - 7.0) < 0.25]
+            assert kept, "%s: nothing kept on the shelf above the dip" % name
+            print("floor-dip %s: feed=%d minz=%.3f dropped=%d kept_shelf=%d"
+                  % (name, len(feed), min(t[2] for t in feed),
+                     stats["n_floor_dropped"], len(kept)))
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -1496,7 +1555,8 @@ if __name__ == "__main__":
                test_rest_pass_table_tool, test_shank_net_keeps_source_index,
                test_holder_drop_tall_boss,
                test_holder_stock_ridge_along_path,
-               test_shank_t31_wall_13mm):
+               test_shank_t31_wall_13mm,
+               test_floor_dip_split_finish_and_rest):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))
