@@ -1082,6 +1082,7 @@ def _main():
                test_rough_synth_pocket_repro, test_rough_rapids_clear_stock,
                test_rough_rt_entries, test_rapid_swept_clear_catches_diagonal_climb,
                test_se2_side_entries_only_through_cleared,
+               test_hr1_rings_after_a2d,
                test_stl_cache_keyed_by_content):
         try:
             fn()
@@ -1345,6 +1346,92 @@ def test_se2_side_entries_only_through_cleared():
         "regions with cleared side approaches did not side-enter"
     print("PASS SE2 side entries: standing-wall part 0 side (helix), test "
           "block %d side through cleared feed-ins" % stats["n_side_entries"])
+
+
+def test_hr1_rings_after_a2d():
+    """Task HR1: per level, ALL hug-ring regions must be emitted AFTER that
+    level's Adaptive2d regions. Synthetic part: slab 40x32 (top Z6) with a
+    cross-wall (x -1..1, top Z12) splitting the territory into a left and a
+    right pocket, plus a boss (x -14..-8, y -4..4, top Z12) inside the left
+    pocket. On main's code the NN travel order slots the boss's hug ring(s)
+    between the two a2d regions, so the ring cuts full width at the full
+    stepdown instead of skimming. Assert on the EMITTED moves: assign every
+    horizontal cutting move at a level Z to the region whose cutting path
+    contains it (a2d vs hug ring, captured by wrapping _run_a2d/hug_regions),
+    and require every ring move at Z to follow the last a2d move at that Z."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    from opencamlib import ocl
+    import engine.rough as R
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "hr1_synth.stl")
+        # slab 40x32 top Z6; central wall (top Z12) whose grown forbidden
+        # band reaches within 0.6 mm of the stock edge in Y - too narrow for
+        # any tool centre -> the machining territory splits into a left and a
+        # right lobe (two a2d regions per level); two fins fused to the wall
+        # (top Z12) give the wall ring extra runs to interleave with a2d.
+        _write_stl(stl, _box_tris(-20.0, 20.0, -16.0, 16.0, 0.0, 6.0)
+                   + _box_tris(-1.0, 1.0, -16.0, 16.0, 6.0, 12.0)
+                   + _box_tris(-8.0, -1.0, -4.0, 4.0, 6.0, 12.0)
+                   + _box_tris(1.0, 8.0, -4.0, 4.0, 6.0, 12.0))
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        cap = []
+        orig_a2d, orig_hug = R._run_a2d, R.hug_regions
+
+        def w_a2d(*a, **k):
+            res = orig_a2d(*a, **k)
+            cap.append([("a2d", r) for r in res])
+            return res
+
+        def w_hug(*a, **k):
+            res = orig_hug(*a, **k)
+            cap[-1].extend(("ring", r) for r in res)
+            return res
+        R._run_a2d, R.hug_regions = w_a2d, w_hug
+        try:
+            moves, stats = R.rough(surf, (-24.0, 24.0, -20.0, 20.0, 6.0, 16.0),
+                                  3.0, 6.0, leave=0.381, axial_leave=0.381,
+                                  stepdown=4.0, stepup=10.0, stepover=2.0 / 6.0,
+                                  tolerance=0.05, threads=4, stock_cell=0.5,
+                                  min_rest=0.5, corner_r=0.0, stl_path=stl)
+        finally:
+            R._run_a2d, R.hug_regions = orig_a2d, orig_hug
+        zs = [lv["z"] for lv in stats["levels"] if not lv.get("skipped")]
+        segs = [s for s in cap if s]
+        assert len(segs) == len(zs), \
+            "captured region segments %d != emitted levels %d" % (len(segs), len(zs))
+        n_both = 0
+        for z, seg in zip(zs, segs):
+            kind_of = {}
+            dup = set()
+            for kind, res in seg:
+                for (kk, pp) in res["paths"]:
+                    if kk != "cutting":
+                        continue
+                    for (x, y) in pp:
+                        p = (round(x, 4), round(y, 4))
+                        if p in kind_of and kind_of[p] != kind:
+                            dup.add(p)
+                        kind_of.setdefault(p, kind)
+            seq = []
+            for mv in moves:
+                if mv["g"] != 1 or mv["z"] is None or abs(mv["z"] - z) > 1e-3:
+                    continue
+                k2 = kind_of.get((round(mv["x"], 4), round(mv["y"], 4)))
+                if k2 is None or (round(mv["x"], 4), round(mv["y"], 4)) in dup:
+                    continue
+                if not seq or seq[-1] != k2:
+                    seq.append(k2)
+            if "ring" in seq and "a2d" in seq:
+                n_both += 1
+                assert "a2d" not in seq[seq.index("ring"):], \
+                    "level Z=%.3f: hug-ring cutting moves do not follow all a2d " \
+                    "cutting moves (emitted order %s)" % (z, seq[:16])
+        assert n_both >= 1, \
+            "no level had both a2d and hug-ring cutting moves: test vacuous"
+    print("PASS hr1 rings after a2d: %d level(s) with ring+a2d moves, every "
+          "ring follows all a2d at its Z" % n_both)
 
 
 if __name__ == "__main__":
