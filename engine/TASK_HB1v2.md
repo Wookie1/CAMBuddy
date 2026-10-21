@@ -45,3 +45,14 @@ PASS:
   /Applications/VibeCAD.app/Contents/Resources/bin/python, as scripts) and
   `/opt/homebrew/bin/python3 -m pytest verify connector engine/test_post.py -q` green, real exit codes, all via the slot.
 Write engine/HB1v2_RESULTS.md with every number and the exact commands. Then stop.
+
+## RESUME (supervisor, after the M5 oMLX outage killed your session)
+Your change is committed on hb1v2 (circle at the helix bottom; CF all-owner FW 330.2 -> 285.5 mm, cycle 4851.6 -> 4980.1 s,
+gates 0, pytest 218 green - all in out/). Do NOT redo those runs. Finish: (1) the ablation result for the containment
+fallback (out/hb1v2_containment.patch / hb1v2_cfa_*: you already ran it - report with vs without); (2) your ridge vs band
+classification of a2d_first FW (out/hb1v2_classify.py, out/hb1v2_*_classify.json) and helix-bottom FW at CUTTING feed,
+before (out/hb1v2_cfmain_*) vs after, Core Front and test block; (3) note: ZE2F currently gives the helix pitch only to the
+FIRST window after a helix, so your circle's later windows show as "fw_entry_not_allowed" - the supervisor is fixing that in
+verify/ (propagate the pitch along the contiguous entry-feed run at the helix bottom Z); report those windows separately as
+"circle windows (entry feed, a <= pitch + 0.05?)" with their a vs the helix pitch, from your own script. Then write
+engine/HB1v2_RESULTS.md with every number and the exact commands, and stop.
