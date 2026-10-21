@@ -1299,6 +1299,258 @@ G1 X20. Y4. F500.
 
 
 # ---------------------------------------------------------------------------
+# Task ZE2: AREA-based radial engagement ae_eff = removed plan area / travel,
+# windows of >= 1 mm travel (ae2 keys) - report-only, old keys frozen.
+# Fixtures: flat D = 12.686, cell 0.1 mm, solid stock (top 18.6).
+# ---------------------------------------------------------------------------
+
+D_ZE2 = 12.686
+CELL_F = 0.1
+X0_F = Y0_F = -30.0
+NF = 600  # grid covers [-30, 30] x [-30, 30]
+STOCK_F = (-30.0, 30.0, -30.0, 30.0, 0.0, 18.6)
+
+
+def _centers_f():
+    return X0_F + (np.arange(NF) + 0.5) * CELL_F
+
+
+def _run_ae2(gcode, part, stock_init=None, dia=D_ZE2):
+    moves = zmap.parse_gcode(gcode)
+    return zmap.simulate(moves, part, CELL_F, X0_F, Y0_F, STOCK_F,
+                        tool="flat", dia=dia, engage_max=2.438,
+                        stock_init=stock_init)
+
+
+def _ae2_gcode(pts, entry_xy, z):
+    """rapid to entry_xy above stock, plunge/feed to tip Z=z, then the G1
+    feed sequence pts [(x, y), ...] at F500."""
+    lines = ["G21 G90 F500",
+             "G0 X%.4f Y%.4f Z20." % entry_xy,
+             "G1 X%.4f Y%.4f Z%.4f F100." % (entry_xy[0], entry_xy[1], z)]
+    for (x, y) in pts:
+        lines.append("G1 X%.4f Y%.4f F500." % (x, y))
+    return "\n".join(lines) + "\n"
+
+
+def test_ze2_full_slot_short_segments_ae_eff_is_dia():
+    """Full-width slot in solid stock cut in 0.1 mm segments: every ae2
+    window removes the full strip D x length, so ae_eff = D within 5 %.
+    (The old max-chord metric also reads ~D here - a slot front crescent IS
+    full width - so this case does NOT separate the metrics.)"""
+    part = np.zeros((NF, NF))
+    pts = [(-20.0 + 0.1 * i, 0.0) for i in range(1, 401)]
+    res = _run_ae2(_ae2_gcode(pts, (-20.0, 0.0), 13.6), part)
+    wins = res["_ae2_raw"]
+    assert len(wins) >= 30, "too few ae2 windows: %d" % len(wins)
+    for w in wins:
+        assert abs(w["ae_eff"] - D_ZE2) <= 0.05 * D_ZE2, \
+            "ae_eff %.3f not within 5%% of D" % w["ae_eff"]
+        assert abs(w["a"] - 5.0) <= 0.2  # 18.6 - tip 13.6
+        # window closes at the first travel >= 1 mm; ten 0.1 mm floats sum to
+        # just under/over 1.0, so accept 10 or 11 segments
+        assert w["n_moves"] in (10, 11)
+        assert 1.0 <= w["length_mm"] <= 1.15
+    eng = res["engagement"]
+    assert eng["ae2"]["n"] == len(wins)
+    assert abs(eng["ae2"]["p50"] - D_ZE2) <= 0.05 * D_ZE2
+    # old metric for comparison: also ~D on a slot
+    assert abs(eng["ae2"]["p50"] - eng["horizontal"]["p50"]) <= 0.6
+    # every window is a full-width slot with axial depth 5 mm
+    assert eng["full_width_slots_ae2"]["count"] == len(wins)
+    assert abs(eng["full_width_slots_ae2"]["total_length_mm"] - 40.0) <= 1.5
+    # ae_eff ~12.7 > 2.4384 -> all windows overload too
+    assert eng["overload_feeds_ae2"]["count"] == len(wins)
+
+
+def test_ze2_full_slot_5mm_segments_ae_eff_is_dia():
+    """Same full slot, coarse 5 mm segments: each move is its own window and
+    ae_eff = D within 5 %."""
+    part = np.zeros((NF, NF))
+    pts = [(-15.0 + 5.0 * i, 0.0) for i in range(1, 8)]
+    res = _run_ae2(_ae2_gcode(pts, (-20.0, 0.0), 13.6), part)
+    wins = res["_ae2_raw"]
+    assert len(wins) == 7, "expected one window per 5 mm move: %d" % len(wins)
+    for w in wins:
+        assert abs(w["ae_eff"] - D_ZE2) <= 0.05 * D_ZE2, \
+            "ae_eff %.3f not within 5%% of D" % w["ae_eff"]
+    assert abs(res["engagement"]["ae2"]["p50"] - D_ZE2) <= 0.05 * D_ZE2
+
+
+def test_ze2_curved_full_slot_ae_eff_is_dia():
+    """Curved full slot: arc r = 40 mm as 0.5 mm chords (0.72 deg per chord,
+    direction change << 45 deg so windows chain across chords). ae_eff = D
+    within 5 %."""
+    part = np.zeros((NF, NF))
+    r = 40.0
+    n = 80
+    th0, th1 = -0.5, 0.5
+
+    def arc_pt(t):
+        a = th0 + (th1 - th0) * t
+        return (r * math.sin(a), -r + r * math.cos(a))
+
+    pts = [arc_pt(i / float(n)) for i in range(1, n + 1)]
+    res = _run_ae2(_ae2_gcode(pts, arc_pt(0.0), 13.6), part)
+    wins = res["_ae2_raw"]
+    assert len(wins) >= 30, "too few ae2 windows: %d" % len(wins)
+    for w in wins:
+        assert abs(w["ae_eff"] - D_ZE2) <= 0.05 * D_ZE2, \
+            "ae_eff %.3f not within 5%% of D on the arc" % w["ae_eff"]
+
+
+def test_ze2_side_cut_2032_ae_eff_is_engagement():
+    """Straight side cut along a wall: face at radial distance R - 2.032 from
+    the path, wall 5 mm above tip Z. Removed strip is 2.03 mm deep x travel,
+    so ae_eff = 2.032 +- 0.1. ZE's old max-chord metric reads the chord of
+    the cells above the tip here (~2.0 mm) and agrees - this case validates
+    that ae_eff measures the true radial engagement, not that the old metric
+    fails it. (The case where the OLD METRIC FAILS is the slot rim skim:
+    test_ze2_slot_rim_skim_old_width_reads_full_but_ae2_small.)"""
+    part = np.zeros((NF, NF))
+    ys = _centers_f()[:, None]
+    face = D_ZE2 / 2.0 - 2.032  # 4.311 mm: tool centre path distance to wall
+    stock_init = np.broadcast_to(np.where(ys <= -face + 1e-9, 18.6, 13.6), (NF, NF)).copy()
+    pts = [(-20.0 + 2.0 * i, 0.0) for i in range(1, 21)]
+    res = _run_ae2(_ae2_gcode(pts, (-20.0, 0.0), 13.6), part,
+                   stock_init=stock_init)
+    wins = res["_ae2_raw"]
+    assert len(wins) >= 10
+    for w in wins:
+        assert abs(w["ae_eff"] - 2.032) <= 0.1, \
+            "ae_eff %.3f not 2.032 +- 0.1" % w["ae_eff"]
+        assert abs(w["a"] - 5.0) <= 0.2
+    eng = res["engagement"]
+    assert abs(eng["ae2"]["p50"] - 2.032) <= 0.1
+    # no full-width slot and no overload by AREA:
+    assert eng["full_width_slots_ae2"]["count"] == 0
+    assert eng["overload_feeds_ae2"]["count"] == 0
+    # old metric agrees here: cells above the tip span the wall strip ~2.0 mm
+    # (NOT the circle chord 9.31 mm - it only reads ~D when rim cells on both
+    # sides stand above the tip, see the rim-skim test)
+    for w in wins:
+        assert abs(w["width_mm"] - 2.0) <= 0.15, \
+            "old width %.3f not the engaged strip ~2.0" % w["width_mm"]
+
+
+def test_ze2_wall_skim_0p1mm_ae_eff_small_and_a_is_18():
+    """0.1 mm skim of an 18 mm tall wall: face at R - 0.1 from the path,
+    floor level with the tip (Z0), wall top 18 mm above the tip. Only a thin
+    rim row of cells is removed -> ae_eff <= 0.2 and a = 18 +- 0.2."""
+    part = np.zeros((NF, NF))
+    ys = _centers_f()[:, None]
+    face = D_ZE2 / 2.0 - 0.1  # 6.243
+    stock_init = np.broadcast_to(np.where(ys <= -face + 1e-9, 18.0, 0.0), (NF, NF)).copy()
+    pts = [(-20.0 + 0.5 * i, 0.0) for i in range(1, 81)]
+    res = _run_ae2(_ae2_gcode(pts, (-20.0, 0.0), 0.0), part,
+                   stock_init=stock_init)
+    wins = res["_ae2_raw"]
+    assert len(wins) >= 30
+    for w in wins:
+        assert w["ae_eff"] <= 0.2, "skim ae_eff %.3f > 0.2" % w["ae_eff"]
+        assert abs(w["a"] - 18.0) <= 0.2, "skim depth a=%.3f" % w["a"]
+    eng = res["engagement"]
+    assert eng["full_width_slots_ae2"]["count"] == 0
+    assert eng["overload_feeds_ae2"]["count"] == 0
+
+
+def test_ze2_slot_rim_skim_old_width_reads_full_but_ae2_small():
+    """The line-567 form: tool runs along a slot whose two walls stand 18 mm
+    above the tip while the floor is level with the tip. The removed cells sit
+    at radial ~6.2-6.3 on BOTH sides and span nearly the full diameter, so
+    ZE's old max-chord width reads ~D (full_width_slots counts every move) -
+    the OLD METRIC FAILS here. By AREA only two thin rim rows are removed:
+    ae_eff ~0.2, so the ae2 keys count nothing."""
+    part = np.zeros((NF, NF))
+    ys = _centers_f()[:, None]
+    face = D_ZE2 / 2.0 - 0.1  # walls at |y| >= 6.243, floor at tip level
+    stock_init = np.broadcast_to(np.where(np.abs(ys) >= face - 1e-9, 18.0, 0.0), (NF, NF)).copy()
+    pts = [(-20.0 + 0.5 * i, 0.0) for i in range(1, 81)]
+    res = _run_ae2(_ae2_gcode(pts, (-20.0, 0.0), 0.0), part,
+                   stock_init=stock_init)
+    wins = res["_ae2_raw"]
+    assert len(wins) >= 30
+    for w in wins:
+        assert w["ae_eff"] <= 0.3, "rim-skim ae_eff %.3f too large" % w["ae_eff"]
+        assert abs(w["a"] - 18.0) <= 0.2
+        # old metric: cells above the tip span both rim rows -> ~full width
+        assert w["width_mm"] >= 0.9 * D_ZE2, \
+            "old width %.3f should read ~full diameter" % w["width_mm"]
+    eng = res["engagement"]
+    # old keys call it full-width slotting (this is the ZE mis-score)
+    assert eng["full_width_slots"]["count"] >= 30
+    # the area form sees the truth: nothing near full width, nothing loaded
+    assert eng["full_width_slots_ae2"]["count"] == 0
+    assert eng["overload_feeds_ae2"]["count"] == 0
+    assert eng["ae2"]["max"] <= 0.3
+
+
+def test_ze2_windows_break_on_direction_z_and_rapid():
+    """A window ends at a direction change > 45 deg, a Z change or a rapid;
+    feeds at <= 45 deg apart keep merging. Geometry: two straight 0.5 mm
+    feeds (line 5-6) -> window 1; a 90 deg turn breaks (window 2 starts at
+    line 7) but within window 2 the direction turns 36.9 deg (line 8) and the
+    window still merges - <= 45 deg keeps joining; lines 9-10 continue straight
+    into window 3; a diagonal Z-change move breaks, the two feeds
+    at Z13.5 form window 4; a rapid plus plunge break, the final two feeds
+    form window 5. Steps are 0.6 mm ((0.36, 0.48) diagonals), so a single
+    feed never reaches 1 mm and every window is exactly two feeds robustly
+    under binary floats."""
+    part = np.zeros((NF, NF))
+    gcode = """
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 X-20. Y0. Z13.6 F100.
+G1 X-19.4 Y0. F500.
+G1 X-18.8 Y0. F500.
+G1 X-18.8 Y0.6 F500.
+G1 X-18.44 Y1.08 F500.
+G1 X-18.08 Y1.56 F500.
+G1 X-17.72 Y2.04 F500.
+G1 X-17.12 Y2.84 Z13.5 F500.
+G1 X-16.52 Y2.84 Z13.5 F500.
+G1 X-15.92 Y2.84 Z13.5 F500.
+G0 X-10. Y0. Z20.
+G1 X-10. Y0. Z13.6 F100.
+G1 X-9.4 Y0. F500.
+G1 X-8.8 Y0. F500.
+"""
+    res = _run_ae2(gcode, part)
+    wins = res["_ae2_raw"]
+    assert len(wins) == 5, "expected 5 windows: %r" % wins
+    assert wins[0]["n_moves"] == 2 and wins[0]["line"] == 5
+    assert wins[1]["n_moves"] == 2 and wins[1]["line"] == 7   # 90 deg break,
+    # 36.9 deg turn inside the window keeps merging
+    assert wins[2]["n_moves"] == 2 and wins[2]["line"] == 9
+    assert wins[3]["z"] == 13.5 and wins[3]["n_moves"] == 2   # Z break
+    assert wins[4]["z"] == 13.6 and wins[4]["line"] == 16     # rapid break
+    for w in wins:
+        assert 1.1 <= w["length_mm"] <= 1.3
+
+
+def test_ze2_parallel_merge_matches_serial():
+    """--jobs merges the raw per-feed area records with global move indices,
+    so ae2 windows and keys equal the serial result exactly."""
+    part = np.zeros((NF, NF))
+    ys = _centers_f()[:, None]
+    stock_init = np.broadcast_to(np.where(np.abs(ys) >= 6.243 - 1e-9, 18.0, 0.0), (NF, NF)).copy()
+    pts = [(-20.0 + 0.5 * i, 0.0) for i in range(1, 81)]
+    gcode = _ae2_gcode(pts, (-20.0, 0.0), 0.0)
+    ser = zmap.simulate(zmap.parse_gcode(gcode), part, CELL_F, X0_F, Y0_F,
+                       STOCK_F, tool="flat", dia=D_ZE2, engage_max=2.438,
+                       stock_init=stock_init)
+    for jobs in (2, 4):
+        par = zmap.simulate_parallel(zmap.parse_gcode(gcode), part, CELL_F,
+                                    X0_F, Y0_F, STOCK_F, jobs, tool="flat",
+                                    dia=D_ZE2, engage_max=2.438,
+                                    stock_init=stock_init)
+        assert par["_ae2_raw"] == ser["_ae2_raw"], \
+            "jobs=%d: ae2 windows differ from serial" % jobs
+        assert par["engagement"] == ser["engagement"], \
+            "jobs=%d: engagement keys differ from serial" % jobs
+
+
+# ---------------------------------------------------------------------------
 # S5: independent holder clearance check (holder frustum stack from
 # tools/x7_tools.json vs max(stock, part), 1.0 mm clearance)
 # ---------------------------------------------------------------------------

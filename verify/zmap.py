@@ -50,6 +50,14 @@ SLOT_AXIAL_MM = 0.5
 SKIM_AXIAL_MM = 0.05
 FULL_WIDTH_FRAC = 0.9
 OVERLOAD_WIDTH_MM = 1.2 * 2.032  # = 2.4384 mm
+# Task ZE2 (report-only): AREA-based radial engagement ae_eff = plan area of
+# the cells a horizontal feed removes material from (cells counted once) over
+# travel length. Consecutive horizontal feeds at the same Z along the same
+# path (direction change <= AE2_DIR_MAX_DEG, no intervening rapid or vertical
+# move) are combined into windows of at least AE2_WINDOW_MM travel, so the
+# 0.1 mm judge grid adds no noise to short moves.
+AE2_WINDOW_MM = 1.0
+AE2_DIR_MAX_DEG = 45.0
 TOOLS_JSON = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "tools", "x7_tools.json")
 
@@ -944,6 +952,98 @@ def _ze_engagement_keys(hw, engage_max, dia):
     }
 
 
+def _ae2_windows(moves):
+    """Task ZE2: combine consecutive horizontal feed moves into windows of at
+    least AE2_WINDOW_MM travel. An entry is one horizontal feed move:
+    {idx (global move index), line, x, y, z (rounded 3), dx, dy (unit chord
+    direction), length_mm, area_mm2 (plan area of cells this move removes,
+    each cell once), depth_mm (ZE axial depth a), width_mm (old max chord)}.
+    A window ends at a non-horizontal move, a rapid or any vertical move (the
+    next feed's idx is not the previous feed's idx + 1), a Z change, or a
+    direction change > AE2_DIR_MAX_DEG. Windows are the MINIMAL runs of >= 1 mm
+    travel: short feeds (< 1 mm) merge forward until the window reaches 1 mm;
+    a move of >= 1 mm is its own window. A trailing run below 1 mm is dropped
+    (grid noise). ae_eff = area_sum / length_sum; a = max depth over the
+    window; width_mm keeps ZE's old max chord for comparison."""
+    windows = []
+    cur = None
+
+    def close(w):
+        if w["length_mm"] >= AE2_WINDOW_MM:
+            w["ae_eff"] = round(w["area_mm2"] / w["length_mm"], 4)
+            windows.append(w)
+
+    for e in moves:
+        link = (cur is not None and e["idx"] == cur["idx"] + 1
+                and e["z"] == cur["z"]
+                and e["dx"] * cur["dx"] + e["dy"] * cur["dy"]
+                >= math.cos(math.radians(AE2_DIR_MAX_DEG)))
+        if not link:
+            if cur is not None:
+                close(cur)
+            cur = {"idx": e["idx"], "line": e["line"], "end_line": e["line"],
+                   "x": e["x"], "y": e["y"], "z": e["z"],
+                   "dx": e["dx"], "dy": e["dy"],
+                   "area_mm2": e["area_mm2"], "length_mm": e["length_mm"],
+                   "a": e["depth_mm"], "width_mm": e["width_mm"],
+                   "n_moves": 1}
+        else:
+            cur["idx"] = e["idx"]
+            cur["end_line"] = e["line"]
+            cur["x"], cur["y"] = e["x"], e["y"]
+            cur["dx"], cur["dy"] = e["dx"], e["dy"]
+            cur["area_mm2"] += e["area_mm2"]
+            cur["length_mm"] += e["length_mm"]
+            cur["a"] = max(cur["a"], e["depth_mm"])
+            cur["width_mm"] = max(cur["width_mm"], e["width_mm"])
+            cur["n_moves"] += 1
+        if cur["length_mm"] >= AE2_WINDOW_MM:
+            close(cur)
+            cur = None
+    if cur is not None:
+        close(cur)
+    return windows
+
+
+def _ae2_engagement_keys(win_recs, dia):
+    """Task ZE2 (report-only): engagement keys from the ae2 windows. Old keys
+    stay untouched.
+    - ae2: {n, p50, p95, p99, max} over ae_eff of every window.
+    - full_width_slots_ae2: windows with ae_eff >= FULL_WIDTH_FRAC x dia AND
+      a > SLOT_AXIAL_MM (a = ZE's axial depth of the window).
+    - overload_feeds_ae2: windows with ae_eff > OVERLOAD_WIDTH_MM AND
+      a > SLOT_AXIAL_MM (the SE2 merge bar, area form).
+    Each with count, total length and worst 10 by ae_eff (line, x, y, z,
+    ae_eff, a, old width)."""
+    def brief(w):
+        return {"line": w["line"], "x": w["x"], "y": w["y"], "z": w["z"],
+                "ae_eff": w["ae_eff"], "a": round(w["a"], 4),
+                "width_mm": w["width_mm"]}
+
+    fws = sorted([w for w in win_recs
+                  if w["ae_eff"] >= FULL_WIDTH_FRAC * dia
+                  and w["a"] > SLOT_AXIAL_MM],
+                 key=lambda w: (-w["ae_eff"], -w["a"]))
+    ovl = sorted([w for w in win_recs
+                  if w["ae_eff"] > OVERLOAD_WIDTH_MM and w["a"] > SLOT_AXIAL_MM],
+                 key=lambda w: (-w["ae_eff"], -w["a"]))
+    return {
+        "ae2": _engage_stats([w["ae_eff"] for w in win_recs]),
+        "full_width_slots_ae2": {
+            "count": len(fws),
+            "total_length_mm": round(sum(w["length_mm"] for w in fws), 1),
+            # worst 10 by ae_eff (line, XY, Z, ae_eff, a, old width)
+            "worst": [brief(w) for w in fws[:10]],
+        },
+        "overload_feeds_ae2": {
+            "ae_eff_above_mm": round(OVERLOAD_WIDTH_MM, 4),
+            "count": len(ovl),
+            "total_length_mm": round(sum(w["length_mm"] for w in ovl), 1),
+            "worst": [brief(w) for w in ovl[:10]],
+        },
+    }
+
+
 def _axial_report(raw):
     """Task ZA: summarize axial plunges (descents steeper than MAX_RAMP_DEG) that removed
     more than AXIAL_FLOOR mm under the tool's flat bottom:
@@ -974,7 +1074,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
              corner=0.0, stock_init=None, window=None, rapid_feed=RAPID_FEED,
              start=None, flute=None, shank_dia=None, holder=None,
              stickout=None, engage_max=None, ramp_angle=3.0,
-             engage_report=False):
+             engage_report=False, idx_offset=0):
     """Run the toolpath over a stock heightfield.
 
     part      : (ny, nx) array of part top-Z heights
@@ -1146,6 +1246,12 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     # length_mm, time_s at the move's feed} - report-only, merged raw in
     # parallel so serial/jobs results agree exactly
     hw_records = []
+    # task ZE2: per horizontal feed move raw records {idx (global move index),
+    # line, x, y, z, dx, dy (unit chord direction), length_mm, area_mm2 (plan
+    # area of cells this move removes material from, cells counted once),
+    # depth_mm (a), width_mm (old max chord)} - merged raw in parallel so
+    # serial/jobs results agree exactly; windows built from the full list
+    ae2_moves = []
     # plunge tracking
     plunge_flags = []  # list of dicts: {line, x, y, z, angle_deg, depth_mm}
     plunge_count = 0
@@ -1157,7 +1263,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     outside_grid = 0
     first_outside_line = None
 
-    for mv in resolved:
+    for mi, mv in enumerate(resolved):
         if mv.get("comp"):
             comp_moves += 1
             if comp_first_line is None:
@@ -1197,6 +1303,9 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         # footprint during this move (max over removed cells of
         # stock_before - cut surface)
         move_max_depth = 0.0
+        # task ZE2: plan area of the cells this move removes material from
+        # (cells counted once: stock update makes later samples cut 0 there)
+        move_area = 0.0
         # travel direction for engagement (perpendicular chord width)
         dx_t = x1 - cur[0]
         dy_t = y1 - cur[1]
@@ -1349,6 +1458,12 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             cut = win - newv
             removed = float(np.sum(np.clip(np.where(msk, cut, 0.0), 0.0, None)))
             if cutting and engage_track:
+                # task ZE2: cells this sample actually removes (finite positive
+                # cut height); each cell is counted at most once per move since
+                # the stock update drops it to the cut surface below
+                nrem = int(np.count_nonzero(cut > REMOVE_EPS))
+                move_area += nrem * cell * cell
+            if cutting and engage_track:
                 # task ZE: axial depth at this sample = deepest column of
                 # stock removed above the tool surface under the footprint
                 # (cut = stock_before - cut surface; -inf outside the disk
@@ -1459,6 +1574,21 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     "time_s": (length / (feed_ze if feed_ze and feed_ze > 0
                                         else rapid_feed) * 60.0),
                 })
+            # task ZE2: EVERY horizontal feed move (even one removing nothing)
+            # enters the ae2 window sequence; travel through air at the same Z
+            # and direction is real feed length with zero removed area
+            if abs(dz_mv) <= 1e-6 and length > 0.0:
+                ae2_moves.append({
+                    "idx": mi + idx_offset,
+                    "line": mv["line"],
+                    "x": round(x1, 4), "y": round(y1, 4),
+                    "z": round(z1, 3),
+                    "dx": dx_t, "dy": dy_t,
+                    "length_mm": length,
+                    "area_mm2": move_area,
+                    "depth_mm": round(max(move_max_depth, 0.0), 4),
+                    "width_mm": round(move_max_engage, 4),
+                })
             if engage_max is not None and move_max_engage > engage_max:
                 engage_count += 1
                 engage_spikes.append({
@@ -1497,6 +1627,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                         "depth_mm": round(depth_m, 4)})
         cur = [x1, y1, z1]
 
+    ae2_windows = _ae2_windows(ae2_moves) if engage_track else []
     result = {
         "stock": stock,
         "rapid_collisions": {"count": rapid_collisions,
@@ -1537,9 +1668,14 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                              reverse=True)[:10],
             # task ZE (new keys only): axial depth per engaging move
             **_ze_engagement_keys(hw_records, engage_max, dia),
+            # task ZE2 (new keys only): AREA-based engagement windows
+            **_ae2_engagement_keys(ae2_windows, dia),
         } if engage_track else None,
         # raw per-move width+depth records for exact parallel merging
         "_hw_raw": hw_records,
+        # task ZE2: raw per-feed area records + built ae2 windows
+        "_ae2_move_raw": ae2_moves,
+        "_ae2_raw": ae2_windows,
         # raw per-bucket values for exact parallel merging (not reported)
         "_engage_raw": {"horizontal": engage_horiz, "entry": engage_entry},
         # task ZA: report-only for every tool; a FAILING gate for flat/bull
@@ -1589,7 +1725,8 @@ def _chunk_worker(idx):
                     start=g["start_per"][idx], flute=g["flute"],
                     shank_dia=g["shank_dia"], holder=g["holder"],
                     stickout=g["stickout"], engage_max=g["engage_max"],
-                    ramp_angle=g["ramp_angle"], engage_report=g["engage_report"])
+                    ramp_angle=g["ramp_angle"], engage_report=g["engage_report"],
+                    idx_offset=g["spans"][idx].start)
 
 
 def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
@@ -1733,9 +1870,18 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
     # serial -> jobs result identical to serial
     hw_all = [r for res in results for r in res["_hw_raw"]]
     combined["_hw_raw"] = hw_all
+    # task ZE2: merge raw per-feed area records (each move lives in exactly
+    # one chunk, global idx preserved), rebuild windows and keys with the same
+    # builders as serial -> jobs result identical to serial
+    ae2_all = [e for res in results for e in res["_ae2_move_raw"]]
+    ae2_windows = _ae2_windows(ae2_all)
+    combined["_ae2_move_raw"] = ae2_all
+    combined["_ae2_raw"] = ae2_windows
     if combined["engagement"] is not None:
         combined["engagement"].update(
             _ze_engagement_keys(hw_all, engage_max, dia))
+        combined["engagement"].update(
+            _ae2_engagement_keys(ae2_windows, dia))
     combined["cutter_comp"] = {
         "active_moves": sum(r["cutter_comp"]["active_moves"] for r in results),
         "first_line": min((r["cutter_comp"]["first_line"] for r in results
@@ -1929,6 +2075,10 @@ def main(argv=None):
                    help="report engagement stats (max/percentiles) without a "
                         "threshold: nothing is flagged (report-only). "
                         "Default off")
+    p.add_argument("--ae2-dump", dest="ae2_dump", default=None,
+                   help="task ZE2 (report-only extra): write the raw ae2 "
+                        "window records (res[_ae2_raw]) to this JSON path in "
+                        "addition to the report; changes nothing else")
     args = p.parse_args(argv)
 
     gtext = None
@@ -2079,6 +2229,11 @@ def main(argv=None):
             f.write(text + "\n")
     else:
         print(text)
+    if args.ae2_dump:
+        # task ZE2 report-only extra: raw ae2 windows (line/end_line span,
+        # ae_eff, a, old width, length) for post-hoc per-line analysis
+        with open(args.ae2_dump, "w") as f:
+            json.dump(_sanitize(res["_ae2_raw"]), f, indent=1)
     if args.stock_out:
         np.save(args.stock_out, res["stock"])
     if args.png:
