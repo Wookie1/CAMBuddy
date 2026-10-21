@@ -1908,6 +1908,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         t0 = time.time()
         regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
                            tolerance, keep_tool_down, helix_dia)
+        n_a2d = len(regions)  # HR1: everything from here on is hug rings
         if _RP:
             rp["a2d_cut_len_mm"] = round(sum(
                 rp_poly(p) for res in regions for (k, p) in res["paths"]
@@ -1934,6 +1935,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # RT travel: order regions nearest-neighbour from the current tool
         # position and enter each at its nearest island-valid candidate, so
         # inter-region rapids stay short instead of following a2d's order.
+        # HR1: all Adaptive2d regions first (NN among themselves), then ALL
+        # hug-ring regions (NN among the rings starting from where the last
+        # a2d region left the tool) - a ring must always be the thin skim R4
+        # intended, never slot full-width ahead of its level's a2d passes.
         cand = []
         for res in regions:
             fc = next((p for (k, p) in res["paths"]
@@ -1947,18 +1952,20 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     ok = [g0[0][g0[1].index(True)]]
             cand.append(ok)
         order = []
-        remaining = [k for k, c in enumerate(cand) if c]
         pos = (prev[0], prev[1]) if prev[0] is not None else None
-        while remaining:
-            if pos is None:
-                k = remaining[0]
-            else:
-                k = min(remaining, key=lambda k: min(
-                    math.dist(pos, p) for p in cand[k]))
-            order.append(k)
-            remaining.remove(k)
-            pos = min(cand[k], key=lambda p: math.dist(pos, p)) \
-                if pos is not None else cand[k][0]
+        for phase in ([k for k, c in enumerate(cand) if c and k < n_a2d],
+                     [k for k, c in enumerate(cand) if c and k >= n_a2d]):
+            remaining = list(phase)
+            while remaining:
+                if pos is None:
+                    k = remaining[0]
+                else:
+                    k = min(remaining, key=lambda k: min(
+                        math.dist(pos, p) for p in cand[k]))
+                order.append(k)
+                remaining.remove(k)
+                pos = min(cand[k], key=lambda p: math.dist(pos, p)) \
+                    if pos is not None else cand[k][0]
         nreg = 0
         cb0 = stats["n_clip_breaks"]
         rp_lk0 = ({k: stats[k] for k in ("n_lifts", "n_notclear_links",
