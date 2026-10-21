@@ -66,6 +66,9 @@ AE2_DIR_MAX_DEG = 45.0
 # the helix turn itself); everything else full-width is a finding.
 AE2_ENTRY_FEED_FRAC = 0.9
 AE2_PITCH_TOL = 0.05
+# Task ZE2F2: the helix pitch carries along the contiguous entry-feed run at
+# the helix-bottom Z for at most one circumference of the helix path plus this
+AE2_CARRY_EXTRA_MM = 1.0
 TOOLS_JSON = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "tools", "x7_tools.json")
 
@@ -1014,6 +1017,15 @@ def _ae2_windows(moves):
     return windows
 
 
+def _helix_radius(run):
+    """Task ZE2F2: mean radius of a helix run about its centroid (0 if none)."""
+    if len(run) < 4:
+        return 0.0
+    P = np.asarray(run, dtype=float)
+    c = P[:, :2].mean(axis=0)
+    return float(np.hypot(P[:, 0] - c[0], P[:, 1] - c[1]).mean())
+
+
 def _helix_pitch(run):
     """Task ZE2F: measured pitch (Z drop per full turn) of a descending feed
     run, or None when it is not a helix (fewer than 4 points, radius under
@@ -1314,6 +1326,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     # serial/jobs results agree exactly; windows built from the full list
     ae2_moves = []
     desc_run = []  # task ZE2F: points of the descending feed run just made
+    hp_carry = None  # task ZE2F2: (pitch, z, feed) carried along the entry-feed run at the helix bottom
     # plunge tracking
     plunge_flags = []  # list of dicts: {line, x, y, z, angle_deg, depth_mm}
     plunge_count = 0
@@ -1640,9 +1653,27 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             # enters the ae2 window sequence; travel through air at the same Z
             # and direction is real feed length with zero removed area
             if abs(dz_mv) <= 1e-6 and length > 0.0:
+                # ZE2F2: the pitch of the helix just made applies to the whole
+                # contiguous run at its bottom Z and feed (e.g. a floor circle),
+                # not only to the first move after it
+                # (bounded: at most one circumference of the helix path,
+                # 2*pi*r + AE2_CARRY_EXTRA_MM; beyond that a window is judged
+                # as a normal window)
+                hp = _helix_pitch(desc_run)
+                if hp is not None:
+                    hp_carry = [hp, round(z1, 3), mv.get("f"),
+                                2.0 * math.pi * _helix_radius(desc_run)
+                                + AE2_CARRY_EXTRA_MM, length]
+                elif (hp_carry is not None and hp_carry[1] == round(z1, 3)
+                      and hp_carry[2] == mv.get("f")
+                      and hp_carry[4] + length <= hp_carry[3]):
+                    hp = hp_carry[0]
+                    hp_carry[4] += length
+                else:
+                    hp_carry = None
                 ae2_moves.append({
                     "feed": mv.get("f"),
-                    "helix_pitch": _helix_pitch(desc_run),
+                    "helix_pitch": hp,
                     "idx": mi + idx_offset,
                     "line": mv["line"],
                     "x": round(x1, 4), "y": round(y1, 4),
@@ -1700,6 +1731,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 desc_run.append((x1, y1, z1))
         else:
             desc_run = []
+        if hp_carry is not None and not (
+                cutting and abs(z1 - cur[2]) <= 1e-6
+                and round(z1, 3) == hp_carry[1] and mv.get("f") == hp_carry[2]):
+            hp_carry = None
         cur = [x1, y1, z1]
 
     ae2_windows = _ae2_windows(ae2_moves) if engage_track else []
