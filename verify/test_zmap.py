@@ -2569,3 +2569,32 @@ def test_ze2f2_carry_is_bounded_to_one_circle():
     assert carried <= 2 * math.pi * 3.0 + 1.0 + 1.1, carried   # one circle + 1 mm (+ one window)
     assert uncarried and sum(w["length_mm"] for w in uncarried) > 2 * math.pi * 3.0, \
         "the second and third circles must be judged as normal windows"
+
+
+def test_ze2d_full_width_depth_true_slot_vs_ridge_plus_graze():
+    """ZE2D: full_width_depth = largest h with (area removed >= h deep) /
+    travel >= 0.9 D. A true full-width slot 10 mm deep scores ~10; a 1 mm
+    full-width ridge plus a 0.3 mm-wide 18 mm-tall graze scores ~1, although
+    its a (max removed height) is 18."""
+    part = np.zeros((NF, NF))
+    # (1) true slot: solid stock top 18.6, tip at 8.6 -> 10 mm deep, full width
+    pts = [(-15.0 + 0.5 * i, 0.0) for i in range(1, 61)]
+    res = _run_ae2(_ae2_gcode(pts, (-20.0, 0.0), 8.6), part)
+    slot = [w for w in res["_ae2_raw"] if w["ae_eff"] >= 0.9 * D_ZE2]
+    assert slot, "no full-width window in the true slot"
+    assert all(abs(w["full_width_depth"] - 10.0) <= 0.3 for w in slot), \
+        [w["full_width_depth"] for w in slot]
+    # (2) ridge + graze: stock 1 mm above the tip everywhere (the ridge), plus a
+    # 0.3 mm-wide 18 mm-tall wall at y = +6.2..6.5 inside the tool's rim reach
+    xs = _centers_f()
+    stock = np.full((NF, NF), 9.6)                   # tip at 8.6 -> 1 mm ridge
+    wall = (xs >= 6.2) & (xs < 6.5)
+    stock[wall, :] = 26.6                            # rows = y: 18 mm above the tip
+    res2 = _run_ae2(_ae2_gcode(pts, (-20.0, 0.0), 8.6), part, stock_init=stock)
+    fw2 = [w for w in res2["_ae2_raw"] if w["ae_eff"] >= 0.9 * D_ZE2]
+    assert fw2, "the 1 mm ridge must still read full width"
+    assert all(w["a"] > 17.5 for w in fw2), [w["a"] for w in fw2]     # a alone says 'deep'
+    assert all(abs(w["full_width_depth"] - 1.0) <= 0.3 for w in fw2), \
+        [w["full_width_depth"] for w in fw2]
+    bands = res2["engagement"]["full_width_depth_bands_ae2"]
+    assert bands["cutting_feed"]["0.5-2"]["count"] == len(fw2)
