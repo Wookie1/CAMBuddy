@@ -188,6 +188,16 @@ SLOPE_ACTION_SPEC = {
                          "default": 0.5,
                          "description": "rest the finish ball leaves (mm) that "
                                         "triggers the rest pass; minimum 0.1"},
+            # FE5: entry ramp angle for the finish and rest passes - entries
+            # where the live stock is deeper than 0.25 mm enter on a ramp;
+            # separate from the roughing helix angle (engine rough default)
+            "ramp_angle_deg": {"type": "number", "minimum": 0.5,
+                               "maximum": 15.0, "default": 2.0,
+                               "description": "entry ramp angle deg for the "
+                                            "finish and rest passes (entries "
+                                            "into deep live stock enter on a "
+                                            "ramp along the pass's own "
+                                            "vertices)"},
             # roughing tool + cutting data (defaults as in adaptive_rough)
             **{"rough_" + k: v for k, v in _ROUGHING_INPUTS.items()},
         },

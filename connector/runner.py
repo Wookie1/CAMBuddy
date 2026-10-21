@@ -797,6 +797,8 @@ class EngineRun:
                     "--floor", "%.4f" % floor,
                     "--cut-feed", "%.1f" % values["feed"],
                     "--ramp-feed", "%.1f" % values["ramp_feed"],
+                    "--ramp-angle-deg",
+                    "%.2f" % (values.get("ramp_angle_deg") or 2.0),
                     "--spindle", str(int(values["rpm"])),
                     "--post-grid-mm", post_grid,
                     "--stock-from", rough_stock_out,
@@ -926,6 +928,8 @@ class EngineRun:
                         "--floor", "%.4f" % floor,
                         "--cut-feed", "%.1f" % values["feed"],
                         "--ramp-feed", "%.1f" % values["ramp_feed"],
+                        "--ramp-angle-deg",
+                        "%.2f" % (values.get("ramp_angle_deg") or 2.0),
                         "--spindle", str(int(values["rpm"])),
                         "--post-grid-mm", post_grid,
                         "--stats-json", rest_stats]

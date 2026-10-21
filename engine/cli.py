@@ -185,6 +185,7 @@ def finish_main(a):
         stickout_mm=getattr(a, "stickout", None),
         holder=getattr(a, "holder", None),
         post_grid_mm=a.post_grid_mm,
+        ramp_angle_deg=a.ramp_angle_deg,
         **rest_kw)
     # PQ: header corner radius = D/2 for a ball, the table corner radius for
     # a bull, 0 for a flat (the CLI spec carries only kind:dia for balls)
@@ -452,6 +453,12 @@ def main(argv=None):
                    help="PQ: output grid mm the emitted points are snapped to "
                         "(0.001 for a metric post, 0.00254 for inch output; "
                         "the caller passes the grid matching its post units)")
+    f.add_argument("--ramp-angle-deg", dest="ramp_angle_deg", type=float,
+                   default=2.0,
+                   help="FE5: entry ramp angle deg - entries where the live "
+                        "stock depth exceeds 0.25 mm enter on a vertex-raise "
+                        "ramp along the pass's own vertices; default 2.0, "
+                        "clamped [0.5, 15], <= 0 rejected")
 
     a = p.parse_args(argv)
 

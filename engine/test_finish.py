@@ -1476,6 +1476,40 @@ def test_shank_t31_wall_13mm():
                                          max(zl)))
 
 
+def test_ramp_vertices_never_below_verified_path():
+    """FE5: every emitted ramp vertex z must be >= the verified path CL z at
+    its own arc position (max(vertex z, z0 + s*tan)); a ramp vertex below
+    the verified path would be an unverified, gouge-risk CL point."""
+    from engine.finish import _ramp_entry
+    n = 40
+    xs = np.arange(n) * 0.7
+    ys = np.sin(np.arange(n) * 0.55) * 3.0
+    zs = 5.0 - 0.08 * xs + 0.4 * np.cos(np.arange(n) * 1.3)
+    P = np.stack([xs, ys, zs], axis=1)
+    s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(xs),
+                                                   np.diff(ys)))])
+    tan = math.tan(math.radians(2.0))
+    for depth in (0.3, 1.7, 60.0):        # full ramp and short-run cases
+        u = min(depth / tan, float(s[-1]))
+        rv = _ramp_entry(P, s, tan, u)
+        assert rv, "empty ramp"
+        z0 = float(P[0, 2])
+        # last ramp vertex is the pass start itself
+        assert math.dist(rv[-1], (float(P[0, 0]), float(P[0, 1]), z0)) \
+            < 1e-9, rv[-1]
+        for (x, y, z) in rv:
+            # arc position of this point on the verified pass: own vertex
+            # (exact XY match) or the interpolated vertex at s = u
+            d = np.hypot(P[:, 0] - x, P[:, 1] - y)
+            i = int(np.argmin(d))
+            sp = float(s[i]) if d[i] < 1e-6 else u
+            verified_z = float(np.interp(sp, s, P[:, 2]))
+            assert z >= verified_z - 1e-9, \
+                "ramp vertex z %.4f below verified path z %.4f at s %.2f" \
+                % (z, verified_z, sp)
+            assert z >= min(z0 + sp * tan, verified_z) - 1e-9
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -1496,7 +1530,8 @@ if __name__ == "__main__":
                test_rest_pass_table_tool, test_shank_net_keeps_source_index,
                test_holder_drop_tall_boss,
                test_holder_stock_ridge_along_path,
-               test_shank_t31_wall_13mm):
+               test_shank_t31_wall_13mm,
+               test_ramp_vertices_never_below_verified_path):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))

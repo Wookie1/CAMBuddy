@@ -84,6 +84,8 @@ import time
 import numpy as np
 from opencamlib import ocl
 
+from engine import entry_depth  # FE5: live-stock entry-depth estimator
+
 CHORD_TOL = 0.005     # mm, one-sided gouge-safe chord tolerance
 NET_TOL = 0.004       # mm, internal check tol: leaves margin under
                       # CHORD_TOL for between-sample CL bulge (kappa*L^2/8)
@@ -102,6 +104,8 @@ BALL_HEIGHT = 50.0
 SHANK_TOL = 0.01      # mm, S4: axial safety margin of the shank rule
 HOLD_CLEAR = 1.0      # mm, S5: min clearance of the holder stack to part/stock
 POST_GRID = 0.001     # mm, PQ: default LNC output grid (inch output: 0.00254)
+RAMP_TRIGGER = 0.25   # mm, FE5: ramp an entry only where the estimator's
+                      # live stock depth at the pass start exceeds this
 GRID_SPIKE = 0.01     # mm, PQ: drop an emitted point whose closest
                       # output-grid CL still differs from its Z by more than
                       # this (no one-point spikes)
@@ -1757,6 +1761,29 @@ def compute_rest_mask(surf, xs, ys, big_tool=("ball", 6.0, 0.0),
     return mask
 
 
+def _ramp_entry(P, s, tan, u):
+    """FE5 vertex-raise entry ramp: the pass's OWN vertices (plus one
+    interpolated vertex at s = u) BACKWARD from s = u to s = 0 with
+    z = max(vertex CL, z0 + s*tan) - at or above the verified path, so ramp
+    chords stay on/above verified chords (CL-safe, no new CL lookup)."""
+    z0 = float(P[0, 2])
+    pts = [(float(u), float(np.interp(u, s, P[:, 0])),
+            float(np.interp(u, s, P[:, 1])),
+            float(np.interp(u, s, P[:, 2])))]
+    for i in range(len(P) - 1, -1, -1):
+        if float(s[i]) < u - 1e-9:
+            pts.append((float(s[i]), float(P[i, 0]), float(P[i, 1]),
+                        float(P[i, 2])))
+    out = []
+    prev = None
+    for su, x, y, vz in pts:
+        p = (x, y, max(vz, z0 + su * tan))
+        if prev is None or math.dist(prev, p) > 1e-9:
+            out.append(p)
+            prev = p
+    return out
+
+
 def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
            sampling=0.1, slope_threshold=40.0, overlap_mm=1.0,
            stepdown=0.3, overlap_deg=5.0, floor_z=None, wl_sampling=0.2,
@@ -1765,7 +1792,8 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
            window=None, progress=None, rapid_margin=RAPID_MARGIN,
            use_rapids=True, rest_from=None, big_tool=("ball", 6.0, 0.0),
            min_rest=0.5, stock_from=None, stock_allow=RAPID_STOCK_ALLOW,
-           flute_mm=None, shank_dia=None, stickout_mm=None, holder=None, post_grid_mm=POST_GRID):
+           flute_mm=None, shank_dia=None, stickout_mm=None, holder=None, post_grid_mm=POST_GRID,
+           ramp_angle_deg=None):
     """Slope-split finishing toolpath (action: slope_split_finish).
     Returns (moves, stats).
 
@@ -1801,6 +1829,11 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     """
     t_start = time.time()
     reset_drop_calls()
+    if ramp_angle_deg is not None:  # FE5: clamped [0.5, 15], <= 0 rejected
+        ramp_angle_deg = float(ramp_angle_deg)
+        if ramp_angle_deg <= 0.0:
+            raise ValueError("ramp_angle_deg must be > 0")
+        ramp_angle_deg = min(15.0, max(0.5, ramp_angle_deg))
     cutter = make_cutter(*tool)
     # S4: flute/shank geometry from tools/x7_tools.json by diameter unless
     # overridden (CLI --flute/--shank); no table entry -> no shank rule.
@@ -2081,6 +2114,107 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
         p = shallow_paths[k]
         ordered.append(p if row_of[k] % 2 == 0 else p[::-1])
 
+    # -- FE5: vertex-raise entry ramps (own vertices only, no zig-zag) ----
+    # Ramp an entry only where the estimator's LIVE depth at p0 exceeds
+    # RAMP_TRIGGER (0.25 mm): r(s) = z0 + s*tan(angle), L = depth/tan;
+    # emit the pass's OWN vertices (plus one interpolated vertex at s = L)
+    # BACKWARD from s = L to s = 0 with z = max(vertex z, r(s)), then cut
+    # the pass forward as today. Every emitted z >= the verified path z, so
+    # no new CL lookup. A run shorter than L ramps over the whole run at
+    # min(depth, s_run*tan) and is counted as a short-run entry (the
+    # residual plunge remains; no zig-zag). Live stock: the same
+    # entry_depth.LiveStock ball model the estimator uses, initialized from
+    # this op's --stock-from / rest stock and stamped by its own passes.
+    tan_ramp = math.tan(math.radians(ramp_angle_deg)) if ramp_angle_deg \
+        else 0.0
+    n_ramped = n_short_run = 0
+    n_unchanged = len(ordered)
+    ramp_cnt = {}
+    fe5_deep_unramped = []  # FE5 diag: entries with live depth > 0.5 left
+    fe5_deep_ramped = []    # FE5 diag: deep entries that WERE ramped
+    _fe5_track = None       # FE5 diag: env FE5_TRACK="x,y" probe cell
+    _env_track = os.environ.get("FE5_TRACK")
+    if _env_track:
+        _tx, _ty = (float(v) for v in _env_track.split(","))
+        _fe5_track = (_tx, _ty)
+    _fe5_track_last = [math.inf]
+    fe5_track_log = []
+    if tan_ramp > 0.0 and link_stock is not None:
+        live = entry_depth.LiveStock(link_stock[0], link_stock[1],
+                                      link_stock[2], link_stock[3],
+                                      0.5 * float(tool[1]))
+        n_unchanged = 0
+        for k in range(len(ordered)):
+            pth = ordered[k]
+            if len(pth) < 2:
+                n_unchanged += 1
+                continue
+            P = np.asarray(pth, dtype=float)
+            s = np.concatenate([[0.0], np.cumsum(np.hypot(
+                np.diff(P[:, 0]), np.diff(P[:, 1])))])
+            total = float(s[-1])
+            z0 = float(P[0, 2])
+            d = live.disk_depth(P[0, 0], P[0, 1], z0)
+            if _fe5_track is not None and \
+                    math.hypot(P[0, 0] - _fe5_track[0],
+                               P[0, 1] - _fe5_track[1]) < 2.0:
+                fe5_track_log.append(
+                    ["P0 k=%d" % k, round(float(P[0, 0]), 3),
+                     round(float(P[0, 1]), 3), round(z0, 3),
+                     round(float(d), 3), len(pth), round(total, 1)])
+            if total >= 1e-9 and d > RAMP_TRIGGER:
+                L = d / tan_ramp
+                rv = _ramp_entry(P, s, tan_ramp, min(L, total))
+                ordered[k] = rv + list(pth[1:])
+                ramp_cnt[k] = len(rv) - 1
+                if total < L:
+                    n_short_run += 1
+                else:
+                    n_ramped += 1
+                if d > 0.5:  # FE5 diag
+                    fe5_deep_ramped.append(
+                        [round(P[0, 0], 3), round(P[0, 1], 3),
+                         round(z0, 3), round(float(d), 3), round(total, 2)])
+                if _fe5_track is not None and \
+                        abs(P[0, 0] - _fe5_track[0]) < 0.05 and \
+                        abs(P[0, 1] - _fe5_track[1]) < 0.05:
+                    fe5_track_log.append(
+                        ["RAMP k=%d" % k, round(float(d), 3),
+                         round(L, 1), round(u := min(L, total), 1),
+                         [round(float(q), 3) for q in rv[0]],
+                         [round(float(q), 3) for q in rv[-1]],
+                         len(rv)])
+            else:
+                n_unchanged += 1
+                if d > 0.5:  # FE5 diag: deep entry left unramped
+                    fe5_deep_unramped.append(
+                        [round(P[0, 0], 3), round(P[0, 1], 3),
+                         round(z0, 3), round(float(d), 3), round(total, 2)])
+                if _fe5_track is not None and \
+                        abs(P[0, 0] - _fe5_track[0]) < 0.05 and \
+                        abs(P[0, 1] - _fe5_track[1]) < 0.05:
+                    fe5_track_log.append(
+                        ["NORAMP k=%d" % k, round(float(d), 4),
+                         round(total, 2), len(pth)])
+            # stamp this pass's PHYSICAL path (ramp first if prepended) so
+            # later entries see the stock this program already cleared
+            F = np.asarray(ordered[k], dtype=float)
+            for i in range(len(F) - 1):
+                live.stamp_chord(F[i], F[i + 1])
+            if _fe5_track is not None:  # FE5 diag: who cuts the probe cell
+                tx, ty = _fe5_track
+                v = float(live.L[int(math.floor((ty - live.y0) / live.f))
+                                 + live.pad,
+                                 int(math.floor((tx - live.x0) / live.f))
+                                 + live.pad])
+                if v < _fe5_track_last[0] - 1e-6:
+                    dd = np.hypot(F[:, 0] - tx, F[:, 1] - ty)
+                    jm = int(np.argmin(dd))
+                    fe5_track_log.append(
+                        [k, round(v, 3), round(float(dd[jm]), 2),
+                         [round(float(q), 2) for q in F[jm]]])
+                    _fe5_track_last[0] = v
+
     # -- links -----------------------------------------------------------
     t0 = time.time()
     links = []
@@ -2137,6 +2271,17 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     stats["n_gridsnap_splits"] = n_gs_split_steep + n_gs_split_shallow
     stats["n_simplify_rounds"] = n_rounds_steep + n_rounds_shallow
     stats["n_chords_checked"] = n_chords + n_chords_sh
+    # FE4/FE5: ramped = full ramp (run >= L); short_run = run < L, ramped
+    # over the whole run at min(depth, s_run*tan); unchanged = depth <= 0.25
+    stats["ramp_angle_deg"] = ramp_angle_deg
+    stats["n_entries_ramped"] = n_ramped
+    stats["n_entries_short_run"] = n_short_run
+    stats["n_entries_unchanged"] = n_unchanged
+    stats["fe5_deep_unramped"] = fe5_deep_unramped[:40]
+    stats["fe5_deep_ramped_n"] = len(fe5_deep_ramped)
+    stats["fe5_deep_ramped"] = sorted(
+        fe5_deep_ramped, key=lambda r: -r[3])[:40]
+    stats["fe5_track_log"] = fe5_track_log[:60]
     if flute_mm is not None and shank_dia is not None:
         # S4: flute/shank-aware pass (tools/x7_tools.json or --flute/--shank)
         stats["flute_mm"] = round(float(flute_mm), 4)
@@ -2247,8 +2392,10 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                 emit(1, path[0][0], path[0][1], lift_z, ramp_feed,
                      stat="rapid")
                 emit(1, path[0][0], path[0][1], path[0][2], ramp_feed)
-        for (x, y, z) in path[1:]:
-            emit(1, x, y, z, cut_feed)
+        nr = ramp_cnt.get(k, 0)
+        for j, (x, y, z) in enumerate(path[1:]):
+            # FE4/FE5: prepended ramp vertices feed at ramp_feed
+            emit(1, x, y, z, ramp_feed if j < nr else cut_feed)
     if prev is not None:
         emit(0, prev[0], prev[1], clearance)
 
