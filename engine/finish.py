@@ -1150,6 +1150,34 @@ def vertex_net(surf, cutter, paths, tol=NET_TOL, threads=None):
     return out, src, n
 
 
+def floor_net(paths, srcs, floor_z, bbox):
+    """FL1: the floor rule on EVERY pass type's emitted vertices (shallow,
+    steep and rest alike; links/entries use only these endpoints): a CL
+    vertex inside the part bbox whose tip Z is below floor_z is DROPPED and
+    the path SPLIT there - never raised to the floor (same rule as S4
+    unreachable points). Vertices OUTSIDE the part bbox are pad-frame edge
+    passes (the ball rolling off a stock edge into air, raster pads half a
+    stepover past the bounds): they cut nothing below the floor and stay
+    unchanged. Runs after grid_snap so it filters exactly the coordinates
+    that get emitted; the pieces rejoin only through the verified link logic
+    below. Returns (paths, srcs, n_dropped) with srcs[i] the input path
+    index output i came from (row_of / run_i0 alignment travels with the
+    pieces)."""
+    xmin, xmax, ymin, ymax = bbox
+    out, osrc, n = [], [], 0
+    for pth, s in zip(paths, srcs):
+        P = np.asarray(pth, dtype=float)
+        inside = ((P[:, 0] >= xmin) & (P[:, 0] <= xmax)
+                  & (P[:, 1] >= ymin) & (P[:, 1] <= ymax))
+        ok = ~inside | (P[:, 2] >= floor_z - 1e-9)
+        n += int((inside & ~ok).sum())
+        for i0, i1 in _runs_of_mask(ok):
+            if i1 - i0 >= 2:
+                out.append(pth[i0:i1])
+                osrc.append(s)
+    return out, osrc, n
+
+
 def grid_decimals(grid):
     """Decimals needed to write multiples of `grid` exactly (never fewer
     than 4, the neutral file's default). 0.001 -> 4, 0.00254 -> 5."""
@@ -2057,6 +2085,13 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
         grid_snap(surf, cutter, shallow_paths, grid=post_grid_mm,
                   threads=threads)
     src_shallow = [src_shallow[j] for j in src_gs_shallow]  # keep row_of aligned
+    # FL1: floor rule on the emitted coordinates of every pass type - CL
+    # vertices below floor_z are dropped and the pass split there (steep,
+    # shallow and rest all flow through here; links use only endpoints).
+    steep_paths, _src_fl_steep, n_floor_steep = floor_net(
+        steep_paths, _src_gs_steep, floor_z, (rxmin, rxmax, rymin, rymax))
+    shallow_paths, src_shallow, n_floor_shallow = floor_net(
+        shallow_paths, src_shallow, floor_z, (rxmin, rxmax, rymin, rymax))
     # row / run index per EMITTED path (vertex_net splits runs, so the
     # pre-net row_of / s_runs indices no longer align with k)
     row_of = [row_of_pre[s] for s in src_shallow]
@@ -2135,6 +2170,8 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     stats["post_grid_mm"] = post_grid_mm
     stats["n_gridsnap_dropped"] = n_gs_drop_steep + n_gs_drop_shallow
     stats["n_gridsnap_splits"] = n_gs_split_steep + n_gs_split_shallow
+    # FL1: vertices below floor_z dropped (pass split) on steep+shallow
+    stats["n_floor_dropped"] = n_floor_steep + n_floor_shallow
     stats["n_simplify_rounds"] = n_rounds_steep + n_rounds_shallow
     stats["n_chords_checked"] = n_chords + n_chords_sh
     if flute_mm is not None and shank_dia is not None:
