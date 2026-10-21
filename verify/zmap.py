@@ -34,6 +34,22 @@ HOLDER_CLEAR = 1.0  # mm, S5: min clearance of the holder stack to material
 # Constants: never raise either later; fix the measurement instead.
 MAX_RAMP_DEG = 15.0
 AXIAL_FLOOR = 0.2  # mm: noise floor, constant, never raise it later
+# Task ZE (report-only): axial depth classification of engaging horizontal
+# feed moves. Axial depth = deepest column of stock removed above the tool
+# tip under the footprint during the move (max over removed cells of
+# stock_before - cut surface, read BEFORE the move cuts).
+# SLOT_AXIAL_MM = 0.5: wide move with axial depth above this is a SLOT
+# (axial cut); at or below it, a SKIM.
+# SKIM_AXIAL_MM = 0.05: a move removing no more than this skims a floor
+# already within a few hundredths of a mm.
+# FULL_WIDTH_FRAC: radial width >= 0.9 x tool diameter = full-width slot.
+# OVERLOAD_WIDTH_MM = 1.2 x the 2.032 mm optimal load (task text rounds to
+# 2.44): the SE2 merge bar - SE2 must not increase overload count or total
+# length vs main's helix-only rough on Core Front.
+SLOT_AXIAL_MM = 0.5
+SKIM_AXIAL_MM = 0.05
+FULL_WIDTH_FRAC = 0.9
+OVERLOAD_WIDTH_MM = 1.2 * 2.032  # = 2.4384 mm
 TOOLS_JSON = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "tools", "x7_tools.json")
 
@@ -842,6 +858,92 @@ def _engage_stats(vals):
             "max": round(float(a.max()), 4)}
 
 
+def _wide_class(recs):
+    """Task ZE: one wide-move class (slot or skim) summary: count, total
+    length, total time at the moves' feed, p50/p99 of radial width and of
+    axial depth."""
+    if not recs:
+        return {"count": 0, "total_length_mm": 0.0, "total_time_s": 0.0,
+                "width_p50": None, "width_p99": None,
+                "depth_p50": None, "depth_p99": None}
+    w = np.asarray([r["width_mm"] for r in recs], dtype=float)
+    d = np.asarray([r["depth_mm"] for r in recs], dtype=float)
+    return {"count": len(recs),
+            "total_length_mm": round(sum(r["length_mm"] for r in recs), 1),
+            "total_time_s": round(sum(r["time_s"] for r in recs), 1),
+            "width_p50": round(float(np.percentile(w, 50)), 4),
+            "width_p99": round(float(np.percentile(w, 99)), 4),
+            "depth_p50": round(float(np.percentile(d, 50)), 4),
+            "depth_p99": round(float(np.percentile(d, 99)), 4)}
+
+
+def _ze_engagement_keys(hw, engage_max, dia):
+    """Task ZE (report-only): new engagement keys derived from the raw
+    per-move records of every engaging cutting move (each: line, x, y, z,
+    kind, width_mm = max chord engagement, depth_mm = axial depth removed
+    above the tip, length_mm, time_s at the move's feed). The existing
+    engagement numbers are computed elsewhere and stay untouched.
+    - wide_moves: horizontal moves over the engagement threshold split into
+      "slot" (axial depth > SLOT_AXIAL_MM) and "skim" (<=); None when no
+      threshold was given.
+    - slot_horizontal: {n, p50, p95, p99, max} of radial width over
+      horizontal moves with axial depth > SLOT_AXIAL_MM - the engagement
+      statistic that matters for load.
+    - skim_by_z: time per Z level spent skimming (horizontal feeds with
+      axial depth <= SKIM_AXIAL_MM, i.e. floors already within a few
+      hundredths).
+    - full_width_slots: horizontal feeds with radial width >=
+      FULL_WIDTH_FRAC x dia AND axial depth > SLOT_AXIAL_MM.
+    - overload_feeds: horizontal feeds with radial width > OVERLOAD_WIDTH_MM
+      AND axial depth > SLOT_AXIAL_MM (the SE2 merge bar)."""
+    horiz = [r for r in hw if r["kind"] == "horizontal"]
+    slots = [r for r in horiz if r["depth_mm"] > SLOT_AXIAL_MM]
+    wide = ([r for r in horiz if r["width_mm"] > engage_max]
+            if engage_max is not None else None)
+    skim_by_z = {}
+    for r in horiz:
+        if r["depth_mm"] <= SKIM_AXIAL_MM:
+            k = "%.3f" % r["z"]
+            skim_by_z[k] = skim_by_z.get(k, 0.0) + r["time_s"]
+    fws = sorted([r for r in horiz if r["width_mm"] >= FULL_WIDTH_FRAC * dia
+                  and r["depth_mm"] > SLOT_AXIAL_MM],
+                 key=lambda r: (-r["depth_mm"], -r["width_mm"]))
+    ovl = sorted([r for r in horiz if r["width_mm"] > OVERLOAD_WIDTH_MM
+                  and r["depth_mm"] > SLOT_AXIAL_MM],
+                 key=lambda r: (-r["width_mm"], -r["depth_mm"]))
+    return {
+        "wide_moves": (None if wide is None else {
+            "threshold_mm": engage_max,
+            "slot": _wide_class([r for r in wide
+                                if r["depth_mm"] > SLOT_AXIAL_MM]),
+            "skim": _wide_class([r for r in wide
+                                if r["depth_mm"] <= SLOT_AXIAL_MM]),
+        }),
+        "slot_horizontal": _engage_stats([r["width_mm"] for r in slots]),
+        "skim_by_z": {k: round(v, 1) for k, v in
+                      sorted(skim_by_z.items(), key=lambda kv: float(kv[0]))},
+        "full_width_slots": {
+            "count": len(fws),
+            "total_length_mm": round(sum(r["length_mm"] for r in fws), 1),
+            "total_time_s": round(sum(r["time_s"] for r in fws), 1),
+            # top 20 by axial depth (line, XY, width, depth)
+            "top": [{"line": r["line"], "x": r["x"], "y": r["y"],
+                    "width_mm": r["width_mm"], "depth_mm": r["depth_mm"]}
+                   for r in fws[:20]],
+        },
+        "overload_feeds": {
+            "width_mm_above": round(OVERLOAD_WIDTH_MM, 4),
+            "count": len(ovl),
+            "total_length_mm": round(sum(r["length_mm"] for r in ovl), 1),
+            "total_time_s": round(sum(r["time_s"] for r in ovl), 1),
+            # worst 20 by radial width, then depth (line, XY, Z, width, depth)
+            "worst": [{"line": r["line"], "x": r["x"], "y": r["y"],
+                      "z": r["z"], "width_mm": r["width_mm"],
+                      "depth_mm": r["depth_mm"]} for r in ovl[:20]],
+        },
+    }
+
+
 def _axial_report(raw):
     """Task ZA: summarize axial plunges (descents steeper than MAX_RAMP_DEG) that removed
     more than AXIAL_FLOOR mm under the tool's flat bottom:
@@ -1039,6 +1141,11 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     engage_count = 0
     engage_horiz = []   # per-move max chord mm: horizontal cuts (|dz|<=1e-6)
     engage_entry = []   # per-move max chord mm: descending entries into stock
+    # task ZE: per engaging cutting move raw records {line, x, y, z, kind,
+    # width_mm (max chord), depth_mm (axial depth removed above the tip),
+    # length_mm, time_s at the move's feed} - report-only, merged raw in
+    # parallel so serial/jobs results agree exactly
+    hw_records = []
     # plunge tracking
     plunge_flags = []  # list of dicts: {line, x, y, z, angle_deg, depth_mm}
     plunge_count = 0
@@ -1086,6 +1193,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         move_shank = False
         move_holder = False
         move_max_engage = 0.0
+        # task ZE: deepest column removed above the tool surface under the
+        # footprint during this move (max over removed cells of
+        # stock_before - cut surface)
+        move_max_depth = 0.0
         # travel direction for engagement (perpendicular chord width)
         dx_t = x1 - cur[0]
         dy_t = y1 - cur[1]
@@ -1237,6 +1348,15 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             newv = np.where(msk, sz + dz(d), np.inf)
             cut = win - newv
             removed = float(np.sum(np.clip(np.where(msk, cut, 0.0), 0.0, None)))
+            if cutting and engage_track:
+                # task ZE: axial depth at this sample = deepest column of
+                # stock removed above the tool surface under the footprint
+                # (cut = stock_before - cut surface; -inf outside the disk
+                # and over non-finite stock, so a finite max is a column this
+                # move actually cuts)
+                dmax = float(np.max(cut))
+                if np.isfinite(dmax) and dmax > move_max_depth:
+                    move_max_depth = dmax
             if cutting:
                 # engaged = any stock cell at/over the footprint edge above the
                 # tip. The radius is padded by half a cell diagonal so that
@@ -1323,6 +1443,22 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     engage_horiz.append(move_max_engage)
                 elif dz_mv < 0.0:
                     engage_entry.append(move_max_engage)
+            # task ZE: record radial width AND axial depth for EVERY engaging
+            # cutting move (report keys filter to horizontal; raw list merges
+            # unchanged under --jobs)
+            if move_max_engage > 0.0 or move_max_depth > 0.0:
+                feed_ze = mv.get("f")
+                hw_records.append({
+                    "line": mv["line"],
+                    "x": round(x1, 4), "y": round(y1, 4), "z": round(z1, 3),
+                    "kind": ("horizontal" if abs(dz_mv) <= 1e-6 else
+                           ("entry" if dz_mv < 0.0 else "rising")),
+                    "width_mm": round(move_max_engage, 4),
+                    "depth_mm": round(max(move_max_depth, 0.0), 4),
+                    "length_mm": length,
+                    "time_s": (length / (feed_ze if feed_ze and feed_ze > 0
+                                        else rapid_feed) * 60.0),
+                })
             if engage_max is not None and move_max_engage > engage_max:
                 engage_count += 1
                 engage_spikes.append({
@@ -1399,7 +1535,11 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             # top 10 worst spots (line, XY, value)
             "spikes": sorted(engage_spikes, key=lambda s: s["engagement_mm"],
                              reverse=True)[:10],
+            # task ZE (new keys only): axial depth per engaging move
+            **_ze_engagement_keys(hw_records, engage_max, dia),
         } if engage_track else None,
+        # raw per-move width+depth records for exact parallel merging
+        "_hw_raw": hw_records,
         # raw per-bucket values for exact parallel merging (not reported)
         "_engage_raw": {"horizontal": engage_horiz, "entry": engage_entry},
         # task ZA: report-only for every tool; a FAILING gate for flat/bull
@@ -1588,6 +1728,14 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
     # recompute air from chunk air fractions (air = fraction * chunk cut len)
     air = sum(r["air_fraction"] * r["cutting_length_mm"] for r in results)
     combined["air_fraction"] = (air / cut) if cut > 0 else 0.0
+    # task ZE: merge raw width+depth records per move (each move lives in
+    # exactly one chunk), then derive the new keys with the same builder as
+    # serial -> jobs result identical to serial
+    hw_all = [r for res in results for r in res["_hw_raw"]]
+    combined["_hw_raw"] = hw_all
+    if combined["engagement"] is not None:
+        combined["engagement"].update(
+            _ze_engagement_keys(hw_all, engage_max, dia))
     combined["cutter_comp"] = {
         "active_moves": sum(r["cutter_comp"]["active_moves"] for r in results),
         "first_line": min((r["cutter_comp"]["first_line"] for r in results

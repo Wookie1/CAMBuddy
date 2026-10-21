@@ -1121,6 +1121,184 @@ G1 X10. Y0. F500.
 
 
 # ---------------------------------------------------------------------------
+# Task ZE: axial depth per engaging move (wide_moves / slot / skim /
+# full_width_slots / overload_feeds) - report-only, existing numbers frozen
+# ---------------------------------------------------------------------------
+
+def test_ze_full_width_slot_3mm_depth_is_slot():
+    """Full-width slot cut 3 mm into a 10 mm block (tip Z7): wide move
+    classified slot (axial depth ~3 > 0.5), visible in slot_horizontal,
+    full_width_slots and overload_feeds."""
+    part = block_part(hi=10.0, half=15.0)
+    res = _run_engage("""
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 Z7. F100.
+G1 X20. Y0. F500.
+""", part, dia=6.0, engage_max=2.0)
+    eng = res["engagement"]
+    wm = eng["wide_moves"]
+    assert wm is not None and wm["threshold_mm"] == 2.0
+    # the horizontal full-width move is a slot, not a skim
+    assert wm["slot"]["count"] == 1, \
+        "full-width 3 mm slot not classified slot: %r" % wm
+    assert wm["skim"]["count"] == 0
+    assert abs(wm["slot"]["depth_p50"] - 3.0) <= 0.1, \
+        "slot axial depth %.3f not ~3 mm" % wm["slot"]["depth_p50"]
+    assert abs(wm["slot"]["width_p50"] - 6.0) <= 0.3
+    assert wm["slot"]["total_length_mm"] > 0.0
+    assert wm["slot"]["total_time_s"] > 0.0
+    # the load-relevant statistic: width over horizontal moves deeper than
+    # 0.5 mm axial
+    sh = eng["slot_horizontal"]
+    assert sh["n"] == 1 and abs(sh["p50"] - 6.0) <= 0.3
+    # full-width slot: width >= 0.9 x dia AND depth > 0.5
+    fws = eng["full_width_slots"]
+    assert fws["count"] == 1 and abs(fws["total_length_mm"] - 40.0) <= 0.5
+    top = fws["top"][0]
+    assert top["width_mm"] >= 5.4 and abs(top["depth_mm"] - 3.0) <= 0.1
+    assert "line" in top and "x" in top and "y" in top
+    # overload: width > 1.2 x the 2.032 load AND axial depth > 0.5
+    ovl = eng["overload_feeds"]
+    assert ovl["count"] == 1 and ovl["total_length_mm"] > 0.0
+    assert abs(ovl["worst"][0]["depth_mm"] - 3.0) <= 0.1
+    assert ovl["worst"][0]["z"] == 7.0
+
+
+def test_ze_floor_pass_0p02mm_is_skim_and_in_skim_by_z():
+    """Full-width pass over a floor 0.02 mm high (stock 7.02, tip Z7):
+    classified skim (depth <= 0.5), and its time is counted in skim_by_z
+    at that Z level (depth <= 0.05)."""
+    part = block_part(hi=10.0, half=15.0)
+    stock_init = np.full((N, N), 7.02)
+    res = _run_engage("""
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 Z7. F100.
+G1 X20. Y0. F500.
+""", part, dia=6.0, engage_max=2.0, stock_init=stock_init)
+    eng = res["engagement"]
+    wm = eng["wide_moves"]
+    assert wm["skim"]["count"] == 1, \
+        "0.02 mm floor pass not classified skim: %r" % wm
+    assert wm["slot"]["count"] == 0
+    assert abs(wm["skim"]["depth_p50"] - 0.02) <= 0.005
+    assert abs(wm["skim"]["width_p50"] - 6.0) <= 0.3
+    # skim_by_z: the 40 mm pass at F500 takes 4.8 s at Z7.000
+    sbz = eng["skim_by_z"]
+    assert "7.000" in sbz, "floor skim not counted in skim_by_z: %r" % sbz
+    assert abs(sbz["7.000"] - 4.8) <= 0.2
+    # not a slot, so no full-width slot / overload either
+    assert eng["full_width_slots"]["count"] == 0
+    assert eng["overload_feeds"]["count"] == 0
+    assert eng["slot_horizontal"]["n"] == 0
+
+
+def test_ze_existing_engagement_numbers_unchanged():
+    """Task ZE HARD RULE: the existing engagement numbers (threshold_mm,
+    count, horizontal/entry p50/p95/p99/max, spikes) are byte-identical to
+    the pre-ZE values on existing fixtures - asserted by equality."""
+    old = {
+        "side15": {
+            "threshold_mm": 2.0, "count": 0, "max_mm": 1.5,
+            "horizontal": {"n": 1, "p50": 1.5, "p95": 1.5, "p99": 1.5,
+                          "max": 1.5},
+            "entry": {"n": 1, "p50": 1.5, "p95": 1.5, "p99": 1.5,
+                     "max": 1.5},
+            "spikes": [],
+        },
+        "fullwidth": {
+            "threshold_mm": 5.0, "count": 2, "max_mm": 6.0,
+            "horizontal": {"n": 1, "p50": 6.0, "p95": 6.0, "p99": 6.0,
+                          "max": 6.0},
+            "entry": {"n": 1, "p50": 6.0, "p95": 6.0, "p99": 6.0,
+                     "max": 6.0},
+            "spikes": [
+                {"line": 4, "x": -20.0, "y": 0.0, "engagement_mm": 6.0,
+                 "kind": "entry"},
+                {"line": 5, "x": 20.0, "y": 0.0, "engagement_mm": 6.0,
+                 "kind": "horizontal"},
+            ],
+        },
+        "corner": {
+            "threshold_mm": 4.0, "count": 4, "max_mm": 6.0,
+            "horizontal": {"n": 3, "p50": 6.0, "p95": 6.0, "p99": 6.0,
+                          "max": 6.0},
+            "entry": {"n": 1, "p50": 6.0, "p95": 6.0, "p99": 6.0,
+                     "max": 6.0},
+            "spikes": [
+                {"line": 4, "x": -10.0, "y": -3.0, "engagement_mm": 6.0,
+                 "kind": "entry"},
+                {"line": 5, "x": 10.0, "y": -3.0, "engagement_mm": 6.0,
+                 "kind": "horizontal"},
+                {"line": 6, "x": 10.0, "y": 3.0, "engagement_mm": 6.0,
+                 "kind": "horizontal"},
+                {"line": 7, "x": -10.0, "y": 3.0, "engagement_mm": 6.0,
+                 "kind": "horizontal"},
+            ],
+        },
+    }
+    part = block_part(hi=10.0, half=15.0)
+    ys = centers()[:, None]
+    stock_init = np.broadcast_to(np.where(ys >= 1.5 - 1e-9, 10.0, 5.0),
+                                 (N, N)).copy()
+    res = {
+        "side15": _run_engage("""
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""", part, dia=6.0, engage_max=2.0, stock_init=stock_init),
+        "fullwidth": _run_engage("""
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 Z5. F100.
+G1 X20. Y0. F500.
+""", part, dia=6.0, engage_max=5.0),
+        "corner": _run_engage("""
+G21 G90 F500
+G0 X-10. Y-3. Z20.
+G1 Z5. F100.
+G1 X10. Y-3. F500.
+G1 X10. Y3. F500.
+G1 X-10. Y3. F500.
+""", part, dia=6.0, engage_max=4.0),
+    }
+    keys = ("threshold_mm", "count", "max_mm", "horizontal", "entry",
+            "spikes")
+    for name, base in old.items():
+        got = {k: res[name]["engagement"][k] for k in keys}
+        assert got == base, \
+            "%s: existing engagement changed:\n got %r\n old %r" % (
+                name, got, base)
+
+
+def test_ze_parallel_merge_matches_serial():
+    """--jobs merges the raw width+depth records per move, so every task ZE
+    key equals the serial result exactly."""
+    part = block_part(hi=10.0, half=15.0)
+    gcode = """
+G21 G90 F500
+G0 X-20. Y0. Z20.
+G1 Z7. F100.
+G1 X20. Y0. F500.
+G0 Z20.
+G0 X-20. Y4. Z20.
+G1 Z7. F100.
+G1 X20. Y4. F500.
+"""
+    moves = zmap.parse_gcode(gcode)
+    ser = zmap.simulate(moves, part, CELL, X0, Y0, STOCK, dia=6.0,
+                       engage_max=2.0)
+    for jobs in (2, 4):
+        par = zmap.simulate_parallel(zmap.parse_gcode(gcode), part, CELL,
+                                    X0, Y0, STOCK, jobs, dia=6.0,
+                                    engage_max=2.0)
+        assert par["engagement"] == ser["engagement"], \
+            "jobs=%d: ZE engagement keys differ from serial" % jobs
+
+
+# ---------------------------------------------------------------------------
 # S5: independent holder clearance check (holder frustum stack from
 # tools/x7_tools.json vs max(stock, part), 1.0 mm clearance)
 # ---------------------------------------------------------------------------
