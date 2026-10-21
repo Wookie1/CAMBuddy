@@ -2462,3 +2462,72 @@ def test_axial_real_core_front_rough_fails():
     finally:
         if os.path.exists(out):
             os.unlink(out)
+
+
+# ---------------------------------------------------------------------------
+# Task ZE2F: ae2 windows carry their feed; full-width split by cutting vs
+# entry feed; entry-feed full-width allowed only right after a helix with
+# a <= that helix's measured pitch + AE2_PITCH_TOL. Report-only.
+# ---------------------------------------------------------------------------
+
+def _helix_gcode(cx, cy, r, z0, pitch, turns, feed=1270.0, seg=72):
+    lines = ["G21 G90",
+             "G0 X%.4f Y%.4f Z20." % (cx + r, cy),
+             "G1 X%.4f Y%.4f Z%.4f F%.1f" % (cx + r, cy, z0, feed)]
+    for k in range(1, int(seg * turns) + 1):
+        a = 2.0 * math.pi * k / seg
+        lines.append("G1 X%.4f Y%.4f Z%.4f F%.1f" % (
+            cx + r * math.cos(a), cy + r * math.sin(a), z0 - pitch * k / seg,
+            feed))
+    return lines
+
+
+def test_ze2f_helix_pitch_measured_and_plunge_is_none():
+    run = [(3.0 * math.cos(2 * math.pi * k / 72), 3.0 * math.sin(2 * math.pi * k / 72),
+            18.6 - 0.8 * k / 72) for k in range(0, 3 * 72 + 1)]
+    assert abs(zmap._helix_pitch(run) - 0.8) <= 0.02
+    assert zmap._helix_pitch([(0.0, 0.0, 18.6 - 0.5 * k) for k in range(6)]) is None
+    assert zmap._helix_pitch(run[:3]) is None
+
+
+def test_ze2f_window_after_helix_carries_pitch_and_feed_breaks():
+    """A real helix (r 3, pitch 1.0, 2 turns) then horizontal feeds: the
+    first window after the helix carries helix_pitch ~1.0 and the entry feed;
+    a feed change at the same Z and direction starts a new window without a
+    pitch."""
+    part = np.zeros((NF, NF))
+    g = _helix_gcode(0.0, 0.0, 3.0, 18.6, 1.0, 2)
+    g += ["G1 X%.4f Y0. F1270." % (3.0 + 0.2 * i) for i in range(1, 7)]
+    g += ["G1 X%.4f Y0. F3429." % (4.2 + 0.2 * i) for i in range(1, 7)]
+    res = _run_ae2("\n".join(g) + "\n", part)
+    wins = res["_ae2_raw"]
+    assert len(wins) == 2, wins
+    assert wins[0]["feed"] == 1270.0 and wins[1]["feed"] == 3429.0
+    assert abs(wins[0]["helix_pitch"] - 1.0) <= 0.03
+    assert wins[1]["helix_pitch"] is None
+
+
+def test_ze2f_fw_split_by_feed_and_helix_bottom_exception():
+    """Crafted windows: cutting feed = the feed with most travel. A cutting
+    full-width window is always a finding; an entry-feed one is allowed only
+    with a helix pitch and a <= pitch + 0.05."""
+    def w(feed, a, pitch, length=1.0, ae=12.6):
+        return {"line": 1, "x": 0.0, "y": 0.0, "z": 0.0, "ae_eff": ae, "a": a,
+                "width_mm": 12.686, "length_mm": length, "feed": feed,
+                "helix_pitch": pitch}
+    wins = [w(3429.0, 0.0, None, length=50.0, ae=1.0),  # bulk cutting travel
+            w(3429.0, 7.0, None),          # cutting-feed FW -> finding
+            w(1270.0, 1.04, 1.0),          # helix bottom within pitch -> allowed
+            w(1270.0, 1.2, 1.0),           # deeper than the pitch -> finding
+            w(1270.0, 0.9, None)]          # entry feed, no helix -> finding
+    k = zmap._ae2_engagement_keys(wins, 12.686)
+    assert k["ae2_cutting_feed"] == 3429.0
+    assert k["full_width_slots_ae2"]["count"] == 4       # unchanged ZE2 key
+    assert k["full_width_slots_ae2_cutting_feed"]["count"] == 1
+    ent = k["full_width_slots_ae2_entry_feed"]
+    assert ent["count"] == 3 and ent["allowed_helix_bottom"] == 1
+    assert ent["not_allowed"]["count"] == 2
+    t = k["roughing_target_ae2"]
+    assert t == {"fw_cutting_feed": 1, "fw_entry_not_allowed": 2, "met": False}
+    clean = [wins[0], wins[2]]
+    assert zmap._ae2_engagement_keys(clean, 12.686)["roughing_target_ae2"]["met"]

@@ -58,6 +58,14 @@ OVERLOAD_WIDTH_MM = 1.2 * 2.032  # = 2.4384 mm
 # 0.1 mm judge grid adds no noise to short moves.
 AE2_WINDOW_MM = 1.0
 AE2_DIR_MAX_DEG = 45.0
+# Task ZE2F (report-only): every ae2 window carries its feed. Cutting feed =
+# the feed with the most horizontal ae2 travel in the program; a window at a
+# feed below AE2_ENTRY_FEED_FRAC x that is an ENTRY-feed window. An entry-feed
+# full-width window is ALLOWED only right after a helix descent and only with
+# a <= that helix's measured pitch + AE2_PITCH_TOL (the same load per tooth as
+# the helix turn itself); everything else full-width is a finding.
+AE2_ENTRY_FEED_FRAC = 0.9
+AE2_PITCH_TOL = 0.05
 TOOLS_JSON = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "tools", "x7_tools.json")
 
@@ -975,7 +983,7 @@ def _ae2_windows(moves):
 
     for e in moves:
         link = (cur is not None and e["idx"] == cur["idx"] + 1
-                and e["z"] == cur["z"]
+                and e["z"] == cur["z"] and e.get("feed") == cur.get("feed")
                 and e["dx"] * cur["dx"] + e["dy"] * cur["dy"]
                 >= math.cos(math.radians(AE2_DIR_MAX_DEG)))
         if not link:
@@ -986,7 +994,8 @@ def _ae2_windows(moves):
                    "dx": e["dx"], "dy": e["dy"],
                    "area_mm2": e["area_mm2"], "length_mm": e["length_mm"],
                    "a": e["depth_mm"], "width_mm": e["width_mm"],
-                   "n_moves": 1}
+                   "n_moves": 1, "feed": e.get("feed"),
+                   "helix_pitch": e.get("helix_pitch")}
         else:
             cur["idx"] = e["idx"]
             cur["end_line"] = e["line"]
@@ -1005,6 +1014,22 @@ def _ae2_windows(moves):
     return windows
 
 
+def _helix_pitch(run):
+    """Task ZE2F: measured pitch (Z drop per full turn) of a descending feed
+    run, or None when it is not a helix (fewer than 4 points, radius under
+    0.05 mm - a straight plunge/ramp - or no XY travel)."""
+    if len(run) < 4:
+        return None
+    P = np.asarray(run, dtype=float)
+    c = P[:, :2].mean(axis=0)
+    r = float(np.hypot(P[:, 0] - c[0], P[:, 1] - c[1]).mean())
+    arc = float(np.hypot(np.diff(P[:, 0]), np.diff(P[:, 1])).sum())
+    dz = float(P[0, 2] - P[-1, 2])
+    if r < 0.05 or arc <= 1e-9 or dz <= 0.0:
+        return None
+    return round(dz / (arc / (2.0 * math.pi * r)), 4)
+
+
 def _ae2_engagement_keys(win_recs, dia):
     """Task ZE2 (report-only): engagement keys from the ae2 windows. Old keys
     stay untouched.
@@ -1020,6 +1045,21 @@ def _ae2_engagement_keys(win_recs, dia):
                 "ae_eff": w["ae_eff"], "a": round(w["a"], 4),
                 "width_mm": w["width_mm"]}
 
+    # task ZE2F: feed classes
+    by_feed = {}
+    for w in win_recs:
+        if w.get("feed"):
+            by_feed[w["feed"]] = by_feed.get(w["feed"], 0.0) + w["length_mm"]
+    cut_feed = max(by_feed, key=by_feed.get) if by_feed else None
+
+    def entry_feed(w):
+        return (cut_feed is not None and w.get("feed") is not None
+                and w["feed"] < AE2_ENTRY_FEED_FRAC * cut_feed)
+
+    def allowed(w):
+        hp = w.get("helix_pitch")
+        return hp is not None and w["a"] <= hp + AE2_PITCH_TOL
+
     fws = sorted([w for w in win_recs
                   if w["ae_eff"] >= FULL_WIDTH_FRAC * dia
                   and w["a"] > SLOT_AXIAL_MM],
@@ -1027,7 +1067,28 @@ def _ae2_engagement_keys(win_recs, dia):
     ovl = sorted([w for w in win_recs
                   if w["ae_eff"] > OVERLOAD_WIDTH_MM and w["a"] > SLOT_AXIAL_MM],
                  key=lambda w: (-w["ae_eff"], -w["a"]))
+    fw_cut = [w for w in fws if not entry_feed(w)]
+    fw_ent = [w for w in fws if entry_feed(w)]
+    fw_ent_bad = [w for w in fw_ent if not allowed(w)]
+
+    def fw_class(ws):
+        return {"count": len(ws),
+                "total_length_mm": round(sum(w["length_mm"] for w in ws), 1),
+                "worst": [dict(brief(w), feed=w.get("feed"),
+                               helix_pitch=w.get("helix_pitch"))
+                          for w in ws[:10]]}
     return {
+        "ae2_cutting_feed": cut_feed,
+        "full_width_slots_ae2_cutting_feed": fw_class(fw_cut),
+        "full_width_slots_ae2_entry_feed": dict(
+            fw_class(fw_ent), allowed_helix_bottom=len(fw_ent) - len(fw_ent_bad),
+            not_allowed=fw_class(fw_ent_bad)),
+        # the roughing target (report-only): 0 full-width at cutting feed and
+        # no entry-feed full-width beyond the bounded helix-bottom exception
+        "roughing_target_ae2": {
+            "fw_cutting_feed": len(fw_cut),
+            "fw_entry_not_allowed": len(fw_ent_bad),
+            "met": not fw_cut and not fw_ent_bad},
         "ae2": _engage_stats([w["ae_eff"] for w in win_recs]),
         "full_width_slots_ae2": {
             "count": len(fws),
@@ -1252,6 +1313,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     # depth_mm (a), width_mm (old max chord)} - merged raw in parallel so
     # serial/jobs results agree exactly; windows built from the full list
     ae2_moves = []
+    desc_run = []  # task ZE2F: points of the descending feed run just made
     # plunge tracking
     plunge_flags = []  # list of dicts: {line, x, y, z, angle_deg, depth_mm}
     plunge_count = 0
@@ -1579,6 +1641,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             # and direction is real feed length with zero removed area
             if abs(dz_mv) <= 1e-6 and length > 0.0:
                 ae2_moves.append({
+                    "feed": mv.get("f"),
+                    "helix_pitch": _helix_pitch(desc_run),
                     "idx": mi + idx_offset,
                     "line": mv["line"],
                     "x": round(x1, 4), "y": round(y1, 4),
@@ -1625,6 +1689,17 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                         "z": round(z1, 4),
                         "angle_deg": round(angle_deg, 2),
                         "depth_mm": round(depth_m, 4)})
+        # task ZE2F: keep the current descending feed run (a helix entry);
+        # any other move ends it (the horizontal move after it reads it first)
+        if cutting and z1 < cur[2] - 1e-6:
+            if math.hypot(x1 - cur[0], y1 - cur[1]) <= 1e-6:
+                desc_run = [(x1, y1, z1)]  # vertical feed-down: helix starts here
+            else:
+                if not desc_run:
+                    desc_run.append((cur[0], cur[1], cur[2]))
+                desc_run.append((x1, y1, z1))
+        else:
+            desc_run = []
         cur = [x1, y1, z1]
 
     ae2_windows = _ae2_windows(ae2_moves) if engage_track else []
