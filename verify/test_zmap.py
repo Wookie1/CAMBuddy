@@ -2531,3 +2531,41 @@ def test_ze2f_fw_split_by_feed_and_helix_bottom_exception():
     assert t == {"fw_cutting_feed": 1, "fw_entry_not_allowed": 2, "met": False}
     clean = [wins[0], wins[2]]
     assert zmap._ae2_engagement_keys(clean, 12.686)["roughing_target_ae2"]["met"]
+
+
+def test_ze2f2_pitch_carries_along_the_helix_bottom_run():
+    """ZE2F2: after a helix, every window of the contiguous run at its bottom
+    Z and entry feed (a floor circle) carries the helix pitch; the first move
+    at a different feed (or any Z change) drops it."""
+    part = np.zeros((NF, NF))
+    g = _helix_gcode(0.0, 0.0, 3.0, 18.6, 1.0, 2)
+    zb = 18.6 - 2.0
+    g += ["G1 X%.4f Y%.4f Z%.4f F1270." % (3.0 * math.cos(2 * math.pi * k / 72), 3.0 * math.sin(2 * math.pi * k / 72), zb)
+          for k in range(1, 73)]                      # one full circle at the bottom, entry feed
+    g += ["G1 X%.4f Y0. F3429." % (3.0 + 0.2 * i) for i in range(1, 7)]
+    res = _run_ae2("\n".join(g) + "\n", part)
+    wins = res["_ae2_raw"]
+    circ = [w for w in wins if w["feed"] == 1270.0]
+    cutw = [w for w in wins if w["feed"] == 3429.0]
+    assert len(circ) >= 10 and cutw, (len(circ), len(cutw))
+    assert all(w["helix_pitch"] is not None and abs(w["helix_pitch"] - 1.0) <= 0.03 for w in circ), \
+        [w["helix_pitch"] for w in circ]
+    assert all(w["helix_pitch"] is None for w in cutw)
+
+
+def test_ze2f2_carry_is_bounded_to_one_circle():
+    """ZE2F2 bound: an entry-feed run at the helix bottom LONGER than one
+    circumference (+1 mm) loses the pitch beyond that length - those windows
+    are judged as normal windows."""
+    part = np.zeros((NF, NF))
+    g = _helix_gcode(0.0, 0.0, 3.0, 18.6, 1.0, 2)
+    zb = 18.6 - 2.0
+    g += ["G1 X%.4f Y%.4f Z%.4f F1270." % (3.0 * math.cos(2 * math.pi * k / 72), 3.0 * math.sin(2 * math.pi * k / 72), zb)
+          for k in range(1, 3 * 72 + 1)]              # THREE circles at the bottom, entry feed
+    res = _run_ae2("\n".join(g) + "\n", part)
+    wins = [w for w in res["_ae2_raw"] if w["feed"] == 1270.0]
+    carried = sum(w["length_mm"] for w in wins if w["helix_pitch"] is not None)
+    uncarried = [w for w in wins if w["helix_pitch"] is None]
+    assert carried <= 2 * math.pi * 3.0 + 1.0 + 1.1, carried   # one circle + 1 mm (+ one window)
+    assert uncarried and sum(w["length_mm"] for w in uncarried) > 2 * math.pi * 3.0, \
+        "the second and third circles must be judged as normal windows"
