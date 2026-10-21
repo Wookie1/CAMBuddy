@@ -71,6 +71,10 @@ import area
 from engine import finish as fin
 from engine.stock import StockField, save_stock_npy
 
+# SE2: noise floor (same value/name as verify/zmap.py's AXIAL_FLOOR); a side
+# entry's feed-in may only cross material already cleared at that level.
+AXIAL_FLOOR = 0.2
+
 
 def rect_loop(xmin, ymin, xmax, ymax):
     return [[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax]]
@@ -1392,6 +1396,15 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     if hf_gouge_violation([(px, py, z) for (px, py) in path],
                                          stock, tool_r) is not None:
                         continue     # feed-in would take the flank over part
+                    # SE2: the whole sideways feed-in (column -> region start,
+                    # swept by tool_r) must run through material ALREADY
+                    # cleared at this level: live stock top along the swept
+                    # path <= Z + AXIAL_FLOOR. Standing stock above the level
+                    # (e.g. a full-width slot of the flat at up to full
+                    # stepdown) means helix instead; link_clear fails closed
+                    # when the path leaves the tracked stock record.
+                    if not stock.link_clear(path, z + AXIAL_FLOOR):
+                        continue     # feed-in crosses standing stock at depth
                     # the G0 descent at (sx, sy) must itself be rapid-clear
                     # down to Z: max(stock, part) within tool_r + margin at the
                     # column <= Z + 0.05, else emit()'s R5 bump lifts the

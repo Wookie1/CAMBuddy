@@ -1081,6 +1081,7 @@ def _main():
                test_islands_grid_edge_parity, test_rough_pocket_in_block,
                test_rough_synth_pocket_repro, test_rough_rapids_clear_stock,
                test_rough_rt_entries, test_rapid_swept_clear_catches_diagonal_climb,
+               test_se2_side_entries_only_through_cleared,
                test_stl_cache_keyed_by_content):
         try:
             fn()
@@ -1248,6 +1249,102 @@ def test_rapid_swept_clear_catches_diagonal_climb():
     assert rapid_swept_clear(sf, rise, p1, SR + 1.0, 1.0), \
         "the traverse at height after a vertical rise must pass"
     print("PASS rapid swept check catches a diagonal climb")
+
+
+def _two_floor_pocket_stl(path, half=16.0, ztop=12.0, pk=13.0, dx=-3.0,
+                          z_deep=6.0, z_shelf=8.0):
+    """ASCII STL: block +-half, 0..ztop with pocket +-pk whose floor steps
+    from z_deep (x < dx) up to a shelf at z_shelf (vertical step wall at
+    x = dx). The shelf level's region can only be approached sideways from
+    the deep floor THROUGH the standing step wall."""
+    h, t, w = half, ztop, pk
+
+    def quad(a, b, c, d):
+        return [(a, b, c), (a, c, d)]
+
+    tris = []
+    tris += quad((-h, -h, 0), (-h, h, 0), (h, h, 0), (h, -h, 0))
+    tris += quad((h, -h, 0), (h, h, 0), (h, h, t), (h, -h, t))
+    tris += quad((-h, -h, 0), (-h, -h, t), (-h, h, t), (-h, h, 0))
+    tris += quad((-h, h, 0), (-h, h, t), (h, h, t), (h, h, 0))
+    tris += quad((-h, -h, 0), (-h, -h, t), (h, -h, t), (h, -h, 0))
+    tris += quad((-h, -h, t), (h, -h, t), (w, -w, t), (-w, -w, t))
+    tris += quad((h, -h, t), (h, h, t), (w, w, t), (w, -w, t))
+    tris += quad((h, h, t), (-h, h, t), (-w, w, t), (w, w, t))
+    tris += quad((-h, h, t), (-h, -h, t), (-w, -w, t), (-w, w, t))
+    tris += quad((dx, -w, z_shelf), (w, -w, z_shelf), (w, w, z_shelf),
+                 (dx, w, z_shelf))                                        # shelf
+    tris += quad((-w, -w, z_deep), (dx, -w, z_deep), (dx, w, z_deep),
+                 (-w, w, z_deep))                                       # deep
+    tris += quad((dx, -w, z_deep), (dx, w, z_deep), (dx, w, z_shelf),
+                 (dx, -w, z_shelf))                                      # step
+    tris += quad((-w, -w, z_deep), (-w, w, z_deep), (-w, w, t),
+                 (-w, -w, t))
+    tris += quad((w, -w, z_shelf), (w, w, z_shelf), (w, w, t),
+                 (w, -w, t))
+    tris += quad((-w, w, z_deep), (dx, w, z_deep), (dx, w, t), (-w, w, t))
+    tris += quad((-w, -w, z_deep), (-w, -w, t), (dx, -w, t),
+                 (dx, -w, z_deep))
+    tris += quad((dx, w, z_shelf), (w, w, z_shelf), (w, w, t), (dx, w, t))
+    tris += quad((dx, -w, z_shelf), (dx, -w, t), (w, -w, t),
+                 (w, -w, z_shelf))
+    with open(path, "w") as fh:
+        fh.write("solid two_floor_pocket\n")
+        for a, b, c in tris:
+            fh.write(" facet normal 0 0 0\n  outer loop\n")
+            for p in (a, b, c):
+                fh.write("   vertex %.4f %.4f %.4f\n" % p)
+            fh.write("  endloop\n endfacet\n")
+        fh.write("endsolid two_floor_pocket\n")
+    return path
+
+
+def test_se2_side_entries_only_through_cleared():
+    """SE2: a side entry is used ONLY if the whole sideways feed-in (column
+    -> region start, swept by tool_r) runs through material already cleared
+    at that level (live stock top <= Z + AXIAL_FLOOR); otherwise helix."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    import json as _json
+    import numpy as np
+    from opencamlib import ocl
+    from engine.rough import rough, AXIAL_FLOOR
+    assert AXIAL_FLOOR == 0.2, "engine AXIAL_FLOOR must equal verify's (0.2)"
+    # (a) standing wall: the shelf level's only side approach crosses the
+    # step wall still standing above Z -> helix entries, no side entry.
+    with tempfile.TemporaryDirectory() as td:
+        stl = _two_floor_pocket_stl(os.path.join(td, "tf.stl"))
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        moves, stats = rough(surf, (-16.2, 16.2, -16.2, 16.2, -1.0, 12.4),
+                            3.0, 6.0, leave=0.381, axial_leave=0.381,
+                            stepdown=19.05, stepup=1.905, stepover=2.0 / 6.0,
+                            tolerance=0.05, threads=4, stock_cell=0.5,
+                            min_rest=0.5, corner_r=0.0)
+        assert stats["n_axial_plunge"] == 0
+        assert stats["n_side_entries"] == 0, \
+            "side entry fed in across the standing step wall: %d" % \
+            stats["n_side_entries"]
+        assert stats["entry_feed_mm"] > 0.0, "entries did not descend by feed"
+    # (b) cleared approach: on the test block the level regions are entered
+    # across floors already milled at/below Z -> side entries must be used.
+    _need(TB_STL, TB_HF)
+    surf = ocl.STLSurf()
+    ocl.STLReader(TB_STL, surf)
+    hf = np.load(TB_HF)
+    meta = _json.load(open(TB_HF[:-4] + ".json"))
+    moves, stats = rough(surf, (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0),
+                         6.343, 20.0, leave=0.381, axial_leave=0.381,
+                         stepdown=19.05, final_zmin=20.381, stepover=0.16,
+                         tolerance=0.05, threads=4, stock_cell=0.5,
+                         min_rest=1.0, corner_r=0.0, stl_path=TB_STL,
+                         part_hf=(hf, float(meta["x0"]), float(meta["y0"]),
+                                 float(meta["cell"])))
+    assert stats["n_axial_plunge"] == 0
+    assert stats["n_side_entries"] > 0, \
+        "regions with cleared side approaches did not side-enter"
+    print("PASS SE2 side entries: standing-wall part 0 side (helix), test "
+          "block %d side through cleared feed-ins" % stats["n_side_entries"])
 
 
 if __name__ == "__main__":
