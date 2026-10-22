@@ -456,6 +456,14 @@ class TestNegatives:
                                          tool_diameter=100.0))
         self._wait_rejected(mock, 605, "input_out_of_range")
 
+    def test_ball_rough_rejected_before_running(self, live):
+        # RR1a: adaptive_rough with a ball roughing tool is REFUSED by
+        # validation (never runs, so it can never run as a flat rough)
+        mock, _, _ = live
+        mock.enqueue_run(606, inputs=dict(GOOD_INPUTS, model=model_input(mock),
+                                           tool_type="ball"))
+        self._wait_rejected(mock, 606, "input_out_of_range")
+
     def test_mock_verifies_request_signatures(self, live):
         """Sanity: the mock really refused something unauthenticated."""
         mock, _, _ = live
@@ -733,6 +741,31 @@ class TestSlopeCatalog:
             {}, catalog_mod.SLOPE_ACTION)
         assert not ok and code == "input_missing"
 
+    def test_rough_refuses_ball(self):
+        # RR1a: a BALL roughing tool is refused by validation on BOTH
+        # actions (the slope action's own finishing ball stays legal), and
+        # the panel no longer offers Ball for roughing
+        ok, code, msg = catalog_mod.validate_inputs(
+            {"model": "m", "tool_type": "ball", "tool_diameter": 9.525},
+            catalog_mod.ACTION)
+        assert not ok and code == "input_out_of_range", (ok, code)
+        assert "ball" in str(msg), msg
+        ok, code, msg = catalog_mod.validate_inputs(
+            dict(SLOPE_GOOD_INPUTS, model="m", rough_tool_type="ball"),
+            catalog_mod.SLOPE_ACTION)
+        assert not ok and code == "input_out_of_range", (ok, code)
+        assert "ball" in str(msg), msg
+        # defaults (bull) and flat still validate clean
+        ok, code, v = catalog_mod.validate_inputs({"model": "m"},
+                                                   catalog_mod.ACTION)
+        assert ok and v["tool_type"] == "bull", code
+        ok, code, _ = catalog_mod.validate_inputs(
+            {"model": "m", "tool_type": "flat"}, catalog_mod.ACTION)
+        assert ok, code
+        html = open(os.path.join(HERE, "panel", "index.html")).read()
+        assert '<option value="ball">' not in html, \
+            "panel still offers a ball roughing tool"
+
 
 class TestSlopeSplitFinish:
     def test_e2e_chain_rough_then_finish(self, live):
@@ -947,6 +980,9 @@ class TestRestPass:
         assert float(zf[zf.index("--flute") + 1]) == pytest.approx(22.225)
         assert float(zf[zf.index("--shank-dia") + 1]) == pytest.approx(9.525)
         # the finish plans its rapids/holder against the roughing stock
+        # (FL1b: and the strict stock-box floor rule depends on it - the
+        # finish and the rest must always get --stock-from on the shipped path)
+        assert "--stock-from" in fin_call, "finish lost --stock-from (FL1b floor rule)"
         rough_out = rough_call[rough_call.index("--stock-out") + 1]
         assert fin_call[fin_call.index("--stock-from") + 1] == rough_out
 
@@ -978,6 +1014,7 @@ class TestRestPass:
             "rest_neutral.ngc")
         assert rest_fin[rest_fin.index("--rest-tool") + 1] == "ball:5.9580"
         assert rest_fin[rest_fin.index("--min-rest") + 1] == "0.5000"
+        assert "--stock-from" in rest_fin, "rest lost --stock-from (FL1b floor rule)"
         assert rest_fin[rest_fin.index("--stock-from") + 1].endswith(
             "stock_after_rough_engine.npy")
         assert rest_fin[rest_fin.index("--flute") + 1] == "12.0000"

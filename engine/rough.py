@@ -897,6 +897,28 @@ def hug_regions(islands, grown, stock, isl_ok, eps=0.05, min_run=1.0):
     return regions
 
 
+def _nn_order(phase, cand, pos):
+    """DT1: nearest-neighbour ordering of region indices for one HR1 phase
+    with deterministic tie-breaking: equal travel distance picks the LOWEST
+    region index, and a chosen region's entry point breaks an exact distance
+    tie by (distance, x, y) - never by the order a set/dict/worker pool
+    happened to emit the candidates. Returns (order, end_pos)."""
+    out = []
+    remaining = sorted(phase)
+    while remaining:
+        if pos is None:
+            k = remaining[0]
+        else:
+            k = min(remaining, key=lambda k: (min(math.dist(pos, p)
+                                                  for p in cand[k]), k))
+        out.append(k)
+        remaining.remove(k)
+        pos = min(cand[k], key=lambda p: (math.dist(pos, p), p[0],
+                                            p[1])) if pos is not None \
+            else cand[k][0]
+    return out, pos
+
+
 def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
              keep_tool_down, helix_dia):
     """One level's Adaptive2d run; returns plain picklable region dicts."""
@@ -1244,7 +1266,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 return False
             # start point on the circle nearest the current XY (short rapid
             # across at z_top), bore down, then feed back to the entry
-            s = min(circ[:-1], key=lambda p: math.dist(p, (x, y)))
+            s = min(circ[:-1], key=lambda p: (math.dist(p, (x, y)),
+                                               p[0], p[1]))
             # helix end point (same turn count as _helix_moves) - validate
             # the return segment to the entry BEFORE emitting anything
             a0s = math.atan2(s[1] - cy, s[0] - cx)
@@ -1311,6 +1334,26 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 stock.mill_segment(hx, hy, hv["x"], hv["y"], hz, tool_r,
                                   corner_r)
                 hx, hy, hz = hv["x"], hv["y"], hv["z"]
+            # HB1v2: a helix floor is a spiral - the point opposite the run's
+            # end last stood under the disk one turn earlier, so it stands up
+            # to one pitch above Z INSIDE the bore; the region's first
+            # horizontal loop then shears that ridge across nearly the whole
+            # disk at the CUTTING feed (the a2d_first ridge windows). Emit one
+            # full flat circle at Z on the helix path (same centre/radius, at
+            # the ramp feed) as part of the entry, milled honestly into the
+            # live stock model, so the ridge is cut flat before any
+            # cutting-feed move runs over it.
+            if r >= 0.15:
+                n_c = max(8, int(2 * math.pi * r / 1.0))
+                ea2 = math.atan2(hy - cy, hx - cx)
+                for i in range(1, n_c + 1):
+                    aa = ea2 + i * 2.0 * math.pi / n_c
+                    cxx = round(cx + r * math.cos(aa), 4)
+                    cyy = round(cy + r * math.sin(aa), 4)
+                    emit({"g": 1, "x": cxx, "y": cyy, "z": round(z, 4),
+                          "f": ramp_feed})
+                    stock.mill_segment(hx, hy, cxx, cyy, z, tool_r, corner_r)
+                    hx, hy = cxx, cyy
             emit({"g": 1, "x": x, "y": y, "z": z, "f": cut_feed})
             stock.mill_path(seg, z, tool_r, corner_r)
             mill_now(x, y, z)
@@ -1955,17 +1998,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         pos = (prev[0], prev[1]) if prev[0] is not None else None
         for phase in ([k for k, c in enumerate(cand) if c and k < n_a2d],
                      [k for k, c in enumerate(cand) if c and k >= n_a2d]):
-            remaining = list(phase)
-            while remaining:
-                if pos is None:
-                    k = remaining[0]
-                else:
-                    k = min(remaining, key=lambda k: min(
-                        math.dist(pos, p) for p in cand[k]))
-                order.append(k)
-                remaining.remove(k)
-                pos = min(cand[k], key=lambda p: math.dist(pos, p)) \
-                    if pos is not None else cand[k][0]
+            sub, pos = _nn_order(phase, cand, pos)
+            order.extend(sub)
         nreg = 0
         cb0 = stats["n_clip_breaks"]
         rp_lk0 = ({k: stats[k] for k in ("n_lifts", "n_notclear_links",
@@ -1980,8 +2014,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             if prev[0] is None:
                 entry = cand[k][0]
             else:
-                entry = min(cand[k], key=lambda p:
-                          math.dist((prev[0], prev[1]), p))
+                # DT1: stable tie-break (distance, x, y) - an exact distance
+                # tie must not follow candidate list order.
+                entry = min(cand[k], key=lambda p: (math.dist(
+                    (prev[0], prev[1]), p), p[0], p[1]))
             rp2_flag, rp2_cand = rp2_open(res)
             pxy0 = (prev[0], prev[1])
             pz0 = prev[2]

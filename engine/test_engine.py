@@ -1083,7 +1083,11 @@ def _main():
                test_rough_rt_entries, test_rapid_swept_clear_catches_diagonal_climb,
                test_se2_side_entries_only_through_cleared,
                test_hr1_rings_after_a2d,
-               test_stl_cache_keyed_by_content):
+               test_dt1_nn_order_ties_stable,
+               test_dt1_synthetic_rough_twice_identical,
+               test_hb1v2_flat_floor_circle_after_helix,
+               test_stl_cache_keyed_by_content,
+               test_rr1a_rough_cli_refuses_ball):
         try:
             fn()
         except AssertionError as e:
@@ -1432,6 +1436,211 @@ def test_hr1_rings_after_a2d():
             "no level had both a2d and hug-ring cutting moves: test vacuous"
     print("PASS hr1 rings after a2d: %d level(s) with ring+a2d moves, every "
           "ring follows all a2d at its Z" % n_both)
+
+
+def test_dt1_nn_order_ties_stable():
+    """Task DT1: a tie in the NN travel order must be broken by a stable
+    key (region index, then coordinates), NEVER by candidate iteration
+    order. Synthetic equal-distance regions: pa=(0,5) and pb=(0,-5) are
+    exactly 5 mm from pos (0,0). Main's inline loop took the FIRST minimum
+    in list order, so swapping two tied entry candidates changed the rapid
+    target - reproduced here with a copy of main's loop (the test fails if
+    ties resolve by iteration order). _nn_order must return the same order
+    and end position regardless of candidate/phase list order."""
+    import math as _m
+    from engine.rough import _nn_order
+    pa, pb, far = (0.0, 5.0), (0.0, -5.0), (50.0, 0.0)
+    # entry-point tie inside one region: same set, opposite list order
+    o1, e1 = _nn_order([0], [[pa, pb]], (0.0, 0.0))
+    o2, e2 = _nn_order([0], [[pb, pa]], (0.0, 0.0))
+    assert o1 == o2 == [0] and e1 == e2 == pb, \
+        "entry tie not resolved by (dist,x,y): %s vs %s" % (e1, e2)
+    # region tie: same result whatever order the phase enumerates in
+    r1, _ = _nn_order([0, 1], [[pa], [pb]], (0.0, 0.0))
+    r2, _ = _nn_order([1, 0], [[pa], [pb]], (0.0, 0.0))
+    assert r1 == r2 == [0, 1], \
+        "region tie not resolved by lowest index: %s vs %s" % (r1, r2)
+
+    def _main_nn(phase, cand, pos):  # main's pre-DT1 loop, verbatim
+        out = []
+        remaining = list(phase)
+        while remaining:
+            k = remaining[0] if pos is None else min(remaining, key=lambda k:
+                min(_m.dist(pos, p) for p in cand[k]))
+            out.append(k)
+            remaining.remove(k)
+            pos = min(cand[k], key=lambda p: _m.dist(pos, p)) \
+                if pos is not None else cand[k][0]
+        return out, pos
+    m1, me1 = _main_nn([0], [[pa, pb]], (0.0, 0.0))
+    m2, me2 = _main_nn([0], [[pb, pa]], (0.0, 0.0))
+    assert me1 != me2, \
+        "test vacuous: main's loop did not exhibit the iteration-order tie"
+    print("PASS dt1 nn tie stability: ties resolve by (dist, index/x/y); "
+          "main's loop resolved the same tie by list order (%s vs %s)"
+          % (me1, me2))
+
+
+def test_dt1_synthetic_rough_twice_identical():
+    """Task DT1: same code + same inputs -> identical emitted move lists.
+    Small synthetic part (hr1 slab: 40x32 top Z6, central wall + two fins)
+    roughed TWICE in-process on fresh state; the move lists must compare
+    equal element for element (rapids included)."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    from opencamlib import ocl
+    import engine.rough as R
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "dt1_synth.stl")
+        _write_stl(stl, _box_tris(-20.0, 20.0, -16.0, 16.0, 0.0, 6.0)
+                   + _box_tris(-1.0, 1.0, -16.0, 16.0, 6.0, 12.0)
+                   + _box_tris(-8.0, -1.0, -4.0, 4.0, 6.0, 12.0)
+                   + _box_tris(1.0, 8.0, -4.0, 4.0, 6.0, 12.0))
+        outs = []
+        for _run in range(2):
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            mv, _st = R.rough(surf, (-24.0, 24.0, -20.0, 20.0, 6.0, 16.0),
+                              3.0, 6.0, leave=0.381, axial_leave=0.381,
+                              stepdown=4.0, stepup=10.0, stepover=2.0 / 6.0,
+                              tolerance=0.05, threads=4, stock_cell=0.5,
+                              min_rest=0.5, corner_r=0.0, stl_path=stl)
+            assert mv, "no moves"
+            outs.append(repr(mv))
+        assert outs[0] == outs[1], \
+            "synthetic rough: two in-process runs emitted different moves"
+    print("PASS dt1 twice-identical synthetic rough: 2 runs emitted "
+          "identical move lists (%d chars of moves)" % len(outs[0]))
+
+
+def test_hb1v2_flat_floor_circle_after_helix():
+    """HB1v2: after EVERY helix entry the next emitted moves are ONE full flat
+    circle at the helix bottom Z - same centre and radius as the helix, at the
+    ramp feed - before any cutting-feed move. On main's code the move right
+    after the helix is the return feed at the cutting feed, so this fails."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    import numpy as np
+    from opencamlib import ocl
+    from engine.rough import rough
+    CUT, RAMP = 3429.0, 1270.0
+    with tempfile.TemporaryDirectory() as td:
+        stl = _two_floor_pocket_stl(os.path.join(td, "hb1v2.stl"))
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        moves, stats = rough(surf, (-16.2, 16.2, -16.2, 16.2, -1.0, 12.4),
+                            3.0, 6.0, leave=0.381, axial_leave=0.381,
+                            stepdown=19.05, stepup=1.905, stepover=2.0 / 6.0,
+                            tolerance=0.05, threads=4, stock_cell=0.5,
+                            min_rest=0.5, corner_r=0.0)
+
+    def fit(pts):
+        A = np.array([[p[0], p[1], 1.0] for p in pts])
+        b = np.array([-(p[0] ** 2 + p[1] ** 2) for p in pts])
+        s, *_ = np.linalg.lstsq(A, b, rcond=None)
+        cx, cy = -s[0] / 2.0, -s[1] / 2.0
+        return cx, cy, math.sqrt(s[2] + cx * cx + cy * cy)
+
+    n_helix = 0
+    i = 0
+    while i + 1 < len(moves):
+        a, b = moves[i], moves[i + 1]
+        if (a["g"] == 1 and b["g"] == 1 and a.get("f") == RAMP
+                and b.get("f") == RAMP and a["z"] is not None
+                and b["z"] is not None and b["z"] < a["z"] - 1e-9):
+            j = i + 1
+            while (j + 1 < len(moves) and moves[j + 1]["g"] == 1
+                   and moves[j + 1].get("f") == RAMP
+                   and moves[j + 1]["z"] is not None
+                   and moves[j]["z"] is not None
+                   and moves[j + 1]["z"] < moves[j]["z"] - 1e-9):
+                j += 1
+            helix = [m for m in moves[i:j + 1]]
+            i = j + 1
+            hx, hy, hr = fit([(m["x"], m["y"]) for m in helix])
+            if hr < 0.2:  # degenerate micro-bore: no floor circle required
+                continue
+            n_helix += 1
+            zb = helix[-1]["z"]
+            circ = []
+            for m in moves[i:]:
+                if (m["g"] == 1 and m.get("f") == RAMP
+                        and m["z"] is not None and abs(m["z"] - zb) < 1e-6):
+                    circ.append(m)
+                else:
+                    break
+            assert circ, \
+                "helix at (%.2f,%.2f) Z %.3f: no ramp-feed floor circle after " \
+                "the helix bottom (next move f=%r)" % (hx, hy, zb,
+                                                      moves[i].get("f"))
+            cx, cy, cr = fit([(m["x"], m["y"]) for m in circ])
+            assert abs(cx - hx) < 0.05 and abs(cy - hy) < 0.05 \
+                and abs(cr - hr) < 0.05, \
+                "floor circle centre/radius (%.3f,%.3f,r=%.3f) != helix " \
+                "(%.3f,%.3f,r=%.3f)" % (cx, cy, cr, hx, hy, hr)
+            pts = [(m["x"], m["y"]) for m in helix[-1:]] + \
+                  [(m["x"], m["y"]) for m in circ]
+            sweep = 0.0
+            for (p, q) in zip(pts, pts[1:]):
+                da = math.atan2(q[1] - cy, q[0] - cx) \
+                    - math.atan2(p[1] - cy, p[0] - cx)
+                sweep += (da - 2 * math.pi) if da > math.pi else \
+                    ((da + 2 * math.pi) if da < -math.pi else da)
+            assert sweep >= 2 * math.pi - 1.0 and len(circ) >= 8, \
+                "floor circle at Z %.3f is not one full turn (%.2f rad, %d " \
+                "moves)" % (zb, sweep, len(circ))
+            nxt = moves[i + len(circ)]
+            assert nxt["g"] == 1 and nxt.get("f") == CUT, \
+                "floor circle must be followed by the cutting-feed return"
+        else:
+            i += 1
+    assert n_helix >= 1, "no helix entry emitted on the synthetic part: vacuous"
+    print("PASS hb1v2 floor circle: %d helix entry/entries each followed by "
+          "one full flat circle at the helix bottom Z, ramp feed" % n_helix)
+
+
+def test_rr1a_rough_cli_refuses_ball():
+    """RR1a: `rough --tool ball:...` fails CLOSED - nonzero exit, clear
+    refusal on stderr, NO program written, before any work (the step file
+    is never even loaded). flat still roughs end to end."""
+    import subprocess
+    import tempfile
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    step = os.path.join(repo, "connector", "testdata", "synth_pocket.step")
+    _need(step)
+    stock = ["-31", "31", "-31", "31", "-1", "12.4"]
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "rough.ngc")
+        r = subprocess.run(
+            [sys.executable, "-m", "engine.cli", "rough", "--step",
+             os.path.join(td, "never-parsed.step"), "--stock", *stock,
+             "--tool", "ball:9.525", "--out", out],
+            capture_output=True, text=True, cwd=repo)
+        assert r.returncode != 0, "ball rough exited 0: %s" % r.stdout[-400:]
+        assert "refused" in r.stderr and "ball" in r.stderr, \
+            "no clear ball refusal on stderr: %r" % r.stderr[-400:]
+        assert not os.path.exists(out), "ball rough wrote a program"
+        # bull without a corner would silently run flat too - refused
+        r = subprocess.run(
+            [sys.executable, "-m", "engine.cli", "rough", "--step",
+             os.path.join(td, "never-parsed.step"), "--stock", *stock,
+             "--tool", "bull:12.7", "--out", out],
+            capture_output=True, text=True, cwd=repo)
+        assert r.returncode != 0 and "corner" in r.stderr, \
+            "bull without corner not refused: %r" % r.stderr[-400:]
+        assert not os.path.exists(out), "refused rough wrote a program"
+        # flat still works (same tiny pocket as test_rough_rt_entries)
+        r = subprocess.run(
+            [sys.executable, "-m", "engine.cli", "rough", "--step", step,
+             "--stock", *stock, "--tool", "flat:6.0", "--out", out,
+             "--floor", "3.0", "--stepdown", "4.0", "--workers", "2"],
+            capture_output=True, text=True, cwd=repo)
+        assert r.returncode == 0, "flat rough failed: %s | %s" % (
+            r.stdout[-500:], r.stderr[-500:])
+        text = open(out).read()
+        assert "G1" in text and len(text) > 1000, "flat program not written"
+    print("PASS rr1a rough cli: ball and corner-less bull refused (no "
+          "program), flat still roughs (%d bytes)" % len(text))
 
 
 if __name__ == "__main__":
