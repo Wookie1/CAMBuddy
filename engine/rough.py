@@ -1939,8 +1939,18 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             rp["_n_a2d"] = len(regions)
         # R4: wall-hugging rings close the margin-wide rest band + corner
         # chunks Adaptive2d cannot reach (its islands are pre-eroded).
-        regions.extend(hug_regions(islands, grown, stock, isl_ok,
-                                  eps=max(0.5 * tolerance, 0.03)))
+        # BS1a: before the rings, clear any ring run that would engage at
+        # full width against the LIVE stock (channel with standing material on
+        # both sides) with trochoidal loops along the channel centre line -
+        # the ring then runs at leave over cleared ground, as intended.
+        rings = hug_regions(islands, grown, stock, isl_ok,
+                           eps=max(0.5 * tolerance, 0.03))
+        from engine.band import channel_regions
+        bands = channel_regions(rings, stock, isl_ok3, z, tool_r, leave,
+                               stock.cell, stats)
+        n_band = len(bands)
+        regions.extend(bands)
+        regions.extend(rings)
         if _RP:
             rp["n_hug"] = len(regions) - rp.pop("_n_a2d")
         t_a2d = time.time() - t0
@@ -1955,10 +1965,11 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # RT travel: order regions nearest-neighbour from the current tool
         # position and enter each at its nearest island-valid candidate, so
         # inter-region rapids stay short instead of following a2d's order.
-        # HR1: all Adaptive2d regions first (NN among themselves), then ALL
-        # hug-ring regions (NN among the rings starting from where the last
-        # a2d region left the tool) - a ring must always be the thin skim R4
-        # intended, never slot full-width ahead of its level's a2d passes.
+        # HR1: all Adaptive2d regions first (NN among themselves), then BS1a
+        # channel-clear trochoids (NN among them), then ALL hug-ring regions
+        # (NN among the rings starting from where the last band region left
+        # the tool) - a ring must always be the thin skim R4 intended, never
+        # slot full-width ahead of its level's a2d / channel passes.
         cand = []
         for res in regions:
             fc = next((p for (k, p) in res["paths"]
@@ -1974,7 +1985,9 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         order = []
         pos = (prev[0], prev[1]) if prev[0] is not None else None
         for phase in ([k for k, c in enumerate(cand) if c and k < n_a2d],
-                     [k for k, c in enumerate(cand) if c and k >= n_a2d]):
+                     [k for k, c in enumerate(cand)
+                      if c and n_a2d <= k < n_a2d + n_band],
+                     [k for k, c in enumerate(cand) if c and k >= n_a2d + n_band]):
             remaining = list(phase)
             while remaining:
                 if pos is None:
