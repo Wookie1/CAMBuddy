@@ -1510,6 +1510,52 @@ def test_ramp_vertices_never_below_verified_path():
             assert z >= min(z0 + sp * tan, verified_z) - 1e-9
 
 
+def test_fe5e_ramp_top_clear_of_ridge():
+    """FE5e: a shallow entry (live depth 0.3 at P0) whose FE5 ramp top
+    (s = d/tan ~ 8.6 mm along) lands UNDER a standing ridge (stock 2.0 mm
+    above the top - the line-52593 case). _fe5_pick_ramp must return the
+    SMALLEST longer L whose ramp top is clear (live disk_depth <= 0.25,
+    which also clears the link's vertical descent column onto rv[0]: depth
+    only grows downward), and (None, False) - reported unresolved - when no
+    L on the run clears. Fails on e40f664's code: there L = d/tan only and
+    the top stays buried (and the helper does not exist)."""
+    from engine.finish import _fe5_pick_ramp, _ramp_entry, RAMP_TRIGGER
+    from engine.entry_depth import LiveStock
+    cell, x0, y0 = 0.5, -15.0, -5.0
+    xs = x0 + (np.arange(100) + 0.5) * cell   # to x = 34.75
+    ys = y0 + (np.arange(20) + 0.5) * cell
+    X, Y = np.meshgrid(xs, ys)
+    A = np.full(X.shape, 10.0)
+    A[(X >= -4.0) & (X <= 2.0) & (np.abs(Y) <= 1.5)] = 12.0
+    tan = math.tan(math.radians(2.0))
+    n = 9                                     # x -10..30, 5 mm chords, flat z
+    P = np.stack([-10.0 + np.arange(n) * 5.0, np.zeros(n),
+                  np.full(n, 9.7)], axis=1)
+    s = np.arange(n) * 5.0
+    live = LiveStock(A, x0, y0, cell, 3.0)
+    d = live.disk_depth(P[0, 0], P[0, 1], 9.7)
+    assert RAMP_TRIGGER < d <= 0.5, "P0 must be shallow, got %.3f" % d
+    L0 = d / tan
+    # today's top (s = L0) is buried under the ridge: the FE5d defect
+    ox = float(np.interp(L0, s, P[:, 0]))
+    oz = max(float(np.interp(L0, s, P[:, 2])), 9.7 + L0 * tan)
+    assert live.disk_depth(ox, 0.0, oz) > RAMP_TRIGGER, \
+        "test shape must bury the FE5 top"
+    L, flip = _fe5_pick_ramp(live, P, s, tan)
+    assert L is not None and not flip and L0 < L <= float(s[-1]), (L, flip)
+    top = _ramp_entry(P, s, tan, L)[0]
+    assert live.disk_depth(top[0], top[1], top[2]) <= RAMP_TRIGGER, \
+        "FE5e ramp top/descent column not clear: %s" % (top,)
+    # ridge over the whole run (+ ball margin): no L clears -> unresolved
+    A2 = np.full(X.shape, 10.0)
+    A2[X >= -13.5] = 12.0
+    live2 = LiveStock(A2, x0, y0, cell, 3.0)
+    L2, flip2 = _fe5_pick_ramp(live2, P, s, tan)
+    assert L2 is None and not flip2, (L2, flip2)
+    print("fe5e ridge: d=%.3f L0=%.1f -> L=%.1f clear; all-ridge unresolved"
+          % (d, L0, L))
+
+
 def floor_dip_stl(path, half_x=15.0, half_y=10.0, top=10.0, slot_half=6.0,
                   deep_z=2.0, shelf_z=7.0, step_y=4.0):
     """Block with a slot along Y (walls at x=+-slot_half, mouth at z=top):
@@ -1652,6 +1698,7 @@ if __name__ == "__main__":
                test_holder_stock_ridge_along_path,
                test_shank_t31_wall_13mm,
                test_ramp_vertices_never_below_verified_path,
+               test_fe5e_ramp_top_clear_of_ridge,
                test_floor_dip_split_finish_and_rest,
                test_floor_pad_rows_inside_stock_box):
         t = __import__("time").time()

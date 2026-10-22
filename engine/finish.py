@@ -1823,6 +1823,34 @@ def _ramp_entry(P, s, tan, u):
     return out
 
 
+def _fe5_pick_ramp(live, P, s, tan):
+    """FE5e: the SMALLEST ramp length L along the available run whose ramp
+    TOP is clear of the live stock: live.disk_depth(rv[0]) <= RAMP_TRIGGER
+    (the estimator's unramped-plunge tolerance; this also clears the link's
+    vertical descent column onto rv[0] - depth only grows downward). The
+    candidates are the pass's OWN vertices (the ramp emits those, and
+    _ramp_entry's top vertex at u = s[i] is exactly vertex i raised to
+    max(vz, z0 + s[i]*tan), so no new CL lookup). If no vertex on this run
+    clears, try entering from the pass's OTHER end (reverse, same rule).
+    Returns (L, flip) with L measured along the (possibly reversed) run;
+    (None, False) when neither end clears - the caller then keeps today's
+    entry (fail closed, ZB must still see it) and reports it unresolved."""
+    for flip in (False, True):
+        if flip:
+            P, s = P[::-1], float(s[-1]) - s[::-1]
+        z0 = float(P[0, 2])
+        d = live.disk_depth(float(P[0, 0]), float(P[0, 1]), z0)
+        if d <= RAMP_TRIGGER:
+            return 0.0, flip  # other end is shallow: reverse, no ramp
+        for i in range(1, len(s)):
+            u = float(s[i])
+            z = max(float(P[i, 2]), z0 + u * tan)
+            if live.disk_depth(float(P[i, 0]), float(P[i, 1]), z) \
+                    <= RAMP_TRIGGER:
+                return u, flip
+    return None, False
+
+
 def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
            sampling=0.1, slope_threshold=40.0, overlap_mm=1.0,
            stepdown=0.3, overlap_deg=5.0, floor_z=None, wl_sampling=0.2,
@@ -2194,6 +2222,8 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     ramp_cnt = {}
     fe5_deep_unramped = []  # FE5 diag: entries with live depth > 0.5 left
     fe5_deep_ramped = []    # FE5 diag: deep entries that WERE ramped
+    fe5_top_unresolved = []  # FE5e: entries with no clear ramp top
+    fe5_chord_depths = []   # FE5e: max live depth along each ramp chord
     _fe5_track = None       # FE5 diag: env FE5_TRACK="x,y" probe cell
     _env_track = os.environ.get("FE5_TRACK")
     if _env_track:
@@ -2225,11 +2255,37 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                      round(float(P[0, 1]), 3), round(z0, 3),
                      round(float(d), 3), len(pth), round(total, 1)])
             if total >= 1e-9 and d > RAMP_TRIGGER:
-                L = d / tan_ramp
-                rv = _ramp_entry(P, s, tan_ramp, min(L, total))
+                # FE5e: size the ramp from its TOP, not only from P0: the
+                # SMALLEST L on the run whose ramp top is clear of the live
+                # stock (disk_depth <= 0.25 at rv[0]; the vertical link
+                # descent onto rv[0] clears with it, depth grows downward).
+                L0 = d / tan_ramp
+                L, flip = _fe5_pick_ramp(live, P, s, tan_ramp)
+                if flip:
+                    # forward never clears but the other end does (same
+                    # rule): reverse the pass, entry at its other vertex
+                    pth = list(pth)[::-1]
+                    P = np.asarray(pth, dtype=float)
+                    s = np.concatenate([[0.0], np.cumsum(np.hypot(
+                        np.diff(P[:, 0]), np.diff(P[:, 1])))])
+                    total = float(s[-1])
+                    z0 = float(P[0, 2])
+                    d = live.disk_depth(P[0, 0], P[0, 1], z0)
+                    L0 = d / tan_ramp
+                if L is None:
+                    # no L forward, none reversed: leave the entry exactly as
+                    # today (fail closed - ZB must still fail on it) + report
+                    fe5_top_unresolved.append(
+                        [round(float(P[0, 0]), 3), round(float(P[0, 1]), 3),
+                         round(z0, 3), round(float(d), 3)])
+                    L = L0
+                u = min(L, total)
+                rv = _ramp_entry(P, s, tan_ramp, u)
                 ordered[k] = rv + list(pth[1:])
                 ramp_cnt[k] = len(rv) - 1
-                if total < L:
+                if len(rv) < 2:
+                    n_unchanged += 1  # flipped to a shallow end, no ramp
+                elif total < L0:
                     n_short_run += 1
                 else:
                     n_ramped += 1
@@ -2242,7 +2298,7 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                         abs(P[0, 1] - _fe5_track[1]) < 0.05:
                     fe5_track_log.append(
                         ["RAMP k=%d" % k, round(float(d), 3),
-                         round(L, 1), round(u := min(L, total), 1),
+                         round(L, 1), round(u, 1),
                          [round(float(q), 3) for q in rv[0]],
                          [round(float(q), 3) for q in rv[-1]],
                          len(rv)])
@@ -2258,6 +2314,23 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                     fe5_track_log.append(
                         ["NORAMP k=%d" % k, round(float(d), 4),
                          round(total, 2), len(pth)])
+            # FE5e: max live depth along this entry's ramp chord (the 2 deg
+            # chord may pass through stock below its top - allowed <=15 deg
+            # descent; recorded for the ZE2 side-load check on ball tools).
+            # Measured BEFORE stamping: the stock as the tool meets it.
+            if k in ramp_cnt:
+                cd = 0.0
+                for i in range(len(rv) - 1):
+                    a, b = rv[i], rv[i + 1]
+                    n = max(1, int(math.ceil(math.dist(a, b) / 0.5)))
+                    for j in range(n + 1):
+                        t = j / n
+                        dd = live.disk_depth(a[0] + (b[0] - a[0]) * t,
+                                             a[1] + (b[1] - a[1]) * t,
+                                             a[2] + (b[2] - a[2]) * t)
+                        if math.isfinite(dd) and dd > cd:
+                            cd = dd
+                fe5_chord_depths.append(round(cd, 3))
             # stamp this pass's PHYSICAL path (ramp first if prepended) so
             # later entries see the stock this program already cleared
             F = np.asarray(ordered[k], dtype=float)
@@ -2346,6 +2419,12 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     stats["fe5_deep_ramped"] = sorted(
         fe5_deep_ramped, key=lambda r: -r[3])[:40]
     stats["fe5_track_log"] = fe5_track_log[:60]
+    # FE5e: unresolved ramp tops (entry left as today, ZB must still see
+    # them) and the max live depth along each ramp chord (ZE2 side load)
+    stats["fe5_top_unresolved_n"] = len(fe5_top_unresolved)
+    stats["fe5_top_unresolved"] = fe5_top_unresolved[:40]
+    stats["fe5_chord_max_depth"] = fe5_chord_depths[:40]
+    stats["fe5_chord_max_depth_max"] = max(fe5_chord_depths, default=0.0)
     if flute_mm is not None and shank_dia is not None:
         # S4: flute/shank-aware pass (tools/x7_tools.json or --flute/--shank)
         stats["flute_mm"] = round(float(flute_mm), 4)
