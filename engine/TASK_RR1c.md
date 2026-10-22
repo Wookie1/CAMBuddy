@@ -58,3 +58,11 @@ Keep RR1b's two tests green.
   `/opt/homebrew/bin/python3 -m pytest verify connector engine/test_post.py -q` green, real exit codes, all via the slot.
 - Regenerate the final rest-rough program once more from the FINAL code and cmp it against the judged one; report.
 Write engine/RR1c_RESULTS.md with every number and the exact commands. Then stop.
+
+## BUDGET RAISE (coordinator, 2026-10-22 12:06 local) - read this
+Budget is now ~550 changed NON-TEST engine lines in total vs the rr1b WIP base (734e7a8); hard cap 2 h from 12:06 (14:06).
+Do NOT loop: if the same test fails ~3 times with no new idea, stop and write the results file. engine/RR1c_RESULTS.md MUST
+include: (1) a line-count section (`git diff --stat 734e7a8`, non-test engine lines vs test lines); (2) per-item status -
+the entry-ladder step used in each zone (8 bay entries, 12 fins, corner and centre-south pockets), each of the 7 rapid
+collisions (fixed or still there, why), the bay leftover (target <= 0.5); (3) every zone it could not enter, with r_max and
+what was tried. Cite only commits that exist (`git cat-file -t <hash>`).
