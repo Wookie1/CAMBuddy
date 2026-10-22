@@ -8,7 +8,9 @@ rr1b = RR1b's WIP commit, see `git log -3`). Cite only files that exist and comm
 or other large outputs into your context: use cmp, diff --stat, wc, head -3, and rg / sed -n with line ranges - never read
 a whole big file. Long runs: nohup + short polling; never end your turn while one runs. ONE-JOB SLOT - every heavy run via
   nohup /private/tmp/claude-502/-Users-James-ai-sandbox-Assistr/adf268db-8f62-488c-bbb0-7ba55042f4d7/scratchpad/slot.sh <command> > out/<log> 2>&1 &
-pytest runs under /opt/homebrew/bin/python3 (NOT the VibeCAD python - it has no pytest).
+pytest runs under /opt/homebrew/bin/python3 (NOT the VibeCAD python - it has no pytest). While
+/private/tmp/claude-502/m4model.busy exists, slot.sh waits: run SMALL synthetic tests/pytest via slot_m4.sh (same dir,
+ENGINE_WORKERS <= 4) and keep every Core Front engine/zmap run on slot.sh (it starts when the flag clears).
 If blocked, write the question into engine/RR1c_RESULTS.md and stop. If the bar cannot be reached, SAY SO - never relax.
 
 ## Why (engine/RR1b_RESULTS.md)
