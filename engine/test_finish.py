@@ -1556,6 +1556,90 @@ def test_fe5e_ramp_top_clear_of_ridge():
           % (d, L0, L))
 
 
+def test_fe5t_public_ramp_top_clear_of_ridge():
+    """FE5e-t: BEHAVIOURAL test through the PUBLIC finish() path. Small
+    synthetic flat block (floor_z 6.0) with --stock-from live stock: a
+    shallow entry shelf (leave 0.3 -> live depth ~0.3 at the first row's
+    P0, over the RAMP_TRIGGER) whose FE5 ramp sized from P0 only
+    (L = d/tan ~ 8.6 mm) lands its TOP (first ramp vertex) UNDER the
+    standing leftover ridge (stock 7.0 -> ~0.7 deep > 0.25) - the
+    line-52593 defect at program level. e40f664 emits exactly that buried
+    top and has no fe5_top_unresolved stat; FE5e (44e0a61) must pick the
+    SMALLEST longer L whose top is clear (or enter from the other end, or
+    report the entry). Assert on the EMITTED moves: replay the estimator's
+    LiveStock in emit order and require every entry landing strictly above
+    the floor - the bottom of a vertical descent (plunge onto a ramp top)
+    or a horizontal arrival at ramp height - to have live depth <= 0.25 or
+    appear in stats fe5_top_unresolved. Ramp chord vertices below their top
+    are sloped moves and stay excluded (allowed, FE5e rule 4). Must FAIL
+    BY ASSERTION on e40f664's engine and PASS on 44e0a61."""
+    from engine.finish import finish, RAMP_TRIGGER
+    from engine.entry_depth import LiveStock, load_heightfield
+    cell = 0.5
+    bx0, bx1, by0, by1 = -15.0, 15.0, -12.0, 12.0
+    floor_z, base, shelf, ridge = 6.0, 6.2, 6.3, 7.0
+    with tempfile.TemporaryDirectory() as td:
+        stl = write_stl(os.path.join(td, "fe5t_block.stl"),
+                        _box(bx0, bx1, by0, by1, 0.0, floor_z))
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        # grid extends 4 mm past the block: a disk centered exactly on the
+        # block edge must read finite stock (an off-grid window is inf and
+        # would flag safe-height traversals as buried)
+        gx0, gx1, gy0, gy1 = bx0 - 4.0, bx1 + 4.0, by0 - 4.0, by1 + 4.0
+        nx = int(round((gx1 - gx0) / cell))
+        ny = int(round((gy1 - gy0) / cell))
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                              gy0 + (np.arange(ny) + 0.5) * cell)
+        A = np.full(CX.shape, base)
+        A[CX <= -9.0] = shelf                  # shallow entry: d(P0) ~ 0.3
+        A[(CX >= -8.0) & (CX <= -4.0)] = ridge  # standing leftover ridge
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 6.0, 0.0),
+                              stepover=1.5, floor_z=floor_z, threads=4,
+                              stock_from=stockp, ramp_angle_deg=2.0)
+        assert moves and stats.get("stock_from"), "stock_from not recorded"
+        n_ramp = stats.get("n_entries_ramped", 0) + \
+            stats.get("n_entries_short_run", 0)
+        assert n_ramp >= 1, "no ramped entry - the ridge scenario is gone"
+        unresolved = [tuple(r[:3]) for r in
+                     stats.get("fe5_top_unresolved", [])]
+        A0, sx0, sy0, c0 = load_heightfield(stockp)
+        live = LiveStock(A0, sx0, sy0, c0, 3.0)
+
+        def listed(x, y):
+            return any(math.hypot(x - ux, y - uy) <= 1.5
+                       for ux, uy, _ in unresolved)
+
+        buried = []
+        prev = None
+        for m in moves:
+            x, y, z = m["x"], m["y"], m["z"]
+            if prev is not None:
+                px, py, pz = prev
+                if m["g"] == 1:
+                    if z > floor_z + 0.05:
+                        vert = abs(x - px) <= 1e-9 and abs(y - py) <= 1e-9
+                        horiz = abs(z - pz) <= 1e-9 and (abs(x - px) > 1e-9
+                                                        or abs(y - py) > 1e-9)
+                        if (vert and z < pz - 1e-9) or horiz:
+                            dd = live.disk_depth(x, y, z)
+                            if dd > RAMP_TRIGGER + 1e-9 and not listed(x, y):
+                                buried.append((round(x, 2), round(y, 2),
+                                             round(z, 3), round(dd, 3)))
+                    live.stamp_chord(prev, (x, y, z))
+            prev = (x, y, z)
+        assert not buried, \
+            "FE5e-t: %d buried ramp top/entry landing (max depth %.3f): %s" \
+            % (len(buried), max(b[3] for b in buried), buried[:4])
+        print("fe5t public: %d entries ramped, %d unresolved, tops clear "
+              "(chord max depth %.3f)"
+              % (n_ramp, len(unresolved),
+                 stats.get("fe5_chord_max_depth_max", float("nan"))))
+
+
 def floor_dip_stl(path, half_x=15.0, half_y=10.0, top=10.0, slot_half=6.0,
                   deep_z=2.0, shelf_z=7.0, step_y=4.0):
     """Block with a slot along Y (walls at x=+-slot_half, mouth at z=top):
@@ -1699,6 +1783,7 @@ if __name__ == "__main__":
                test_shank_t31_wall_13mm,
                test_ramp_vertices_never_below_verified_path,
                test_fe5e_ramp_top_clear_of_ridge,
+               test_fe5t_public_ramp_top_clear_of_ridge,
                test_floor_dip_split_finish_and_rest,
                test_floor_pad_rows_inside_stock_box):
         t = __import__("time").time()

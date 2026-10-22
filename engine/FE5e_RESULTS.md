@@ -68,3 +68,66 @@ zmap gates, clcheck, cycle times, fe5_top_unresolved / fe5_chord_max_depth on
 the real part), scripts/check_fixtures.py, engine/test_engine.py, the pytest
 verify-connector run, and the final regenerate-and-cmp: none executed in this
 session (all are Core Front / zmap judge jobs the supervisor runs).
+
+---
+
+# ADDENDUM FE5e-t results (this session, Thu Oct 22 2026)
+
+Behavioural test through the PUBLIC finish() path - TEST ONLY, no engine
+change, no commit. `git diff --stat 44e0a61 -- engine/finish.py
+engine/entry_depth.py` is EMPTY; the only change is
+`engine/test_finish.py` (+85 lines): new test
+`test_fe5t_public_ramp_top_clear_of_ridge` (added after
+`test_fe5e_ramp_top_clear_of_ridge`, also added to the __main__ runner).
+
+## Scenario (small synthetic, NO Core Front / fe5_judge.py / zmap job)
+
+Flat block 30x24 mm, floor_z 6.0, ball 6.0, stepover 1.5, ramp_angle_deg
+2.0 (never steeper), --stock-from heightfield (cell 0.5, grid extends
+4 mm past the block so edge disks read finite stock): base leave 0.2, a
+shallow entry shelf (z 6.3 -> live depth ~0.3 > RAMP_TRIGGER at every
+-X row start), and a standing leftover ridge (z 7.0) at x -8..-4 across
+the whole raster. The FE5 ramp sized from P0 alone (L = 0.3/tan(2 deg)
+~ 8.6 mm) lands its TOP at x ~ -6.43, z 6.3 -> ~0.7 mm UNDER the ridge
+(the line-52593 defect reproduced at program level). The test replays the
+estimator's LiveStock in emit order over the EMITTED moves and asserts
+every entry landing strictly above the floor (vertical-descent bottom =
+plunge onto a ramp top; horizontal arrival at ramp height) has live depth
+<= 0.25 or appears in stats fe5_top_unresolved; sloped ramp-chord
+vertices stay excluded (allowed, FE5e rule 4).
+
+## Results (both runs, via slot_m4.sh)
+
+- AFTER = worktree code (HEAD c342fcf; engine identical to 44e0a61):
+  **PASS, exit 0** - `fe5t public: 9 entries ramped, 0 unresolved, tops
+  clear (chord max depth 0.772)`. All 9 ramp tops sit clear of the live
+  stock; the chord through the ridge (max 0.772) is the allowed <=15 deg
+  descent recorded for ZE2.
+- BEFORE = `git archive e40f664` extract in the scratchpad (worktree
+  untouched - no checkout), same test file copied in: **FAIL BY
+  ASSERTION, exit 1** - `AssertionError: FE5e-t: 9 buried ramp
+  top/entry landing (max depth 0.700): [(-6.43, -12.0, 6.3, 0.7),
+  (-6.43, -9.0, 6.3, 0.605), (-6.43, -6.0, 6.3, 0.605),
+  (-6.43, -3.0, 6.3, 0.605)]` and there is no fe5_top_unresolved stat
+  on e40f664 to report them. This is the FE5d defect itself: every
+  forward row's P0-sized ramp top buried ~0.6-0.7 mm under the ridge.
+- Full `engine/test_finish.py` on AFTER code: **exit 0**, 29 tests OK
+  (28 before + the new one), `test_fe5t_public_ramp_top_clear_of_ridge
+  OK in 0.2s`, ALL FINISH TESTS PASSED.
+- `py_compile` of test_finish.py: clean.
+
+## Exact commands
+
+    SCRATCH=/private/tmp/claude-502/-Users-James-ai-sandbox-Assistr/adf268db-8f62-488c-bbb0-7ba55042f4d7/scratchpad
+    # both runs in one script ($SCRATCH/fe5t_test.sh: 1 = AFTER single test,
+    # 2 = same test on git archive e40f664 extract, must fail by assertion):
+    cd /Users/James/ai-sandbox/stevecam-fe5 && nohup $SCRATCH/slot_m4.sh \
+      $SCRATCH/fe5t_test.sh > out/oc_fe5t.log 2>&1 &
+    # log: out/oc_fe5t.log (AFTER_fe5t_exit=0, BEFORE_fe5t_exit=1)
+    cd /Users/James/ai-sandbox/stevecam-fe5 && nohup $SCRATCH/slot_m4.sh \
+      /Applications/VibeCAD.app/Contents/Resources/bin/python \
+      engine/test_finish.py > out/oc_fe5t_full.log 2>&1 &
+    # log: out/oc_fe5t_full.log (ALL FINISH TESTS PASSED, 29 tests)
+
+Not committed (per instruction). No Core Front, no fe5_judge.py, no zmap
+job run in this session.
