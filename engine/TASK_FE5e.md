@@ -43,3 +43,13 @@ AFTER = your code, same judge. Report BEFORE vs AFTER:
   `/opt/homebrew/bin/python3 -m pytest verify connector engine/test_post.py -q` green, real exit codes, all via the slot.
 - Regenerate the finish once more from the FINAL code and cmp it against the one you judged; report.
 Write engine/FE5e_RESULTS.md with every number and the exact commands. Then stop.
+
+## ADDENDUM FE5e-t (coordinator): behavioural test through the PUBLIC finish path - test only, no engine change
+The ImportError proof only shows _fe5_pick_ramp is new. Add ONE small test to engine/test_finish.py that drives the public
+`finish()` path (as the other finish tests do: a small synthetic STL + a live stock from --stock-from / the stock argument
+the existing FE5 tests use) on a synthetic ridge where the GENERATED program's ramp top (first vertex of the ramped entry)
+sits buried in the live stock on e40f664 (> 0.25 deep). Assert, on the emitted moves, that every ramp top / entry descent
+is <= 0.25 live depth or is listed in stats fe5_top_unresolved. It must FAIL BY ASSERTION on e40f664's engine (run it
+against a `git archive e40f664` extract, as before - never checkout) and PASS on 44e0a61. Small synthetic only; NO Core
+Front, NO fe5_judge.py, NO zmap job. Run via slot_m4.sh. Append the results (both runs, exact commands) to
+engine/FE5e_RESULTS.md. Then stop.
