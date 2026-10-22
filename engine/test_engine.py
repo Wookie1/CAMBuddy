@@ -1084,7 +1084,8 @@ def _main():
                test_se2_side_entries_only_through_cleared,
                test_hr1_rings_after_a2d,
                test_hb1v2_flat_floor_circle_after_helix,
-               test_stl_cache_keyed_by_content):
+               test_stl_cache_keyed_by_content,
+               test_rr1a_rough_cli_refuses_ball):
         try:
             fn()
         except AssertionError as e:
@@ -1519,6 +1520,50 @@ def test_hb1v2_flat_floor_circle_after_helix():
     assert n_helix >= 1, "no helix entry emitted on the synthetic part: vacuous"
     print("PASS hb1v2 floor circle: %d helix entry/entries each followed by "
           "one full flat circle at the helix bottom Z, ramp feed" % n_helix)
+
+
+def test_rr1a_rough_cli_refuses_ball():
+    """RR1a: `rough --tool ball:...` fails CLOSED - nonzero exit, clear
+    refusal on stderr, NO program written, before any work (the step file
+    is never even loaded). flat still roughs end to end."""
+    import subprocess
+    import tempfile
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    step = os.path.join(repo, "connector", "testdata", "synth_pocket.step")
+    _need(step)
+    stock = ["-31", "31", "-31", "31", "-1", "12.4"]
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "rough.ngc")
+        r = subprocess.run(
+            [sys.executable, "-m", "engine.cli", "rough", "--step",
+             os.path.join(td, "never-parsed.step"), "--stock", *stock,
+             "--tool", "ball:9.525", "--out", out],
+            capture_output=True, text=True, cwd=repo)
+        assert r.returncode != 0, "ball rough exited 0: %s" % r.stdout[-400:]
+        assert "refused" in r.stderr and "ball" in r.stderr, \
+            "no clear ball refusal on stderr: %r" % r.stderr[-400:]
+        assert not os.path.exists(out), "ball rough wrote a program"
+        # bull without a corner would silently run flat too - refused
+        r = subprocess.run(
+            [sys.executable, "-m", "engine.cli", "rough", "--step",
+             os.path.join(td, "never-parsed.step"), "--stock", *stock,
+             "--tool", "bull:12.7", "--out", out],
+            capture_output=True, text=True, cwd=repo)
+        assert r.returncode != 0 and "corner" in r.stderr, \
+            "bull without corner not refused: %r" % r.stderr[-400:]
+        assert not os.path.exists(out), "refused rough wrote a program"
+        # flat still works (same tiny pocket as test_rough_rt_entries)
+        r = subprocess.run(
+            [sys.executable, "-m", "engine.cli", "rough", "--step", step,
+             "--stock", *stock, "--tool", "flat:6.0", "--out", out,
+             "--floor", "3.0", "--stepdown", "4.0", "--workers", "2"],
+            capture_output=True, text=True, cwd=repo)
+        assert r.returncode == 0, "flat rough failed: %s | %s" % (
+            r.stdout[-500:], r.stderr[-500:])
+        text = open(out).read()
+        assert "G1" in text and len(text) > 1000, "flat program not written"
+    print("PASS rr1a rough cli: ball and corner-less bull refused (no "
+          "program), flat still roughs (%d bytes)" % len(text))
 
 
 if __name__ == "__main__":

@@ -456,6 +456,14 @@ class TestNegatives:
                                          tool_diameter=100.0))
         self._wait_rejected(mock, 605, "input_out_of_range")
 
+    def test_ball_rough_rejected_before_running(self, live):
+        # RR1a: adaptive_rough with a ball roughing tool is REFUSED by
+        # validation (never runs, so it can never run as a flat rough)
+        mock, _, _ = live
+        mock.enqueue_run(606, inputs=dict(GOOD_INPUTS, model=model_input(mock),
+                                           tool_type="ball"))
+        self._wait_rejected(mock, 606, "input_out_of_range")
+
     def test_mock_verifies_request_signatures(self, live):
         """Sanity: the mock really refused something unauthenticated."""
         mock, _, _ = live
@@ -732,6 +740,31 @@ class TestSlopeCatalog:
         ok, code, v = catalog_mod.validate_inputs(
             {}, catalog_mod.SLOPE_ACTION)
         assert not ok and code == "input_missing"
+
+    def test_rough_refuses_ball(self):
+        # RR1a: a BALL roughing tool is refused by validation on BOTH
+        # actions (the slope action's own finishing ball stays legal), and
+        # the panel no longer offers Ball for roughing
+        ok, code, msg = catalog_mod.validate_inputs(
+            {"model": "m", "tool_type": "ball", "tool_diameter": 9.525},
+            catalog_mod.ACTION)
+        assert not ok and code == "input_out_of_range", (ok, code)
+        assert "ball" in str(msg), msg
+        ok, code, msg = catalog_mod.validate_inputs(
+            dict(SLOPE_GOOD_INPUTS, model="m", rough_tool_type="ball"),
+            catalog_mod.SLOPE_ACTION)
+        assert not ok and code == "input_out_of_range", (ok, code)
+        assert "ball" in str(msg), msg
+        # defaults (bull) and flat still validate clean
+        ok, code, v = catalog_mod.validate_inputs({"model": "m"},
+                                                   catalog_mod.ACTION)
+        assert ok and v["tool_type"] == "bull", code
+        ok, code, _ = catalog_mod.validate_inputs(
+            {"model": "m", "tool_type": "flat"}, catalog_mod.ACTION)
+        assert ok, code
+        html = open(os.path.join(HERE, "panel", "index.html")).read()
+        assert '<option value="ball">' not in html, \
+            "panel still offers a ball roughing tool"
 
 
 class TestSlopeSplitFinish:
