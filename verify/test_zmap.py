@@ -2531,3 +2531,70 @@ def test_ze2f_fw_split_by_feed_and_helix_bottom_exception():
     assert t == {"fw_cutting_feed": 1, "fw_entry_not_allowed": 2, "met": False}
     clean = [wins[0], wins[2]]
     assert zmap._ae2_engagement_keys(clean, 12.686)["roughing_target_ae2"]["met"]
+
+
+def test_ze2f2_pitch_carries_along_the_helix_bottom_run():
+    """ZE2F2: after a helix, every window of the contiguous run at its bottom
+    Z and entry feed (a floor circle) carries the helix pitch; the first move
+    at a different feed (or any Z change) drops it."""
+    part = np.zeros((NF, NF))
+    g = _helix_gcode(0.0, 0.0, 3.0, 18.6, 1.0, 2)
+    zb = 18.6 - 2.0
+    g += ["G1 X%.4f Y%.4f Z%.4f F1270." % (3.0 * math.cos(2 * math.pi * k / 72), 3.0 * math.sin(2 * math.pi * k / 72), zb)
+          for k in range(1, 73)]                      # one full circle at the bottom, entry feed
+    g += ["G1 X%.4f Y0. F3429." % (3.0 + 0.2 * i) for i in range(1, 7)]
+    res = _run_ae2("\n".join(g) + "\n", part)
+    wins = res["_ae2_raw"]
+    circ = [w for w in wins if w["feed"] == 1270.0]
+    cutw = [w for w in wins if w["feed"] == 3429.0]
+    assert len(circ) >= 10 and cutw, (len(circ), len(cutw))
+    assert all(w["helix_pitch"] is not None and abs(w["helix_pitch"] - 1.0) <= 0.03 for w in circ), \
+        [w["helix_pitch"] for w in circ]
+    assert all(w["helix_pitch"] is None for w in cutw)
+
+
+def test_ze2f2_carry_is_bounded_to_one_circle():
+    """ZE2F2 bound: an entry-feed run at the helix bottom LONGER than one
+    circumference (+1 mm) loses the pitch beyond that length - those windows
+    are judged as normal windows."""
+    part = np.zeros((NF, NF))
+    g = _helix_gcode(0.0, 0.0, 3.0, 18.6, 1.0, 2)
+    zb = 18.6 - 2.0
+    g += ["G1 X%.4f Y%.4f Z%.4f F1270." % (3.0 * math.cos(2 * math.pi * k / 72), 3.0 * math.sin(2 * math.pi * k / 72), zb)
+          for k in range(1, 3 * 72 + 1)]              # THREE circles at the bottom, entry feed
+    res = _run_ae2("\n".join(g) + "\n", part)
+    wins = [w for w in res["_ae2_raw"] if w["feed"] == 1270.0]
+    carried = sum(w["length_mm"] for w in wins if w["helix_pitch"] is not None)
+    uncarried = [w for w in wins if w["helix_pitch"] is None]
+    assert carried <= 2 * math.pi * 3.0 + 1.0 + 1.1, carried   # one circle + 1 mm (+ one window)
+    assert uncarried and sum(w["length_mm"] for w in uncarried) > 2 * math.pi * 3.0, \
+        "the second and third circles must be judged as normal windows"
+
+
+def test_ze2d_full_width_depth_true_slot_vs_ridge_plus_graze():
+    """ZE2D: full_width_depth = largest h with (area removed >= h deep) /
+    travel >= 0.9 D. A true full-width slot 10 mm deep scores ~10; a 1 mm
+    full-width ridge plus a 0.3 mm-wide 18 mm-tall graze scores ~1, although
+    its a (max removed height) is 18."""
+    part = np.zeros((NF, NF))
+    # (1) true slot: solid stock top 18.6, tip at 8.6 -> 10 mm deep, full width
+    pts = [(-15.0 + 0.5 * i, 0.0) for i in range(1, 61)]
+    res = _run_ae2(_ae2_gcode(pts, (-20.0, 0.0), 8.6), part)
+    slot = [w for w in res["_ae2_raw"] if w["ae_eff"] >= 0.9 * D_ZE2]
+    assert slot, "no full-width window in the true slot"
+    assert all(abs(w["full_width_depth"] - 10.0) <= 0.3 for w in slot), \
+        [w["full_width_depth"] for w in slot]
+    # (2) ridge + graze: stock 1 mm above the tip everywhere (the ridge), plus a
+    # 0.3 mm-wide 18 mm-tall wall at y = +6.2..6.5 inside the tool's rim reach
+    xs = _centers_f()
+    stock = np.full((NF, NF), 9.6)                   # tip at 8.6 -> 1 mm ridge
+    wall = (xs >= 6.2) & (xs < 6.5)
+    stock[wall, :] = 26.6                            # rows = y: 18 mm above the tip
+    res2 = _run_ae2(_ae2_gcode(pts, (-20.0, 0.0), 8.6), part, stock_init=stock)
+    fw2 = [w for w in res2["_ae2_raw"] if w["ae_eff"] >= 0.9 * D_ZE2]
+    assert fw2, "the 1 mm ridge must still read full width"
+    assert all(w["a"] > 17.5 for w in fw2), [w["a"] for w in fw2]     # a alone says 'deep'
+    assert all(abs(w["full_width_depth"] - 1.0) <= 0.3 for w in fw2), \
+        [w["full_width_depth"] for w in fw2]
+    bands = res2["engagement"]["full_width_depth_bands_ae2"]
+    assert bands["cutting_feed"]["0.5-2"]["count"] == len(fw2)

@@ -250,7 +250,8 @@ def main(argv=None):
     r.add_argument("--stock", type=float, nargs=6, required=True,
                    metavar=("XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX"))
     r.add_argument("--tool", required=True,
-                  help="bull:DIA:CORNER | flat:DIA | ball:DIA")
+                  help="bull:DIA:CORNER | flat:DIA (any other kind, e.g. "
+                       "ball, is refused: rough would silently run it flat)")
     r.add_argument("--out", required=True, help="output .ngc file")
     r.add_argument("--floor", type=float, default=24.765,
                    help="main floor Z; last level = floor + axial leave")
@@ -466,6 +467,18 @@ def main(argv=None):
 
     from engine import model, rough as roughmod
     kind, dia, corner = parse_tool(a.tool)
+    # RR1a: rough fails CLOSED on any tool kind it cannot honour. It cuts
+    # with CylCutter (flat) or BullCutter (bull, corner carried); a ball
+    # spec would silently become a FLAT rough (corner defaults to 0).
+    if kind not in ("flat", "bull"):
+        raise SystemExit("rough: tool kind %r refused (%s): adaptive rough "
+                         "cuts flat or bull end mills only - a ball request "
+                         "would silently run as a flat rough; use `finish` "
+                         "for ball tools" % (kind, a.tool))
+    if kind == "bull" and corner <= 0.0:
+        raise SystemExit("rough: bull tool needs a corner radius "
+                         "(--tool bull:DIA:CORNER, got %s) - without one it "
+                         "would silently run as a flat rough" % a.tool)
     if a.optimal_load_mm is not None:
         stepover = a.optimal_load_mm / dia
     else:

@@ -1334,6 +1334,26 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 stock.mill_segment(hx, hy, hv["x"], hv["y"], hz, tool_r,
                                   corner_r)
                 hx, hy, hz = hv["x"], hv["y"], hv["z"]
+            # HB1v2: a helix floor is a spiral - the point opposite the run's
+            # end last stood under the disk one turn earlier, so it stands up
+            # to one pitch above Z INSIDE the bore; the region's first
+            # horizontal loop then shears that ridge across nearly the whole
+            # disk at the CUTTING feed (the a2d_first ridge windows). Emit one
+            # full flat circle at Z on the helix path (same centre/radius, at
+            # the ramp feed) as part of the entry, milled honestly into the
+            # live stock model, so the ridge is cut flat before any
+            # cutting-feed move runs over it.
+            if r >= 0.15:
+                n_c = max(8, int(2 * math.pi * r / 1.0))
+                ea2 = math.atan2(hy - cy, hx - cx)
+                for i in range(1, n_c + 1):
+                    aa = ea2 + i * 2.0 * math.pi / n_c
+                    cxx = round(cx + r * math.cos(aa), 4)
+                    cyy = round(cy + r * math.sin(aa), 4)
+                    emit({"g": 1, "x": cxx, "y": cyy, "z": round(z, 4),
+                          "f": ramp_feed})
+                    stock.mill_segment(hx, hy, cxx, cyy, z, tool_r, corner_r)
+                    hx, hy = cxx, cyy
             emit({"g": 1, "x": x, "y": y, "z": z, "f": cut_feed})
             stock.mill_path(seg, z, tool_r, corner_r)
             mill_now(x, y, z)
