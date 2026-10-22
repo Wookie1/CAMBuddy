@@ -947,6 +947,9 @@ class TestRestPass:
         assert float(zf[zf.index("--flute") + 1]) == pytest.approx(22.225)
         assert float(zf[zf.index("--shank-dia") + 1]) == pytest.approx(9.525)
         # the finish plans its rapids/holder against the roughing stock
+        # (FL1b: and the strict stock-box floor rule depends on it - the
+        # finish and the rest must always get --stock-from on the shipped path)
+        assert "--stock-from" in fin_call, "finish lost --stock-from (FL1b floor rule)"
         rough_out = rough_call[rough_call.index("--stock-out") + 1]
         assert fin_call[fin_call.index("--stock-from") + 1] == rough_out
 
@@ -978,6 +981,7 @@ class TestRestPass:
             "rest_neutral.ngc")
         assert rest_fin[rest_fin.index("--rest-tool") + 1] == "ball:5.9580"
         assert rest_fin[rest_fin.index("--min-rest") + 1] == "0.5000"
+        assert "--stock-from" in rest_fin, "rest lost --stock-from (FL1b floor rule)"
         assert rest_fin[rest_fin.index("--stock-from") + 1].endswith(
             "stock_after_rough_engine.npy")
         assert rest_fin[rest_fin.index("--flute") + 1] == "12.0000"

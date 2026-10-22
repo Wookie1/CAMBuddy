@@ -2107,6 +2107,12 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
         _A, _sx0, _sy0, _cell = link_stock
         floor_box = (_sx0, _sx0 + (_A.shape[1] - 1) * _cell,
                      _sy0, _sy0 + (_A.shape[0] - 1) * _cell)
+    else:
+        import sys
+        print("warning: no stock model - the floor exemption falls back to "
+              "the part bbox; pass --stock-from (or --rest-from) so every "
+              "below-floor vertex inside the stock box is dropped",
+              file=sys.stderr)
     steep_paths, _src_fl_steep, n_floor_steep = floor_net(
         steep_paths, _src_gs_steep, floor_z, (rxmin, rxmax, rymin, rymax),
         stock_box=floor_box, tool_r=0.5 * tool[1])
