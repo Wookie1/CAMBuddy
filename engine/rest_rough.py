@@ -1,24 +1,42 @@
 """T20-style ball rest-rough for the material the big flat tool left.
 
-Task RR1b. Live stock more than `min_excess` mm above the part cannot be
-removed by the finishing ball in one stepover; this generator machines that
-rest with a ball:
+Tasks RR1b + RR1c. Live stock more than `min_excess` mm above the part
+cannot be removed by the finishing ball in one stepover; this generator
+machines that rest with a ball:
 
   * zones: 8-connected components where
     live stock - max(exact part ball-CL, floor_z) > min_excess (>= 5 mm2);
-  * entry per zone: one helix at r_h = 0.8 * r_max, where r_max is the
-    largest inscribed CL-circle radius of the leave-legal region at the
-    deepest ENTERABLE level (FE5 rule); deeper levels whose r_max is below
-    min_helix_r are skipped and reported. r_max < min_helix_r for every
-    level -> the zone is REPORTED (no legal entry), never drilled or forced;
-  * then one flat floor circle at r_h (ramp feed, only if legal) and
-    z-level contours at c = ae/2 stepping ae, greedy-nearest pass order,
-    rising in place between levels;
+  * levels: z = floor_z + rest_leave + k*stepdown that have leave-legal
+    stock in the zone, PLUS a floor-hugging level t_f = min(part CL over
+    the zone) + rest_leave so the deepest floor of every zone is cut to
+    leave, not left as a stepdown terrace (RR1c: the bay leftover);
+  * entry PER PASS, chosen by the pass's live depth (FE5 LiveStock), in
+    this order (RR1c):
+      1. live depth <= shallow (0.25): straight feed descent, no entry;
+      2. in-pass ramp at ramp_angle: the SMALLEST L along the pass whose
+         top clears with the FE5e top-clear rule (descent column at the
+         ramp top verified live depth <= shallow);
+      3. zig-zag along the zone's long axis at this level, only if every
+         run >= tool diameter D (entry via 1/2 along the axis);
+      4. SE2-verified side entry: descend at a column already cleared at
+         this level (live depth <= shallow) and feed in horizontally
+         through stock cleared at that level (the engine's SE2 rule);
+      5. helix + floor circle at r >= min_helix_r (RR1b, zone entry);
+      6. else REPORT the pass/zone (r_max, run length, depth) - no
+         plunges, no smaller helix, never steeper than ramp_angle.
+    Every entry records which step it took (stats["entry_steps"],
+    stats["zones"][*]["entry_steps"]);
+  * z-level contours at c = ae/2 stepping ae (or zig-zag runs), greedy-
+    nearest pass order, rising in place between levels;
   * no axial plunges: every scored descent (pass start after a G0) is
     checked with the FE5 disk rule against LIVE stock (stamp_chord order,
-    engine/entry_depth.py) and must stay <= zb_floor; links feed only along
-    paths keeping leave above the exact part CL, else verified rapid +
-    landing check, else the pass is skipped;
+    engine/entry_depth.py) and must stay <= shallow; links feed only along
+    paths keeping leave above the exact part CL, else SE2/step-1 verified
+    entry, else the pass is skipped and reported;
+  * rapids (RR1c): a G0 may never pass through live stock. Leaving a
+    pocket feeds out first to the ball-aware clear height at the column
+    (disk_top), then retracts; every traverse is swept-sampled and raised
+    to the highest disk_top along the path before moving;
   * fail closed: every feed path point must sit leave above the exact part
     ball-CL (validate_exact, 0.005 mm) before posting.
 
@@ -121,7 +139,48 @@ def circle_points(cx, cy, r, z, theta0=0.0):
             for k in range(n + 1)]
 
 
-
+def zigzag_runs(reg, xs, ys, ae, min_run):
+    """Straight runs along the region's long axis spaced ae apart; every
+    run must be >= min_run long. Returns list of point lists (XY), each
+    ordered along its own travel direction."""
+    js, is_ = np.nonzero(reg)
+    if len(js) < 2:
+        return []
+    x0v, x1v = float(xs[is_].min()), float(xs[is_].max())
+    y0v, y1v = float(ys[js].min()), float(ys[js].max())
+    horiz = (x1v - x0v) >= (y1v - y0v)
+    runs = []
+    lo, hi = (y0v, y1v) if horiz else (x0v, x1v)
+    offs = list(np.arange(lo + ae / 2.0, hi - ae / 2.0 + 1e-9, ae))
+    if not offs or offs[-1] < hi - ae / 2.0 - 1e-9:
+        offs.append(hi - ae / 2.0)
+    if not offs:
+        offs = [(lo + hi) / 2.0]
+    for w in offs:
+        if horiz:
+            sel = np.abs(ys[js] - w) <= CELL / 2.0 + 1e-9
+            cols = np.unique(is_[sel])
+        else:
+            sel = np.abs(xs[is_] - w) <= CELL / 2.0 + 1e-9
+            cols = np.unique(js[sel])
+        if len(cols) < 2:
+            continue
+        brk = np.nonzero(np.diff(cols) > 1)[0]
+        groups = np.split(cols, brk + 1)
+        for g in groups:
+            if len(g) < 2:
+                continue
+            a0, a1 = float(xs[g[0]]), float(xs[g[-1]])
+            b = float(w)
+            if horiz:
+                pts = [(a0, b), (a1, b)]
+                L = a1 - a0
+            else:
+                pts = [(b, a0), (b, a1)]
+                L = a1 - a0
+            if L >= min_run - 1e-9:
+                runs.append(pts)
+    return runs
 
 
 def validate_exact(surf, dia, moves, leave, workers=1):
@@ -162,11 +221,17 @@ def validate_exact(surf, dia, moves, leave, workers=1):
 def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                min_excess, min_helix_r, ramp_angle_deg, cut_feed, ramp_feed,
                clearance=None, zb_floor=0.5, margin=0.02, workers=1,
-               progress=None):
+               shallow=0.25, progress=None):
     """Plan the ball rest-rough. Returns (moves, stats); moves are dicts
-    {'g': 0|1, 'x', 'y', 'z', 'f'} in tip-Z convention."""
+    {'g': 0|1, 'x', 'y', 'z', 'f'} in tip-Z convention.
+
+    shallow: RR1c step-1 live-depth limit (mm) - a pass start whose FE5
+    disk depth against live stock is at or below this may be entered by a
+    straight feed descent; the same limit sizes the FE5e top-clear rule of
+    the in-pass ramp (step 2) and the SE2 descent column (step 4)."""
     kind, dia = tool
     R = dia / 2.0
+    tanr = math.tan(math.radians(ramp_angle_deg))
     xs, ys = _grid(stock)
     Sg = _resample_stock(stock, xs, ys)
     Zraw = part_cl(surf, dia, xs, ys, workers)
@@ -179,17 +244,14 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
 
     moves = []
     stats = {"zones": [], "no_entry": [], "cut_len": 0.0, "ramp_len": 0.0,
-             "rapid_len": 0.0, "n_levels": 0}
+             "rapid_len": 0.0, "n_levels": 0, "entry_steps": {},
+             "entries": [], "passes_skipped": []}
 
-    def g0(x, y, z):
+    def g0r(x, y, z):
         prev = moves[-1] if moves else None
         if prev is not None:
-            stats["rapid_len"] += math.hypot(x - prev["x"], y - prev["y"])
-            if z > prev["z"] + 1e-9:
-                # retract vertically first, then traverse at the clearance
-                # plane: a combined X-Y-Z rapid is a diagonal through stock
-                moves.append({"g": 0, "x": prev["x"], "y": prev["y"],
-                            "z": round(z, 4)})
+            stats["rapid_len"] += math.hypot(x - prev["x"], y - prev["y"]) \
+                + max(z - prev["z"], 0.0)
         moves.append({"g": 0, "x": round(x, 4), "y": round(y, 4),
                      "z": round(z, 4)})
 
@@ -203,7 +265,186 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
         moves.append({"g": 1, "x": round(x, 4), "y": round(y, 4),
                      "z": round(z, 4), "f": f})
 
-    for z in zones:
+    def col_top(x, y):
+        """Ball-aware lowest non-cutting tip Z at (x, y) vs LIVE stock;
+        fail closed to the clearance plane when the column is unjudged."""
+        h = live.disk_top(x, y)
+        return clearance if not math.isfinite(h) else h
+
+    def g0(x, y, z):
+        """Rapid to (x, y, z) that can never collide with live stock
+        (RR1c): feed out of the current column first when a vertical
+        rapid would drag through standing material, traverse at a height
+        swept-checked against disk_top along the whole path, then drop at
+        the target column to its own ball-aware clear height."""
+        prev = moves[-1] if moves else None
+        if prev is None:
+            g0r(x, y, z)
+            return
+        px, py, pz = prev["x"], prev["y"], prev["z"]
+        h0 = col_top(px, py)
+        zh = max(z, h0 + 0.01)
+        if pz < h0 - 1e-9:
+            g1(px, py, round(h0 + 0.01, 4), ramp_feed)
+        n = max(int(math.hypot(x - px, y - py) / CELL), 1)
+        hp = -1e30
+        for q in range(n + 1):
+            t_ = q / n
+            hp = max(hp, col_top(px + (x - px) * t_, py + (y - py) * t_))
+        if math.isfinite(hp):
+            zh = max(zh, hp + 0.01)
+        if pz < zh - 1e-9:
+            g0r(px, py, round(zh, 4))
+        # drop at the target column to its own ball-aware clear height
+        ht = col_top(x, y)
+        g0r(x, y, round(min(zh, ht + 0.01), 4))
+
+    def legal(x, y, z):
+        return _at(Zraw, xs, ys, x, y) <= z - rest_leave + 0.005
+
+    cutter_ball = make_cutter("ball", dia)
+
+    def cl_ok(x, y, z):
+        """Exact (continuous-triangle) part CL at (x, y) permits tip Z = z:
+        a vertical descent to z there can never gouge. The stock grid alone
+        misses walls between cell centres, so every ladder vertical descent
+        column is checked against the exact CL too; fail closed."""
+        v = batch_drop(surf, cutter_ball, [(x, y)], threads=1)[0]
+        return math.isfinite(v) and v <= z + 0.005
+
+    def _record(zone_i, t, step, kind_s, depth):
+        stats["entry_steps"][step] = stats["entry_steps"].get(step, 0) + 1
+        stats["entries"].append({"zone": zone_i, "t": round(t, 3),
+                                "step": step, "kind": kind_s,
+                                "depth_mm": (round(depth, 3) if depth is not None
+                                           and math.isfinite(depth) else None)})
+
+    def step1(x, y, t, zi):
+        """Straight feed descent: live depth <= shallow."""
+        d = live.disk_depth(x, y, t)
+        if not (math.isfinite(d) and d <= shallow):
+            return False
+        if not cl_ok(x, y, t):
+            return False
+        g0(x, y, clearance)
+        g1(x, y, round(t, 4), ramp_feed)
+        _record(zi, t, 1, "direct-descent", d)
+        return True
+
+    def step2(x, y, t, ux, uy, zi):
+        """In-pass ramp at ramp_angle: smallest L along +-u whose top
+        satisfies the FE5e top-clear rule (descent column at the ramp top
+        verified live depth <= shallow); the ramp is IN-PASS: its top and
+        path stay inside the level region and leave-legal."""
+        for sgn in (1.0, -1.0):
+            if step2_dir(x, y, t, sgn * ux, sgn * uy, zi):
+                return True
+        return False
+
+    def step2_dir(x, y, t, ux, uy, zi):
+        L = CELL
+        while L <= 80.0:
+            ax, ay = x - ux * L, y - uy * L
+            az = t + L * tanr
+            if az >= clearance:
+                return False
+            i0 = int(round((ay - ys[0]) / CELL))
+            j0 = int(round((ax - xs[0]) / CELL))
+            inpass = (0 <= i0 < reg_cur.shape[0]
+                     and 0 <= j0 < reg_cur.shape[1] and bool(reg_cur[i0, j0]))
+            if inpass and legal(ax, ay, az):
+                d = live.disk_depth(ax, ay, az)
+                if math.isfinite(d) and d <= shallow and cl_ok(ax, ay, az):
+                    n = max(int(L / CELL), 1)
+                    ok = all(legal(x - ux * L * q / n, y - uy * L * q / n,
+                                  t + L * tanr * q / n)
+                             for q in range(n + 1))
+                    if ok:
+                        g0(ax, ay, clearance)
+                        g1(ax, ay, round(az, 4), ramp_feed)
+                        for q in range(1, n + 1):
+                            t_ = q / n
+                            g1(x - ux * L * (1.0 - t_),
+                               y - uy * L * (1.0 - t_),
+                               round(t + L * tanr * (1.0 - t_), 4), ramp_feed)
+                        _record(zi, t, 2, "in-pass-ramp %.1f deg L=%.1f"
+                               % (ramp_angle_deg, L), d)
+                        return True
+            L += CELL
+        return False
+
+    def step4(x, y, t, zi):
+        """SE2 side entry: descend at a nearby column already cleared at
+        this level (live depth <= shallow) and feed in horizontally; every
+        path point either runs through stock cleared at that level (live
+        depth <= shallow) or is leave-legal against the part."""
+        for dist in (2.0, 3.5, 5.0, 7.0, 9.0, 11.0, 13.0):
+            for q in range(16):
+                a = q * math.pi / 8.0
+                sx, sy = x + dist * math.cos(a), y + dist * math.sin(a)
+                d = live.disk_depth(sx, sy, t)
+                if not (math.isfinite(d) and d <= shallow):
+                    continue
+                n = max(int(dist / 0.2), 1)
+                ok = True
+                for w in range(n + 1):
+                    t_ = w / n
+                    qx, qy = sx + (x - sx) * t_, sy + (y - sy) * t_
+                    dq = live.disk_depth(qx, qy, t)
+                    if math.isfinite(dq) and dq <= shallow:
+                        continue
+                    if not legal(qx, qy, t):
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                g0(sx, sy, clearance)
+                g1(sx, sy, round(t, 4), ramp_feed)
+                m = max(int(dist / CELL), 1)
+                for w in range(1, m + 1):
+                    t_ = w / m
+                    g1(sx + (x - sx) * t_, sy + (y - sy) * t_, round(t, 4),
+                       ramp_feed)
+                _record(zi, t, 4, "SE2 side-entry d=%.1f" % dist, d)
+                return True
+        return False
+
+    def helix_entry(x, y, t, zi):
+        """RR1b helix: bore at r_h = 0.8 * local inscribed radius from the
+        live disk-top down to level t, then caller cuts the floor circle."""
+        cand = [(x, y)]
+        pk = ((Dz >= ndimage.maximum_filter(Dz, size=15))
+              & (Dz >= min_helix_r / 0.8))
+        pii, pjj = np.nonzero(pk & reg_cur)
+        if len(pii):
+            cand = [(float(xs[j0c]), float(ys[i0c]))
+                    for i0c, j0c in zip(pii[np.argsort(-Dz[pii, pjj])[:6]],
+                                       pjj[np.argsort(-Dz[pii, pjj])[:6]])]
+        for cx0, cy0 in cand:
+            rr = 0.8 * float(Dz[int(round((cy0 - ys[0]) / CELL)),
+                               int(round((cx0 - xs[0]) / CELL))])
+            rr = max(rr, min_helix_r)
+            while rr >= min_helix_r:
+                z_top = min(clearance, live.disk_top(cx0, cy0) - 0.01)
+                if not math.isfinite(z_top) or z_top <= t:
+                    break
+                hp = helix_points(cx0, cy0, rr, z_top, t, ramp_angle_deg)
+                if all(legal(px, py, pz) for px, py, pz in hp):
+                    d0 = live.disk_depth(hp[1][0], hp[1][1], hp[1][2])
+                    if math.isfinite(d0) and d0 <= zb_floor:
+                        g0(cx0, cy0, clearance)
+                        for px, py, pz in hp:
+                            g1(px, py, round(pz, 4), ramp_feed)
+                        _record(zi, t, 5, "helix %.1f deg r=%.3f"
+                               % (ramp_angle_deg, rr), d0)
+                        return (round(cx0, 4), round(cy0, 4), rr)
+                rr *= 0.85
+        return None
+
+    Dz = None            # distance transform of the current level region
+    reg_cur = None
+
+    for zi, z in enumerate(zones):
         # centres must sit on the zone itself: R-dilation admitted foreign
         # floor cells whose links crossed fins and polluted r_max anchoring
         zdil = ndimage.binary_dilation(z["mask"], structure=np.ones((3, 3)),
@@ -215,109 +456,147 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
         t = floor_z + rest_leave
         while t <= z["stockmax"] - 0.01 + 1e-9:
             sub = ((Sg[b0:b1, c0:c1] >= t + 0.01)
-                  & (Zraw[b0:b1, c0:c1] <= t - rest_leave + 0.005))
+                  & (Zraw[b0:b1, c0:c1] <= t - rest_leave + 0.005)
+                  & z["mask"][b0:b1, c0:c1])
             if sub.any():
                 reg = np.zeros_like(zdil)
                 reg[b0:b1, c0:c1] = sub
                 levels.append((round(t, 4), reg))
             t += stepdown
+        # RR1c: floor-hugging level so the deepest part CL of the zone is
+        # cut to leave instead of left as a stepdown terrace (the bay
+        # leftover: 2.0-grid levels stopped ~0.6 mm above the bay floor).
+        zmin = float(np.nanmin(Zraw[z["mask"]])) if np.isfinite(
+            Zraw[z["mask"]]).any() else -1e30
+        if math.isfinite(zmin) and zmin > -1e29:
+            tf = round(zmin + rest_leave, 4)
+            if tf >= floor_z + rest_leave and (
+                    not levels or tf < levels[0][0] - 0.005):
+                sub = ((Sg[b0:b1, c0:c1] >= tf + 0.01)
+                     & (Zraw[b0:b1, c0:c1] <= tf - rest_leave + 0.005)
+                     & z["mask"][b0:b1, c0:c1])
+                if sub.any():
+                    reg = np.zeros_like(zdil)
+                    reg[b0:b1, c0:c1] = sub
+                    levels.insert(0, (tf, reg))
         if not levels:
             stats["no_entry"].append({
                 "bbox": z["bbox"], "area_mm2": z["area_mm2"],
                 "volume_mm3": z["volume_mm3"], "r_max_cl": 0.0,
                 "reason": "no leave-legal floor region at the deepest level"})
             continue
-        sk = 0
-        while levels:
-            t0, reg0 = levels[0]
-            D0 = ndimage.distance_transform_edt(reg0) * CELL
-            r_max = float(D0.max())
-            if r_max >= min_helix_r:
-                break
-            levels.pop(0)  # narrow deep strip: T20 cannot enter it legally
-            sk += 1
-        if not levels:
-            stats["no_entry"].append({
-                "bbox": z["bbox"], "area_mm2": z["area_mm2"],
-                "volume_mm3": z["volume_mm3"], "r_max_cl": round(r_max, 3),
-                "reason": "no legal entry: largest inscribed CL circle "
-                        "r_max=%.3f mm < min_helix_r=%.3f mm"
-                        % (r_max, min_helix_r)})
-            continue
-        if sk:
-            stats.setdefault("levels_unreachable", []).append(
-                {"bbox": z["bbox"], "n_deep_levels_skipped": sk})
 
-        # --- entry: helix at r_h = 0.8 * local inscribed radius from the
-        #     live disk-top to the deepest level (2 deg, self-clearing; only
-        #     the first segment is a scored entry, starts within zb_floor) ---
-        hel = None
-        r_h = 0.0
+        # --- RR1c ladder per level: try to enter the deepest level; if no
+        #     step reaches it legally, skip that level (recorded) and try
+        #     the next one up. The helix's centre/radius (step 5) also
+        #     anchors the floor circle. ---
+        entered = False
+        mode = "rings"
+        runs0 = None
+        li0 = 0
         cx = cy = 0.0
-        pk = ((D0 >= ndimage.maximum_filter(D0, size=15))
-              & (D0 >= min_helix_r / 0.8))
-        pii, pjj = np.nonzero(pk)
-        if len(pii):
-            cand_order = np.argsort(-D0[pii, pjj])[:6]
-            for oi in cand_order:
-                i0c, j0c = pii[oi], pjj[oi]
-                cx0, cy0 = float(xs[j0c]), float(ys[i0c])
-                rr = 0.8 * float(D0[i0c, j0c])
-                while rr >= min_helix_r:
-                    z_top = min(clearance, live.disk_top(cx0, cy0) - 0.01)
-                    if not math.isfinite(z_top) or z_top <= t0:
-                        break
-                    cand = helix_points(cx0, cy0, rr, z_top, t0,
-                                       ramp_angle_deg)
-                    if all(_at(Zraw, xs, ys, px, py) <= pz - rest_leave + 0.005
-                           for px, py, pz in cand):
-                        d0 = live.disk_depth(cand[1][0], cand[1][1],
-                                            cand[1][2])
-                        if math.isfinite(d0) and d0 <= zb_floor:
-                            hel, r_h, cx, cy = cand, rr, cx0, cy0
-                            break
-                    rr *= 0.85
-                if hel is not None:
+        r_h = 0.0
+        t0 = reg0 = None
+        while li0 < len(levels):
+            t0, reg0 = levels[li0]
+            Dz = ndimage.distance_transform_edt(reg0) * CELL
+            reg_cur = reg0
+            p0 = None
+            # aim the entry at the start of the c = ae/2 contour of reg0
+            for P, closed, _K in march_level(Dz, xs, ys, ae / 2.0,
+                                            comp=reg0):
+                pts = [(float(a), float(b)) for a, b in P]
+                if len(pts) >= 3:
+                    p0 = pts + [pts[0]] if closed else pts
                     break
-        if hel is None:
+            if p0 is None:
+                js0, is0 = np.nonzero(reg0)
+                k0 = int(np.argmax(Dz[js0, is0]))
+                p0 = [(float(xs[is0[k0]]), float(ys[js0[k0]]))]
+            ux = uy = 0.0
+            if len(p0) >= 2:
+                dl = math.hypot(p0[1][0] - p0[0][0], p0[1][1] - p0[0][1])
+                if dl > 1e-9:
+                    ux, uy = ((p0[1][0] - p0[0][0]) / dl,
+                             (p0[1][1] - p0[0][1]) / dl)
+            if step1(p0[0][0], p0[0][1], t0, zi):
+                entered = True
+            elif abs(ux) + abs(uy) > 0.5 and step2(p0[0][0], p0[0][1], t0,
+                                                   ux, uy, zi):
+                entered = True
+            if not entered:
+                # step 3: zig-zag along the zone's long axis (only if every
+                # run >= D); enter the first run via steps 1/2 along the axis
+                zig0 = zigzag_runs(reg0, xs, ys, ae, dia)
+                if zig0:
+                    horiz = abs(zig0[0][1][0] - zig0[0][0][0]) >= abs(
+                        zig0[0][1][1] - zig0[0][0][1])
+                    axu = (1.0, 0.0) if horiz else (0.0, 1.0)
+                    runs0 = []
+                    for i, r in enumerate(zig0):
+                        forward = ((r[1][0] > r[0][0]) if horiz
+                                 else (r[1][1] > r[0][1]))
+                        runs0.append(r if (i % 2 == 0) == forward else r[::-1])
+                    k0 = min(range(len(runs0)), key=lambda ki: math.hypot(
+                        runs0[ki][0][0] - p0[0][0],
+                        runs0[ki][0][1] - p0[0][1]))
+                    rfirst = runs0[k0]
+                    if (step1(rfirst[0][0], rfirst[0][1], t0, zi)
+                            or step2(rfirst[0][0], rfirst[0][1], t0, axu[0],
+                                    axu[1], zi)):
+                        entered = True
+                        mode = "zigzag"
+            if not entered and step4(p0[0][0], p0[0][1], t0, zi):
+                entered = True
+            if not entered:
+                hc = helix_entry(p0[0][0], p0[0][1], t0, zi)
+                if hc is not None:
+                    entered = True
+                    cx, cy, r_h = hc
+            if entered:
+                break
+            stats.setdefault("levels_unreachable", []).append({
+                "zone": zi, "t": round(t0, 3),
+                "r_max_cl": round(float(Dz.max()), 3),
+                "live_depth_mm": (lambda dd: round(dd, 3) if math.isfinite(dd)
+                                else None)(live.disk_depth(p0[0][0], p0[0][1],
+                                                        t0))})
+            li0 += 1
+        r_max = float(Dz.max())
+        if not entered:
             stats["no_entry"].append({
                 "bbox": z["bbox"], "area_mm2": z["area_mm2"],
                 "volume_mm3": z["volume_mm3"], "r_max_cl": round(r_max, 3),
-                "reason": "no legal entry: helix at r_h would break leave "
-                        "or the first descent exceeds zb_floor"})
+                "reason": "no legal entry: steps 1-5 all refused (r_max_cl="
+                        "%.3f < min_helix_r=%.3f, no shallow column, ramp/"
+                        "zigzag/SE2 blocked)" % (r_max, min_helix_r)})
             continue
-        r_h = round(r_h, 3)
-        g0(cx, cy, clearance)
-        for px, py, pz in hel:
-            g1(px, py, round(pz, 4), ramp_feed)
-        prev = (hel[-1][0], hel[-1][1], round(t0, 4))
 
-        # --- deepest first: floor circle at r_h on t0 (ramp feed), rings
-        #     greedy-nearest; rise one stepdown in place between levels ---
+        prev = (moves[-1]["x"], moves[-1]["y"], round(t0, 4))
+        # floor circle at r_h on t0 (step 5 companion), only where legal
+        if r_h > 0.0:
+            theta0 = math.atan2(prev[1] - cy, prev[0] - cx)
+            rc = r_h
+            while rc >= min_helix_r:
+                cp = circle_points(cx, cy, rc, t0, theta0)
+                if all(legal(px, py, pz) for px, py, pz in cp):
+                    for px, py, pz in cp:
+                        g1(px, py, pz, ramp_feed)
+                    prev = (px, py, pz)
+                    break
+                rc *= 0.8
+
         n_levels = 0
-        for li, (t, reg) in enumerate(levels):
+        for li, (t, reg) in enumerate(levels[li0:]):
             if li:
-                g1(prev[0], prev[1], t, ramp_feed)
-            if t == t0:
-                # one flat floor circle at the deepest level (ramp feed),
-                # only where it keeps leave: shrink radius, else omit
-                theta0 = math.atan2(prev[1] - cy, prev[0] - cx)
-                rc = r_h
-                while rc >= min_helix_r:
-                    cp = circle_points(cx, cy, rc, t0, theta0)
-                    if all(_at(Zraw, xs, ys, px, py) <= t0 - rest_leave + 0.005
-                           for px, py, pz in cp):
-                        for px, py, pz in cp:
-                            g1(px, py, pz, ramp_feed)
-                        prev = (px, py, pz)
-                        break
-                    rc *= 0.8
-            Dt = ndimage.distance_transform_edt(reg) * CELL
-            maxc = float(Dt.max())
+                g1(prev[0], prev[1], round(t, 4), ramp_feed)
+            Dz = ndimage.distance_transform_edt(reg) * CELL
+            reg_cur = reg
+            maxc = float(Dz.max())
             rings = []
             c = ae / 2.0
             while c <= maxc + 1e-9:
-                for P, closed, _K in march_level(Dt, xs, ys, c, comp=reg):
+                for P, closed, _K in march_level(Dz, xs, ys, c, comp=reg):
                     pts = [(float(a), float(b)) for a, b in P]
                     if len(pts) < 3:
                         continue
@@ -325,46 +604,70 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                         pts = pts + [pts[0]]
                     rings.append(pts)
                 c += ae
+            if li == 0 and mode == "zigzag":
+                paths = runs0 + rings          # zigzag first, then rings
+            else:
+                paths = rings
             cut_here = 0
             skipped = 0
-            while rings:
+            while paths:
                 k, d0 = min(
                     ((ki, math.hypot(r[0][0] - prev[0], r[0][1] - prev[1]))
-                     for ki, r in enumerate(rings)), key=lambda t_: t_[1])
-                pts = rings.pop(k)
+                     for ki, r in enumerate(paths)), key=lambda t_: t_[1])
+                pts = paths.pop(k)
                 if cut_here % 2:
                     pts = pts[::-1]
                 if math.hypot(pts[0][0] - prev[0], pts[0][1] - prev[1]) > 1e-6:
                     # feed link only where the straight path keeps leave above
-                    # the exact part CL; else verified rapid + descent at the
-                    # the landing point; else skip this pass.
+                    # the exact part CL; else the RR1c ladder (step 1 shallow
+                    # descent / step 2 in-pass ramp / step 4 SE2), else skip.
                     n = max(int(d0 / 0.25), 1)
                     clear = all(
-                        _at(Zraw, xs, ys,
-                          prev[0] + (pts[0][0] - prev[0]) * q / n,
-                          prev[1] + (pts[0][1] - prev[1]) * q / n)
-                        <= t - rest_leave + 0.005 for q in range(n + 1))
+                        legal(prev[0] + (pts[0][0] - prev[0]) * q / n,
+                              prev[1] + (pts[0][1] - prev[1]) * q / n, t)
+                        for q in range(n + 1))
                     if clear:
-                        g1(pts[0][0], pts[0][1], t, ramp_feed)
+                        g1(pts[0][0], pts[0][1], round(t, 4), ramp_feed)
                     else:
-                        dd = live.disk_depth(pts[0][0], pts[0][1], t)
-                        if not (math.isfinite(dd) and dd <= zb_floor):
+                        ldx = ldy = 0.0
+                        if len(pts) >= 2:
+                            dl = math.hypot(pts[1][0] - pts[0][0],
+                                           pts[1][1] - pts[0][1])
+                            if dl > 1e-9:
+                                ldx, ldy = ((pts[1][0] - pts[0][0]) / dl,
+                                          (pts[1][1] - pts[0][1]) / dl)
+                        if not (step1(pts[0][0], pts[0][1], t, zi)
+                               or (abs(ldx) + abs(ldy) > 0.5
+                                   and step2(pts[0][0], pts[0][1], t, ldx, ldy,
+                                          zi))
+                               or step4(pts[0][0], pts[0][1], t, zi)):
                             skipped += 1
+                            stats["passes_skipped"].append({
+                                "zone": zi, "t": round(t, 3),
+                                "xy": [round(pts[0][0], 2),
+                                     round(pts[0][1], 2)],
+                                "run_mm": round(sum(
+                                    math.hypot(pts[i + 1][0] - pts[i][0],
+                                             pts[i + 1][1] - pts[i][1])
+                                    for i in range(len(pts) - 1)), 1),
+                                "live_depth_mm": (lambda dd: round(dd, 3) if
+                                               math.isfinite(dd) else None)(
+                                    live.disk_depth(pts[0][0], pts[0][1], t))})
                             continue
-                        g0(pts[0][0], pts[0][1], clearance)
-                        g1(pts[0][0], pts[0][1], t, ramp_feed)
                 for (px, py) in pts[1:]:
-                    g1(px, py, t, cut_feed)
-                prev = (pts[-1][0], pts[-1][1], t)
+                    g1(px, py, round(t, 4), cut_feed)
+                prev = (pts[-1][0], pts[-1][1], round(t, 4))
                 cut_here += 1
             if cut_here:
                 n_levels += 1
                 stats["n_levels"] += 1
+        zone_steps = [e["step"] for e in stats["entries"] if e["zone"] == zi]
         stats["zones"].append({
             "bbox": z["bbox"], "area_mm2": z["area_mm2"],
             "volume_mm3": z["volume_mm3"], "r_max_cl": round(r_max, 3),
             "helix": r_h, "floor_tip_z": t0, "levels": n_levels,
-            "entry": "helix %.1f deg + floor circle" % ramp_angle_deg})
+            "entry_steps": zone_steps,
+            "entry": "ladder steps %s" % (sorted(set(zone_steps)) or "-")})
         if progress:
             progress(stats)
     return moves, stats

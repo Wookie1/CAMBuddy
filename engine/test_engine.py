@@ -1208,6 +1208,131 @@ def test_rr1b_rest_rough_reports_small_pocket():
                 "feed move inside un-enterable pocket: %r" % m
 
 
+def _rr1c_boxes():
+    """Unit-box builder: returns the 12 triangles of [x0,x1]x[y0,y1]x[z0,z1]."""
+    def q(p1, p2, p3, p4):
+        return [(p1, p2, p3), (p1, p3, p4)]
+
+    def box(x0, x1, y0, y1, z0, z1):
+        A_, B_, C_, D_ = (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), \
+            (x0, y1, z1)
+        E_, F_, G_, H_ = (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), \
+            (x0, y1, z0)
+        return q(A_, B_, C_, D_) + q(E_, H_, G_, F_) \
+            + q(A_, E_, F_, B_) + q(D_, C_, G_, H_) \
+            + q(A_, D_, H_, E_) + q(B_, F_, G_, C_)
+    return box
+
+
+def _rr1c_surf(tris):
+    from opencamlib import ocl
+    surf = ocl.STLSurf()
+    for t in tris:
+        surf.addTriangle(ocl.Triangle(*[ocl.Point(*p) for p in t]))
+    return surf
+
+
+def test_rr1c_thin_band_inpass_ramp():
+    """RR1c: a thin band (0.6 mm deep below the 0.1 mm stock skin, r_max
+    1.9 < min_helix_r) is now CUT via the in-pass 2-deg ramp (ladder step
+    2) - RR1b reported it. Every scored entry <= 0.5 mm (ZB), no helix."""
+    try:
+        from engine import rest_rough as rr
+        from engine import entry_depth as ed
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    box = _rr1c_boxes()
+    tris = []
+    tris += box(0, 18.1, 0, 40, 20, 30)
+    tris += box(21.9, 40, 0, 40, 20, 30)
+    tris += box(18.1, 21.9, 0, 8, 20, 30)
+    tris += box(18.1, 21.9, 32, 40, 20, 30)
+    tris += box(18.1, 21.9, 8, 32, 20, 29.4)   # band floor 29.4
+    surf = _rr1c_surf(tris)
+    cell = 0.5
+    n = int(40 / cell)
+    cxv = (np.arange(n) + 0.5) * cell
+    X, Y = np.meshgrid(cxv, cxv)
+    A = np.full((n, n), 30.1)                   # 0.1 skin over the frame
+    band = ((X >= 18.1) & (X <= 21.9) & (Y >= 8) & (Y <= 32))
+    A[band] = 30.4                              # rest left in the band
+    moves, stats = rr.rest_rough(
+        surf, (A, 0.0, 0.0, cell), ("ball", 9.525), floor_z=29.4,
+        stepdown=2.0, ae=1.905, rest_leave=0.2, min_excess=0.4,
+        min_helix_r=1.903, ramp_angle_deg=2.0, cut_feed=2280.0,
+        ramp_feed=850.0)
+    assert moves, "no moves emitted"
+    assert len(stats["zones"]) == 1 and not stats["no_entry"], \
+        "thin band must be entered now: %r" % stats["no_entry"]
+    z = stats["zones"][0]
+    assert z["r_max_cl"] < 1.903, "band unexpectedly wide: %r" % z["r_max_cl"]
+    assert z["helix"] == 0.0, "helix used where a ramp suffices: %r" % z
+    assert 2 in z["entry_steps"], \
+        "in-pass ramp (step 2) not used: %r" % z["entry_steps"]
+    below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
+    assert below == 0, "gouge: %d pts (worst %.3f)" % (below, worst)
+    live = ed.LiveStock(A, 0.0, 0.0, cell, 9.525 / 2.0)
+    mv = [dict(m, line=i) for i, m in enumerate(moves)]
+    entries = ed.estimate_entries(mv, live)
+    assert entries, "no entries recorded"
+    deep = [e for e in entries if not math.isfinite(e["depth_mm"])
+            or e["depth_mm"] > 0.5]
+    assert not deep, "deep entry: %s" % deep[:3]
+
+
+def test_rr1c_narrow_pocket_side_entry():
+    """RR1c: a bay whose ramp directions are blocked (frame east/west, a
+    higher shelf north) but which opens onto stock cleared at the level is
+    entered through that mouth (ladder step 4, SE2 rule) - no helix, no
+    plunge; every entry <= 0.5 mm."""
+    try:
+        from engine import rest_rough as rr
+        from engine import entry_depth as ed
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    box = _rr1c_boxes()
+    tris = []
+    tris += box(0, 8, 0, 40, 20, 30)
+    tris += box(32, 40, 0, 40, 20, 30)
+    tris += box(8, 32, 0, 8, 20, 30)
+    tris += box(8, 32, 32, 40, 20, 30)
+    tris += box(8, 32, 8, 16, 20, 26.8)     # cleared pocket floor (mouth S)
+    tris += box(8, 32, 29.5, 32, 20, 27.4)  # higher shelf (N)
+    tris += box(8, 32, 16, 29.5, 20, 26.65)  # bay floor
+    surf = _rr1c_surf(tris)
+    cell = 0.5
+    n = int(40 / cell)
+    cxv = (np.arange(n) + 0.5) * cell
+    X, Y = np.meshgrid(cxv, cxv)
+    A = np.full((n, n), 30.0)
+    A[(X >= 8) & (X <= 32) & (Y >= 8) & (Y <= 32)] = 27.05  # cleared
+    A[(X >= 8) & (X <= 32) & (Y >= 29.5) & (Y <= 32)] = 27.65
+    A[(X >= 8) & (X <= 32) & (Y >= 16) & (Y <= 29.5)] = 28.0  # bay stock
+    moves, stats = rr.rest_rough(
+        surf, (A, 0.0, 0.0, cell), ("ball", 9.525), floor_z=26.85,
+        stepdown=2.0, ae=1.905, rest_leave=0.2, min_excess=0.5,
+        min_helix_r=1.903, ramp_angle_deg=2.0, cut_feed=2280.0,
+        ramp_feed=850.0)
+    assert moves, "no moves emitted"
+    assert len(stats["zones"]) == 1 and not stats["no_entry"], \
+        "bay must be entered from the cleared side: %r" % stats["no_entry"]
+    z = stats["zones"][0]
+    assert z["helix"] == 0.0, "helix used: %r" % z
+    assert z["entry_steps"] and z["entry_steps"][0] == 4, \
+        "first entry not SE2 side-entry (step 4): %r" % z["entry_steps"]
+    inside = [m for m in moves if m["g"] == 1 and 8.0 < m["x"] < 32.0
+              and 16.0 < m["y"] < 29.5]
+    assert inside, "no feed move inside the bay"
+    below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
+    assert below == 0, "gouge: %d pts (worst %.3f)" % (below, worst)
+    live = ed.LiveStock(A, 0.0, 0.0, cell, 9.525 / 2.0)
+    mv = [dict(m, line=i) for i, m in enumerate(moves)]
+    entries = ed.estimate_entries(mv, live)
+    deep = [e for e in entries if not math.isfinite(e["depth_mm"])
+            or e["depth_mm"] > 0.5]
+    assert not deep, "plunge/deep entry: %s" % deep[:3]
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -1228,7 +1353,9 @@ def _main():
                test_stl_cache_keyed_by_content,
                test_rr1a_rough_cli_refuses_ball,
                test_rr1b_rest_rough_synth_pocket,
-               test_rr1b_rest_rough_reports_small_pocket):
+               test_rr1b_rest_rough_reports_small_pocket,
+               test_rr1c_thin_band_inpass_ramp,
+               test_rr1c_narrow_pocket_side_entry):
         try:
             fn()
         except AssertionError as e:

@@ -249,7 +249,8 @@ def rest_rough_main(a):
         ae=a.ae, rest_leave=a.rest_leave, min_excess=a.min_excess,
         min_helix_r=a.min_helix_r, ramp_angle_deg=a.ramp_angle_deg,
         cut_feed=a.cut_feed, ramp_feed=a.ramp_feed, clearance=a.clearance,
-        zb_floor=a.zb_floor, workers=workers, progress=prog)
+        zb_floor=a.zb_floor, workers=workers, shallow=a.shallow,
+        progress=prog)
 
     below_cl, worst = rrmod.validate_exact(surf, dia, moves, a.rest_leave,
                                            workers=workers)
@@ -553,6 +554,12 @@ def main(argv=None):
     rr.add_argument("--zb-floor", dest="zb_floor", type=float, default=0.5,
                    help="entry-depth floor mm (FE5/ZB): no descent after a G0 "
                         "may exceed it against live stock (default 0.5)")
+    rr.add_argument("--shallow", type=float, default=0.25,
+                   help="RR1c step-1 live-depth limit mm: a pass start whose "
+                        "FE5 disk depth against live stock is at or below this "
+                        "is entered by a straight feed descent (no helix); it "
+                        "also sizes the in-pass-ramp top-clear rule and the "
+                        "SE2 descent column (default 0.25)")
     rr.add_argument("--workers", type=int, default=None)
     rr.add_argument("--stats-json", dest="stats_json", default=None)
     rr.add_argument("--post", choices=("neutral", "lnc"), default="neutral")
