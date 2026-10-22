@@ -1150,15 +1150,20 @@ def vertex_net(surf, cutter, paths, tol=NET_TOL, threads=None):
     return out, src, n
 
 
-def floor_net(paths, srcs, floor_z, bbox):
-    """FL1: the floor rule on EVERY pass type's emitted vertices (shallow,
+def floor_net(paths, srcs, floor_z, bbox, stock_box=None, tool_r=0.0):
+    """FL1/FL1b: the floor rule on EVERY pass type's emitted vertices (shallow,
     steep and rest alike; links/entries use only these endpoints): a CL
-    vertex inside the part bbox whose tip Z is below floor_z is DROPPED and
-    the path SPLIT there - never raised to the floor (same rule as S4
-    unreachable points). Vertices OUTSIDE the part bbox are pad-frame edge
-    passes (the ball rolling off a stock edge into air, raster pads half a
-    stepover past the bounds): they cut nothing below the floor and stay
-    unchanged. Runs after grid_snap so it filters exactly the coordinates
+    vertex whose tip Z is below floor_z is DROPPED and the path SPLIT there -
+    never raised to the floor (same rule as S4 unreachable points). FL1b:
+    the FL1 exemption for pad-frame edge passes applies only OUTSIDE the
+    STOCK BOX + tool radius (stock stands BETWEEN the part bbox and the
+    stock box): a below-floor vertex inside it is dropped like any other;
+    only vertices outside that box roll off stock edges into air and stay
+    unchanged. No stock box -> fall back to FL1's part-bbox exemption (the
+    raster region bbox is then the only stock-footprint estimate; measured:
+    dropping the pad rows anyway breaks the S2c cut_len calibration of
+    test_no_duplicate_raster_rows by 32 mm on a part whose bbox IS the
+    stock box). Runs after grid_snap so it filters exactly the coordinates
     that get emitted; the pieces rejoin only through the verified link logic
     below. Returns (paths, srcs, n_dropped) with srcs[i] the input path
     index output i came from (row_of / run_i0 alignment travels with the
@@ -1169,8 +1174,14 @@ def floor_net(paths, srcs, floor_z, bbox):
         P = np.asarray(pth, dtype=float)
         inside = ((P[:, 0] >= xmin) & (P[:, 0] <= xmax)
                   & (P[:, 1] >= ymin) & (P[:, 1] <= ymax))
-        ok = ~inside | (P[:, 2] >= floor_z - 1e-9)
-        n += int((inside & ~ok).sum())
+        if stock_box is None:
+            free = ~inside
+        else:
+            sxmin, sxmax, symin, symax = stock_box
+            free = ((P[:, 0] < sxmin - tool_r) | (P[:, 0] > sxmax + tool_r)
+                   | (P[:, 1] < symin - tool_r) | (P[:, 1] > symax + tool_r))
+        ok = (~inside & free) | (P[:, 2] >= floor_z - 1e-9)
+        n += int((~ok).sum())
         for i0, i1 in _runs_of_mask(ok):
             if i1 - i0 >= 2:
                 out.append(pth[i0:i1])
@@ -2088,10 +2099,26 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     # FL1: floor rule on the emitted coordinates of every pass type - CL
     # vertices below floor_z are dropped and the pass split there (steep,
     # shallow and rest all flow through here; links use only endpoints).
+    # FL1b: the stock box for the floor exemption = the --stock-from (or
+    # rest) heightfield grid extent + tool radius; no stock model -> fall
+    # back to FL1's part-bbox exemption (see floor_net).
+    floor_box = None
+    if link_stock is not None:
+        _A, _sx0, _sy0, _cell = link_stock
+        floor_box = (_sx0, _sx0 + (_A.shape[1] - 1) * _cell,
+                     _sy0, _sy0 + (_A.shape[0] - 1) * _cell)
+    else:
+        import sys
+        print("warning: no stock model - the floor exemption falls back to "
+              "the part bbox; pass --stock-from (or --rest-from) so every "
+              "below-floor vertex inside the stock box is dropped",
+              file=sys.stderr)
     steep_paths, _src_fl_steep, n_floor_steep = floor_net(
-        steep_paths, _src_gs_steep, floor_z, (rxmin, rxmax, rymin, rymax))
+        steep_paths, _src_gs_steep, floor_z, (rxmin, rxmax, rymin, rymax),
+        stock_box=floor_box, tool_r=0.5 * tool[1])
     shallow_paths, src_shallow, n_floor_shallow = floor_net(
-        shallow_paths, src_shallow, floor_z, (rxmin, rxmax, rymin, rymax))
+        shallow_paths, src_shallow, floor_z, (rxmin, rxmax, rymin, rymax),
+        stock_box=floor_box, tool_r=0.5 * tool[1])
     # row / run index per EMITTED path (vertex_net splits runs, so the
     # pre-net row_of / s_runs indices no longer align with k)
     row_of = [row_of_pre[s] for s in src_shallow]
