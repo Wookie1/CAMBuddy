@@ -55,8 +55,10 @@ _STOCK_INPUTS = {
 # roughing tool + cutting data inputs (defaults mirror adaptive_rough);
 # the slope_split_finish action prefixes them with "rough_"
 _ROUGHING_INPUTS = {
-    "tool_type": {"type": "string", "enum": ["flat", "bull", "ball"],
-                  "default": "bull", "title": "Tool type"},
+    "tool_type": {"type": "string", "enum": ["flat", "bull"],
+                  "default": "bull", "title": "Tool type",
+                  "description": "roughing end mill kind; a ball is refused "
+                                 "- adaptive roughing runs flat or bull only"},
     "tool_diameter": {"type": "number", "minimum": 1.0,
                       "maximum": 32.0, "default": 12.7},
     "corner_radius": {"type": "number", "minimum": 0.0,
@@ -287,7 +289,8 @@ def validate_inputs(values, action=ACTION):
         if v is None:
             continue
         if "enum" in s and v not in s["enum"]:
-            return False, "input_out_of_range", "%s=%r not in enum" % (name, v)
+            return False, "input_out_of_range", "%s=%r not in enum %s" % (
+                name, v, s["enum"])
         if isinstance(s.get("minimum"), (int, float)) and \
                 isinstance(v, (int, float)) and v < s["minimum"]:
             return False, "input_out_of_range", \
@@ -296,12 +299,11 @@ def validate_inputs(values, action=ACTION):
                 isinstance(v, (int, float)) and v > s["maximum"]:
             return False, "input_out_of_range", \
                 "%s=%s above maximum %s" % (name, v, s["maximum"])
-    # tool shape sanity (per action's own tool inputs)
+    # tool shape sanity (per action's own tool inputs; ball was dropped from
+    # the roughing enum in RR1a: the engine's rough cannot cut with a ball)
     if "tool_type" in props:  # adaptive_rough
         kind, dia, cr = out["tool_type"], out["tool_diameter"], \
             out["corner_radius"]
-        if kind == "ball" and abs(cr - dia / 2.0) > 1e-6:
-            out["corner_radius"] = dia / 2.0
         if kind == "bull" and not (0.0 < cr < dia / 2.0):
             return False, "input_out_of_range", \
                 "bull corner radius must satisfy 0 < cr < dia/2"
@@ -310,8 +312,6 @@ def validate_inputs(values, action=ACTION):
     if "rough_tool_type" in props:  # slope_split_finish roughing tool
         kind, dia, cr = out["rough_tool_type"], \
             out["rough_tool_diameter"], out["rough_corner_radius"]
-        if kind == "ball" and abs(cr - dia / 2.0) > 1e-6:
-            out["rough_corner_radius"] = dia / 2.0
         if kind == "bull" and not (0.0 < cr < dia / 2.0):
             return False, "input_out_of_range", \
                 "rough bull corner radius must satisfy 0 < cr < dia/2"
