@@ -1083,6 +1083,8 @@ def _main():
                test_rough_rt_entries, test_rapid_swept_clear_catches_diagonal_climb,
                test_se2_side_entries_only_through_cleared,
                test_hr1_rings_after_a2d,
+               test_dt1_nn_order_ties_stable,
+               test_dt1_synthetic_rough_twice_identical,
                test_stl_cache_keyed_by_content):
         try:
             fn()
@@ -1432,6 +1434,81 @@ def test_hr1_rings_after_a2d():
             "no level had both a2d and hug-ring cutting moves: test vacuous"
     print("PASS hr1 rings after a2d: %d level(s) with ring+a2d moves, every "
           "ring follows all a2d at its Z" % n_both)
+
+
+def test_dt1_nn_order_ties_stable():
+    """Task DT1: a tie in the NN travel order must be broken by a stable
+    key (region index, then coordinates), NEVER by candidate iteration
+    order. Synthetic equal-distance regions: pa=(0,5) and pb=(0,-5) are
+    exactly 5 mm from pos (0,0). Main's inline loop took the FIRST minimum
+    in list order, so swapping two tied entry candidates changed the rapid
+    target - reproduced here with a copy of main's loop (the test fails if
+    ties resolve by iteration order). _nn_order must return the same order
+    and end position regardless of candidate/phase list order."""
+    import math as _m
+    from engine.rough import _nn_order
+    pa, pb, far = (0.0, 5.0), (0.0, -5.0), (50.0, 0.0)
+    # entry-point tie inside one region: same set, opposite list order
+    o1, e1 = _nn_order([0], [[pa, pb]], (0.0, 0.0))
+    o2, e2 = _nn_order([0], [[pb, pa]], (0.0, 0.0))
+    assert o1 == o2 == [0] and e1 == e2 == pb, \
+        "entry tie not resolved by (dist,x,y): %s vs %s" % (e1, e2)
+    # region tie: same result whatever order the phase enumerates in
+    r1, _ = _nn_order([0, 1], [[pa], [pb]], (0.0, 0.0))
+    r2, _ = _nn_order([1, 0], [[pa], [pb]], (0.0, 0.0))
+    assert r1 == r2 == [0, 1], \
+        "region tie not resolved by lowest index: %s vs %s" % (r1, r2)
+
+    def _main_nn(phase, cand, pos):  # main's pre-DT1 loop, verbatim
+        out = []
+        remaining = list(phase)
+        while remaining:
+            k = remaining[0] if pos is None else min(remaining, key=lambda k:
+                min(_m.dist(pos, p) for p in cand[k]))
+            out.append(k)
+            remaining.remove(k)
+            pos = min(cand[k], key=lambda p: _m.dist(pos, p)) \
+                if pos is not None else cand[k][0]
+        return out, pos
+    m1, me1 = _main_nn([0], [[pa, pb]], (0.0, 0.0))
+    m2, me2 = _main_nn([0], [[pb, pa]], (0.0, 0.0))
+    assert me1 != me2, \
+        "test vacuous: main's loop did not exhibit the iteration-order tie"
+    print("PASS dt1 nn tie stability: ties resolve by (dist, index/x/y); "
+          "main's loop resolved the same tie by list order (%s vs %s)"
+          % (me1, me2))
+
+
+def test_dt1_synthetic_rough_twice_identical():
+    """Task DT1: same code + same inputs -> identical emitted move lists.
+    Small synthetic part (hr1 slab: 40x32 top Z6, central wall + two fins)
+    roughed TWICE in-process on fresh state; the move lists must compare
+    equal element for element (rapids included)."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    from opencamlib import ocl
+    import engine.rough as R
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "dt1_synth.stl")
+        _write_stl(stl, _box_tris(-20.0, 20.0, -16.0, 16.0, 0.0, 6.0)
+                   + _box_tris(-1.0, 1.0, -16.0, 16.0, 6.0, 12.0)
+                   + _box_tris(-8.0, -1.0, -4.0, 4.0, 6.0, 12.0)
+                   + _box_tris(1.0, 8.0, -4.0, 4.0, 6.0, 12.0))
+        outs = []
+        for _run in range(2):
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            mv, _st = R.rough(surf, (-24.0, 24.0, -20.0, 20.0, 6.0, 16.0),
+                              3.0, 6.0, leave=0.381, axial_leave=0.381,
+                              stepdown=4.0, stepup=10.0, stepover=2.0 / 6.0,
+                              tolerance=0.05, threads=4, stock_cell=0.5,
+                              min_rest=0.5, corner_r=0.0, stl_path=stl)
+            assert mv, "no moves"
+            outs.append(repr(mv))
+        assert outs[0] == outs[1], \
+            "synthetic rough: two in-process runs emitted different moves"
+    print("PASS dt1 twice-identical synthetic rough: 2 runs emitted "
+          "identical move lists (%d chars of moves)" % len(outs[0]))
 
 
 if __name__ == "__main__":
