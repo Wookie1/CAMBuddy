@@ -1333,6 +1333,69 @@ def test_rr1c_narrow_pocket_side_entry():
     assert not deep, "plunge/deep entry: %s" % deep[:3]
 
 
+def test_rr1c2_cf_rapid_shapes_clear_stock():
+    """RR1c-2 item 3: the 7 zmap rapid collisions in RR1b's Core Front rest
+    program were diagonal G0s leaving a low cutting Z across standing stock.
+    Synthetic two-zone scene (deep south bay cut first, shallower north bay
+    entered across the 29.8 step wall): every emitted G0, swept at 0.2 mm
+    and checked against LIVE stock with the ball disk, must stay clear."""
+    try:
+        from engine import rest_rough as rr
+        from engine import entry_depth as ed
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    box = _rr1c_boxes()
+    tris = []
+    tris += box(0, 4, 0, 60, 20, 30)
+    tris += box(76, 80, 0, 60, 20, 30)
+    tris += box(4, 76, 0, 4, 20, 30)
+    tris += box(4, 76, 41, 60, 20, 30)
+    tris += box(4, 76, 4, 25, 25.0, 26.4)     # deep south bay floor
+    tris += box(4, 76, 25, 29, 26.4, 29.8)    # step wall between the bays
+    tris += box(4, 76, 29, 41, 25.0, 26.8)    # shallower north bay floor
+    surf = _rr1c_surf(tris)
+    cell = 0.5
+    nx, ny = int(80 / cell), int(60 / cell)
+    cxv = (np.arange(nx) + 0.5) * cell
+    cyv = (np.arange(ny) + 0.5) * cell
+    X, Y = np.meshgrid(cxv, cyv)
+    A = np.full((ny, nx), 26.0)
+    A[(X >= 4) & (X <= 76) & (Y >= 4) & (Y <= 29)] = 30.0   # south + wall
+    A[(X >= 4) & (X <= 76) & (Y > 29) & (Y <= 41)] = 27.3   # north stock
+    moves, stats = rr.rest_rough(
+        surf, (A, 0.0, 0.0, cell), ("ball", 9.525), floor_z=26.4,
+        stepdown=2.0, ae=1.905, rest_leave=0.2, min_excess=0.4,
+        min_helix_r=1.903, ramp_angle_deg=2.0, cut_feed=2280.0,
+        ramp_feed=850.0)
+    assert moves, "no moves emitted"
+    assert len(stats["zones"]) >= 2, \
+        "both bays must be entered (diagonal is zone-to-zone): %r" % (
+            [z["bbox"] for z in stats["zones"]],)
+    live = ed.LiveStock(A, 0.0, 0.0, cell, 9.525 / 2.0)
+    prev = None
+    bad = []
+    for m in moves:
+        cur = (m["x"], m["y"], m["z"])
+        if prev is not None:
+            if m["g"] == 0:
+                L = math.hypot(cur[0] - prev[0], cur[1] - prev[1])
+                k = max(int(L / 0.2), 1)
+                for q in range(k + 1):
+                    t_ = q / k
+                    x = prev[0] + (cur[0] - prev[0]) * t_
+                    y = prev[1] + (cur[1] - prev[1]) * t_
+                    z = prev[2] + (cur[2] - prev[2]) * t_
+                    dt = live.disk_top(x, y)
+                    if math.isfinite(dt) and z < dt - 0.005:
+                        bad.append((round(x, 2), round(y, 2), round(z, 2),
+                                    round(dt - z, 3)))
+            else:
+                live.stamp_chord(prev, cur)
+        prev = cur
+    assert not bad, "rapid through live stock: %d pts (worst %.3f)" % (
+        len(bad), max(b[3] for b in bad))
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -1355,7 +1418,8 @@ def _main():
                test_rr1b_rest_rough_synth_pocket,
                test_rr1b_rest_rough_reports_small_pocket,
                test_rr1c_thin_band_inpass_ramp,
-               test_rr1c_narrow_pocket_side_entry):
+               test_rr1c_narrow_pocket_side_entry,
+               test_rr1c2_cf_rapid_shapes_clear_stock):
         try:
             fn()
         except AssertionError as e:

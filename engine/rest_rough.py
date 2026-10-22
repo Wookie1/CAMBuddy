@@ -151,11 +151,12 @@ def zigzag_runs(reg, xs, ys, ae, min_run):
     horiz = (x1v - x0v) >= (y1v - y0v)
     runs = []
     lo, hi = (y0v, y1v) if horiz else (x0v, x1v)
-    offs = list(np.arange(lo + ae / 2.0, hi - ae / 2.0 + 1e-9, ae))
-    if not offs or offs[-1] < hi - ae / 2.0 - 1e-9:
-        offs.append(hi - ae / 2.0)
-    if not offs:
-        offs = [(lo + hi) / 2.0]
+    if hi - lo < ae - 1e-9:
+        offs = [(lo + hi) / 2.0]      # strip narrower than ae: centre run
+    else:
+        offs = list(np.arange(lo + ae / 2.0, hi - ae / 2.0 + 1e-9, ae))
+        if not offs or offs[-1] < hi - ae / 2.0 - 1e-9:
+            offs.append(hi - ae / 2.0)
     for w in offs:
         if horiz:
             sel = np.abs(ys[js] - w) <= CELL / 2.0 + 1e-9
@@ -170,15 +171,15 @@ def zigzag_runs(reg, xs, ys, ae, min_run):
         for g in groups:
             if len(g) < 2:
                 continue
-            a0, a1 = float(xs[g[0]]), float(xs[g[-1]])
             b = float(w)
             if horiz:
+                a0, a1 = float(xs[g[0]]), float(xs[g[-1]])
                 pts = [(a0, b), (a1, b)]
-                L = a1 - a0
             else:
+                # g indexes ROWS here: the run's extent is along ys, not xs
+                a0, a1 = float(ys[g[0]]), float(ys[g[-1]])
                 pts = [(b, a0), (b, a1)]
-                L = a1 - a0
-            if L >= min_run - 1e-9:
+            if a1 - a0 >= min_run - 1e-9:
                 runs.append(pts)
     return runs
 
@@ -283,24 +284,29 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
             return
         px, py, pz = prev["x"], prev["y"], prev["z"]
         h0 = col_top(px, py)
-        zh = max(z, h0 + 0.01)
         if pz < h0 - 1e-9:
             g1(px, py, round(h0 + 0.01, 4), ramp_feed)
+            pz = h0 + 0.01
         n = max(int(math.hypot(x - px, y - py) / CELL), 1)
         hp = -1e30
         for q in range(n + 1):
             t_ = q / n
             hp = max(hp, col_top(px + (x - px) * t_, py + (y - py) * t_))
+        zh = max(z, h0 + 0.01)
         if math.isfinite(hp):
             zh = max(zh, hp + 0.01)
         if pz < zh - 1e-9:
             g0r(px, py, round(zh, 4))
-        # drop at the target column to its own ball-aware clear height
+            pz = zh
+        # whole-G0 swept check (RR1b CF collisions): traverse horizontally at
+        # the safe height FIRST, then drop at the target column - never one
+        # diagonal G0, whose interior drags below standing stock tops.
+        if abs(x - px) > 1e-9 or abs(y - py) > 1e-9:
+            g0r(x, y, round(pz, 4))
         ht = col_top(x, y)
-        g0r(x, y, round(min(zh, ht + 0.01), 4))
-
-    def legal(x, y, z):
-        return _at(Zraw, xs, ys, x, y) <= z - rest_leave + 0.005
+        z_land = round(min(zh, ht + 0.01), 4)
+        if z_land < pz - 1e-9:
+            g0r(x, y, z_land)
 
     cutter_ball = make_cutter("ball", dia)
 
@@ -311,6 +317,19 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
         column is checked against the exact CL too; fail closed."""
         v = batch_drop(surf, cutter_ball, [(x, y)], threads=1)[0]
         return math.isfinite(v) and v <= z + 0.005
+
+    def cl_ok_path(pts):
+        """Exact batched drop-cutter check for a whole EMITTED path (ramp
+        interior, side-entry feed-in, helix, floor circle, feed link): every
+        point must sit at or above the exact part CL (+0.005); fail closed on
+        no contact. The 0.2 mm grid `legal` misses walls between cell
+        centres, so emitted geometry never relies on it alone."""
+        if not pts:
+            return True
+        v = batch_drop(surf, cutter_ball, [(p[0], p[1]) for p in pts],
+                       threads=workers)
+        return all(math.isfinite(zc) and zc <= p[2] + 0.005
+                   for p, zc in zip(pts, v))
 
     def _record(zone_i, t, step, kind_s, depth):
         stats["entry_steps"][step] = stats["entry_steps"].get(step, 0) + 1
@@ -352,21 +371,20 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
             j0 = int(round((ax - xs[0]) / CELL))
             inpass = (0 <= i0 < reg_cur.shape[0]
                      and 0 <= j0 < reg_cur.shape[1] and bool(reg_cur[i0, j0]))
-            if inpass and legal(ax, ay, az):
+            if inpass and cl_ok(ax, ay, az):
                 d = live.disk_depth(ax, ay, az)
-                if math.isfinite(d) and d <= shallow and cl_ok(ax, ay, az):
+                if math.isfinite(d) and d <= shallow:
                     n = max(int(L / CELL), 1)
-                    ok = all(legal(x - ux * L * q / n, y - uy * L * q / n,
-                                  t + L * tanr * q / n)
-                             for q in range(n + 1))
-                    if ok:
+                    rp = [(x - ux * L * (1.0 - q / n),
+                         y - uy * L * (1.0 - q / n),
+                         t + L * tanr * (1.0 - q / n))
+                        for q in range(n + 1)]
+                    if cl_ok_path(rp):
                         g0(ax, ay, clearance)
                         g1(ax, ay, round(az, 4), ramp_feed)
                         for q in range(1, n + 1):
-                            t_ = q / n
-                            g1(x - ux * L * (1.0 - t_),
-                               y - uy * L * (1.0 - t_),
-                               round(t + L * tanr * (1.0 - t_), 4), ramp_feed)
+                            g1(rp[q][0], rp[q][1], round(rp[q][2], 4),
+                               ramp_feed)
                         _record(zi, t, 2, "in-pass-ramp %.1f deg L=%.1f"
                                % (ramp_angle_deg, L), d)
                         return True
@@ -375,9 +393,10 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
 
     def step4(x, y, t, zi):
         """SE2 side entry: descend at a nearby column already cleared at
-        this level (live depth <= shallow) and feed in horizontally; every
-        path point either runs through stock cleared at that level (live
-        depth <= shallow) or is leave-legal against the part."""
+        this level (live depth <= shallow) and feed in horizontally. Every
+        descent column AND every feed-in point is checked against the EXACT
+        part CL - 'stock cleared at this level' is NOT 'part-legal', so no
+        point is ever skipped because its live stock is gone."""
         for dist in (2.0, 3.5, 5.0, 7.0, 9.0, 11.0, 13.0):
             for q in range(16):
                 a = q * math.pi / 8.0
@@ -385,18 +404,12 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 d = live.disk_depth(sx, sy, t)
                 if not (math.isfinite(d) and d <= shallow):
                     continue
+                if not cl_ok(sx, sy, t):
+                    continue
                 n = max(int(dist / 0.2), 1)
-                ok = True
-                for w in range(n + 1):
-                    t_ = w / n
-                    qx, qy = sx + (x - sx) * t_, sy + (y - sy) * t_
-                    dq = live.disk_depth(qx, qy, t)
-                    if math.isfinite(dq) and dq <= shallow:
-                        continue
-                    if not legal(qx, qy, t):
-                        ok = False
-                        break
-                if not ok:
+                fp = [(sx + (x - sx) * w / n, sy + (y - sy) * w / n, t)
+                     for w in range(n + 1)]
+                if not cl_ok_path(fp):
                     continue
                 g0(sx, sy, clearance)
                 g1(sx, sy, round(t, 4), ramp_feed)
@@ -429,7 +442,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 if not math.isfinite(z_top) or z_top <= t:
                     break
                 hp = helix_points(cx0, cy0, rr, z_top, t, ramp_angle_deg)
-                if all(legal(px, py, pz) for px, py, pz in hp):
+                if cl_ok_path(hp):
                     d0 = live.disk_depth(hp[1][0], hp[1][1], hp[1][2])
                     if math.isfinite(d0) and d0 <= zb_floor:
                         g0(cx0, cy0, clearance)
@@ -443,6 +456,16 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
 
     Dz = None            # distance transform of the current level region
     reg_cur = None
+
+    def enter(x, y, t, ux, uy, zi):
+        """ONE ladder entry (steps 1, 2, 4) used by both the zone entry and
+        the per-pass links (RR1c_DIAG 3): shallow descent, in-pass ramp along
+        (ux, uy) when a direction exists, SE2 side entry."""
+        if step1(x, y, t, zi):
+            return True
+        if abs(ux) + abs(uy) > 0.5 and step2(x, y, t, ux, uy, zi):
+            return True
+        return step4(x, y, t, zi)
 
     for zi, z in enumerate(zones):
         # centres must sit on the zone itself: R-dilation admitted foreign
@@ -519,10 +542,14 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 if dl > 1e-9:
                     ux, uy = ((p0[1][0] - p0[0][0]) / dl,
                              (p0[1][1] - p0[0][1]) / dl)
-            if step1(p0[0][0], p0[0][1], t0, zi):
-                entered = True
-            elif abs(ux) + abs(uy) > 0.5 and step2(p0[0][0], p0[0][1], t0,
-                                                   ux, uy, zi):
+            if abs(ux) + abs(uy) == 0.0:
+                # argmax-fallback p0 carries no direction: use the region's
+                # own long axis for the step-2 ramp (RR1c_DIAG 1)
+                jsr, isr = np.nonzero(reg0)
+                if len(jsr) >= 2:
+                    ux, uy = ((1.0, 0.0) if xs[isr].max() - xs[isr].min()
+                             >= ys[jsr].max() - ys[jsr].min() else (0.0, 1.0))
+            if enter(p0[0][0], p0[0][1], t0, ux, uy, zi):
                 entered = True
             if not entered:
                 # step 3: zig-zag along the zone's long axis (only if every
@@ -541,13 +568,10 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                         runs0[ki][0][0] - p0[0][0],
                         runs0[ki][0][1] - p0[0][1]))
                     rfirst = runs0[k0]
-                    if (step1(rfirst[0][0], rfirst[0][1], t0, zi)
-                            or step2(rfirst[0][0], rfirst[0][1], t0, axu[0],
-                                    axu[1], zi)):
+                    if enter(rfirst[0][0], rfirst[0][1], t0, axu[0], axu[1],
+                            zi):
                         entered = True
                         mode = "zigzag"
-            if not entered and step4(p0[0][0], p0[0][1], t0, zi):
-                entered = True
             if not entered:
                 hc = helix_entry(p0[0][0], p0[0][1], t0, zi)
                 if hc is not None:
@@ -579,7 +603,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
             rc = r_h
             while rc >= min_helix_r:
                 cp = circle_points(cx, cy, rc, t0, theta0)
-                if all(legal(px, py, pz) for px, py, pz in cp):
+                if cl_ok_path(cp):
                     for px, py, pz in cp:
                         g1(px, py, pz, ramp_feed)
                     prev = (px, py, pz)
@@ -608,6 +632,10 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 paths = runs0 + rings          # zigzag first, then rings
             else:
                 paths = rings
+            if not paths:
+                # centre-line pass: a region thinner than ae/2 max-distance
+                # has NO offset rings at all - cut its centre runs instead
+                paths = zigzag_runs(reg, xs, ys, ae, 2 * CELL)
             cut_here = 0
             skipped = 0
             while paths:
@@ -619,14 +647,13 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                     pts = pts[::-1]
                 if math.hypot(pts[0][0] - prev[0], pts[0][1] - prev[1]) > 1e-6:
                     # feed link only where the straight path keeps leave above
-                    # the exact part CL; else the RR1c ladder (step 1 shallow
-                    # descent / step 2 in-pass ramp / step 4 SE2), else skip.
+                    # the EXACT part CL (batched drop-cutter, same check as the
+                    # passes); else the ONE RR1c ladder enter(), else skip.
                     n = max(int(d0 / 0.25), 1)
-                    clear = all(
-                        legal(prev[0] + (pts[0][0] - prev[0]) * q / n,
-                              prev[1] + (pts[0][1] - prev[1]) * q / n, t)
-                        for q in range(n + 1))
-                    if clear:
+                    lp = [(prev[0] + (pts[0][0] - prev[0]) * q / n,
+                         prev[1] + (pts[0][1] - prev[1]) * q / n, t)
+                        for q in range(n + 1)]
+                    if cl_ok_path(lp):
                         g1(pts[0][0], pts[0][1], round(t, 4), ramp_feed)
                     else:
                         ldx = ldy = 0.0
@@ -636,11 +663,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                             if dl > 1e-9:
                                 ldx, ldy = ((pts[1][0] - pts[0][0]) / dl,
                                           (pts[1][1] - pts[0][1]) / dl)
-                        if not (step1(pts[0][0], pts[0][1], t, zi)
-                               or (abs(ldx) + abs(ldy) > 0.5
-                                   and step2(pts[0][0], pts[0][1], t, ldx, ldy,
-                                          zi))
-                               or step4(pts[0][0], pts[0][1], t, zi)):
+                        if not enter(pts[0][0], pts[0][1], t, ldx, ldy, zi):
                             skipped += 1
                             stats["passes_skipped"].append({
                                 "zone": zi, "t": round(t, 3),
