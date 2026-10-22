@@ -19,6 +19,36 @@ import threading
 ROUGH_ENGAGE_FACTOR = 1.2
 FINISH_ENGAGE_FACTOR = 1.5
 
+# ---------------------------------------------------------------------------
+# Task RR1b: T20 ball rest-rough defaults (parameters + defaults only).
+# The engine (engine/cli.py rest-rough) takes every one of these as an
+# explicit parameter and holds no T20 numbers; the connector carries them
+# here so a rest-rough run of Core Front with T20 is fully specified by
+# defaults. Judging follows the same tool contract as the T20 finish
+# (zmap --tool ball --dia 9.525 --flute 22.225 --shank-dia 9.525
+# --holder BT30-ER20-60 --stickout 46.2).
+# ---------------------------------------------------------------------------
+REST_ROUGH_DEFAULTS = {
+    "rest_rough_tool": "ball",
+    "rest_rough_tool_number": 20,          # X7 T20: ball D9.525
+    "rest_rough_diameter": 9.525,
+    "rest_rough_flute": 22.225,
+    "rest_rough_shank_dia": 9.525,
+    "rest_rough_holder": "BT30-ER20-60",
+    "rest_rough_stickout": 46.2,
+    "rest_rough_stepdown": 2.0,           # mm per level (2.0-stepdown terraces)
+    "rest_rough_ae": 1.905,              # mm radial engagement
+    "rest_rough_leave": 0.2,             # mm leave for the T20 finish
+    "rest_rough_min_excess": 0.5,        # mm stock above part = rest material
+    "rest_rough_min_helix_r": 1.903,     # mm = (leave/2)*(1+sqrt(2))
+    "rest_rough_ramp_angle_deg": 2.0,
+    "rest_rough_cut_feed": 2280.0,       # mm/min
+    "rest_rough_ramp_feed": 850.0,      # mm/min
+    "rest_rough_spindle": 9500,         # rpm
+    "rest_rough_floor_z": 24.765,       # mm part floor
+    "rest_rough_zb_floor": 0.5,         # mm axial-plunge floor
+}
+
 
 class Cancelled(Exception):
     pass

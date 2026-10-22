@@ -18,6 +18,8 @@ import math
 import os
 import sys
 
+import numpy as np  # RR1b rest-rough tests (entry_depth needs numpy anyway)
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, "/Applications/VibeCAD.app/Contents/Resources/lib")
 
@@ -1067,6 +1069,145 @@ def test_rough_rapids_clear_stock():
           "lifted to verified heights" % (len(moves), stats["n_rapid_bumps"]))
 
 
+def _rr1b_pocket_scene(pocket):
+    """Synthetic frame + pocket scene for rest-rough tests.
+    Frame [0,40]^2 z 20..30, square pocket `pocket`=(lo,hi) down to floor 24.
+    Returns (surf, A, x0, y0, cell): the live stock map is uniform 30.0
+    (the pocket carries a 6 mm rest band; the frame top is already at part).
+    """
+    from opencamlib import ocl
+
+    def box(xmin, xmax, ymin, ymax, zmin, zmax):
+        v = {(sx, sy, sz): (xmin if sx < 0 else xmax,
+                            ymin if sy < 0 else ymax,
+                            zmin if sz < 0 else zmax)
+             for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)}
+
+        def q(p1, p2, p3, p4):
+            return [(p1, p2, p3), (p1, p3, p4)]
+
+        t = []
+        A_, B_, C_, D_ = (v[(-1, -1, 1)], v[(1, -1, 1)], v[(1, 1, 1)],
+                          v[(-1, 1, 1)])
+        E_, F_, G_, H_ = (v[(-1, -1, -1)], v[(1, -1, -1)], v[(1, 1, -1)],
+                          v[(-1, 1, -1)])
+        t += q(A_, B_, C_, D_) + q(E_, H_, G_, F_)
+        t += q(A_, E_, F_, B_) + q(D_, C_, G_, H_)
+        t += q(A_, D_, H_, E_) + q(B_, F_, G_, C_)
+        return t
+
+    lo, hi = pocket
+    tris = []
+    tris += box(0, lo, 0, 40, 20, 30)
+    tris += box(hi, 40, 0, 40, 20, 30)
+    tris += box(lo, hi, 0, lo, 20, 30)
+    tris += box(lo, hi, hi, 40, 20, 30)
+    tris += box(lo, hi, lo, hi, 20, 24)      # pocket floor slab
+    surf = ocl.STLSurf()
+    for t in tris:
+        surf.addTriangle(ocl.Triangle(*[ocl.Point(*p) for p in t]))
+    cell = 0.5
+    n = int(40 / cell)
+    cx = (np.arange(n) + 0.5) * cell
+    X, Y = np.meshgrid(cx, cx)
+    A = np.full((n, n), 30.0)
+    return surf, (A, 0.0, 0.0, cell), lo, hi
+
+
+def test_rr1b_rest_rough_synth_pocket():
+    """RR1b: synthetic pocket with a 6 mm rest band. The rest-rough enters
+    with a 2-deg helix, levels up, and leaves <= 0.2 mm (+ tolerance)
+    everywhere the T20 ball reaches on the pocket floor; 0 gouges against
+    the exact CL; 0 axial plunges (FE5/ZB entry depth <= 0.5 mm)."""
+    try:
+        from engine import rest_rough as rr
+        from engine import entry_depth as ed
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing on main (%s)" % e)
+    surf, stock, lo, hi = _rr1b_pocket_scene((10.0, 30.0))
+    moves, stats = rr.rest_rough(
+        surf, stock, ("ball", 9.525), floor_z=24.0, stepdown=2.0, ae=1.905,
+        rest_leave=0.2, min_excess=0.5, min_helix_r=1.903, ramp_angle_deg=2.0,
+        cut_feed=2280.0, ramp_feed=850.0)
+    assert moves, "no moves emitted"
+    assert len(stats["zones"]) == 1 and not stats["no_entry"], \
+        "expected the pocket entered by helix: %s" % stats["no_entry"]
+    z = stats["zones"][0]
+    assert z["r_max_cl"] >= 1.903 and "helix" in z
+    assert z["levels"] >= 3, "expected >= 3 levels, got %r" % z["levels"]
+    below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
+    assert below == 0, "gouge: %d pts below exact CL (worst %.3f)" % (below,
+                                                                       worst)
+    # FE5/ZB: every entry against live stock <= 0.5 mm, finite
+    live = ed.LiveStock(stock[0], *stock[1:], 9.525 / 2.0)
+    mv = [dict(m, line=i) for i, m in enumerate(moves)]
+    entries = ed.estimate_entries(mv, live)
+    deep = [e for e in entries
+            if not math.isfinite(e["depth_mm"]) or e["depth_mm"] > 0.5]
+    assert not deep, "deep entry: %s" % deep[:3]
+    # leftover on the pocket floor after the program, read from the stamped
+    # live grid; only where the ball can hold leave at all (Zd legal CL)
+    live2 = ed.LiveStock(stock[0], *stock[1:], 9.525 / 2.0)
+    prev = None
+    for m in moves:
+        cur = (m["x"], m["y"], m["z"])
+        if prev is not None and m["g"] == 1:
+            live2.stamp_chord(prev, cur)
+        prev = cur
+
+    def surf_at(x, y):
+        i = int(math.floor((x - live2.x0) / live2.f)) + live2.pad
+        j = int(math.floor((y - live2.y0) / live2.f)) + live2.pad
+        return float(live2.L[j, i])
+
+    xs = np.arange(0.1, 40.0, rr.CELL)
+    ys = np.arange(0.1, 40.0, rr.CELL)
+    Zd = rr.part_cl(surf, 9.525, xs, ys)
+    worst_strict = -9.0
+    worst_terr = -9.0
+    checked = 0
+    for px in (12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0):
+        for py in (12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0):
+            v = rr._at(Zd, xs, ys, px, py)
+            if v > 24.0 + 0.2 + rr.CELL:
+                continue          # ball cannot hold leave at this point at all
+            top = surf_at(px, py)
+            assert math.isfinite(top), "no stock data at %.1f,%.1f" % (px, py)
+            if v <= 24.0 + 0.2:
+                worst_strict = max(worst_strict, top - 24.0)
+                checked += 1
+            else:
+                # legally only reachable at a higher level than the deepest:
+                # record the terrace height (no strict bound here)
+                worst_terr = max(worst_terr, top - 24.0)
+    assert checked >= 15, "leftover probe checked only %d points" % checked
+    assert worst_strict <= 0.4, \
+        "rest leaves %.3f mm on the pocket floor (want <= 0.2 + tol)" \
+        % worst_strict
+
+
+def test_rr1b_rest_rough_reports_small_pocket():
+    """RR1b: a closed pocket too small for a CL circle of r 1.903 at leave
+    0.2 is REPORTED, not entered: no feed move goes inside it."""
+    try:
+        from engine import rest_rough as rr
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing on main (%s)" % e)
+    surf, stock, lo, hi = _rr1b_pocket_scene((16.0, 24.0))
+    moves, stats = rr.rest_rough(
+        surf, stock, ("ball", 9.525), floor_z=24.0, stepdown=2.0, ae=1.905,
+        rest_leave=0.2, min_excess=0.5, min_helix_r=1.903, ramp_angle_deg=2.0,
+        cut_feed=2280.0, ramp_feed=850.0)
+    assert not stats["zones"], "small pocket must not be entered"
+    assert len(stats["no_entry"]) == 1, \
+        "expected the pocket reported: %r" % stats["no_entry"]
+    assert stats["no_entry"][0]["r_max_cl"] < 1.903
+    for m in moves:
+        if m["g"] == 1:
+            assert not (lo < m["x"] < hi and lo < m["y"] < hi), \
+                "feed move inside un-enterable pocket: %r" % m
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -1085,7 +1226,9 @@ def _main():
                test_hr1_rings_after_a2d,
                test_hb1v2_flat_floor_circle_after_helix,
                test_stl_cache_keyed_by_content,
-               test_rr1a_rough_cli_refuses_ball):
+               test_rr1a_rough_cli_refuses_ball,
+               test_rr1b_rest_rough_synth_pocket,
+               test_rr1b_rest_rough_reports_small_pocket):
         try:
             fn()
         except AssertionError as e:
@@ -1434,8 +1577,6 @@ def test_hr1_rings_after_a2d():
             "no level had both a2d and hug-ring cutting moves: test vacuous"
     print("PASS hr1 rings after a2d: %d level(s) with ring+a2d moves, every "
           "ring follows all a2d at its Z" % n_both)
-
-
 def test_hb1v2_flat_floor_circle_after_helix():
     """HB1v2: after EVERY helix entry the next emitted moves are ONE full flat
     circle at the helix bottom Z - same centre and radius as the helix, at the

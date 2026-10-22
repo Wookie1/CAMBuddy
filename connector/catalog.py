@@ -19,7 +19,11 @@ MM_FIELDS = ("stock_xy", "stock_x", "stock_y", "stock_top", "stock_bottom",
              # slope_split_finish:
              "stepover", "rough_tool_diameter", "rough_corner_radius",
              "rough_flute_length", "rough_stepdown", "rough_optimal_load",
-             "rough_stock_to_leave", "rough_rest_stepup", "min_rest")
+             "rough_stock_to_leave", "rough_rest_stepup", "min_rest",
+             # rest-rough (engine.cli rest-rough):
+             "rest_rough_ae", "rest_rough_stepdown", "rest_rough_leave",
+             "rest_rough_min_excess", "rest_rough_min_helix_r",
+             "rest_rough_cut_feed", "rest_rough_ramp_feed")
 
 _ORIENTATION = {"type": "string",
                 "enum": ["as_modeled", "flip_x_180", "flip_y_180",
@@ -123,6 +127,52 @@ ROUGHING_ACTION = {
                "within_0p5mm; files: .nc, check.json, preview.png."),
 }
 
+# rest-rough (engine.cli rest-rough) parameters + CONNECTOR DEFAULTS: James's
+# confirmed T20 values (3/8" ball = tools/x7_tools.json #20). Parameters only -
+# the engine takes them as arguments and carries no machine-specific numbers.
+_REST_ROUGH_INPUTS = {
+    "rest_rough_tool_number": {"type": "integer", "minimum": 1, "maximum": 999,
+                               "default": 20,
+                               "description": "ball tool for the rest-rough pass "
+                                            "(default 20 = 3/8\" ball, tools/"
+                                            "x7_tools.json: dia 9.525, flute "
+                                            "22.225, stickout 46.2, holder "
+                                            "BT30-ER20-60)"},
+    "rest_rough_ae": {"type": "number", "minimum": 0.1, "maximum": 9.525,
+                      "default": 1.905,
+                      "description": "max radial engagement / stepover mm "
+                                    "(20 % of D 9.525)"},
+    "rest_rough_stepdown": {"type": "number", "minimum": 0.1, "maximum": 20.0,
+                            "default": 2.0,
+                            "description": "level stepdown mm"},
+    "rest_rough_leave": {"type": "number", "minimum": 0.05, "maximum": 2.0,
+                         "default": 0.2,
+                         "description": "stock left on the part for the finish, "
+                                        "mm"},
+    "rest_rough_min_excess": {"type": "number", "minimum": 0.1,
+                              "maximum": 20.0, "default": 0.5,
+                              "description": "zone threshold mm: live stock "
+                                           "above the T20 ball CL surface that "
+                                           "must come off before the finish"},
+    "rest_rough_min_helix_r": {"type": "number", "minimum": 0.5,
+                               "maximum": 4.7625, "default": 1.903,
+                               "description": "smallest largest-CL-circle radius "
+                                            "mm that earns a 2-deg helix entry; "
+                                            "pockets below it are reported, not "
+                                            "entered"},
+    "rest_rough_cut_feed": {"type": "number", "minimum": 10.0,
+                            "maximum": 10000.0, "default": 2280.0,
+                            "description": "cutting feed mm/min (aluminium, "
+                                         "0.06 mm/z x 4 flutes x 9500 rpm)"},
+    "rest_rough_ramp_feed": {"type": "number", "minimum": 10.0,
+                             "maximum": 10000.0, "default": 850.0,
+                             "description": "ramp / helix feed mm/min"},
+    "rest_rough_spindle": {"type": "integer", "minimum": 100,
+                           "maximum": 30000, "default": 9500,
+                           "description": "spindle rpm (vc ~285 m/min at D "
+                                        "9.525 in aluminium)"},
+}
+
 SLOPE_ACTION_SPEC = {
     "name": SLOPE_ACTION,
     "title": "Slope-split finishing",
@@ -192,6 +242,11 @@ SLOPE_ACTION_SPEC = {
                                         "triggers the rest pass; minimum 0.1"},
             # roughing tool + cutting data (defaults as in adaptive_rough)
             **{"rough_" + k: v for k, v in _ROUGHING_INPUTS.items()},
+            # rest-rough parameters + defaults live in _REST_ROUGH_INPUTS
+            # (above) and runner.REST_ROUGH_DEFAULTS: they are NOT merged
+            # into this action's inputs - the action-shape contract caps
+            # inputs at 30 (test_action_shape) and rest-rough is a separate
+            # engine.cli command.
         },
         "required": ["model"],
     },
