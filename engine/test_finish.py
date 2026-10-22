@@ -1535,6 +1535,67 @@ def test_floor_dip_split_finish_and_rest():
                      stats["n_floor_dropped"], len(kept)))
 
 
+def two_step_stl(path, half_x=6.0, half_y=4.0, top=10.0, low_z=3.0):
+    """Block with a step down along Y: tall slab y in [-half_y, 0] up to
+    top, low slab y in [0, half_y] up to low_z (below the requested
+    floor_z) - the FL1b shape: the raster pad rows just past y=half_y roll
+    off the LOW step edge at CL ~low_z, between the part bbox and the
+    stock box where stock stands."""
+    tris = []
+    tris += _box(-half_x, half_x, -half_y, 0.0, 0.0, top)
+    tris += _box(-half_x, half_x, 0.0, half_y, 0.0, low_z)
+    return write_stl(path, tris)
+
+
+def test_floor_pad_rows_inside_stock_box():
+    """FL1b: part bbox (+-6 x +-4) smaller than the stock box (+-12 x +-8).
+    The raster's pad row at y=half_y+0.1 rides the low step edge (z~3)
+    BELOW floor_z=5 - inside the stock box, so it cuts stock the floor
+    forbids: it must be DROPPED (FL1's bbox exemption is tightened to
+    outside stock_box + tool radius). Fails on main's code: FL1 exempted
+    every vertex outside the part bbox, so this pad row survived as feed
+    moves below floor_z inside the stock box."""
+    floor_z = 5.0
+    q, hy, top, low = 6.0, 4.0, 10.0, 3.0
+    sq, shy = 12.0, 8.0  # stock box: strictly bigger than the part bbox
+    with tempfile.TemporaryDirectory() as td:
+        stl = two_step_stl(os.path.join(td, "step.stl"), q, hy, top, low)
+        surf = model.load_surf(stl)
+        X, Y, nx, ny = _grid((-sq, sq, -shy, shy))
+        stock = np.full(X.shape, top + 0.381)
+        np.save(os.path.join(td, "stock.npy"), stock)
+        with open(os.path.join(td, "stock.json"), "w") as fh:
+            json.dump({"x0": -sq, "y0": -shy, "cell": CELL}, fh)
+        cases = (("finish", dict(tool=("ball", 6.0, 0.0),
+                                  stock_from=os.path.join(td, "stock.npy"))),
+                 ("rest", dict(tool=("ball", 3.0, 0.0),
+                               rest_from=os.path.join(td, "stock.npy"),
+                               big_tool=("ball", 6.0, 0.0), min_rest=0.5)))
+        for name, kw in cases:
+            moves, stats = finish(surf, stl_path=stl, floor_z=floor_z,
+                                  threads=4, **kw)
+            feed = [(mv["x"], mv["y"], mv["z"]) for mv in moves
+                    if mv["g"] == 1 and mv.get("z") is not None]
+            assert feed, "%s: no feed moves" % name
+            inbox = [t for t in feed if abs(t[0]) <= sq - 0.5
+                     and abs(t[1]) <= shy - 0.5]
+            below = [t for t in inbox if t[2] < floor_z - 1e-6]
+            assert not below, \
+                "%s: %d feed moves below floor_z inside the stock box " \
+                "(min %.3f at y=%.2f)" % (name, len(below),
+                                           min(t[2] for t in below),
+                                           max(abs(t[1]) for t in below))
+            assert stats.get("n_floor_dropped", 0) > 0, \
+                "%s: n_floor_dropped=0 (pad rows never reached the floor)" \
+                % name
+            kept = [t for t in feed if t[2] >= floor_z]
+            assert kept, "%s: nothing kept above the floor (wholesale drop)" \
+                % name
+            print("floor-pad %s: feed=%d inbox=%d dropped=%d kept_above=%d"
+                  % (name, len(feed), len(inbox), stats["n_floor_dropped"],
+                     len(kept)))
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -1556,7 +1617,8 @@ if __name__ == "__main__":
                test_holder_drop_tall_boss,
                test_holder_stock_ridge_along_path,
                test_shank_t31_wall_13mm,
-               test_floor_dip_split_finish_and_rest):
+               test_floor_dip_split_finish_and_rest,
+               test_floor_pad_rows_inside_stock_box):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))
