@@ -646,21 +646,38 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 paths = rings
             if not paths:
                 if maxc < ae / 2.0:
-                    # RR1c-3: thin level strip (max distance < ae/2) - cut
-                    # ALONG ITS OWN CENTRE LINE: the ordered iso-polylines of
-                    # the distance field at c = max(maxDz/2, CELL/2). The
-                    # axis-aligned zig-zag rows crossed a curved 1-2 cell
-                    # strip in < min_run groups and cut nothing (DIAG (a)).
+                    # RR1c-3b: thin level strip (max distance < ae/2). The
+                    # iso at c = max(maxDz/2, CELL/2) over comp=reg has no
+                    # valid marching-squares cell: every node inside the strip
+                    # sits on the quantised Dz plateau (>= c) and every
+                    # mixed-case cell straddles the boundary (corners outside
+                    # comp), so RR1c-3 traced nothing and cut 0 mm (DIAG (a)).
+                    # Trace that iso over a 1-cell DILATED comp instead: the
+                    # ordered loop bounding the strip. Keep it only when every
+                    # point stays leave-legal against the exact CL (on a
+                    # concave floor the edges rise above CL + leave), else
+                    # fall back to the axis zig-zag, whose centre run still
+                    # hits a straight thin strip on its own centre line.
                     c_mid = max(maxc / 2.0, CELL / 2.0)
+                    dil = ndimage.binary_dilation(reg, structure=np.ones((3, 3)))
                     for P, closed, _K in march_level(Dz, xs, ys, c_mid,
-                                                    comp=reg):
+                                                    comp=dil):
                         pts = [(float(a), float(b)) for a, b in P]
                         if len(pts) < 2:
                             continue
                         if closed:
                             pts = pts + [pts[0]]
                         paths.append(pts)
-                        clneed.append(True)   # every point CL-checked below
+                    if paths:
+                        vp = batch_drop(surf, cutter_ball,
+                                       [(a, b) for pth in paths for a, b in pth],
+                                       threads=workers)
+                        if not all(math.isfinite(zc) and zc <= t - rest_leave
+                                 + 0.005 for zc in vp):
+                            paths = []   # strip edges above CL + rest leave
+                    if not paths:
+                        paths = zigzag_runs(reg, xs, ys, ae, 2 * CELL)
+                    clneed = [True] * len(paths)   # every point CL-checked
                 else:
                     paths = zigzag_runs(reg, xs, ys, ae, 2 * CELL)
                     clneed = [False] * len(paths)
