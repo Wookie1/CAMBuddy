@@ -2320,14 +2320,34 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                 if _unres and (d > ZB_FLOOR_BALL or live.disk_depth(
                         rv[0][0], rv[0][1], rv[0][2]) > ZB_FLOOR_BALL):
                     n_skipped += 1
-                    for q in P:
+                    # FE5f-b: trim ONLY the illegal fragment - keep the rest
+                    # of the pass, re-entered at the next vertex where FE5e's
+                    # rule makes a legal entry (own vertices, forward only:
+                    # both ends of the whole run already failed). No such
+                    # point on the pass -> drop the pass as FE5f did.
+                    j = None
+                    for m in range(1, len(P) - 1):
+                        Lm, fl = _fe5_pick_ramp(live, P[m:], s[m:] - s[m],
+                                               tan_ramp)
+                        if Lm is not None and not fl:
+                            j = m
+                            break
+                    for q in (P if j is None else P[:j]):
                         dq = live.disk_depth(float(q[0]), float(q[1]),
                                             float(q[2]))
                         fe5_skip_pts.append(
                             [round(float(q[0]), 3), round(float(q[1]), 3),
                              round(dq if math.isfinite(dq) else float(d), 3)])
-                    ordered[k] = None
-                    continue
+                    if j is None:
+                        ordered[k] = None
+                        continue
+                    ss = s[j:] - s[j]
+                    rv = _ramp_entry(P[j:], ss, tan_ramp,
+                                    min(Lm, float(ss[-1])))
+                    pth = list(pth)[j:]
+                    total = float(ss[-1])
+                    L0 = live.disk_depth(float(P[j, 0]), float(P[j, 1]),
+                                       float(P[j, 2])) / tan_ramp
                 ordered[k] = rv + list(pth[1:])
                 ramp_cnt[k] = len(rv) - 1
                 if len(rv) < 2:
@@ -2479,6 +2499,7 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     stats["fe5_skipped_n"] = n_skipped
     stats["fe5_skipped_clusters"] = _fe5_cluster_skips(
         fe5_skip_pts, 2.0 * float(tool[1]))
+    stats["fe5_skip_pts"] = fe5_skip_pts[:400]  # FE5f-b: fragment vertices
     if flute_mm is not None and shank_dia is not None:
         # S4: flute/shank-aware pass (tools/x7_tools.json or --flute/--shank)
         stats["flute_mm"] = round(float(flute_mm), 4)

@@ -1794,6 +1794,29 @@ def bored_cyl_stl(path, ro=8.0, ri=4.8, h=14.0, n=96):
     return write_stl(path, tris)
 
 
+def plain_cyl_stl(path, ro=18.0, h=20.0, n=96):
+    """FE5f-b: plain vertical cylinder (radius ro, z 0..h) - the dome/boss
+    surface. The bores are NOT in the part: they stand as tall stock columns
+    (to be drilled), so a raster row crossing them has BOTH ends buried while
+    the middle is clear - the whole-pass-drop trap."""
+    ang = np.linspace(0.0, 2.0 * math.pi, n + 1)[:-1]
+    xo, yo = ro * np.cos(ang), ro * np.sin(ang)
+    tris = []
+    for i in range(n):
+        j = (i + 1) % n
+        mo = (math.cos(ang[i] + ang[j] - math.pi),
+              math.sin(ang[i] + ang[j] - math.pi), 0.0)
+        tris += [((xo[i], yo[i], 0.0), (xo[j], yo[j], 0.0),
+                  (xo[j], yo[j], h), mo),
+                 ((xo[i], yo[i], 0.0), (xo[j], yo[j], h),
+                  (xo[i], yo[i], h), mo),
+                 ((xo[i], yo[i], h), (xo[j], yo[j], h), (0.0, 0.0, h),
+                  (0.0, 0.0, 1.0)),
+                 ((xo[i], yo[i], 0.0), (0.0, 0.0, 0.0),
+                  (xo[j], yo[j], 0.0), (0.0, 0.0, -1.0))]
+    return write_stl(path, tris)
+
+
 def test_fe5f_skip_bore_entries():
     """FE5f: a boss with a 10 mm-ish THROUGH bore full of stock (stock top
     above the boss top; the 9.525 ball has ~0.038 mm radial room per side).
@@ -1865,6 +1888,184 @@ def test_fe5f_skip_bore_entries():
                  clusters[0]["center"], clusters[0]["max_depth_mm"]))
 
 
+def _g1_samples(moves, step=0.25):
+    """XY samples every <= step mm along every emitted G1 segment (coverage
+    checks must not read sparse move ENDPOINTS as gaps)."""
+    out = []
+    prev = None
+    for m in moves:
+        cur = (m["x"], m["y"])
+        if prev is not None and m["g"] == 1:
+            n = max(1, int(math.ceil(math.dist(prev, cur) / step)))
+            out.extend((prev[0] + (cur[0] - prev[0]) * t / n,
+                        prev[1] + (cur[1] - prev[1]) * t / n)
+                       for t in range(1, n + 1))
+        prev = cur
+    return np.asarray(out, dtype=float)
+
+
+def test_fe5fb_real_bore_surface_kept():
+    """FE5f-b on the REAL bore geometry (bored_cyl_stl, boss r 18 with one
+    4.8 mm through-bore full of stock, 0.3 finish allowance elsewhere): the
+    boss surface beyond bore + tool + 0.5 mm stays finished (emitted cut
+    points within 1 mm of every such cell) and no skip vertex lies beyond
+    bore + tool + 1 mm of the bore axis. Coordinator: must fail on 1f499f5
+    (whole-pass drop) by assertion where that geometry exposes it."""
+    from engine.finish import finish
+    cell, top, ro, bore_r = 0.5, 14.0, 18.0, 4.8
+    with tempfile.TemporaryDirectory() as td:
+        stl = bored_cyl_stl(os.path.join(td, "bore.stl"), ro=ro, ri=bore_r,
+                            h=top)
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        gx0, gx1, gy0, gy1 = -22.0, 22.0, -22.0, 22.0
+        nx = int(round((gx1 - gx0) / cell))
+        ny = int(round((gy1 - gy0) / cell))
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                             gy0 + (np.arange(ny) + 0.5) * cell)
+        A = np.full(CX.shape, top + 0.3)
+        A[np.hypot(CX, CY) <= bore_r] = top + 2.0   # bore full of stock
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 9.525, 0.0),
+                              stepover=1.5, floor_z=6.0, threads=4,
+                              stock_from=stockp, ramp_angle_deg=2.0)
+        assert moves, "no moves"
+        pts = _g1_samples(moves)
+        keep_r = bore_r + 0.5 * 9.525 + 0.5
+        miss = []
+        for cy in np.arange(-ro + 1.0, ro, 0.5):
+            for cx in np.arange(-ro + 1.0, ro, 0.5):
+                r = math.hypot(cx, cy)
+                if r <= keep_r or r > ro - 1.0:
+                    continue
+                dd = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy).min()
+                if dd > 1.0:
+                    miss.append((round(cx, 2), round(cy, 2), round(dd, 2)))
+        assert not miss, "real bore: %d boss cells beyond bore+tool+0.5 " \
+            "uncovered: %s" % (len(miss), miss[:4])
+        far = [p for p in (stats.get("fe5_skip_pts") or [])
+               if math.hypot(p[0], p[1]) > bore_r + 0.5 * 9.525 + 1.0]
+        assert not far, "real bore: %d skip vertices beyond bore+tool+1: %s" \
+            % (len(far), far[:4])
+        print("fe5fb real bore: surface beyond the bore covered, skips %d"
+              % stats.get("fe5_skipped_n", 0))
+
+
+def test_fe5fb_fragment_trim_keeps_surface():
+    """FE5f/FE5f-b: boss (plain cyl r 18, h 20) with two through-bores'
+    worth of standing stock: columns r 4.8 at (+-12.5, 0) filled to h + 2
+    above the 0.3-mm finish allowance (the 9.525 ball has ~0.038 mm radial
+    room per side; James drills those). A shallow row crossing a column has
+    its entry buried (disk sees the 2-mm-tall column) and no ramp top on
+    that run clears, and neither end does - FE5f must SKIP the entry (never
+    plunge: replay the estimator's LiveStock in emit order, as test_fe5t
+    does, and require every ENTRY - the bottom of a vertical G1 descent -
+    to land at live depth <= the ball floor 0.5 mm) and report it clustered
+    on the column axes. FE5f-b: only the ILLEGAL FRAGMENT may be dropped -
+    every finish-relevant cell of the boss surface beyond bore radius + tool
+    radius + 0.5 mm must still be finished: no skipped vertex there (raw
+    fe5_skip_pts, and the report must expose them whenever passes were
+    dropped), and emitted cut points within one stepover of every such
+    cell. Must FAIL BY ASSERTION on 1f499f5 (whole-pass drop: rows crossing
+    a column lose their whole stripe across the boss - cells beyond both
+    columns unfinished - and raw skip vertices reach past bore + tool +
+    0.5 mm)."""
+    from engine import finish as _fmod
+    from engine.finish import finish
+    ZB_FLOOR_BALL = getattr(_fmod, "ZB_FLOOR_BALL", 0.5)
+    from engine.entry_depth import LiveStock, load_heightfield
+    cell, h, ro, bore_r, axis = 0.5, 20.0, 18.0, 4.8, 12.5
+    col_top = h + 2.0               # columns stand 2 mm above the allowance
+    with tempfile.TemporaryDirectory() as td:
+        stl = plain_cyl_stl(os.path.join(td, "boss.stl"), ro=ro, h=h)
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        gx0, gx1, gy0, gy1 = -22.0, 22.0, -22.0, 22.0
+        nx = int(round((gx1 - gx0) / cell))
+        ny = int(round((gy1 - gy0) / cell))
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                             gy0 + (np.arange(ny) + 0.5) * cell)
+        RA = np.hypot(CX - axis, CY)     # distance to either bore column
+        RB = np.hypot(CX + axis, CY)
+        A = np.full(CX.shape, h + 0.3)   # normal 0.3 finish allowance
+        A[np.minimum(RA, RB) <= bore_r] = col_top
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 9.525, 0.0),
+                              stepover=1.5, floor_z=12.0, threads=4,
+                              stock_from=stockp, ramp_angle_deg=2.0)
+        assert moves and stats.get("stock_from"), "stock_from not recorded"
+        # the trap must be real: something tries to enter a column
+        A0, sx0, sy0, c0 = load_heightfield(stockp)
+        live = LiveStock(A0, sx0, sy0, c0, 0.5 * 9.525)
+        deep = []
+        prev = None
+        cut_pts = []                   # emitted feed (G1) cut points
+        for m in moves:
+            x, y, z = m["x"], m["y"], m["z"]
+            if m["g"] == 1:
+                cut_pts.append((x, y))
+            if prev is not None:
+                px, py, pz = prev
+                if m["g"] == 1 and z < pz - 1e-9 \
+                        and abs(x - px) <= 1e-9 and abs(y - py) <= 1e-9:
+                    dd = live.disk_depth(x, y, z)
+                    if math.isfinite(dd) and dd > ZB_FLOOR_BALL:
+                        deep.append((round(x, 2), round(y, 2),
+                                     round(z, 3), round(dd, 3)))
+                live.stamp_chord(prev, (x, y, z))
+            prev = (x, y, z)
+        assert not deep, \
+            "FE5f: %d bore entries plunged > %.1f mm into live stock " \
+            "(max %.3f): %s" % (len(deep), ZB_FLOOR_BALL,
+                                 max(e[3] for e in deep), deep[:4])
+        clusters = stats.get("fe5_skipped_clusters", [])
+        n_skip = stats.get("fe5_skipped_n", 0)
+        assert n_skip >= 1, "nothing was skipped"
+        assert clusters, "no skip clusters reported"
+        # FE5f-b 1: the boss surface beyond bore + tool + 0.5 mm from both
+        # columns is still finished - emitted cut points within one stepover
+        # of every such cell
+        tol = 1.0   # rows are stepover=1.5 apart; worst in-band gap 0.75
+        pts = _g1_samples(moves)
+        miss = []
+        yy = np.arange(-ro + 1.0, ro, 0.5)
+        xx = np.arange(-ro + 1.0, ro, 0.5)
+        for cy in yy:
+            inside = xx[xx ** 2 + cy ** 2 <= (ro - 1.0) ** 2]
+            for cx in inside:
+                if min(math.hypot(cx - axis, cy), math.hypot(cx + axis, cy)) \
+                        <= bore_r + 0.5 * 9.525 + 0.5:
+                    continue          # may be left with the bores
+                dd = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy).min()
+                if dd > tol:
+                    miss.append((round(cx, 2), round(cy, 2), round(dd, 2)))
+        assert not miss, \
+            "FE5f-b: %d finish-relevant cells beyond bore+tool+0.5 mm are " \
+            "uncovered (nearest cut point > %.1f mm; whole stripes lost): %s" \
+            % (len(miss), tol, miss[:4])
+        # FE5f-b 2: only the fragment near a column may be skipped - every
+        # recorded skip vertex within bore + tool + 1 mm of a column axis
+        skip_pts = stats.get("fe5_skip_pts")
+        assert skip_pts is not None, \
+            "FE5f-b: %d passes skipped but raw skip vertices not reported" \
+            % n_skip
+        far = [(x, y, dep) for x, y, dep in skip_pts
+               if min(math.hypot(x - axis, y), math.hypot(x + axis, y))
+               > bore_r + 0.5 * 9.525 + 1.0]
+        assert not far, \
+            "FE5f-b: %d skipped vertices beyond bore+tool+1 mm off the " \
+            "column axes (unfinished outside the bores): %s" % (len(far),
+                                                                far[:4])
+        print("fe5f skip-bore: skipped %d passes/fragments in %d cluster(s) "
+              "at %s (max live depth %.2f mm); surface beyond the bores "
+              "fully covered" % (n_skip, len(clusters), clusters[0]["center"],
+                                clusters[0]["max_depth_mm"]))
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -1890,6 +2091,8 @@ if __name__ == "__main__":
                test_fe5e_ramp_top_clear_of_ridge,
                test_fe5t_public_ramp_top_clear_of_ridge,
                test_fe5f_skip_bore_entries,
+               test_fe5fb_fragment_trim_keeps_surface,
+               test_fe5fb_real_bore_surface_kept,
                test_floor_dip_split_finish_and_rest,
                test_floor_pad_rows_inside_stock_box):
         t = __import__("time").time()
