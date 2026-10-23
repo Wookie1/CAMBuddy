@@ -1760,6 +1760,111 @@ def test_floor_pad_rows_inside_stock_box():
                      len(kept)))
 
 
+def bored_cyl_stl(path, ro=8.0, ri=4.8, h=14.0, n=96):
+    """FE5f: vertical cylinder (radius ro, z 0..h) with a THROUGH bore
+    (radius ri): the bore wall is steep and, with stock filled in, every
+    entry into it plunges - the through-bore trap (James drills those)."""
+    ang = np.linspace(0.0, 2.0 * math.pi, n + 1)[:-1]
+    xo, yo = ro * np.cos(ang), ro * np.sin(ang)
+    xi, yi = ri * np.cos(ang), ri * np.sin(ang)
+    tris = []
+    for i in range(n):
+        j = (i + 1) % n
+        mo = (math.cos(ang[i] + ang[j] - math.pi),
+              math.sin(ang[i] + ang[j] - math.pi), 0.0)   # outer +radial
+        mi = (-mo[0], -mo[1], 0.0)                        # bore wall -radial
+        up = (0.0, 0.0, 1.0)
+        dn = (0.0, 0.0, -1.0)
+        tris += [((xo[i], yo[i], 0.0), (xo[j], yo[j], 0.0),
+                  (xo[j], yo[j], h), mo),
+                 ((xo[i], yo[i], 0.0), (xo[j], yo[j], h),
+                  (xo[i], yo[i], h), mo),
+                 ((xi[i], yi[i], 0.0), (xi[i], yi[i], h),
+                  (xi[j], yi[j], h), mi),
+                 ((xi[i], yi[i], 0.0), (xi[j], yi[j], h),
+                  (xi[j], yi[j], 0.0), mi),
+                 ((xo[i], yo[i], h), (xo[j], yo[j], h),
+                  (xi[j], yi[j], h), up),
+                 ((xo[i], yo[i], h), (xi[j], yi[j], h),
+                  (xi[i], yi[i], h), up),
+                 ((xo[i], yo[i], 0.0), (xi[i], yi[i], 0.0),
+                  (xi[j], yi[j], 0.0), dn),
+                 ((xo[i], yo[i], 0.0), (xi[j], yi[j], 0.0),
+                  (xo[j], yo[j], 0.0), dn)]
+    return write_stl(path, tris)
+
+
+def test_fe5f_skip_bore_entries():
+    """FE5f: a boss with a 10 mm-ish THROUGH bore full of stock (stock top
+    above the boss top; the 9.525 ball has ~0.038 mm radial room per side).
+    No ramp top on a bore-wall entry can be clear, and neither end is -
+    FE5e left those unramped (ZB violations). FE5f must SKIP them: replay
+    the estimator's LiveStock in emit order (as test_fe5t does) and require
+    every ENTRY - the bottom of a vertical G1 descent (link plunge onto the
+    pass / ramp top) - to land at live depth <= the ball floor 0.5 mm
+    (mid-pass CL descents along verified paths are FE5e traversal behaviour,
+    out of scope here), AND the skip report to list a cluster centred within
+    1 mm of the bore axis. Must FAIL BY ASSERTION on e773afa (entries
+    plunged up to 5.6 mm deep; no fe5_skipped_* stats at all)."""
+    from engine import finish as _fmod
+    from engine.finish import finish
+    ZB_FLOOR_BALL = getattr(_fmod, "ZB_FLOOR_BALL", 0.5)
+    from engine.entry_depth import LiveStock, load_heightfield
+    cell, top, boss_r, bore_r = 0.5, 14.0, 8.0, 4.8
+    stock_bore = top + 2.0            # bore FULL of stock, top above boss
+    with tempfile.TemporaryDirectory() as td:
+        stl = bored_cyl_stl(os.path.join(td, "bore.stl"), ro=boss_r,
+                            ri=bore_r, h=top)
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        gx0, gx1, gy0, gy1 = -16.0, 16.0, -16.0, 16.0
+        nx = int(round((gx1 - gx0) / cell))
+        ny = int(round((gy1 - gy0) / cell))
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                             gy0 + (np.arange(ny) + 0.5) * cell)
+        R = np.hypot(CX, CY)
+        A = np.full(CX.shape, top + 0.3)   # normal 0.3 finish allowance
+        A[R <= bore_r] = stock_bore        # the bore stands full of stock
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 9.525, 0.0),
+                              stepover=1.5, floor_z=6.0, threads=4,
+                              stock_from=stockp, ramp_angle_deg=2.0)
+        assert moves and stats.get("stock_from"), "stock_from not recorded"
+        # the trap must be real: something tries to enter the bore
+        A0, sx0, sy0, c0 = load_heightfield(stockp)
+        live = LiveStock(A0, sx0, sy0, c0, 0.5 * 9.525)
+        deep = []
+        prev = None
+        for m in moves:
+            x, y, z = m["x"], m["y"], m["z"]
+            if prev is not None:
+                px, py, pz = prev
+                if m["g"] == 1 and z < pz - 1e-9 \
+                        and abs(x - px) <= 1e-9 and abs(y - py) <= 1e-9:
+                    dd = live.disk_depth(x, y, z)
+                    if math.isfinite(dd) and dd > ZB_FLOOR_BALL:
+                        deep.append((round(x, 2), round(y, 2),
+                                     round(z, 3), round(dd, 3)))
+                live.stamp_chord(prev, (x, y, z))
+            prev = (x, y, z)
+        assert not deep, \
+            "FE5f: %d bore entries plunged > %.1f mm into live stock " \
+            "(max %.3f): %s" % (len(deep), ZB_FLOOR_BALL,
+                                 max(e[3] for e in deep), deep[:4])
+        clusters = stats.get("fe5_skipped_clusters", [])
+        assert stats.get("fe5_skipped_n", 0) >= 1, "nothing was skipped"
+        assert clusters, "no skip clusters reported"
+        d0 = min(math.hypot(c["center"][0], c["center"][1]) for c in clusters)
+        assert d0 <= 1.0, \
+            "no skip cluster centred on the bore axis: %s" % (clusters,)
+        print("fe5f skip-bore: skipped %d passes in %d cluster(s) at %s "
+              "(max live depth %.2f mm)"
+              % (stats["fe5_skipped_n"], len(clusters),
+                 clusters[0]["center"], clusters[0]["max_depth_mm"]))
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -1784,6 +1889,7 @@ if __name__ == "__main__":
                test_ramp_vertices_never_below_verified_path,
                test_fe5e_ramp_top_clear_of_ridge,
                test_fe5t_public_ramp_top_clear_of_ridge,
+               test_fe5f_skip_bore_entries,
                test_floor_dip_split_finish_and_rest,
                test_floor_pad_rows_inside_stock_box):
         t = __import__("time").time()

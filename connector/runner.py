@@ -1040,6 +1040,19 @@ class EngineRun:
             check["warnings"]["engagement"]["rest"] = \
                 check_s.get("engagement")
             check["warnings"]["plunge"]["rest"] = check_s.get("plunge")
+        # FE5f: pass entries with no legal entry (deeper than the ball ZB
+        # floor) were SKIPPED by finish/rest, never plunged - the areas stay
+        # for a hole op or another setup, so James sees them in the summary
+        def _skips(p):
+            try:
+                with open(p) as fh:
+                    return json.load(fh).get("fe5_skipped_clusters", [])
+            except (OSError, ValueError):
+                return []
+        check["left_for_hole_op_or_another_setup"] = {
+            "finish": _skips(fin_stats),
+            "rest": _skips(rest_stats) if rest else [],
+        }
         with open(os.path.join(self.work, "check.json"), "w") as fh:
             json.dump(check, fh, indent=2)
 

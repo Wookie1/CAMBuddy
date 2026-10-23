@@ -106,6 +106,8 @@ HOLD_CLEAR = 1.0      # mm, S5: min clearance of the holder stack to part/stock
 POST_GRID = 0.001     # mm, PQ: default LNC output grid (inch output: 0.00254)
 RAMP_TRIGGER = 0.25   # mm, FE5: ramp an entry only where the estimator's
                       # live stock depth at the pass start exceeds this
+ZB_FLOOR_BALL = 0.5   # mm, FE5f: mirror of zmap BALL_AXIAL_FLOOR - an
+                      # unresolved entry deeper than this is SKIPPED (drill)
 GRID_SPIKE = 0.01     # mm, PQ: drop an emitted point whose closest
                       # output-grid CL still differs from its Z by more than
                       # this (no one-point spikes)
@@ -1851,6 +1853,34 @@ def _fe5_pick_ramp(live, P, s, tan):
     return None, False
 
 
+def _fe5_cluster_skips(pts, merge_r):
+    """FE5f: merge skipped points into clusters (greedy, nearest centre
+    within merge_r = 2 x tool D): centre, bbox, max live depth, area."""
+    cl = []
+    for x, y, dep in pts:
+        best, bd = None, merge_r + 1e-9
+        for c in cl:
+            dd = math.hypot(x - c["center"][0], y - c["center"][1])
+            if dd <= bd:
+                best, bd = c, dd
+        if best is None:
+            cl.append({"center": [x, y], "bbox": [x, x, y, y],
+                       "max_depth_mm": dep, "n": 1})
+            continue
+        bb = best["bbox"]
+        bb[0], bb[1] = min(bb[0], x), max(bb[1], x)
+        bb[2], bb[3] = min(bb[2], y), max(bb[3], y)
+        best["center"] = [0.5 * (bb[0] + bb[1]), 0.5 * (bb[2] + bb[3])]
+        best["max_depth_mm"] = max(best["max_depth_mm"], dep)
+        best["n"] += 1
+    for c in cl:
+        bb = c["bbox"]
+        c["area_mm2"] = round((bb[1] - bb[0]) * (bb[3] - bb[2]), 2)
+        c["center"] = [round(v, 3) for v in c["center"]]
+        c["bbox"] = [round(v, 3) for v in bb]
+    return cl
+
+
 def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
            sampling=0.1, slope_threshold=40.0, overlap_mm=1.0,
            stepdown=0.3, overlap_deg=5.0, floor_z=None, wl_sampling=0.2,
@@ -2215,15 +2245,18 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     # residual plunge remains; no zig-zag). Live stock: the same
     # entry_depth.LiveStock ball model the estimator uses, initialized from
     # this op's --stock-from / rest stock and stamped by its own passes.
+    # FE5f: an unresolved entry deeper than the ball ZB floor is SKIPPED.
     tan_ramp = math.tan(math.radians(ramp_angle_deg)) if ramp_angle_deg \
         else 0.0
     n_ramped = n_short_run = 0
     n_unchanged = len(ordered)
+    n_skipped = 0                  # FE5f: entries skipped (never plunged)
     ramp_cnt = {}
     fe5_deep_unramped = []  # FE5 diag: entries with live depth > 0.5 left
     fe5_deep_ramped = []    # FE5 diag: deep entries that WERE ramped
     fe5_top_unresolved = []  # FE5e: entries with no clear ramp top
     fe5_chord_depths = []   # FE5e: max live depth along each ramp chord
+    fe5_skip_pts = []       # FE5f: skipped pass vertices (x, y, live depth)
     _fe5_track = None       # FE5 diag: env FE5_TRACK="x,y" probe cell
     _env_track = os.environ.get("FE5_TRACK")
     if _env_track:
@@ -2272,15 +2305,29 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                     z0 = float(P[0, 2])
                     d = live.disk_depth(P[0, 0], P[0, 1], z0)
                     L0 = d / tan_ramp
-                if L is None:
-                    # no L forward, none reversed: leave the entry exactly as
-                    # today (fail closed - ZB must still fail on it) + report
+                _unres = L is None
+                if _unres:
+                    # FE5f: unresolved + deeper than the ball ZB floor - at
+                    # the entry, or where the link's vertical plunge lands on
+                    # the ramp top - is SKIPPED (pass dropped + clustered;
+                    # James drills the bores). Shallower: fail-closed as yet.
                     fe5_top_unresolved.append(
                         [round(float(P[0, 0]), 3), round(float(P[0, 1]), 3),
                          round(z0, 3), round(float(d), 3)])
                     L = L0
                 u = min(L, total)
                 rv = _ramp_entry(P, s, tan_ramp, u)
+                if _unres and (d > ZB_FLOOR_BALL or live.disk_depth(
+                        rv[0][0], rv[0][1], rv[0][2]) > ZB_FLOOR_BALL):
+                    n_skipped += 1
+                    for q in P:
+                        dq = live.disk_depth(float(q[0]), float(q[1]),
+                                            float(q[2]))
+                        fe5_skip_pts.append(
+                            [round(float(q[0]), 3), round(float(q[1]), 3),
+                             round(dq if math.isfinite(dq) else float(d), 3)])
+                    ordered[k] = None
+                    continue
                 ordered[k] = rv + list(pth[1:])
                 ramp_cnt[k] = len(rv) - 1
                 if len(rv) < 2:
@@ -2349,6 +2396,9 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                         [k, round(v, 3), round(float(dd[jm]), 2),
                          [round(float(q), 2) for q in F[jm]]])
                     _fe5_track_last[0] = v
+
+    # FE5f: drop skipped passes - never plunged; links join retained only
+    ordered = [p for p in ordered if p is not None]
 
     # -- links -----------------------------------------------------------
     t0 = time.time()
@@ -2425,6 +2475,10 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     stats["fe5_top_unresolved"] = fe5_top_unresolved[:40]
     stats["fe5_chord_max_depth"] = fe5_chord_depths[:40]
     stats["fe5_chord_max_depth_max"] = max(fe5_chord_depths, default=0.0)
+    # FE5f: skipped unenterable areas, left for a hole op / another setup
+    stats["fe5_skipped_n"] = n_skipped
+    stats["fe5_skipped_clusters"] = _fe5_cluster_skips(
+        fe5_skip_pts, 2.0 * float(tool[1]))
     if flute_mm is not None and shank_dia is not None:
         # S4: flute/shank-aware pass (tools/x7_tools.json or --flute/--shank)
         stats["flute_mm"] = round(float(flute_mm), 4)
