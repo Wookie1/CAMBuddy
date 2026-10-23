@@ -1655,6 +1655,85 @@ def floor_dip_stl(path, half_x=15.0, half_y=10.0, top=10.0, slot_half=6.0,
     return write_stl(path, tris)
 
 
+def test_fe5fc_degenerate_pass_never_plunged():
+    """FE5fc (supervisor): a ONE-POINT pass and a ZERO-LENGTH pass whose live
+    depth exceeds the ball floor 0.5 must be SKIPPED and reported, never
+    linked-to and plunged (the T33 chain's 1.06 mm straight plunge at
+    (-23.64, 1.68)). The two passes are injected into finish()'s own steep
+    pass list (floor_net wrapper, steep call) over the hill scene's +2.0 mm
+    buried stock, away from every real pass. Asserts: fe5_skipped_n grows by
+    exactly 2 vs the same run without injection, each point is in a skip
+    cluster with max depth > 0.5, and no move reaches either injected XY at
+    or below its z. Must FAIL BY ASSERTION with the old plunge path (1f499f5:
+    degenerate passes bypass every FE5e/FE5f check)."""
+    from engine import finish as _fmod
+    from engine.finish import finish
+    cell = 0.5
+    INJ = [[(-11.13, 2.37, 10.0)], [(11.27, -2.41, 10.0), (11.27, -2.41, 10.0)]]
+
+    def surfz(x):
+        if x <= -8 or x >= 8:
+            return 10.0
+        if x < -2:
+            return 10.0 + 3.0 * (x + 8) / 6.0
+        if x > 2:
+            return 13.0 - 3.0 * (x - 2) / 6.0
+        return 13.0
+
+    with tempfile.TemporaryDirectory() as td:
+        prof = [(-14, 0), (14, 0), (14, 10), (8, 10), (2, 13), (-2, 13),
+                (-8, 10), (-14, 10)]
+        stl = _prism_stl(os.path.join(td, "hill.stl"), prof, -6.0, 6.0)
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        gx0, gy0 = -20.0, -10.0
+        CX, _CY = np.meshgrid(gx0 + (np.arange(80) + 0.5) * cell,
+                              gy0 + (np.arange(40) + 0.5) * cell)
+        A = np.vectorize(lambda x: surfz(x) + (2.0 if abs(x) >= 8 else 0.3))(CX)
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        kw = dict(stl_path=stl, tool=("ball", 6.0, 0.0), stepover=1.5,
+                  floor_z=5.0, threads=4, stock_from=stockp,
+                  ramp_angle_deg=2.0)
+        _m0, st0 = finish(surf, **kw)
+        orig = _fmod.floor_net
+        calls = []
+
+        def inject(paths, src, *a, **k):
+            out = orig(paths, src, *a, **k)
+            calls.append(1)
+            if len(calls) == 1:            # the steep call (first in finish)
+                out = (list(out[0]) + [list(p) for p in INJ],
+                       list(out[1]) + [0] * len(INJ), out[2])
+            return out
+
+        _fmod.floor_net = inject
+        try:
+            moves, st = finish(surf, **kw)
+        finally:
+            _fmod.floor_net = orig
+        assert len(calls) >= 1, "floor_net wrapper never called"
+        dn = st.get("fe5_skipped_n", 0) - st0.get("fe5_skipped_n", 0)
+        assert dn == 2, "degenerate deep passes not skipped: skipped %d -> " \
+            "%d (expected +2)" % (st0.get("fe5_skipped_n", 0),
+                                  st.get("fe5_skipped_n", 0))
+        cls = st.get("fe5_skipped_clusters") or []
+        for p in INJ:
+            x, y, z = p[0]
+            near = [c for c in cls if c["bbox"][0] - 1e-3 <= x <= c["bbox"][1]
+                    + 1e-3 and c["bbox"][2] - 1e-3 <= y <= c["bbox"][3] + 1e-3]
+            assert near and any((c["max_depth_mm"] or 0) > 0.5 for c in near), \
+                "injected (%.1f, %.1f) not reported deeper than 0.5: %s" % (
+                    x, y, near)
+            hit = [m for m in moves if abs(m["x"] - x) < 1e-3
+                   and abs(m["y"] - y) < 1e-3 and m["z"] <= z + 1e-6]
+            assert not hit, "injected pass at (%.1f, %.1f) was emitted " \
+                "(plunged to z %.3f)" % (x, y, hit[0]["z"])
+    print("PASS fe5fc degenerate passes: one-point + zero-length deep passes "
+          "skipped and clustered (+%d), none emitted" % dn)
+
+
 def test_floor_dip_split_finish_and_rest():
     """FL1: part surface dips below floor_z (deep slot floor z=2 <
     floor_z=5; shelf z=7 stays above). In BOTH the finish and the rest
@@ -2066,6 +2145,129 @@ def test_fe5fb_fragment_trim_keeps_surface():
                                 clusters[0]["max_depth_mm"]))
 
 
+def _prism_stl(path, prof, y0, y1):
+    """FE5fc: extrude an XZ profile polygon along Y (both windings, so the
+    drop-cutter sees every face)."""
+    n = len(prof)
+    tris = []
+    for i in range(n):
+        j = (i + 1) % n
+        x0, z0 = prof[i]
+        x1, z1 = prof[j]
+        ref = (z1 - z0, 0.0, -(x1 - x0))
+        tris.append(((x0, y0, z0), (x1, y1, z1), (x1, y0, z1), ref))
+        tris.append(((x0, y0, z0), (x0, y1, z0), (x1, y1, z1), ref))
+    for yy, sgn in ((y0, -1.0), (y1, 1.0)):
+        for i in range(1, n - 1):
+            tris.append(((prof[0][0], yy, prof[0][1]),
+                        (prof[i][0], yy, prof[i][1]),
+                        (prof[i + 1][0], yy, prof[i + 1][1]), (0, sgn, 0)))
+    return write_stl(path, tris)
+
+
+def test_fe5fc_buried_ends_keep_middle():
+    """FE5fc: a long raster pass whose FIRST part is buried > 0.5 mm with no
+    legal ramp at either end - deep stock (+2.0) at both ends of a hill
+    prism, only +0.3 over the hill - must lose only the illegal fragment.
+    The whole-pass sizing (both ends, FE5e) fails: every vertex sits 0.3
+    under the allowance and the 2 deg ramp from the buried end cannot beat
+    the hill. But a suffix based ON THE HILL clears within ~1.5 mm, so
+    FE5f-b's fragment trim keeps the middle: assert every hill cell in
+    |x| <= 4, |y| <= 5 is cut (G1 samples within 1 mm); no vertical G1
+    descent may land deeper than the ball floor 0.5 mm (replay as in
+    test_fe5f); passes were skipped and clustered; and every recorded raw
+    skip vertex has a FINITE live depth (FE5fc: off-grid vertices are not
+    recorded, no invented depth). Must FAIL BY ASSERTION on 1f499f5
+    (whole-pass drop: hill cells uncovered, no fe5_skip_pts stat)."""
+    from engine import finish as _fmod
+    from engine.finish import finish
+    ZB_FLOOR_BALL = getattr(_fmod, "ZB_FLOOR_BALL", 0.5)
+    from engine.entry_depth import LiveStock, load_heightfield
+    cell = 0.5
+
+    def surfz(x):
+        if x <= -8 or x >= 8:
+            return 10.0
+        if x < -2:
+            return 10.0 + 3.0 * (x + 8) / 6.0
+        if x > 2:
+            return 13.0 - 3.0 * (x - 2) / 6.0
+        return 13.0
+
+    with tempfile.TemporaryDirectory() as td:
+        prof = [(-14, 0), (14, 0), (14, 10), (8, 10), (2, 13), (-2, 13),
+                (-8, 10), (-14, 10)]
+        stl = _prism_stl(os.path.join(td, "hill.stl"), prof, -6.0, 6.0)
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        gx0, gx1, gy0, gy1 = -20.0, 20.0, -10.0, 10.0
+        nx = int(round((gx1 - gx0) / cell))
+        ny = int(round((gy1 - gy0) / cell))
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                             gy0 + (np.arange(ny) + 0.5) * cell)
+        A = np.empty(CX.shape)
+        for j in range(ny):
+            for i in range(nx):
+                x = CX[j, i]
+                A[j, i] = surfz(x) + (2.0 if x <= -8 or x >= 8 else 0.3)
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 6.0, 0.0),
+                             stepover=1.5, floor_z=5.0, threads=4,
+                             stock_from=stockp, ramp_angle_deg=2.0)
+        assert moves and stats.get("stock_from"), "stock_from not recorded"
+        # the middle of the hill must still be cut (fails on 1f499f5:
+        # every crossing pass is dropped whole)
+        pts = _g1_samples(moves)
+        assert len(pts), "no G1 cut points at all"
+        miss = []
+        for cy in np.arange(-5.0, 5.1, 1.0):
+            for cx in np.arange(-2.0, 4.1, 1.0):
+                dd = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy).min()
+                if dd > 1.0:
+                    miss.append((round(cx, 1), round(cy, 1), round(float(dd),
+                                                              2)))
+        assert not miss, \
+            "FE5fc: %d hill cells uncovered (whole passes dropped): %s" \
+            % (len(miss), miss[:4])
+        # no entry may plunge deeper than the ball floor (replay, test_fe5f
+        # convention: mid-pass descents along verified paths are traversal)
+        live = LiveStock(*load_heightfield(stockp), 3.0)
+        deep = []
+        prev = None
+        for m in moves:
+            x, y, z = m["x"], m["y"], m["z"]
+            if prev is not None:
+                px, py, pz = prev
+                if m["g"] == 1 and z < pz - 1e-9 \
+                        and abs(x - px) <= 1e-9 and abs(y - py) <= 1e-9:
+                    dd = live.disk_depth(x, y, z)
+                    if math.isfinite(dd) and dd > ZB_FLOOR_BALL:
+                        deep.append((round(x, 2), round(y, 2), round(z, 3),
+                                   round(dd, 3)))
+                live.stamp_chord(prev, (x, y, z))
+            prev = (x, y, z)
+        assert not deep, \
+            "FE5fc: %d entries plunged > %.1f mm into live stock (max " \
+            "%.3f): %s" % (len(deep), ZB_FLOOR_BALL,
+                           max(e[3] for e in deep), deep[:4])
+        n_skip = stats.get("fe5_skipped_n", 0)
+        assert n_skip >= 1, "nothing was skipped"
+        assert stats.get("fe5_skipped_clusters"), "no skip clusters reported"
+        skip_pts = stats.get("fe5_skip_pts")
+        assert skip_pts is not None, \
+            "FE5fc: %d passes skipped but raw skip vertices not reported" \
+            % n_skip
+        bad = [p for p in skip_pts if not math.isfinite(p[2])]
+        assert not bad, \
+            "FE5fc: %d skip vertices with non-finite (invented) depth: %s" \
+            % (len(bad), bad[:4])
+        print("fe5fc buried-ends: skipped %d, hill kept (%.0f mm cut, "
+              "%d finite skip vertices)" % (n_skip, stats.get("cut_len", 0.0),
+                                           len(skip_pts)))
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -2093,6 +2295,8 @@ if __name__ == "__main__":
                test_fe5f_skip_bore_entries,
                test_fe5fb_fragment_trim_keeps_surface,
                test_fe5fb_real_bore_surface_kept,
+               test_fe5fc_buried_ends_keep_middle,
+               test_fe5fc_degenerate_pass_never_plunged,
                test_floor_dip_split_finish_and_rest,
                test_floor_pad_rows_inside_stock_box):
         t = __import__("time").time()

@@ -2272,6 +2272,17 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
         for k in range(len(ordered)):
             pth = ordered[k]
             if len(pth) < 2:
+                # FE5fc: never plunge a one-point pass deeper than the floor
+                if pth:
+                    q = pth[0]
+                    dq = live.disk_depth(float(q[0]), float(q[1]), float(q[2]))
+                    if dq > ZB_FLOOR_BALL:
+                        n_skipped += 1
+                        fe5_skip_pts.append([round(float(q[0]), 3),
+                                            round(float(q[1]), 3),
+                                            round(dq, 3)])
+                        ordered[k] = None
+                        continue
                 n_unchanged += 1
                 continue
             P = np.asarray(pth, dtype=float)
@@ -2287,6 +2298,14 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                     ["P0 k=%d" % k, round(float(P[0, 0]), 3),
                      round(float(P[0, 1]), 3), round(z0, 3),
                      round(float(d), 3), len(pth), round(total, 1)])
+            if total < 1e-9 and d > ZB_FLOOR_BALL:
+                # FE5fc: zero-length pass deeper than the floor - never plunged
+                n_skipped += 1
+                fe5_skip_pts.append([round(float(P[0, 0]), 3),
+                                    round(float(P[0, 1]), 3),
+                                    round(float(d), 3)])
+                ordered[k] = None
+                continue
             if total >= 1e-9 and d > RAMP_TRIGGER:
                 # FE5e: size the ramp from its TOP, not only from P0: the
                 # SMALLEST L on the run whose ramp top is clear of the live
@@ -2333,11 +2352,11 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                             j = m
                             break
                     for q in (P if j is None else P[:j]):
-                        dq = live.disk_depth(float(q[0]), float(q[1]),
-                                            float(q[2]))
+                        # FE5fc: measured live depth only, never invent one
                         fe5_skip_pts.append(
                             [round(float(q[0]), 3), round(float(q[1]), 3),
-                             round(dq if math.isfinite(dq) else float(d), 3)])
+                             round(live.disk_depth(float(q[0]), float(q[1]),
+                                                 float(q[2])), 3)])
                     if j is None:
                         ordered[k] = None
                         continue
@@ -2499,7 +2518,8 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     stats["fe5_skipped_n"] = n_skipped
     stats["fe5_skipped_clusters"] = _fe5_cluster_skips(
         fe5_skip_pts, 2.0 * float(tool[1]))
-    stats["fe5_skip_pts"] = fe5_skip_pts[:400]  # FE5f-b: fragment vertices
+    stats["fe5_skip_pts"] = [p for p in fe5_skip_pts  # FE5f-b/c: fragment
+                            if math.isfinite(p[2])][:400]  # verts, on-grid only
     if flute_mm is not None and shank_dia is not None:
         # S4: flute/shank-aware pass (tools/x7_tools.json or --flute/--shank)
         stats["flute_mm"] = round(float(flute_mm), 4)
