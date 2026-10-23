@@ -99,7 +99,7 @@ def _at(G, xs, ys, x, y):
     return -1e30
 
 
-def find_zones(Sg, Zd, floor_z, min_excess, xs, ys):
+def find_zones(Sg, Zd, floor_z, min_excess, xs, ys, dropped=None):
     reach = np.maximum(Zd, floor_z)
     exc = np.where(np.isfinite(Sg) & (Sg > floor_z), Sg - reach, -1e3)
     mask = exc > min_excess
@@ -108,9 +108,17 @@ def find_zones(Sg, Zd, floor_z, min_excess, xs, ys):
     for k in range(1, n + 1):
         zz = lab == k
         area = float(zz.sum()) * CELL * CELL
-        if area < 5.0:
-            continue
         js, is_ = np.where(zz)
+        if area < 5.0:
+            # too small to plan as its own zone: REPORT it, never drop it
+            # silently (RR1c-3: quarter-ring end caps split into fragments)
+            if dropped is not None:
+                dropped.append({
+                    "bbox": (float(xs[is_].min()), float(xs[is_].max()),
+                             float(ys[js].min()), float(ys[js].max())),
+                    "area_mm2": round(area, 2),
+                    "max_excess_mm": round(float(exc[zz].max()), 3)})
+            continue
         zones.append({
             "bbox": (float(xs[is_].min()), float(xs[is_].max()),
                     float(ys[js].min()), float(ys[js].max())),
@@ -241,10 +249,12 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                         fine=stock[3])
     if clearance is None:
         clearance = float(np.nanmax(Sg[np.isfinite(Sg)])) + 2.0
-    zones = find_zones(Sg, Zd, floor_z, min_excess, xs, ys)
+    fragments = []
+    zones = find_zones(Sg, Zd, floor_z, min_excess, xs, ys, fragments)
 
     moves = []
-    stats = {"zones": [], "no_entry": [], "cut_len": 0.0, "ramp_len": 0.0,
+    stats = {"zones": [], "no_entry": [], "fragments_dropped": fragments,
+             "cut_len": 0.0, "ramp_len": 0.0,
              "rapid_len": 0.0, "n_levels": 0, "entry_steps": {},
              "entries": [], "passes_skipped": []}
 

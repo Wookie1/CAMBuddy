@@ -1426,19 +1426,37 @@ def test_rr1c3_curved_thin_band_centre_line():
         ramp_feed=850.0)
     assert moves and len(stats["zones"]) == 1 and not stats["no_entry"], \
         "curved band must be entered: %r" % (stats["no_entry"],)
-    centre_len = 0.5 * math.pi * 30.0          # quarter ring at r = 30
-    cut = 0.0
+    # COVERAGE (not path length - a loop round a 0.4 mm strip counts both
+    # edges): replay the program on the live grid; every band cell inside the
+    # kept zone must be down to part + leave (an uncut 0.6 mm rest reads
+    # 0.4 here, cut reads ~0), and every band cell outside it must be in a
+    # REPORTED dropped fragment (the end caps), never silently missing.
+    live_c = ed.LiveStock(A, 0.0, 0.0, cell, 9.525 / 2.0)
     prev = None
     for m in moves:
-        if m["g"] == 1 and m["f"] >= 2280.0 and prev is not None:
-            mx, my = (m["x"] + prev[0]) / 2.0, (m["y"] + prev[1]) / 2.0
-            rm = math.hypot(mx - 20.0, my - 20.0)
-            if mx >= 20.0 and my >= 20.0 and 29.3 <= rm <= 30.7:
-                cut += math.hypot(m["x"] - prev[0], m["y"] - prev[1])
-        prev = (m["x"], m["y"])
-    assert cut >= 0.8 * centre_len, \
-        "centre-line pass cut %.1f mm of %.1f mm centre line (want >= 80%%)" \
-        % (cut, centre_len)
+        cur = (m["x"], m["y"], m["z"])
+        if prev is not None and m["g"] == 1:
+            live_c.stamp_chord(prev, cur)
+        prev = cur
+    zx0, zx1, zy0, zy1 = stats["zones"][0]["bbox"]
+    frags = stats.get("fragments_dropped") or []
+    uncut, unreported, n_zone = [], [], 0
+    for j, i in zip(*np.nonzero(band)):
+        x, y = float(cxv[i]), float(cxv[j])
+        if zx0 - cell <= x <= zx1 + cell and zy0 - cell <= y <= zy1 + cell:
+            n_zone += 1
+            d = live_c.disk_depth(x, y, 30.0 + 0.2)
+            if not math.isfinite(d) or d > 0.1:
+                uncut.append((round(x, 2), round(y, 2), d))
+        elif not any(f["bbox"][0] - cell <= x <= f["bbox"][1] + cell and
+                     f["bbox"][2] - cell <= y <= f["bbox"][3] + cell
+                     for f in frags):
+            unreported.append((round(x, 2), round(y, 2)))
+    assert n_zone >= 10, "band zone has %d cells: vacuous" % n_zone
+    assert not uncut, "band zone cells left uncut (%d of %d): %s" % (
+        len(uncut), n_zone, uncut[:4])
+    assert not unreported, "band cells outside the zone and not reported " \
+        "as dropped fragments: %s" % unreported[:4]
     below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
     assert below == 0, "gouge: %d pts (worst %.3f)" % (below, worst)
     live = ed.LiveStock(A, 0.0, 0.0, cell, 9.525 / 2.0)
@@ -1522,14 +1540,23 @@ def test_rr1c3_bay_deep_groove_top_down():
         if prev is not None and m["g"] == 1:
             live2.stamp_chord(prev, cur)
         prev = cur
-    worst_left = 0.0
+    # leftover above what the ball can LEGALLY reach: at every sample the
+    # tip may go no lower than the exact part CL + rest leave (sample y 60 is
+    # 4.25 mm from the north end block, CL ~27.8, so a fixed tip 26.2 there
+    # would be a gouge); no sample is dropped
+    from engine.finish import batch_drop, make_cutter
+    cutter = make_cutter("ball", 9.525)
+    worst_left, where = 0.0, None
     for py in (12.0, 24.0, 36.0, 48.0, 60.0):
-        d = live2.disk_depth(17.0, py, 26.2)
+        cl = batch_drop(surf, cutter, [(17.0, py)], threads=1)[0]
+        assert math.isfinite(cl), "no part CL at 17.0,%.0f" % py
+        d = live2.disk_depth(17.0, py, cl + 0.2)
         assert math.isfinite(d), "no live data at groove floor 17.0,%.0f" % py
-        worst_left = max(worst_left, d)
+        if d > worst_left:
+            worst_left, where = d, (17.0, py, round(cl, 3))
     assert worst_left <= 0.5, \
-        "groove floor leaves %.3f mm (want <= 0.5; e206c56 left ~2.0)" \
-        % worst_left
+        "groove floor leaves %.3f mm above CL + leave at %s (want <= 0.5; " \
+        "e206c56 left ~2.0)" % (worst_left, where)
 
 
 def _main():
