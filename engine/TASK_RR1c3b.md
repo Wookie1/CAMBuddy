@@ -1,4 +1,5 @@
 # Task RR1c-3b: make RR1c-3's two new tests pass (they fail on its own code). Fix, then report. Do not commit.
+LOCKS: NEVER create, remove or edit /private/tmp/claude-502/*.lock, /private/tmp/claude-502/m4slot.prio or /private/tmp/claude-502/m4model.busy - not even a lock you think is stale (the slot scripts clear a dead owner's lock themselves); if a slot seems stuck, write that into your results file and wait or stop.
 HARD RULES: no git stash/reset/clean/restore/checkout/rebase; no bypass flags; never relax or delete tests - do NOT change
 the assertions or thresholds of test_rr1c3_curved_thin_band_centre_line or test_rr1c3_bay_deep_groove_top_down (or any
 other test); no skip path that makes a test pass by cutting nothing. Edit engine/rest_rough.py only. Do NOT touch
