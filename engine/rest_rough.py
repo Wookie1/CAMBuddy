@@ -99,34 +99,48 @@ def _at(G, xs, ys, x, y):
     return -1e30
 
 
-def find_zones(Sg, Zd, floor_z, min_excess, xs, ys, dropped=None):
+def find_zones(Sg, Zd, floor_z, min_excess, xs, ys, dropped=None,
+               tool_r=0.0):
     reach = np.maximum(Zd, floor_z)
     exc = np.where(np.isfinite(Sg) & (Sg > floor_z), Sg - reach, -1e3)
     mask = exc > min_excess
     lab, n = ndimage.label(mask, structure=np.ones((3, 3)))
     zones = []
+    frags = []
     for k in range(1, n + 1):
         zz = lab == k
         area = float(zz.sum()) * CELL * CELL
         js, is_ = np.where(zz)
-        if area < 5.0:
-            # too small to plan as its own zone: REPORT it, never drop it
-            # silently (RR1c-3: quarter-ring end caps split into fragments)
-            if dropped is not None:
-                dropped.append({
-                    "bbox": (float(xs[is_].min()), float(xs[is_].max()),
-                             float(ys[js].min()), float(ys[js].max())),
-                    "area_mm2": round(area, 2),
-                    "max_excess_mm": round(float(exc[zz].max()), 3)})
-            continue
-        zones.append({
+        rec = {
             "bbox": (float(xs[is_].min()), float(xs[is_].max()),
-                    float(ys[js].min()), float(ys[js].max())),
+                     float(ys[js].min()), float(ys[js].max())),
             "area_mm2": round(area, 1),
             "volume_mm3": round(float(exc[zz].sum()) * CELL * CELL, 0),
             "stockmax": float(Sg[zz].max()),
             "mask": zz,
-        })
+        }
+        if area < 5.0:
+            frags.append(rec)   # RR1c-4: plan fragments, never drop silently
+            continue
+        zones.append(rec)
+    # RR1c-4: merge a fragment within the tool radius into the nearest
+    # zone's mask; a lone fragment stays a mini-zone (entered, or reported
+    # in fragments_dropped when the ladder finds no legal entry there).
+    for f in sorted(frags, key=lambda z: -z["area_mm2"]):
+        near = [(float(ndimage.distance_transform_edt(~z["mask"])[f["mask"]]
+                       .min()) * CELL, z) for z in zones]
+        d, z = min(near, key=lambda t_: t_[0]) if near else (1e30, None)
+        if d <= tool_r + 1e-9:
+            m = z["mask"] | f["mask"]
+            j2, i2 = np.nonzero(m)
+            z.update({"mask": m, "stockmax": float(Sg[m].max()),
+                     "area_mm2": round(float(m.sum()) * CELL * CELL, 1),
+                     "volume_mm3": round(float(exc[m].sum()) * CELL * CELL, 0),
+                     "bbox": (float(xs[i2].min()), float(xs[i2].max()),
+                              float(ys[j2].min()), float(ys[j2].max()))})
+        else:
+            f["fragment"] = True   # lone mini-zone: entered or reported
+            zones.append(f)
     zones.sort(key=lambda z: -z["area_mm2"])
     return zones
 
@@ -250,7 +264,8 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
     if clearance is None:
         clearance = float(np.nanmax(Sg[np.isfinite(Sg)])) + 2.0
     fragments = []
-    zones = find_zones(Sg, Zd, floor_z, min_excess, xs, ys, fragments)
+    zones = find_zones(Sg, Zd, floor_z, min_excess, xs, ys, fragments,
+                       tool_r=R)
 
     moves = []
     stats = {"zones": [], "no_entry": [], "fragments_dropped": fragments,
@@ -517,27 +532,28 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 "bbox": z["bbox"], "area_mm2": z["area_mm2"],
                 "volume_mm3": z["volume_mm3"], "r_max_cl": 0.0,
                 "reason": "no leave-legal floor region at the deepest level"})
+            if z.get("fragment"):
+                fragments.append({"bbox": z["bbox"], "area_mm2": z["area_mm2"],
+                                  "reason": "no leave-legal level, no entry"})
             continue
 
-        # --- RR1c ladder per level: try to enter the deepest level; if no
-        #     step reaches it legally, skip that level (recorded) and try
-        #     the next one up. The helix's centre/radius (step 5) also
-        #     anchors the floor circle. ---
+        # --- RR1c-4 ladder: enter at the HIGHEST level with a legal entry
+        #     (same ladder/rules), then cut top-down; refused levels are
         entered = False
         mode = "rings"
         runs0 = None
-        li0 = 0
+        li0 = len(levels) - 1
         cx = cy = 0.0
         r_h = 0.0
         t0 = reg0 = None
-        while li0 < len(levels):
+        while li0 >= 0:
             t0, reg0 = levels[li0]
             Dz = ndimage.distance_transform_edt(reg0) * CELL
             reg_cur = reg0
             p0 = None
-            # aim the entry at the start of the c = ae/2 contour of reg0
-            for P, closed, _K in march_level(Dz, xs, ys, ae / 2.0,
-                                            comp=reg0):
+            cin = ae / 2.0 + max(Dz.max() - ae / 2.0, 0.0) // ae * ae
+            for P, closed, _K in march_level(Dz, xs, ys, cin,
+                                             comp=reg0):
                 pts = [(float(a), float(b)) for a, b in P]
                 if len(pts) >= 3:
                     p0 = pts + [pts[0]] if closed else pts
@@ -595,7 +611,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 "live_depth_mm": (lambda dd: round(dd, 3) if math.isfinite(dd)
                                 else None)(live.disk_depth(p0[0][0], p0[0][1],
                                                         t0))})
-            li0 += 1
+            li0 -= 1
         r_max = float(Dz.max())
         if not entered:
             stats["no_entry"].append({
@@ -604,6 +620,10 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 "reason": "no legal entry: steps 1-5 all refused (r_max_cl="
                         "%.3f < min_helix_r=%.3f, no shallow column, ramp/"
                         "zigzag/SE2 blocked)" % (r_max, min_helix_r)})
+            if z.get("fragment"):
+                fragments.append({"bbox": z["bbox"], "area_mm2": z["area_mm2"],
+                                  "reason": "lone mini-zone, no legal entry "
+                                          "(r_max_cl=%.3f)" % r_max})
             continue
 
         prev = (moves[-1]["x"], moves[-1]["y"], round(t0, 4))
@@ -621,12 +641,10 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 rc *= 0.8
 
         n_levels = 0
-        # RR1c-3: cut TOP-DOWN from the entered level, then step down level
-        # by level (the levels the ladder refused at full live depth are
-        # re-tried from the level just cleared, where their depth is ~ one
-        # stepdown); levels above the entry follow, fed up as before.
-        order = [li0] + list(range(li0 - 1, -1, -1)) + \
-            list(range(li0 + 1, len(levels)))
+        # RR1c-4: cut the zone's levels TOP-DOWN from the entered level; no
+        # level cuts while higher-level stock stands above it; each lower
+        # level is re-entered from the level just cleared (as RR1c-3).
+        order = list(range(li0, -1, -1))
         for li, idx in enumerate(order):
             t, reg = levels[idx]
             if li and t >= prev[2] - 1e-9:
@@ -649,11 +667,14 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                     rings.append(pts)
                     clneed.append(False)
                 c += ae
+            rings.reverse()    # RR1c-4: rings INSIDE-OUT, largest c first
+            ring_seq = False
             if li == 0 and mode == "zigzag":
                 paths = runs0 + rings          # zigzag first, then rings
                 clneed = [False] * len(paths)
             else:
                 paths = rings
+                ring_seq = True    # keep the inside-out order (no greedy)
             if not paths:
                 if maxc < ae / 2.0:
                     # RR1c-3b: thin level strip (max distance < ae/2). The
@@ -694,11 +715,14 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
             cut_here = 0
             skipped = 0
             while paths:
-                k, d0 = min(
-                    ((ki, math.hypot(r[0][0] - prev[0], r[0][1] - prev[1]))
-                     for ki, r in enumerate(paths)), key=lambda t_: t_[1])
+                if ring_seq:
+                    k = 0   # RR1c-4: rings stay inside-out, not greedy
+                else:
+                    k = min(range(len(paths)), key=lambda ki: math.hypot(
+                        paths[ki][0][0] - prev[0], paths[ki][0][1] - prev[1]))
                 pts = paths.pop(k)
                 need_cl = clneed.pop(k)
+                d0 = math.hypot(pts[0][0] - prev[0], pts[0][1] - prev[1])
                 if cut_here % 2:
                     pts = pts[::-1]
                 if (math.hypot(pts[0][0] - prev[0], pts[0][1] - prev[1])
