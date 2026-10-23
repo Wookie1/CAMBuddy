@@ -34,6 +34,11 @@ import numpy as np
 # target is steady 2.032, spike 2.438. Engine-side targets sit under them
 # for grid/quantisation margin.
 FW_FRAC = 0.9
+# BS1a3b: the selection triggers BELOW the judge's 0.9 x D - its replay of the
+# ZE2 windows on the engine stock grid reads a little under zmap's grid
+# (one 1.06 mm ring window at ae_eff 11.91 >= 11.42 slipped through on Core
+# Front, Z 42.926); the judge's own threshold stays 0.9 x D
+FW_TRIGGER = 0.85
 AE_SS = 1.85            # steady target per 1 mm window
 AE_SPIKE = 2.25         # spike target per 1 mm window
 MIN_SLIVER = 4.0        # CL-allowed sliver needed to host loops + entry
@@ -254,7 +259,7 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
     regions = []
     if not rings:
         return regions
-    fw_min = FW_FRAC * 2.0 * tool_r
+    fw_min = FW_TRIGGER * 2.0 * tool_r
     done = np.zeros((stock.ny, stock.nx), dtype=bool)
     blocked = []
     cl_len = 0.0
