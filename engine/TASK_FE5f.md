@@ -1,4 +1,5 @@
 # Task FE5f: skip (never plunge) finish/rest entries FE5e cannot make legal; report the skipped area. Build, then report. Do not commit.
+LOCKS: NEVER create, remove or edit /private/tmp/claude-502/*.lock, /private/tmp/claude-502/m4slot.prio or /private/tmp/claude-502/m4model.busy - not even a lock you think is stale (the slot scripts clear a dead owner's lock themselves); if a slot seems stuck, write that into your results file and wait or stop.
 HARD RULES: no git stash/reset/clean/restore/checkout/rebase; no bypass flags; never relax or delete tests; do NOT edit
 verify/ or opencode.json; NEVER lower the ZB floor; NEVER skip a pass entry that can be entered legally (FE5e's top-clear
 ramp or the reverse end). Edit engine/finish.py, connector/runner.py (summary only), engine/test_finish.py.
