@@ -1,12 +1,12 @@
-"""Task BS1a: trochoidal channel clearing for the hug-ring residue.
+"""Task BS1a3: trochoidal channel clearing for the hug-ring residue.
 
-Per level, AFTER all Adaptive2d regions and BEFORE the hug rings: a hug-ring
-run whose engagement against the LIVE stock model would be full width (stock
-standing on both sides of the ring, at the level's full stepdown) can never
+Per level, AFTER every Adaptive2d region has been emitted and milled: where
+a ring's own ZE2 windows against that LIVE stock are full width (ae_eff >=
+FW_FRAC x D, plus a small lead-in/out), the ring can never
 be a thin skim - Adaptive2d never entered that channel (no start point / over
 the load), so the ring would slot the whole channel cross-section at cutting
-feed. Here those runs are cleared first with TROCHOIDAL loops along the
-channel centre line:
+feed. Those stretches are cleared first with TROCHOIDAL loops along the
+channel centre line; light / over-load-only windows stay with the ring (BS1b):
 
   * the centre line is marched from the ring point into the channel side
     (isl_ok3 at every step) to the middle of the CL-allowed sliver;
@@ -27,7 +27,6 @@ r >= 1.903 helix: they are REPORTED (stats["band_blocked"]) and left to the
 ring, never forced (no plunge).
 """
 import math
-import os
 
 import numpy as np
 
@@ -46,19 +45,7 @@ P_CAP = 0.36          # empirical spike cap: the fresh lens at the channel-side
                       # loop apex is cut in one ~1 mm window (~6 mm2 per mm of
                       # advance on a 12.686 flat) - keep advance small
 MARCH_STEP = 0.25       # sliver march resolution
-
-# BS1a addendum item 3 (report-only what-if): env overrides of the EXISTING
-# parameters - unset, every default below is unchanged and behaviour is
-# byte-identical to the judged run. BS1A_LOOP_R_MAX=99 sizes loop radius
-# purely from the local CL room (half-width minus 0.15 clearance, no clamp);
-# AE_SS/AE_SPIKE/P_CAP are the same knobs the tuner already has.
-_WHATIF = bool(os.environ.get("BS1A_WHATIF"))
-if _WHATIF:
-    LOOP_R_MAX = float(os.environ.get("BS1A_LOOP_R_MAX", LOOP_R_MAX))
-    AE_SS = float(os.environ.get("BS1A_AE_SS", AE_SS))
-    AE_SPIKE = float(os.environ.get("BS1A_AE_SPIKE", AE_SPIKE))
-    P_CAP = float(os.environ.get("BS1A_P_CAP", P_CAP))
-_ADV = {"n": 0, "sum": 0.0, "max": 0.0}     # advance stats (what-if only)
+FW_LEAD_PTS = 3         # lead-in/out (x 0.4 mm) around a full-width run
 
 
 def _march(p, ux, uy, isl_ok3, maxd):
@@ -136,13 +123,15 @@ def _advance(r, tool_r):
     return max(LOOP_R_MIN * 0.3, min(p, P_CAP))
 
 
-def _simulate(path, stock, z, tool_r, cell, bore_r):
-    """Replay ZE2 windowing on the engine stock grid: fixed 1 mm windows of
+def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None):
+    """Replay ZE2 windowing on the engine stock grid: move-aligned windows of
     path travel; a window's area = distinct cells whose live top stands above
     z + 0.05 and that first fall under the cutter disk (applied at every
     emitted point) inside it. The entry bore (disk bore_r about the start) is
     pre-cleared - the helix + floor circle cut it at entry feed. Returns the
-    list of per-window ae_eff estimates (mm)."""
+    list of per-window ae_eff estimates (mm); ends collects each window's
+    cumulative end-of-window travel (zmap _ae2_windows: moves merge until the
+    window reaches 1 mm, a move >= 1 mm is its own window)."""
     k = int(math.ceil(tool_r / cell))
     offs = [(dj, di) for dj in range(-k, k + 1) for di in range(-k, k + 1)
             if (dj * dj + di * di) * cell * cell <= tool_r * tool_r]
@@ -165,9 +154,11 @@ def _simulate(path, stock, z, tool_r, cell, bore_r):
     wins = []
     acc_area = 0.0
     acc_len = 0.0
+    tot = 0.0
     prev = None
     for (x, y) in path[1:]:
         step_len = math.dist(prev, (x, y)) if prev is not None else 0.0
+        tot += step_len
         ci, cj = stock._ci(x) - i0, stock._cj(y) - j0
         removed = 0
         for dj, di in offs:
@@ -181,16 +172,14 @@ def _simulate(path, stock, z, tool_r, cell, bore_r):
             acc_area += area
             acc_len += 0.0
         else:
-            if acc_len + step_len >= 1.0 and step_len > 1e-9:
-                frac = (1.0 - acc_len) / step_len
-                win_area = acc_area + area * frac
-                wins.append(win_area)
-                rest = 1.0 - frac
-                acc_area = area * rest
-                acc_len = step_len * rest
-            else:
-                acc_area += area
-                acc_len += step_len
+            acc_area += area
+            acc_len += step_len
+            if acc_len >= 1.0:                 # move-aligned windows (judge)
+                wins.append(acc_area)
+                if ends is not None:
+                    ends.append(tot)
+                acc_area = 0.0
+                acc_len = 0.0
         prev = (x, y)
     return wins
 
@@ -230,10 +219,6 @@ def _trochoid(seg, tool_r):
         # share per window must stay under the steady bar: dr <= AE*r/(R+r)
         r_used = min(rt, LOOP_R_MIN + 0.5 * AE_SS * k * rt / (tool_r + rt))
         p = _advance(r_used, tool_r)
-        if _WHATIF:
-            _ADV["n"] += 1
-            _ADV["sum"] += p
-            _ADV["max"] = max(_ADV["max"], p)
         dt = 0.35 / max(r_used, LOOP_R_MIN)   # ~0.35 mm arc/point
         n = max(8, int(math.ceil(2.0 * math.pi / dt)))
         for i in range(n + 1):
@@ -259,38 +244,61 @@ def _trochoid(seg, tool_r):
 
 def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                     stats=None):
-    """rings: hug_regions output for this level (before emission, live stock
-    at start of level). Returns trochoidal channel-clear region dicts to emit
-    BEFORE the rings. stats gets n_band_regions / band_cut_len_mm /
-    band_blocked [(z, x, y), ...]."""
-    from engine.rough import _strip_engage
+    """rings: hug_regions output for this level; stock is the LIVE model AFTER
+    this level's Adaptive2d regions have been emitted and milled. Per ring
+    path the ZE2 windows are replayed on that live stock (entry bore
+    pre-cleared) and ONLY the full-width stretches - windows with ae_eff >=
+    FW_FRAC x D, plus a FW_LEAD_PTS-sample lead-in/out - are trochoided;
+    light / over-load-only windows are left to the ring (BS1b's job). stats
+    gets n_band_regions / band_cut_len_mm / band_cl_len_mm / band_blocked."""
     regions = []
     if not rings:
         return regions
     fw_min = FW_FRAC * 2.0 * tool_r
     done = np.zeros((stock.ny, stock.nx), dtype=bool)
     blocked = []
+    cl_len = 0.0
     for res in rings:
         for (kind, pts) in res["paths"]:
             if kind != "cutting" or len(pts) < 2:
                 continue
-            eng = _strip_engage(stock, pts, z, tool_r)
-            if eng < fw_min:
-                continue
             dense = _resample(pts, step=0.4)
+            wb = []
+            wins = _simulate(pts, stock, z, tool_r, cell, 1.3 * tool_r, wb)
+            if not wins:
+                continue
+            # a dense sample is judged by the same window zmap will use:
+            arc = [0.0]
+            for a, b in zip(dense[:-1], dense[1:]):
+                arc.append(arc[-1] + math.dist(a[:2], b[:2]))
+            mark = [False] * len(dense)
+            w = 0
+            for i, s in enumerate(arc):
+                while w < len(wb) and wb[w] < s:
+                    w += 1
+                if w >= len(wins):
+                    break                       # trailing < 1 mm: judge drops it
+                if wins[w] < fw_min:
+                    continue
+                lo = max(0, i - FW_LEAD_PTS)
+                hi = min(len(dense), i + FW_LEAD_PTS + 1)
+                for k in range(lo, hi):
+                    mark[k] = True
+            if not any(mark):
+                continue
             cl = _centreline(dense, isl_ok3, tool_r, leave)
             prev_bad = None
             for i, s in enumerate(cl):
-                if s is None:
+                if mark[i] and s is None:      # FW spot, no CL room to host
                     if (prev_bad is None
                             or math.dist(prev_bad, dense[i][:2]) > 2.0):
                         blocked.append((round(dense[i][0], 2),
                                       round(dense[i][1], 2)))
-                    prev_bad = dense[i][:2]
+                prev_bad = (dense[i][:2] if mark[i] and s is None else None)
             segs = []
             cur = []
-            for s in cl:
-                if s is None:
+            for i, s in enumerate(cl):
+                if s is None or not mark[i]:
                     if len(cur) >= 4:
                         segs.append(cur)
                     cur = []
@@ -333,6 +341,7 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                     i, j = stock._ci(s[0]), stock._cj(s[1])
                     if 0 <= i < stock.nx and 0 <= j < stock.ny:
                         done[j, i] = True
+                cl_len += length
                 regions.append({"start": list(pts_out[0]), "helix": None,
                                "paths": [["cutting", pts_out]]})
     if stats is not None:
@@ -343,11 +352,9 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                       for a, b in zip(r["paths"][0][1][:-1],
                                      r["paths"][0][1][1:]))
                   for r in regions), 1)
+        stats["band_cl_len_mm"] = round(
+            stats.get("band_cl_len_mm", 0.0) + cl_len, 1)
         if blocked:
             stats.setdefault("band_blocked", []).extend(
                 (round(z, 3), b[0], b[1]) for b in blocked[:40])
-        if _WHATIF and _ADV["n"]:
-            stats["band_advance_mean_mm"] = round(
-                _ADV["sum"] / _ADV["n"], 3)
-            stats["band_advance_max_mm"] = round(_ADV["max"], 3)
     return regions

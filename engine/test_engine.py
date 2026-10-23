@@ -1088,6 +1088,7 @@ def _main():
                test_hb1v2_flat_floor_circle_after_helix,
                test_bs1a_straight_channel,
                test_bs1a_lshaped_channel,
+               test_bs1a3_no_band_after_a2d,
                test_stl_cache_keyed_by_content,
                test_rr1a_rough_cli_refuses_ball):
         try:
@@ -1719,6 +1720,59 @@ def test_bs1a_lshaped_channel():
     print("PASS bs1a L-shaped channel: %d band region(s), %.1f mm trochoidal "
           "cut, 0 full-width windows at cutting feed in the channel"
           % (stats["n_band_regions"], stats["band_cut_len_mm"]))
+
+
+def test_bs1a3_no_band_after_a2d():
+    """Task BS1a3: an open 40 x 30 mm, 18 mm-deep pocket that Adaptive2d
+    clears completely (the hug rings only skim the leave margin): judged on
+    the LIVE stock AFTER this level's a2d passes, no ring window reaches full
+    width (ae_eff >= 0.9 x D), so BS1a3 must emit ZERO band regions here.
+    FAILS on c074148, which ran the channel check on the stock as it stood at
+    the START of the level - pre-a2d, every ring looked like a full-width
+    channel and got trochoided."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    from opencamlib import ocl
+    import engine.rough as R
+    from engine.rough import rough
+    orig_hug = R.hug_regions
+    seen = []
+
+    def _spy(*a, **k):
+        res = orig_hug(*a, **k)
+        seen.append(sum(1 for r in res for kp in r["paths"]
+                        if kp[0] == "cutting"))
+        return res
+    R.hug_regions = _spy
+    stock_box = (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0)
+    tris = (_box_tris(-20.0, 20.0, -15.0, 15.0, -1.0, 0.0)     # pocket floor
+            + _box_tris(-40.0, -20.0, -30.0, 30.0, 0.0, 18.0)   # surrounding
+            + _box_tris(20.0, 40.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-20.0, 20.0, -30.0, -15.0, 0.0, 18.0)
+            + _box_tris(-20.0, 20.0, 15.0, 30.0, 0.0, 18.0))
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a3_pocket.stl")
+        _write_stl(stl, tris)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        try:
+            moves, stats = rough(surf, stock_box, 6.343, 0.0, leave=0.381,
+                                axial_leave=0.381, stepdown=19.05,
+                                stepup=1.905, tolerance=0.05, threads=4,
+                                stock_cell=0.5, min_rest=0.5, corner_r=0.0,
+                                stl_path=stl)
+        finally:
+            R.hug_regions = orig_hug
+        assert sum(seen) > 0, "no hug-ring paths were planned: the level " \
+            "residue the check judges is missing (vacuous test)"
+        assert sum(l.get("n_regions", 0) for l in stats["levels"]) > 0, \
+            "no regions at all: the pocket was never machined"
+        assert stats.get("n_band_regions", 0) == 0, \
+            "%d band region(s) in a pocket a2d clears - the channel check is " \
+            "still judging pre-a2d / non-full-width stock (blocked: %s)" \
+            % (stats["n_band_regions"], stats.get("band_blocked", [])[:4])
+    print("PASS bs1a3 no-band-after-a2d: pocket fully cleared by a2d, "
+          "0 band regions emitted")
 
 
 def test_rr1a_rough_cli_refuses_ball():
