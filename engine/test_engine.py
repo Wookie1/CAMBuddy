@@ -1396,6 +1396,142 @@ def test_rr1c2_cf_rapid_shapes_clear_stock():
         len(bad), max(b[3] for b in bad))
 
 
+def test_rr1c3_curved_thin_band_centre_line():
+    """RR1c-3 item 1: a CURVED thin band (quarter-ring rest strip, max
+    distance < ae/2) on the part is cut ALONG ITS OWN CENTRE LINE. On
+    e206c56 the axis-aligned zig-zag fallback crossed the arc in short
+    chords and left most of the band uncut (DIAG (a), the flank bands); now
+    the ordered distance-field iso-polylines at c = max(maxDz/2, CELL/2)
+    cut it: >= 80 % of the centre-line length at cut feed, validate_exact
+    0, every scored entry <= 0.5 mm."""
+    try:
+        from engine import rest_rough as rr
+        from engine import entry_depth as ed
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    box = _rr1c_boxes()
+    surf = _rr1c_surf(box(0, 52, 0, 52, 20, 30))
+    cell = 0.5
+    n = int(52 / cell)
+    cxv = (np.arange(n) + 0.5) * cell
+    X, Y = np.meshgrid(cxv, cxv)
+    Rq = np.hypot(X - 20.0, Y - 20.0)
+    band = (Rq >= 29.8) & (Rq <= 30.2) & (X >= 20.0) & (Y >= 20.0)
+    A = np.full((n, n), 30.0)
+    A[band] = 30.6                              # 0.6 mm rest on the arc
+    moves, stats = rr.rest_rough(
+        surf, (A, 0.0, 0.0, cell), ("ball", 9.525), floor_z=30.0,
+        stepdown=2.0, ae=1.905, rest_leave=0.2, min_excess=0.4,
+        min_helix_r=1.903, ramp_angle_deg=2.0, cut_feed=2280.0,
+        ramp_feed=850.0)
+    assert moves and len(stats["zones"]) == 1 and not stats["no_entry"], \
+        "curved band must be entered: %r" % (stats["no_entry"],)
+    centre_len = 0.5 * math.pi * 30.0          # quarter ring at r = 30
+    cut = 0.0
+    prev = None
+    for m in moves:
+        if m["g"] == 1 and m["f"] >= 2280.0 and prev is not None:
+            mx, my = (m["x"] + prev[0]) / 2.0, (m["y"] + prev[1]) / 2.0
+            rm = math.hypot(mx - 20.0, my - 20.0)
+            if mx >= 20.0 and my >= 20.0 and 29.3 <= rm <= 30.7:
+                cut += math.hypot(m["x"] - prev[0], m["y"] - prev[1])
+        prev = (m["x"], m["y"])
+    assert cut >= 0.8 * centre_len, \
+        "centre-line pass cut %.1f mm of %.1f mm centre line (want >= 80%%)" \
+        % (cut, centre_len)
+    below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
+    assert below == 0, "gouge: %d pts (worst %.3f)" % (below, worst)
+    live = ed.LiveStock(A, 0.0, 0.0, cell, 9.525 / 2.0)
+    mv = [dict(m, line=i) for i, m in enumerate(moves)]
+    entries = ed.estimate_entries(mv, live)
+    assert entries, "no entries recorded"
+    deep = [e for e in entries if not math.isfinite(e["depth_mm"])
+            or e["depth_mm"] > 0.5]
+    assert not deep, "deep entry: %s" % deep[:3]
+
+
+def test_rr1c3_bay_deep_groove_top_down():
+    """RR1c-3 item 2: a bay whose deepest level is a NARROW GROOVE (max
+    distance 0.2 mm) under a wider upper level. On e206c56 the pass loop
+    ran levels[li0:] and skipped the groove (DIAG (b): 0.83-1.52 mm left at
+    the finish's bay entries although the leave is 0.2); now levels cut
+    top-down from the entered level, each deeper level re-tried through the
+    one enter() ladder from the level just cleared. After the rest-rough the
+    LIVE STOCK depth at the groove floor is <= 0.5 mm (target 0.2 + tol),
+    both levels are cut, validate_exact 0, every entry <= 0.5 mm."""
+    try:
+        from engine import rest_rough as rr
+        from engine import entry_depth as ed
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    box = _rr1c_boxes()
+    tris = []
+    tris += box(0, 10, 0, 68, 20, 30)          # side walls
+    tris += box(24, 34, 0, 68, 20, 30)
+    tris += box(10, 24, 64, 68, 20, 30)       # north end (south open)
+    # bay floor: concave arc rho = 12 across the bay (centre x 17, z 38),
+    # running straight along y from 4 to 64 -> the ball reaches z = 26.0 at
+    # the valley line, so the deepest leave-legal level is a ~0.4 mm wide
+    # strip on the floor (r_max_cl 0.2), under a ~10 mm wide upper level
+    xs_ = [10.0 + i for i in range(15)]
+    zs = [38.0 - math.sqrt(144.0 - (x - 17.0) ** 2) for x in xs_]
+    for i in range(len(xs_) - 1):
+        tris += [((xs_[i], 4.0, zs[i]), (xs_[i + 1], 4.0, zs[i + 1]),
+                  (xs_[i + 1], 64.0, zs[i + 1])),
+                 ((xs_[i], 4.0, zs[i]), (xs_[i + 1], 64.0, zs[i + 1]),
+                  (xs_[i], 64.0, zs[i]))]
+    tris += [((10.0, 4.0, zs[0]), (10.0, 64.0, zs[0]), (10.0, 64.0, 20.0)),
+             ((10.0, 4.0, zs[0]), (10.0, 64.0, 20.0), (10.0, 4.0, 20.0)),
+             ((24.0, 4.0, zs[-1]), (24.0, 64.0, 20.0), (24.0, 64.0, zs[-1])),
+             ((24.0, 4.0, zs[-1]), (24.0, 4.0, 20.0), (24.0, 64.0, 20.0)),
+             ((10.0, 4.0, zs[0]), (24.0, 4.0, zs[-1]), (24.0, 4.0, 20.0)),
+             ((10.0, 4.0, zs[0]), (24.0, 4.0, 20.0), (10.0, 4.0, 20.0)),
+             ((10.0, 64.0, zs[0]), (24.0, 64.0, 20.0), (24.0, 64.0, zs[-1])),
+             ((10.0, 64.0, zs[0]), (24.0, 64.0, zs[-1]), (10.0, 64.0, 20.0))]
+    surf = _rr1c_surf(tris)
+    cell = 0.5
+    nX, nY = int(34 / cell), int(68 / cell)
+    xv = (np.arange(nX) + 0.5) * cell
+    yv = (np.arange(nY) + 0.5) * cell
+    X, Y = np.meshgrid(xv, yv)
+    A = np.full((nY, nX), 30.0)               # 4 mm of rest over the bay
+    A[Y < 4.0] = 25.0                         # open south, below the floor
+    moves, stats = rr.rest_rough(
+        surf, (A, 0.0, 0.0, cell), ("ball", 9.525), floor_z=26.0,
+        stepdown=2.0, ae=1.905, rest_leave=0.2, min_excess=0.5,
+        min_helix_r=1.903, ramp_angle_deg=2.0, cut_feed=2280.0,
+        ramp_feed=850.0)
+    assert moves and len(stats["zones"]) == 1 and not stats["no_entry"], \
+        "bay must be entered: %r" % (stats["no_entry"],)
+    assert stats["zones"][0]["levels"] >= 2, \
+        "only the entered level cut: %r" % stats["zones"][0]
+    below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
+    assert below == 0, "gouge: %d pts (worst %.3f)" % (below, worst)
+    live = ed.LiveStock(A, 0.0, 0.0, cell, 9.525 / 2.0)
+    mv = [dict(m, line=i) for i, m in enumerate(moves)]
+    entries = ed.estimate_entries(mv, live)
+    deep = [e for e in entries if not math.isfinite(e["depth_mm"])
+            or e["depth_mm"] > 0.5]
+    assert not deep, "deep entry: %s" % deep[:3]
+    # leftover on the groove floor after the program, from the stamped live
+    # grid: stock above (exact CL + rest leave) at the valley line
+    live2 = ed.LiveStock(A, 0.0, 0.0, cell, 9.525 / 2.0)
+    prev = None
+    for m in moves:
+        cur = (m["x"], m["y"], m["z"])
+        if prev is not None and m["g"] == 1:
+            live2.stamp_chord(prev, cur)
+        prev = cur
+    worst_left = 0.0
+    for py in (12.0, 24.0, 36.0, 48.0, 60.0):
+        d = live2.disk_depth(17.0, py, 26.2)
+        assert math.isfinite(d), "no live data at groove floor 17.0,%.0f" % py
+        worst_left = max(worst_left, d)
+    assert worst_left <= 0.5, \
+        "groove floor leaves %.3f mm (want <= 0.5; e206c56 left ~2.0)" \
+        % worst_left
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -1419,7 +1555,9 @@ def _main():
                test_rr1b_rest_rough_reports_small_pocket,
                test_rr1c_thin_band_inpass_ramp,
                test_rr1c_narrow_pocket_side_entry,
-               test_rr1c2_cf_rapid_shapes_clear_stock):
+               test_rr1c2_cf_rapid_shapes_clear_stock,
+               test_rr1c3_curved_thin_band_centre_line,
+               test_rr1c3_bay_deep_groove_top_down):
         try:
             fn()
         except AssertionError as e:

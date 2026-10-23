@@ -611,13 +611,23 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 rc *= 0.8
 
         n_levels = 0
-        for li, (t, reg) in enumerate(levels[li0:]):
-            if li:
+        # RR1c-3: cut TOP-DOWN from the entered level, then step down level
+        # by level (the levels the ladder refused at full live depth are
+        # re-tried from the level just cleared, where their depth is ~ one
+        # stepdown); levels above the entry follow, fed up as before.
+        order = [li0] + list(range(li0 - 1, -1, -1)) + \
+            list(range(li0 + 1, len(levels)))
+        for li, idx in enumerate(order):
+            t, reg = levels[idx]
+            if li and t >= prev[2] - 1e-9:
                 g1(prev[0], prev[1], round(t, 4), ramp_feed)
+            # a descent level is never a vertical drop at prev XY: the pass
+            # loop re-enters it through the one enter() ladder below
             Dz = ndimage.distance_transform_edt(reg) * CELL
             reg_cur = reg
             maxc = float(Dz.max())
             rings = []
+            clneed = []
             c = ae / 2.0
             while c <= maxc + 1e-9:
                 for P, closed, _K in march_level(Dz, xs, ys, c, comp=reg):
@@ -627,15 +637,33 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                     if closed:
                         pts = pts + [pts[0]]
                     rings.append(pts)
+                    clneed.append(False)
                 c += ae
             if li == 0 and mode == "zigzag":
                 paths = runs0 + rings          # zigzag first, then rings
+                clneed = [False] * len(paths)
             else:
                 paths = rings
             if not paths:
-                # centre-line pass: a region thinner than ae/2 max-distance
-                # has NO offset rings at all - cut its centre runs instead
-                paths = zigzag_runs(reg, xs, ys, ae, 2 * CELL)
+                if maxc < ae / 2.0:
+                    # RR1c-3: thin level strip (max distance < ae/2) - cut
+                    # ALONG ITS OWN CENTRE LINE: the ordered iso-polylines of
+                    # the distance field at c = max(maxDz/2, CELL/2). The
+                    # axis-aligned zig-zag rows crossed a curved 1-2 cell
+                    # strip in < min_run groups and cut nothing (DIAG (a)).
+                    c_mid = max(maxc / 2.0, CELL / 2.0)
+                    for P, closed, _K in march_level(Dz, xs, ys, c_mid,
+                                                    comp=reg):
+                        pts = [(float(a), float(b)) for a, b in P]
+                        if len(pts) < 2:
+                            continue
+                        if closed:
+                            pts = pts + [pts[0]]
+                        paths.append(pts)
+                        clneed.append(True)   # every point CL-checked below
+                else:
+                    paths = zigzag_runs(reg, xs, ys, ae, 2 * CELL)
+                    clneed = [False] * len(paths)
             cut_here = 0
             skipped = 0
             while paths:
@@ -643,17 +671,23 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                     ((ki, math.hypot(r[0][0] - prev[0], r[0][1] - prev[1]))
                      for ki, r in enumerate(paths)), key=lambda t_: t_[1])
                 pts = paths.pop(k)
+                need_cl = clneed.pop(k)
                 if cut_here % 2:
                     pts = pts[::-1]
-                if math.hypot(pts[0][0] - prev[0], pts[0][1] - prev[1]) > 1e-6:
+                if (math.hypot(pts[0][0] - prev[0], pts[0][1] - prev[1])
+                        > 1e-6 or prev[2] - t > 1e-9):
                     # feed link only where the straight path keeps leave above
                     # the EXACT part CL (batched drop-cutter, same check as the
-                    # passes); else the ONE RR1c ladder enter(), else skip.
+                    # passes); a descent link only at <= ramp_angle (in-pass,
+                    # live depth ~ one stepdown); else the ONE RR1c ladder
+                    # enter(), else skip.
                     n = max(int(d0 / 0.25), 1)
                     lp = [(prev[0] + (pts[0][0] - prev[0]) * q / n,
                          prev[1] + (pts[0][1] - prev[1]) * q / n, t)
                         for q in range(n + 1)]
-                    if cl_ok_path(lp):
+                    dzd = prev[2] - t
+                    if cl_ok_path(lp) and (dzd <= 1e-9
+                                          or d0 * tanr >= dzd - 1e-9):
                         g1(pts[0][0], pts[0][1], round(t, 4), ramp_feed)
                     else:
                         ldx = ldy = 0.0
@@ -663,7 +697,27 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                             if dl > 1e-9:
                                 ldx, ldy = ((pts[1][0] - pts[0][0]) / dl,
                                           (pts[1][1] - pts[0][1]) / dl)
-                        if not enter(pts[0][0], pts[0][1], t, ldx, ldy, zi):
+                        if dzd > 1e-9 and d0 > 1e-6:
+                            # descent: the step-2 ramp must come down along
+                            # the direction of travel FROM the level just
+                            # cleared (its top sits in material that is
+                            # already cut), not the contour tangent
+                            ldx, ldy = ((pts[0][0] - prev[0]) / d0,
+                                       (pts[0][1] - prev[1]) / d0)
+                        ok = enter(pts[0][0], pts[0][1], t, ldx, ldy, zi)
+                        if not ok and dzd > 1e-9:
+                            # descent into a narrow strip: at the contour's
+                            # start (its cap) the tangent runs ACROSS the
+                            # strip - retry the ladder along the strip's own
+                            # long axis, where a step-2 ramp fits inside it
+                            jsr2, isr2 = np.nonzero(reg)
+                            if len(jsr2) >= 2:
+                                ax2 = ((1.0, 0.0) if xs[isr2].max() -
+                                     xs[isr2].min() >= ys[jsr2].max() -
+                                     ys[jsr2].min() else (0.0, 1.0))
+                                ok = enter(pts[0][0], pts[0][1], t, ax2[0],
+                                         ax2[1], zi)
+                        if not ok:
                             skipped += 1
                             stats["passes_skipped"].append({
                                 "zone": zi, "t": round(t, 3),
@@ -677,6 +731,21 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                                                math.isfinite(dd) else None)(
                                     live.disk_depth(pts[0][0], pts[0][1], t))})
                             continue
+                if need_cl and not cl_ok_path(
+                        [(px, py, round(t, 4)) for px, py in pts]):
+                    # every point of a centre-line pass goes through the same
+                    # exact CL check as the passes; fail closed, skip it
+                    skipped += 1
+                    stats["passes_skipped"].append({
+                        "zone": zi, "t": round(t, 3),
+                        "xy": [round(pts[0][0], 2), round(pts[0][1], 2)],
+                        "run_mm": round(sum(
+                            math.hypot(pts[i + 1][0] - pts[i][0],
+                                     pts[i + 1][1] - pts[i][1])
+                            for i in range(len(pts) - 1)), 1),
+                        "live_depth_mm": None,
+                        "reason": "centre-line not CL-legal"})
+                    continue
                 for (px, py) in pts[1:]:
                     g1(px, py, round(t, 4), cut_feed)
                 prev = (pts[-1][0], pts[-1][1], round(t, 4))
