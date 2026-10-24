@@ -268,7 +268,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
 
     def link_clear(fr, zn):
         """RR1c-4b fragment bridge at the cutting Z (fragment stockmax -
-        leave): every bridge point exact-CL-legal AND stock-clear - no live
+        leave): every bridge point CL+leave legal AND stock-clear - no live
         column deeper than zb_floor; fail closed on unjudged stock."""
         dt = ndimage.distance_transform_edt(~zn["mask"])
         fi, fj = np.unravel_index(int(np.argmin(
@@ -284,7 +284,8 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
         if any(live.disk_top(px, py) > zc + zb_floor for px, py in pts):
             return False
         v = batch_drop(surf, make_cutter("ball", dia), pts, threads=1)
-        return all(math.isfinite(z_) and z_ <= zc + 0.005 for z_ in v)
+        return all(math.isfinite(z_) and z_ <= zc - rest_leave + 0.005
+                   for z_ in v)
 
     zones = find_zones(Sg, Zd, floor_z, min_excess, xs, ys, fragments,
                        tool_d=dia, link_ok=link_clear)
@@ -358,24 +359,24 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
     cutter_ball = make_cutter("ball", dia)
 
     def cl_ok(x, y, z):
-        """Exact (continuous-triangle) part CL at (x, y) permits tip Z = z:
-        a vertical descent to z there can never gouge. The stock grid alone
+        """Exact (continuous-triangle) part CL + rest leave at (x, y):
+        v <= z - rest_leave + 0.005 (validate_exact). The stock grid alone
         misses walls between cell centres, so every ladder vertical descent
         column is checked against the exact CL too; fail closed."""
         v = batch_drop(surf, cutter_ball, [(x, y)], threads=1)[0]
-        return math.isfinite(v) and v <= z + 0.005
+        return math.isfinite(v) and v <= z - rest_leave + 0.005
 
     def cl_ok_path(pts):
         """Exact batched drop-cutter check for a whole EMITTED path (ramp
         interior, side-entry feed-in, helix, floor circle, feed link): every
-        point must sit at or above the exact part CL (+0.005); fail closed on
+        point keeps CL + rest_leave above exact CL (+0.005); fail closed on
         no contact. The 0.2 mm grid `legal` misses walls between cell
         centres, so emitted geometry never relies on it alone."""
         if not pts:
             return True
         v = batch_drop(surf, cutter_ball, [(p[0], p[1]) for p in pts],
                        threads=workers)
-        return all(math.isfinite(zc) and zc <= p[2] + 0.005
+        return all(math.isfinite(zc) and zc <= p[2] - rest_leave + 0.005
                    for p, zc in zip(pts, v))
 
     def _record(zone_i, t, step, kind_s, depth):

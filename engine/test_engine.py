@@ -1713,6 +1713,82 @@ def test_rr1c4b_closed_pocket_bore_levels():
     assert not deep, "deep entry (ZB): %s" % deep[:3]
 
 
+def _rr1c4c_plateau_pocket_scene():
+    """RR1c-4c scene: frame [0,40]^2, stock 30, pocket [8,32]^2 to floor
+    24.0 whose +x half is a low plateau at 24.1 - a rising part surface
+    INSIDE the rest leave (0.2) of the deepest legal level Z 24.2: a bore
+    floor circle / helix bottom that crosses the plateau edge is above the
+    exact CL but 0.1 mm inside the leave. Returns (surf, stock)."""
+    from opencamlib import ocl
+
+    def box(xmin, xmax, ymin, ymax, zmin, zmax):
+        v = {(sx, sy, sz): (xmin if sx < 0 else xmax,
+                            ymin if sy < 0 else ymax,
+                            zmin if sz < 0 else zmax)
+             for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)}
+
+        def q(p1, p2, p3, p4):
+            return [(p1, p2, p3), (p1, p3, p4)]
+
+        t = []
+        A_, B_, C_, D_ = (v[(-1, -1, 1)], v[(1, -1, 1)], v[(1, 1, 1)],
+                          v[(-1, 1, 1)])
+        E_, F_, G_, H_ = (v[(-1, -1, -1)], v[(1, -1, -1)], v[(1, 1, -1)],
+                          v[(-1, 1, -1)])
+        t += q(A_, B_, C_, D_) + q(E_, H_, G_, F_)
+        t += q(A_, E_, F_, B_) + q(D_, C_, G_, H_)
+        t += q(A_, D_, H_, E_) + q(B_, F_, G_, C_)
+        return t
+
+    tris = []
+    tris += box(0, 8.0, 0, 40, 20, 30)
+    tris += box(32.0, 40, 0, 40, 20, 30)
+    tris += box(8.0, 32.0, 0, 8.0, 20, 30)
+    tris += box(8.0, 32.0, 32.0, 40, 20, 30)
+    tris += box(8.0, 25.0, 8.0, 32.0, 20, 24.0)     # flat pocket floor
+    tris += box(25.0, 32.0, 8.0, 32.0, 20, 24.1)      # low plateau
+    surf = ocl.STLSurf()
+    for t in tris:
+        surf.addTriangle(ocl.Triangle(*[ocl.Point(*p) for p in t]))
+    cell = 0.5
+    n = int(40 / cell)
+    c = (np.arange(n) + 0.5) * cell
+    A = np.full((n, n), 30.0)
+    return surf, (A, 0.0, 0.0, cell)
+
+
+def test_rr1c4c_floor_circle_over_rising_surface():
+    """RR1c-4c: every emitted move kind passes the exact CL + rest leave
+    check (the validate_exact rule) BEFORE it is emitted. The plateau pocket
+    above is entered by the bore; its floor circle / helix bottom at level
+    Z 24.2 would cross the plateau (exact CL 24.1, CL + leave 24.3): on
+    d08749a cl_ok/cl_ok_path checked the exact CL only and emitted ~27
+    feed points 0.1 mm INSIDE the leave (validate_exact > 0, the Core Front
+    refusal). After the fix validate_exact gives 0, no feed point over the
+    plateau (x >= 25.0) cuts below CL + leave, and the zone is either cut
+    legally or reported - never posted inside the leave."""
+    try:
+        from engine import rest_rough as rr
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    surf, stock = _rr1c4c_plateau_pocket_scene()
+    moves, stats = rr.rest_rough(
+        surf, stock, ("ball", 9.525), floor_z=24.0, stepdown=2.0, ae=1.905,
+        rest_leave=0.2, min_excess=0.5, min_helix_r=1.903, ramp_angle_deg=2.0,
+        cut_feed=2280.0, ramp_feed=850.0)
+    assert moves, "no moves emitted"
+    assert stats["zones"] or stats["no_entry"], \
+        "zone neither cut nor reported: %r" % (stats,)
+    below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
+    assert below == 0, \
+        "%d feed points inside the rest leave (worst %.3f mm): emitted " \
+        "moves must pass CL + leave before emit" % (below, worst)
+    for m in moves:
+        if m["g"] == 1 and m["x"] >= 25.0:
+            assert m["z"] >= 24.3 - 0.005, \
+                "feed point over plateau inside its leave: %r" % (m,)
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -1740,7 +1816,8 @@ def _main():
                test_rr1c3_curved_thin_band_centre_line,
                test_rr1c3_bay_deep_groove_top_down,
                test_rr1c4b_plateau_topdown_axial_load,
-               test_rr1c4b_closed_pocket_bore_levels):
+               test_rr1c4b_closed_pocket_bore_levels,
+               test_rr1c4c_floor_circle_over_rising_surface):
         try:
             fn()
         except AssertionError as e:
