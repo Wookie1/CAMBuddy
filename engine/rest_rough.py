@@ -729,10 +729,32 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
             F = ndimage.distance_transform_edt(~seed) * CELL if fronts else Dz
             rings = []
             clneed = []
+            f1 = []
             c = ae / 2.0
+            hch = ae / 2.0
             maxf = float(F[reg].max()) if reg.any() else 0.0
+            if fronts:
+                # RR1c-5d front 1 offset from cleared ground by the ball
+                # chord at that edge: a1 = max live height above Z along the
+                # cleared edge (planning LiveStock, no new grid), c0 = ae -
+                # c(a1)/2 SIGNED (negative: CL INSIDE cleared ground), cf =
+                # clip to the leave-legal CL grid; fronts at c0 + k*ae.
+                e = reg & ~seed & ndimage.binary_dilation(seed)
+                D = ndimage.distance_transform_edt(~e) * CELL
+                m = (D <= R + 1e-9) & np.isfinite(Sg)
+                a1 = float(np.max(Sg[m] - (R - np.sqrt(np.maximum(
+                    R * R - D[m] * D[m], 0.0))))) - t if m.any() else 0.0
+                hch = math.sqrt(max(a1 * (dia - a1), 0.0)) if a1 > 0.0 \
+                    else ae / 2.0
+                Sv = F - ndimage.distance_transform_edt(seed) * CELL
+                cf = (reg | (seed & ndimage.binary_dilation(
+                    reg, iterations=int(max(hch - ae / 2.0, 0.0) / CELL) + 2))
+                    ) & np.isfinite(Zraw) & (Zraw <= t - rest_leave + 0.005)
+                c = ae - hch
+                maxf = float(Sv[cf].max()) if cf.any() else 0.0
             while c <= maxf + 1e-9:
-                for P, closed, _K in march_level(F, xs, ys, c, comp=reg):
+                for P, closed, _K in march_level(Sv if fronts else F, xs,
+                                                 ys, c, comp=cf if fronts else reg):
                     pts = [(float(a), float(b)) for a, b in P]
                     if len(pts) < 3:
                         continue
@@ -740,6 +762,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                         pts = pts + [pts[0]]
                     rings.append(pts)
                     clneed.append(False)
+                    f1.append(fronts and abs(c - (ae - hch)) < 1e-9)
                 c += ae
             if not fronts:
                 rings.reverse()  # RR1c-4 fallback: largest c first
@@ -747,6 +770,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
             if li == 0 and mode == "zigzag":
                 paths = runs0 + rings          # zigzag first, then rings
                 clneed = [False] * len(paths)
+                f1 = [False] * len(paths)
             else:
                 paths = rings
                 ring_seq = True    # keep the inside-out order (no greedy)
@@ -791,6 +815,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
             skipped = 0
             # RR1c-5b engagement model: cleared at this Z (seed) + fronts
             clm = seed.copy()
+            clmn = seed.copy()   # RR1c5d: near-groove mask for depth links
             dilk = int(round(ae / 2.0 / CELL)) + 1
             while paths:
                 if ring_seq:
@@ -800,6 +825,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                         paths[ki][0][0] - prev[0], paths[ki][0][1] - prev[1]))
                 pts = paths.pop(k)
                 need_cl = clneed.pop(k)
+                isf1 = f1.pop(k)
                 d0 = math.hypot(pts[0][0] - prev[0], pts[0][1] - prev[1])
                 if cut_here % 2:
                     pts = pts[::-1]
@@ -829,7 +855,10 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                     if cl_ok_path(lp) and (onbore or all(
                             live.disk_top(px, py) <= t + 0.05
                             for px, py, _ in lp)) and (dzd <= 1e-9
-                                          or d0 * tanr >= dzd - 1e-9):
+                                          or d0 * tanr >= dzd - 1e-9) and all(
+                            clmn[int(round((py - ys[0]) / CELL)),
+                               int(round((px - xs[0]) / CELL))]
+                            for px, py, _ in lp):
                         g1(pts[0][0], pts[0][1], round(t, 4), ramp_feed)
                     else:
                         ldx = ldy = 0.0
@@ -899,9 +928,11 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 # engagement check (RR1c-5b): fronts stay within ae of
                 # cleared ground; raw slots NEVER silent (rr_ring_failed).
                 if ring_seq and fronts:
-                    dv = ndimage.distance_transform_edt(~clm)[ii, jj] * CELL
+                    # RR1c-5d front 1: SIGNED dv, flag when dv+c(a1)/2>ae+CELL
+                    dv = (Sv if isf1 else ndimage.distance_transform_edt(
+                        ~clm))[ii, jj] * CELL
                     kx = int(np.argmax(dv))
-                    if float(dv[kx]) > ae + CELL:
+                    if float(dv[kx]) > ((ae - hch) if isf1 else ae) + CELL:
                         ad = live.disk_depth(pts[kx][0], pts[kx][1], t)
                         ad = ad if math.isfinite(ad) else 0.0
                         rc = math.sqrt(max(2.0 * R * ad - ad * ad, 0.0))
@@ -911,6 +942,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                              "w_plan": round(float(dv[kx]) + rc, 3),
                              "ae_eq": round(2.0 * rc, 3)})
                 clm |= ndimage.binary_dilation(pm, iterations=dilk)
+                clmn |= ndimage.binary_dilation(pm, iterations=2)
                 ad0 = live.disk_depth(pts[0][0], pts[0][1], t)
                 if math.isfinite(ad0) and ad0 > stepdown + 1e-9:
                     stats["rr_axial_over"].append(

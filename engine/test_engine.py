@@ -1744,6 +1744,101 @@ def test_rr1c5c_closed_pocket_bore_entry_no_deep_axial():
         "bore-seed level entered by axial entry into live stock: %s" % deep[:3]
 
 
+def test_rr1c5d_front1_chord_offset_slabs():
+    """RR1c5d: two OPEN-EDGE slabs beside cleared ground (supervisor: the
+    first version used closed pockets, whose bore-seeded zones run the
+    inside-out fallback, never fronts). Each pocket's west part is already
+    cleared to floor + leave (24.8); its east part is a standing slab:
+    pocket A stock top 27.55 -> front-1 wall a1 = 0.75 above the cutting Z
+    26.8; pocket B top 28.9 -> a1 ~2.1 (live) at Z 26.8, exactly the CF
+    centre-band facts. Front 1 of every zone/level offsets from cleared
+    ground by the ball chord at that edge, c0 = ae - c(a1)/2 SIGNED
+    (negative: CL inside cleared ground), not ae/2. Judged with verify/'s
+    ZE2B: every window at cutting feed has ae_eq <= 2.286 and there is no
+    full-width flag - the assertion is on MEASURED ae_eq. On 035e590 front
+    1 sits ae/2 from the bore wall and engages ae/2 + c(a1)/2 = 3.5 / 4.9
+    mm (model) against the standing wall, so the gate fails BY ASSERTION."""
+    try:
+        from engine import rest_rough as rr
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    tris = []
+    tris += _rr1c5b_slab_tris(0, 6.0, 0, 40, 20.0, 30.0)     # west frame
+    tris += _rr1c5b_slab_tris(22.0, 30.0, 0, 40, 20.0, 30.0)  # centre wall
+    tris += _rr1c5b_slab_tris(46.0, 52.0, 0, 40, 20.0, 30.0)  # east frame
+    tris += _rr1c5b_slab_tris(6.0, 22.0, 0, 12.0, 20.0, 30.0)   # south wall
+    tris += _rr1c5b_slab_tris(6.0, 22.0, 28.0, 40.0, 20.0, 30.0)
+    tris += _rr1c5b_slab_tris(30.0, 46.0, 0, 12.0, 20.0, 30.0)
+    tris += _rr1c5b_slab_tris(30.0, 46.0, 28.0, 40.0, 20.0, 30.0)
+    tris += _rr1c5b_slab_tris(6.0, 22.0, 12.0, 28.0, 20.0, 24.6)   # floor A
+    tris += _rr1c5b_slab_tris(30.0, 46.0, 12.0, 28.0, 20.0, 24.6)  # floor B
+    surf = _rr1c5b_surf(tris)
+    cell = 0.5
+    nx, ny = int(52 / cell), int(40 / cell)
+    cx = (np.arange(nx) + 0.5) * cell
+    cy = (np.arange(ny) + 0.5) * cell
+    X, Y = np.meshgrid(cx, cy)
+    A = np.full((ny, nx), 30.0)
+    pocketA = (X >= 6.0) & (X <= 22.0) & (Y >= 12.0) & (Y <= 28.0)
+    pocketB = (X >= 30.0) & (X <= 46.0) & (Y >= 12.0) & (Y <= 28.0)
+    A[pocketA] = 27.55   # a1 = 0.75 above the cutting Z 26.8
+    A[pocketB] = 28.9    # a1 ~2.1 (live) above the cutting Z 26.8
+    A[pocketA & (X < 12.0)] = 24.8   # cleared ground: the open edge
+    A[pocketB & (X < 36.0)] = 24.8
+    import time as _time
+    t0 = _time.time()
+    moves, stats = rr.rest_rough(
+        surf, (A, 0.0, 0.0, cell), ("ball", 9.525), floor_z=24.6,
+        stepdown=2.0, ae=1.905, rest_leave=0.2, min_excess=0.4,
+        min_helix_r=1.903, ramp_angle_deg=2.0, cut_feed=2280.0,
+        ramp_feed=850.0)
+    gen_s = _time.time() - t0
+    assert moves and stats["zones"] and not stats["no_entry"], \
+        "pockets must be entered: %r" % (stats["no_entry"],)
+    assert len(stats["zones"]) == 2, \
+        "two open-edge slab zones required: %s" % [
+            (z["bbox"], z["helix"]) for z in stats["zones"]]
+    assert any(m["g"] == 1 and m.get("f") == 2280.0 for m in moves), \
+        "no cutting-feed moves: vacuous"
+    below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
+    assert below == 0, "gouge: %d pts (worst %.3f)" % (below, worst)
+    pad = 4
+    pny, pnx = ny + 2 * pad, nx + 2 * pad
+    part = np.full((pny, pnx), 30.0)
+    stock_init = np.full((pny, pnx), 30.0)
+    xp = -pad * cell + (np.arange(pnx) + 0.5) * cell
+    yp = -pad * cell + (np.arange(pny) + 0.5) * cell
+    Xp, Yp = np.meshgrid(xp, yp)
+    part[(Xp >= 6.0) & (Xp <= 22.0) & (Yp >= 12.0) & (Yp <= 28.0)] = 24.6
+    part[(Xp >= 30.0) & (Xp <= 46.0) & (Yp >= 12.0) & (Yp <= 28.0)] = 24.6
+    stock_init[(Xp >= 6.0) & (Xp <= 22.0) & (Yp >= 12.0) &
+               (Yp <= 28.0)] = 27.55
+    stock_init[(Xp >= 30.0) & (Xp <= 46.0) & (Yp >= 12.0) &
+               (Yp <= 28.0)] = 28.9
+    stock_init[(Xp >= 6.0) & (Xp < 12.0) & (Yp >= 12.0) & (Yp <= 28.0)] = 24.8
+    stock_init[(Xp >= 30.0) & (Xp < 36.0) & (Yp >= 12.0) &
+               (Yp <= 28.0)] = 24.8
+    _rr1c5b_zmap_gate(moves, part, stock_init, cell,
+                      (0.0, 52.0, 0.0, 40.0, 20.0, 28.9))
+    # non-vacuous: deep cutting-feed engagement windows DO exist here
+    from verify import zmap
+    _rep = zmap.simulate(zmap.parse_gcode(moves_to_gcode(
+        moves, spindle_rpm=8000)), part, cell, 0.0, 0.0,
+        (0.0, 52.0, 0.0, 40.0, 20.0, 28.9), tool="ball", dia=9.525,
+        stock_init=stock_init, engage_max=2.286)
+    deep = [w for w in _rep["_ae2_raw"]
+            if w.get("feed", 0.0) >= 0.9 * 2280.0 and w["a"] > 0.5]
+    assert deep, "no deep cutting-feed windows: gate would be vacuous"
+    rep = []
+    for tag, top in (("A", 27.55), ("B", 28.9)):
+        a1 = top - 26.8
+        hch = math.sqrt(a1 * (9.525 - a1))
+        rep.append("%s: a1=%.2f c0=%.3f est_w=%.3f" % (tag, a1,
+                                                        1.905 - hch, 1.905))
+    print("PASS rr1c5d front-1 chord: %s | gen %.2fs"
+          % ("; ".join(rep), gen_s))
+
+
 def _rr1c4c_plateau_pocket_scene():
     """RR1c-4c scene: frame [0,40]^2, stock 30, pocket [8,32]^2 to floor
     24.0 whose +x half is a low plateau at 24.1 - a rising part surface
@@ -2171,7 +2266,8 @@ def _main():
                test_rr1c5b_open_edge_proud_block,
                test_rr1c5b_fully_walled_band_bore_seed,
                test_rr1c5b_mixed_band_core_front,
-               test_rr1c5c_closed_pocket_bore_entry_no_deep_axial):
+               test_rr1c5c_closed_pocket_bore_entry_no_deep_axial,
+               test_rr1c5d_front1_chord_offset_slabs):
         try:
             fn()
         except AssertionError as e:
