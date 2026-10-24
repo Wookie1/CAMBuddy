@@ -2293,7 +2293,12 @@ def _main():
                test_rough_rt_entries, test_rapid_swept_clear_catches_diagonal_climb,
                test_se2_side_entries_only_through_cleared,
                test_hr1_rings_after_a2d,
+               test_dt1_nn_order_ties_stable,
+               test_dt1_synthetic_rough_twice_identical,
                test_hb1v2_flat_floor_circle_after_helix,
+               test_bs1a_straight_channel,
+               test_bs1a_lshaped_channel,
+               test_bs1a3_no_band_after_a2d,
                test_stl_cache_keyed_by_content,
                test_rr1a_rough_cli_refuses_ball,
                test_rr1b_rest_rough_synth_pocket,
@@ -2661,6 +2666,83 @@ def test_hr1_rings_after_a2d():
             "no level had both a2d and hug-ring cutting moves: test vacuous"
     print("PASS hr1 rings after a2d: %d level(s) with ring+a2d moves, every "
           "ring follows all a2d at its Z" % n_both)
+
+
+def test_dt1_nn_order_ties_stable():
+    """Task DT1: a tie in the NN travel order must be broken by a stable
+    key (region index, then coordinates), NEVER by candidate iteration
+    order. Synthetic equal-distance regions: pa=(0,5) and pb=(0,-5) are
+    exactly 5 mm from pos (0,0). Main's inline loop took the FIRST minimum
+    in list order, so swapping two tied entry candidates changed the rapid
+    target - reproduced here with a copy of main's loop (the test fails if
+    ties resolve by iteration order). _nn_order must return the same order
+    and end position regardless of candidate/phase list order."""
+    import math as _m
+    from engine.rough import _nn_order
+    pa, pb, far = (0.0, 5.0), (0.0, -5.0), (50.0, 0.0)
+    # entry-point tie inside one region: same set, opposite list order
+    o1, e1 = _nn_order([0], [[pa, pb]], (0.0, 0.0))
+    o2, e2 = _nn_order([0], [[pb, pa]], (0.0, 0.0))
+    assert o1 == o2 == [0] and e1 == e2 == pb, \
+        "entry tie not resolved by (dist,x,y): %s vs %s" % (e1, e2)
+    # region tie: same result whatever order the phase enumerates in
+    r1, _ = _nn_order([0, 1], [[pa], [pb]], (0.0, 0.0))
+    r2, _ = _nn_order([1, 0], [[pa], [pb]], (0.0, 0.0))
+    assert r1 == r2 == [0, 1], \
+        "region tie not resolved by lowest index: %s vs %s" % (r1, r2)
+
+    def _main_nn(phase, cand, pos):  # main's pre-DT1 loop, verbatim
+        out = []
+        remaining = list(phase)
+        while remaining:
+            k = remaining[0] if pos is None else min(remaining, key=lambda k:
+                min(_m.dist(pos, p) for p in cand[k]))
+            out.append(k)
+            remaining.remove(k)
+            pos = min(cand[k], key=lambda p: _m.dist(pos, p)) \
+                if pos is not None else cand[k][0]
+        return out, pos
+    m1, me1 = _main_nn([0], [[pa, pb]], (0.0, 0.0))
+    m2, me2 = _main_nn([0], [[pb, pa]], (0.0, 0.0))
+    assert me1 != me2, \
+        "test vacuous: main's loop did not exhibit the iteration-order tie"
+    print("PASS dt1 nn tie stability: ties resolve by (dist, index/x/y); "
+          "main's loop resolved the same tie by list order (%s vs %s)"
+          % (me1, me2))
+
+
+def test_dt1_synthetic_rough_twice_identical():
+    """Task DT1: same code + same inputs -> identical emitted move lists.
+    Small synthetic part (hr1 slab: 40x32 top Z6, central wall + two fins)
+    roughed TWICE in-process on fresh state; the move lists must compare
+    equal element for element (rapids included)."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    from opencamlib import ocl
+    import engine.rough as R
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "dt1_synth.stl")
+        _write_stl(stl, _box_tris(-20.0, 20.0, -16.0, 16.0, 0.0, 6.0)
+                   + _box_tris(-1.0, 1.0, -16.0, 16.0, 6.0, 12.0)
+                   + _box_tris(-8.0, -1.0, -4.0, 4.0, 6.0, 12.0)
+                   + _box_tris(1.0, 8.0, -4.0, 4.0, 6.0, 12.0))
+        outs = []
+        for _run in range(2):
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            mv, _st = R.rough(surf, (-24.0, 24.0, -20.0, 20.0, 6.0, 16.0),
+                              3.0, 6.0, leave=0.381, axial_leave=0.381,
+                              stepdown=4.0, stepup=10.0, stepover=2.0 / 6.0,
+                              tolerance=0.05, threads=4, stock_cell=0.5,
+                              min_rest=0.5, corner_r=0.0, stl_path=stl)
+            assert mv, "no moves"
+            outs.append(repr(mv))
+        assert outs[0] == outs[1], \
+            "synthetic rough: two in-process runs emitted different moves"
+    print("PASS dt1 twice-identical synthetic rough: 2 runs emitted "
+          "identical move lists (%d chars of moves)" % len(outs[0]))
+
+
 def test_hb1v2_flat_floor_circle_after_helix():
     """HB1v2: after EVERY helix entry the next emitted moves are ONE full flat
     circle at the helix bottom Z - same centre and radius as the helix, at the
@@ -2745,6 +2827,179 @@ def test_hb1v2_flat_floor_circle_after_helix():
     assert n_helix >= 1, "no helix entry emitted on the synthetic part: vacuous"
     print("PASS hb1v2 floor circle: %d helix entry/entries each followed by "
           "one full flat circle at the helix bottom Z, ramp feed" % n_helix)
+
+
+def _bs1a_channel_case(name, tris, in_channel):
+    """BS1a shared driver: rough a synthetic 19 mm-wide, 18 mm-deep channel
+    with walls on both sides (stock top Z18, floor Z0, flat 12.686), judge
+    with verify/zmap.py --ae2-dump and require ZERO full-width windows at
+    CUTTING feed inside the channel plus 0 gouges / rapid collisions / axial
+    plunges / outside_grid (CL-legality of every new point is additionally
+    enforced inside rough(): allowance, hf backstop, CLCHECK)."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import subprocess
+    import tempfile
+    import json as _json
+    import numpy as np
+    from opencamlib import ocl
+    from engine.gcode import moves_to_gcode
+    from engine.rough import rough, build_part_hf
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    stock_box = (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0)
+    tool_r = 6.343
+    dia = 2.0 * tool_r
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, name + ".stl")
+        _write_stl(stl, tris)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        moves, stats = rough(surf, stock_box, tool_r, 0.0, leave=0.381,
+                            axial_leave=0.381, stepdown=19.05, stepup=1.905,
+                            tolerance=0.05, threads=4, stock_cell=0.5,
+                            min_rest=0.5, corner_r=0.0, stl_path=stl)
+        assert stats.get("n_band_regions", 0) >= 1, \
+            "no trochoidal channel-clear region was planned: the residue " \
+            "channel was not recognised (main's code has no band step)"
+        ngc = os.path.join(td, name + ".ngc")
+        with open(ngc, "w") as fh:
+            fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+        hf = build_part_hf(surf, -40.0, -30.0, 0.5, 160, 120, threads=4,
+                           drop_z=-1.0)
+        hf_p = os.path.join(td, "part_hf.npy")
+        pad = int(math.ceil((tool_r + 5.0) / 0.5))
+        padded = np.full((hf.shape[0] + 2 * pad, hf.shape[1] + 2 * pad),
+                        np.nan, dtype=hf.dtype)
+        padded[pad:pad + hf.shape[0], pad:pad + hf.shape[1]] = hf
+        np.save(hf_p, padded)
+        with open(hf_p[:-4] + ".json", "w") as fh:
+            _json.dump({"x0": -40.0 - pad * 0.5, "y0": -30.0 - pad * 0.5,
+                       "cell": 0.5, "tess_tol": 0.01}, fh)
+        rj = os.path.join(td, "zmap.json")
+        dj = os.path.join(td, "ae2.json")
+        rr = subprocess.run(
+            [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+             "--part", hf_p, "--tool", "flat", "--dia", "%.3f" % dia,
+             "--stock", *[str(v) for v in stock_box],
+             "--engage-max", "2.438", "--ae2-dump", dj, "--out-json", rj],
+            capture_output=True, text=True, cwd=repo)
+        assert rr.returncode == 0, "zmap failed: %s | %s" % (
+            rr.stdout[-800:], rr.stderr[-600:])
+        rep = _json.load(open(rj))
+        assert rep["gouges"]["count"] == 0, "zmap gouges: %s" % rep["gouges"]
+        assert rep["rapid_collisions"]["count"] == 0
+        assert rep["axial_plunges"]["count"] == 0, \
+            "zmap axial_plunges: %s" % rep["axial_plunges"]["flags"][:3]
+        assert rep["outside_grid"]["count"] == 0
+        cut_feed = rep["engagement"]["ae2_cutting_feed"]
+        wins = _json.load(open(dj))
+        fw = [w for w in wins
+              if w["ae_eff"] >= 0.9 * dia and w["a"] > 0.5
+              and w.get("feed") is not None
+              and abs(w["feed"] - cut_feed) < 1e-6
+              and in_channel(w["x"], w["y"])]
+        assert not fw, "%d full-width window(s) at cutting feed in the " \
+            "channel: %s" % (len(fw), [(w["line"], w["x"], w["y"], w["z"],
+                                       round(w["ae_eff"], 2), round(w["a"], 2))
+                                      for w in fw[:6]])
+    return stats
+
+
+def test_bs1a_straight_channel():
+    """Task BS1a: a closed 19 mm-wide, 18 mm-deep channel (annular slot:
+    central island + outer wall ring, 19 mm gap on every side) leaves the
+    hug rings no thin option - on main's code the ring slots the whole channel
+    cross-section at the full stepdown (full-width windows at cutting feed,
+    a ~ 17.6 mm). The band step must clear it trochoidally first: ZE2 shows 0
+    full-width windows at cutting feed in the channel. FAILS on main."""
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)      # floor
+            + _box_tris(-40.0, -30.0, -30.0, 30.0, 0.0, 18.0)    # outer ring
+            + _box_tris(30.0, 40.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-30.0, 30.0, -30.0, -25.0, 0.0, 18.0)
+            + _box_tris(-30.0, 30.0, 25.0, 30.0, 0.0, 18.0)
+            + _box_tris(-11.0, 11.0, -6.0, 6.0, 0.0, 18.0))       # island
+
+    def in_channel(x, y):
+        return (-32.0 < x < 32.0 and -27.0 < y < 27.0
+                and not (-13.0 < x < 13.0 and -8.0 < y < 8.0))
+    stats = _bs1a_channel_case("bs1a_straight", tris, in_channel)
+    print("PASS bs1a straight channel: %d band region(s), %.1f mm trochoidal "
+          "cut, 0 full-width windows at cutting feed in the channel"
+          % (stats["n_band_regions"], stats["band_cut_len_mm"]))
+
+
+def test_bs1a_lshaped_channel():
+    """Task BS1a: same bar on an L-SHAPED 19 mm-wide, 18 mm-deep channel
+    (blind ends): straight run along X, 90 deg corner, straight run along Y,
+    walls live on both sides. FAILS on main (ring slots the channel)."""
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)       # floor
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)     # left wall
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)      # bottom wall
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)         # inner corner
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)         # right wall
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)        # upper-left
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))        # top cap
+
+    def in_channel(x, y):
+        return ((-30.0 < x < 4.0 and -11.5 < y < 11.5)
+                or (-11.5 < x < 11.5 and -4.0 < y < 30.0))
+    stats = _bs1a_channel_case("bs1a_lshape", tris, in_channel)
+    print("PASS bs1a L-shaped channel: %d band region(s), %.1f mm trochoidal "
+          "cut, 0 full-width windows at cutting feed in the channel"
+          % (stats["n_band_regions"], stats["band_cut_len_mm"]))
+
+
+def test_bs1a3_no_band_after_a2d():
+    """Task BS1a3: an open 40 x 30 mm, 18 mm-deep pocket that Adaptive2d
+    clears completely (the hug rings only skim the leave margin): judged on
+    the LIVE stock AFTER this level's a2d passes, no ring window reaches full
+    width (ae_eff >= 0.9 x D), so BS1a3 must emit ZERO band regions here.
+    FAILS on c074148, which ran the channel check on the stock as it stood at
+    the START of the level - pre-a2d, every ring looked like a full-width
+    channel and got trochoided."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    from opencamlib import ocl
+    import engine.rough as R
+    from engine.rough import rough
+    orig_hug = R.hug_regions
+    seen = []
+
+    def _spy(*a, **k):
+        res = orig_hug(*a, **k)
+        seen.append(sum(1 for r in res for kp in r["paths"]
+                        if kp[0] == "cutting"))
+        return res
+    R.hug_regions = _spy
+    stock_box = (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0)
+    tris = (_box_tris(-20.0, 20.0, -15.0, 15.0, -1.0, 0.0)     # pocket floor
+            + _box_tris(-40.0, -20.0, -30.0, 30.0, 0.0, 18.0)   # surrounding
+            + _box_tris(20.0, 40.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-20.0, 20.0, -30.0, -15.0, 0.0, 18.0)
+            + _box_tris(-20.0, 20.0, 15.0, 30.0, 0.0, 18.0))
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a3_pocket.stl")
+        _write_stl(stl, tris)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        try:
+            moves, stats = rough(surf, stock_box, 6.343, 0.0, leave=0.381,
+                                axial_leave=0.381, stepdown=19.05,
+                                stepup=1.905, tolerance=0.05, threads=4,
+                                stock_cell=0.5, min_rest=0.5, corner_r=0.0,
+                                stl_path=stl)
+        finally:
+            R.hug_regions = orig_hug
+        assert sum(seen) > 0, "no hug-ring paths were planned: the level " \
+            "residue the check judges is missing (vacuous test)"
+        assert sum(l.get("n_regions", 0) for l in stats["levels"]) > 0, \
+            "no regions at all: the pocket was never machined"
+        assert stats.get("n_band_regions", 0) == 0, \
+            "%d band region(s) in a pocket a2d clears - the channel check is " \
+            "still judging pre-a2d / non-full-width stock (blocked: %s)" \
+            % (stats["n_band_regions"], stats.get("band_blocked", [])[:4])
+    print("PASS bs1a3 no-band-after-a2d: pocket fully cleared by a2d, "
+          "0 band regions emitted")
 
 
 def test_rr1a_rough_cli_refuses_ball():

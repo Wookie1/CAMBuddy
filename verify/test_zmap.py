@@ -2598,3 +2598,220 @@ def test_ze2d_full_width_depth_true_slot_vs_ridge_plus_graze():
         [w["full_width_depth"] for w in fw2]
     bands = res2["engagement"]["full_width_depth_bands_ae2"]
     assert bands["cutting_feed"]["0.5-2"]["count"] == len(fw2)
+
+
+# ---------------------------------------------------------------------------
+# Task ZE2B: ball-tool engagement vs the live stock zmap (report-only).
+# BOTH widths: w_plan vs the ball chord c(a) for the full-width flag, and
+# ae_eq (removed volume per mm of 3D travel / a) vs --engage-max for load.
+# Fixtures: ball D = 9.525, cell 0.05 mm; a >= 0.05 gate; descents (horiz
+# < 10 % of 3D travel) are tagged and never full width.
+# ---------------------------------------------------------------------------
+
+D_ZB = 9.525
+CELL_B = 0.05
+NB = 400                      # grid covers [-10, 10] x [-10, 10]
+X0_B = Y0_B = -10.0
+STOCK_B = (-10.0, 10.0, -10.0, 10.0, 0.0, 10.0)
+NB_L = 900                    # long grid covers [-12, 33] (long side pass)
+X0_L = Y0_L = -12.0
+STOCK_L = (-12.0, 33.0, -12.0, 33.0, 0.0, 10.0)
+
+
+def _run_zb(gcode, part, stock_init=None, x0=X0_B, y0=Y0_B, stock=STOCK_B):
+    moves = zmap.parse_gcode(gcode)
+    return zmap.simulate(moves, part, CELL_B, x0, y0, stock, tool="ball",
+                        dia=D_ZB, engage_max=2.286, stock_init=stock_init)
+
+
+def _zb_pass_gcode(y, z, x0=-5.0, x1=5.0):
+    """rapid above (x0, y), vertical feed descent to the tip Z=z (a descent
+    window: horiz = 0), then the X-direction feed pass at lateral y, F500."""
+    return "\n".join([
+        "G21 G90 F500",
+        "G0 X%.4f Y%.4f Z12." % (x0, y),
+        "G1 X%.4f Y%.4f Z%.4f F100." % (x0, y, z),
+        "G1 X%.4f Y%.4f F500." % (x1, y),
+    ]) + "\n"
+
+
+def _check_side_pass(res):
+    """Design case 1: straight pass at a = 2.0 beside a cleared pass at
+    stepover s = 1.905 -> ae_eq ~ s (+-5 %); w_plan/c(a) ~ 0.62 (contact from
+    the scallop crest at -s/2 to the far chord edge); NOT full width."""
+    a = 2.0
+    c_a = 2.0 * math.sqrt(a * (D_ZB - a))
+    horiz = [w for w in res["_zb_raw"] if not w["descent"]]
+    assert len(horiz) == 1, "expected one non-descent window: %d" % len(horiz)
+    w = horiz[0]
+    assert abs(w["a"] - a) <= 0.1
+    assert abs(w["c_a"] - c_a) <= 0.05
+    assert abs(w["theta"] - math.degrees(
+        math.acos(1.0 - a / (D_ZB / 2.0)))) <= 1.0
+    assert abs(w["ae_eq"] - 1.905) <= 0.05 * 1.905, \
+        "ae_eq %.3f not within 5%% of stepover" % w["ae_eq"]
+    assert abs(w["w_plan"] / w["c_a"] - 0.62) <= 0.08, \
+        "w_plan/c(a) %.3f not ~0.62" % (w["w_plan"] / w["c_a"])
+    eng = res["engagement"]["ze2b"]
+    assert eng["full_width"]["count"] == 0, \
+        "side pass flagged full width: %r" % eng["full_width"]["worst"]
+    assert eng["descent"]["count"] >= 1
+
+
+def test_ze2b_side_pass_ae_eq_is_stepover():
+    part = np.zeros((NB_L, NB_L))
+    g_a = _zb_pass_gcode(-2.905, 8.0, x0=-5.0, x1=20.0)
+    res_a = _run_zb(g_a, part, x0=X0_L, y0=Y0_L, stock=STOCK_L)
+    res = _run_zb(_zb_pass_gcode(-1.0, 8.0, x0=-5.0, x1=20.0), part,
+                  stock_init=res_a["stock"], x0=X0_L, y0=Y0_L, stock=STOCK_L)
+    _check_side_pass(res)
+
+
+def _check_full_slot(res):
+    """Design case 2: full-width slot at a = 2.0 into flat stock -> w_plan ~
+    c(2.0) = 7.76 and full_width flagged; ae_eq = segment area / a ~ 5.44."""
+    a = 2.0
+    c_a = 2.0 * math.sqrt(a * (D_ZB - a))
+    assert abs(c_a - 7.759) <= 0.01
+    horiz = [w for w in res["_zb_raw"] if not w["descent"]]
+    assert len(horiz) == 1, "expected one non-descent window: %d" % len(horiz)
+    w = horiz[0]
+    assert abs(w["w_plan"] - c_a) <= 0.15, \
+        "w_plan %.3f vs c(a) %.3f" % (w["w_plan"], c_a)
+    assert abs(w["ae_eq"] - 5.44) <= 0.27, "ae_eq %.3f" % w["ae_eq"]
+    eng = res["engagement"]["ze2b"]
+    assert eng["full_width"]["count"] == 1, \
+        "slot pass not flagged full width: %r" % eng["full_width"]
+    assert eng["overload"]["count"] >= 1        # ae_eq ~5.4 > 2.286
+    assert eng["descent"]["count"] == 1         # plunge tagged...
+    assert eng["full_width"]["worst"][0]["line"] == w["line"]  # ... not flagged
+
+
+def test_ze2b_full_slot_flagged_chord_and_ae_eq():
+    res = _run_zb(_zb_pass_gcode(0.0, 8.0), np.zeros((NB, NB)))
+    _check_full_slot(res)
+
+
+def test_ze2b_slope_skim_not_flagged():
+    """Design case 3: 0.2 mm normal-thickness skim on a 45 deg slope -> not
+    full width, not overload at the spike load 2.286."""
+    ys = X0_B + (np.arange(NB) + 0.5) * CELL_B
+    stock = np.broadcast_to(ys[:, None] + 10.0, (NB, NB)).copy()
+    # ball centre 0.2 mm (normal) off the plane z = y + 10 at y = 0
+    tip = (10.0 + (D_ZB / 2.0 - 0.2) * math.sqrt(2.0)) - D_ZB / 2.0
+    res = _run_zb(_zb_pass_gcode(0.0, tip), np.zeros((NB, NB)),
+                  stock_init=stock)
+    eng = res["engagement"]["ze2b"]
+    assert eng["full_width"]["count"] == 0
+    assert eng["overload"]["count"] == 0
+    assert eng["ae_eq"]["max"] < 2.286
+    assert eng["ae_eq"]["max"] > 0.0           # it does cut
+
+
+def test_ze2b_helix_finite_and_descent_tagged():
+    """Design case 4: 2 deg helix descent (r 3, ~5 mm deep): finite
+    ae_eq/w_plan everywhere, nothing above D, the vertical entry tagged."""
+    lines = ["G21 G90 F500", "G0 X3. Y0. Z12.", "G1 X3. Y0. Z9.5 F100."]
+    pitch = 0.658                              # 2 deg at r 3 per turn
+    for i in range(1, 229):                   # 12 deg steps, 7.6 turns
+        th = math.radians(12.0 * i)
+        lines.append("G1 X%.4f Y%.4f Z%.4f F100."
+                     % (3.0 * math.cos(th), 3.0 * math.sin(th),
+                        9.5 - pitch * i / 30.0))
+    res = _run_zb("\n".join(lines) + "\n", np.zeros((NB, NB)))
+    wins = res["_zb_raw"]
+    assert len(wins) >= 50
+    for w in wins:
+        assert math.isfinite(w["ae_eq"]) and math.isfinite(w["w_plan"])
+        assert w["w_plan"] <= D_ZB + 1e-9
+        assert w["ae_eq"] <= D_ZB
+    eng = res["engagement"]["ze2b"]
+    assert eng["descent"]["count"] >= 1       # the vertical entry is tagged
+    assert wins[0]["descent"] is True
+    assert wins[-1]["descent"] is False      # helix windows are not descents
+    assert eng["a"]["max"] <= D_ZB / 2.0 + 1e-9   # a clipped to R
+
+
+def test_ze2b_flat_and_bull_json_byte_identical(tmp_path):
+    """Design case 5: flat/bull --out-json stays BYTE-IDENTICAL to b1688b8's
+    zmap (the ZE2B block is ball-only)."""
+    import subprocess
+    here = os.path.dirname(os.path.abspath(zmap.__file__))
+    root = os.path.dirname(here)
+    old = tmp_path / "zmap_b1688b8.py"
+    old.write_bytes(subprocess.check_output(
+        ["git", "-C", root, "show", "b1688b8:verify/zmap.py"]))
+    part = block_part(hi=10.0, half=15.0)
+    npf = tmp_path / "part.npy"
+    np.save(npf, part)
+    with open(tmp_path / "part.json", "w") as f:
+        json.dump({"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}, f)
+    ngc = tmp_path / "prog.ngc"
+    ngc.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\nG1 Z5. F100.\n"
+                   "G1 X20. Y0. F500.\nG0 X-20. Y2. Z20.\nG1 Z5. F100.\n"
+                   "G1 X20. Y2. F500.\n")
+    stock_args = ["-15.0", "15.0", "-15.0", "15.0", "0.0", "10.0"]
+    for extra in ([], ["--tool", "bull", "--corner", "1.0"]):
+        outs = []
+        for script in (str(old), os.path.join(here, "zmap.py")):
+            o = tmp_path / ("out_%d_%s.json"
+                            % (len(extra), os.path.basename(script)))
+            rc = subprocess.call(
+                [sys.executable, script, str(ngc), "--part", str(npf),
+                 "--stock"] + stock_args + ["--engage-max", "2.0"]
+                + ["--out-json", str(o)] + extra)
+            assert rc == 0, "zmap run failed: %s %s" % (script, extra)
+            outs.append(o.read_bytes())
+        assert outs[0] == outs[1], "flat/bull JSON changed: %r" % extra
+
+
+def test_ze2b_cli_ball_block_and_dump(tmp_path):
+    """ball + engagement: report carries engagement.ze2b and the ZE2 semantics
+    marker; --ae2b-dump writes the windows with the design's fields."""
+    part = np.zeros((NB, NB))
+    npf = tmp_path / "p.npy"
+    np.save(npf, part)
+    with open(tmp_path / "p.json", "w") as f:
+        json.dump({"cell": CELL_B, "x0": X0_B, "y0": Y0_B, "tess_tol": 0.01},
+                  f)
+    ngc = tmp_path / "slot.ngc"
+    ngc.write_text(_zb_pass_gcode(0.0, 8.0))
+    out = tmp_path / "rep.json"
+    dump = tmp_path / "wins.json"
+    rc = zmap.main([str(ngc), "--part", str(npf), "--tool", "ball",
+                    "--dia", str(D_ZB), "--stock"]
+                   + [str(v) for v in STOCK_B]
+                   + ["--engage-max", "2.286", "--out-json", str(out),
+                      "--ae2b-dump", str(dump)])
+    assert rc == 0                                  # report-only, never fails
+    with open(out) as f:
+        eng = json.load(f)["engagement"]
+    assert eng["semantics"] == "flat-only, see ze2b"
+    zb = eng["ze2b"]
+    for k in ("n_windows", "full_width", "overload", "ae_eq",
+              "w_plan_over_chord", "a", "descent"):
+        assert k in zb, "missing ze2b key %s" % k
+    assert zb["n_windows"] >= 1
+    with open(dump) as f:
+        wins = json.load(f)
+    assert wins
+    need = {"line", "x", "y", "z", "a", "theta", "w_plan", "c_a", "ae_eq",
+            "length_3d", "feed", "descent"}
+    assert need <= set(wins[0]), sorted(need - set(wins[0]))
+
+
+def test_ze2b_mutation_broken_chord_breaks_assertions(monkeypatch):
+    """Design case 6, mutation proof: with c(a) replaced by D (a broken chord
+    formula - monkeypatched wrapper, no edit to zmap.py) the full-width slot
+    and side-pass checks must FAIL BY ASSERTION."""
+    monkeypatch.setattr(zmap, "_ze2b_chord", lambda a, dia: dia)
+    with pytest.raises(AssertionError):
+        _check_full_slot(_run_zb(_zb_pass_gcode(0.0, 8.0),
+                                 np.zeros((NB, NB))))
+    part = np.zeros((NB_L, NB_L))
+    res_a = _run_zb(_zb_pass_gcode(-2.905, 8.0, x0=-5.0, x1=20.0), part,
+                    x0=X0_L, y0=Y0_L, stock=STOCK_L)
+    with pytest.raises(AssertionError):
+        _check_side_pass(_run_zb(_zb_pass_gcode(-1.0, 8.0, x0=-5.0, x1=20.0),
+                                 part, stock_init=res_a["stock"],
+                                 x0=X0_L, y0=Y0_L, stock=STOCK_L))

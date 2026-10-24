@@ -897,6 +897,28 @@ def hug_regions(islands, grown, stock, isl_ok, eps=0.05, min_run=1.0):
     return regions
 
 
+def _nn_order(phase, cand, pos):
+    """DT1: nearest-neighbour ordering of region indices for one HR1 phase
+    with deterministic tie-breaking: equal travel distance picks the LOWEST
+    region index, and a chosen region's entry point breaks an exact distance
+    tie by (distance, x, y) - never by the order a set/dict/worker pool
+    happened to emit the candidates. Returns (order, end_pos)."""
+    out = []
+    remaining = sorted(phase)
+    while remaining:
+        if pos is None:
+            k = remaining[0]
+        else:
+            k = min(remaining, key=lambda k: (min(math.dist(pos, p)
+                                                  for p in cand[k]), k))
+        out.append(k)
+        remaining.remove(k)
+        pos = min(cand[k], key=lambda p: (math.dist(pos, p), p[0],
+                                            p[1])) if pos is not None \
+            else cand[k][0]
+    return out, pos
+
+
 def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
              keep_tool_down, helix_dia):
     """One level's Adaptive2d run; returns plain picklable region dicts."""
@@ -1244,7 +1266,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 return False
             # start point on the circle nearest the current XY (short rapid
             # across at z_top), bore down, then feed back to the entry
-            s = min(circ[:-1], key=lambda p: math.dist(p, (x, y)))
+            s = min(circ[:-1], key=lambda p: (math.dist(p, (x, y)),
+                                               p[0], p[1]))
             # helix end point (same turn count as _helix_moves) - validate
             # the return segment to the entry BEFORE emitting anything
             a0s = math.atan2(s[1] - cy, s[0] - cx)
@@ -1939,8 +1962,11 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             rp["_n_a2d"] = len(regions)
         # R4: wall-hugging rings close the margin-wide rest band + corner
         # chunks Adaptive2d cannot reach (its islands are pre-eroded).
-        regions.extend(hug_regions(islands, grown, stock, isl_ok,
-                                  eps=max(0.5 * tolerance, 0.03)))
+        # BS1a3: the channel check runs INSIDE the emit loop, at the -1
+        # sentinel, once this level's a2d passes are milled into the LIVE stock.
+        rings = hug_regions(islands, grown, stock, isl_ok,
+                           eps=max(0.5 * tolerance, 0.03))
+        regions.extend(rings)
         if _RP:
             rp["n_hug"] = len(regions) - rp.pop("_n_a2d")
         t_a2d = time.time() - t0
@@ -1955,10 +1981,11 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # RT travel: order regions nearest-neighbour from the current tool
         # position and enter each at its nearest island-valid candidate, so
         # inter-region rapids stay short instead of following a2d's order.
-        # HR1: all Adaptive2d regions first (NN among themselves), then ALL
-        # hug-ring regions (NN among the rings starting from where the last
-        # a2d region left the tool) - a ring must always be the thin skim R4
-        # intended, never slot full-width ahead of its level's a2d passes.
+        # HR1/BS1a3: all Adaptive2d regions first (NN among themselves); the
+        # channel-clear trochoids and ALL hug-ring regions are ordered at the
+        # -1 sentinel inside the emit loop, once this level's a2d passes are
+        # milled into the LIVE stock - a ring must always be the thin skim
+        # R4 intended, never slot full-width ahead of its level's passes.
         cand = []
         for res in regions:
             fc = next((p for (k, p) in res["paths"]
@@ -1973,19 +2000,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             cand.append(ok)
         order = []
         pos = (prev[0], prev[1]) if prev[0] is not None else None
-        for phase in ([k for k, c in enumerate(cand) if c and k < n_a2d],
-                     [k for k, c in enumerate(cand) if c and k >= n_a2d]):
-            remaining = list(phase)
-            while remaining:
-                if pos is None:
-                    k = remaining[0]
-                else:
-                    k = min(remaining, key=lambda k: min(
-                        math.dist(pos, p) for p in cand[k]))
-                order.append(k)
-                remaining.remove(k)
-                pos = min(cand[k], key=lambda p: math.dist(pos, p)) \
-                    if pos is not None else cand[k][0]
+        sub, pos = _nn_order([k for k, c in enumerate(cand) if c
+                              and k < n_a2d], cand, pos)
+        order.extend(sub)
+        order.append(-1)        # sentinel: the band phase is detected here
         nreg = 0
         cb0 = stats["n_clip_breaks"]
         rp_lk0 = ({k: stats[k] for k in ("n_lifts", "n_notclear_links",
@@ -1994,14 +2012,48 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                   if _RP else None)
         level_pts = []  # (x, y, tag) cutter centres cutting at this level's Z
         region_dump = []
-        for k in order:
+        for idx, k in enumerate(order):   # order grows by one phase at the -1
+            if k < 0:                    # sentinel: every a2d region of this
+                # level is emitted and milled into the LIVE stock - detect the
+                # full-width ring stretches against it now, then order bands
+                # (NN) and rings (NN from the last band).
+                from engine.band import channel_regions
+                bands = channel_regions(rings, stock, isl_ok3, z, tool_r,
+                                      leave, stock.cell, stats)
+                base = len(regions)
+                regions.extend(bands)
+                for res in bands:                 # candidate rule as above
+                    fc = next((p for (k, p) in res["paths"]
+                              if k == "cutting" and p), None)
+                    pts0 = [p for p in (res["start"], fc[0] if fc else None)
+                            if p]
+                    ok = [p for p in pts0 if isl_ok([p])[0]]
+                    if not ok:
+                        g0 = next(((p, m) for (k, p) in res["paths"]
+                                  if k == "cutting"
+                                  for m in [isl_ok(p)] if any(m)),
+                                 (None, None))
+                        if g0[0] is not None:
+                            ok = [g0[0][g0[1].index(True)]]
+                    cand.append(ok)
+                if _RP:
+                    rp["n_hug"] += len(bands)
+                sub, pos = _nn_order([k for k in range(base, len(cand))
+                                     if cand[k]], cand, pos)
+                order.extend(sub)
+                sub, pos = _nn_order([k for k in range(n_a2d, base)
+                                     if cand[k]], cand, pos)
+                order.extend(sub)
+                continue
             res = regions[k]
             nreg += 1
             if prev[0] is None:
                 entry = cand[k][0]
             else:
-                entry = min(cand[k], key=lambda p:
-                          math.dist((prev[0], prev[1]), p))
+                # DT1: stable tie-break (distance, x, y) - an exact distance
+                # tie must not follow candidate list order.
+                entry = min(cand[k], key=lambda p: (math.dist(
+                    (prev[0], prev[1]), p), p[0], p[1]))
             rp2_flag, rp2_cand = rp2_open(res)
             pxy0 = (prev[0], prev[1])
             pz0 = prev[2]
