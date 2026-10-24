@@ -1559,6 +1559,160 @@ def test_rr1c3_bay_deep_groove_top_down():
         "e206c56 left ~2.0)" % (worst_left, where)
 
 
+def _rr1c4b_axial_max(moves, A, cell, cut_feed):
+    """Max axial engagement a = live disk_top - tip Z over every cut-feed
+    move, measured on the LIVE grid replayed from moves (before each stamp)."""
+    from engine import entry_depth as ed
+    live = ed.LiveStock(A, 0.0, 0.0, cell, 9.525 / 2.0)
+    worst, where = 0.0, None
+    prev = None
+    for m in moves:
+        cur = (m["x"], m["y"], m["z"])
+        if prev is not None and m["g"] == 1:
+            if m.get("f") == cut_feed:
+                n = max(int(math.hypot(cur[0] - prev[0],
+                                        cur[1] - prev[1]) / 0.2), 1)
+                for q in range(n + 1):
+                    t_ = q / n
+                    x = prev[0] + (cur[0] - prev[0]) * t_
+                    y = prev[1] + (cur[1] - prev[1]) * t_
+                    d = live.disk_top(x, y) - cur[2]
+                    if not math.isfinite(d):
+                        return math.inf, (round(x, 2), round(y, 2), cur[2])
+                    if d > worst:
+                        worst, where = d, (round(x, 2), round(y, 2), cur[2])
+            live.stamp_chord(prev, cur)
+        prev = cur
+    return worst, where
+
+
+def test_rr1c4b_plateau_topdown_axial_load():
+    """RR1c-4b: a synthetic plateau - a 3.4 mm stock block standing over a
+    flat part floor (like the Core Front's 3.26 mm block), whose lowest
+    level is a legal helix entry. The rest-rough bores to the LOWEST legal
+    level, rises inside the bore and cuts levels TOP-DOWN: max axial
+    engagement at cutting feed <= stepdown + 0.05, ZE2B (verify/zmap.py
+    read-only, padded part grid) 0 mm over 2.286 and 0 full-width windows
+    at cutting feed, exact clcheck 0, every ZB entry <= 0.5. On d46a04a
+    the program entered LOW and cut up under the standing block: a ~ 3.2 mm
+    at the first level."""
+    try:
+        from engine import rest_rough as rr
+        from engine import entry_depth as ed
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    box = _rr1c_boxes()
+    surf = _rr1c_surf(box(0, 40, 0, 40, 20, 26.6))   # flat-floor slab
+    cell = 0.5
+    n = int(40 / cell)
+    cxv = (np.arange(n) + 0.5) * cell
+    X, Y = np.meshgrid(cxv, cxv)
+    A = np.full((n, n), 26.6)
+    A[(X >= 14.0) & (X <= 26.0) & (Y >= 14.0) & (Y <= 26.0)] = 30.0
+    moves, stats = rr.rest_rough(
+        surf, (A, 0.0, 0.0, cell), ("ball", 9.525), floor_z=26.6,
+        stepdown=2.0, ae=1.905, rest_leave=0.2, min_excess=0.5,
+        min_helix_r=1.903, ramp_angle_deg=2.0, cut_feed=2280.0,
+        ramp_feed=850.0)
+    assert moves and len(stats["zones"]) == 1 and not stats["no_entry"], \
+        "plateau must be entered: %r" % (stats["no_entry"],)
+    assert stats["zones"][0]["levels"] >= 2, \
+        "expected >= 2 levels top-down, got %r" % stats["zones"][0]["levels"]
+    assert stats["zones"][0]["helix"] >= 1.903, \
+        "plateau must be entered by the bore helix: %r" % stats["zones"][0]
+    cfz = [round(m["z"], 3) for m in moves if m["g"] == 1
+           and m.get("f") == 2280.0]
+    assert cfz and abs(cfz[0] - max(cfz)) < 1e-6, \
+        "first cut-feed level is %.3f, not the highest (top-down)" % cfz[0]
+    a, where = _rr1c4b_axial_max(moves, A, cell, 2280.0)
+    assert a <= 2.0 + 0.05, \
+        "axial engagement %.3f mm at cutting feed > stepdown + 0.05 at %s" \
+        % (a, where)
+    below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
+    assert below == 0, "gouge: %d pts (worst %.3f)" % (below, worst)
+    live = ed.LiveStock(A, 0.0, 0.0, cell, 9.525 / 2.0)
+    mv = [dict(m, line=i) for i, m in enumerate(moves)]
+    entries = ed.estimate_entries(mv, live)
+    deep = [e for e in entries if not math.isfinite(e["depth_mm"])
+            or e["depth_mm"] > 0.5]
+    assert not deep, "deep entry: %s" % deep[:3]
+    # ZE2B load bar via verify/zmap.py, read-only, padded part grid
+    from engine.gcode import moves_to_gcode
+    from verify import zmap
+    pg = zmap.parse_gcode(moves_to_gcode(moves, spindle_rpm=8000))
+    pad = 4
+    ny = nx = n + 2 * pad
+    part = np.full((ny, nx), 26.6)
+    stock_init = np.full((ny, nx), 26.6)
+    xp = -pad * cell + (np.arange(nx) + 0.5) * cell
+    yp = -pad * cell + (np.arange(ny) + 0.5) * cell
+    Xp, Yp = np.meshgrid(xp, yp)
+    stock_init[(Xp >= 14.0) & (Xp <= 26.0) &
+               (Yp >= 14.0) & (Yp <= 26.0)] = 30.0
+    rep = zmap.simulate(pg, part, cell, -pad * cell, -pad * cell,
+                        (0.0, 40.0, 0.0, 40.0, 20.0, 30.0), tool="ball",
+                        dia=9.525, stock_init=stock_init, engage_max=2.286)
+    raw = rep["_ae2_raw"]
+    by_feed = {}
+    for w in raw:
+        if w.get("feed"):
+            by_feed[w["feed"]] = by_feed.get(w["feed"], 0.0) + w["length_mm"]
+    cut = max(by_feed, key=by_feed.get) if by_feed else None
+    # wide SLOT engagement at cutting feed (a > 0.5, the ZE load class;
+    # shallow re-cut films a <= 0.5 are skim, listed separately by design)
+    over = sum(w["length_mm"] for w in raw if cut is not None
+               and w.get("feed", 0.0) >= 0.9 * cut
+               and w["ae_eff"] > 2.286 and w["a"] > 0.5)
+    assert over == 0.0, \
+        "ZE2B: %.1f mm of wide slots over 2.286 at cutting feed" % over
+    fw = rep["engagement"]["full_width_slots_ae2_cutting_feed"]
+    assert fw["count"] == 0, \
+        "ZE2B: %d full-width windows at cutting feed: %s" % (
+            fw["count"], fw["worst"][:2])
+
+
+def test_rr1c4b_closed_pocket_bore_levels():
+    """RR1c-4b: the closed 20x20 pocket (stock 30 over floor 24, ramp
+    2 deg) is entered by a BORE helix down to the LOWEST legal level; the
+    program rises inside the bore, cuts every level top-down and re-enters
+    each lower level by a real descent inside the bore: >= 3 levels cut,
+    >= 2 bore descents recorded below the entered top, ZB 0 (no scored
+    entry deeper than 0.5 into live stock), exact clcheck 0 and axial
+    engagement <= stepdown + 0.05 at cutting feed. On d46a04a the pocket
+    entered low and cut up: no descents, a ~ 3.8 mm at Z 26.2."""
+    try:
+        from engine import rest_rough as rr
+        from engine import entry_depth as ed
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    surf, stock, lo, hi = _rr1b_pocket_scene((10.0, 30.0))
+    moves, stats = rr.rest_rough(
+        surf, stock, ("ball", 9.525), floor_z=24.0, stepdown=2.0, ae=1.905,
+        rest_leave=0.2, min_excess=0.5, min_helix_r=1.903, ramp_angle_deg=2.0,
+        cut_feed=2280.0, ramp_feed=850.0)
+    assert moves and len(stats["zones"]) == 1 and not stats["no_entry"], \
+        "pocket must be entered by bore: %r" % stats["no_entry"]
+    z0 = stats["zones"][0]
+    assert z0["levels"] >= 3, "expected >= 3 levels, got %r" % z0["levels"]
+    assert z0["helix"] >= 1.903, "bore helix missing: %r" % z0["helix"]
+    descs = [e for e in stats["entries"] if "descent" in str(e["kind"])]
+    assert len(descs) >= 2, \
+        "lower levels not re-entered through the bore: %r" % stats["entries"]
+    a, where = _rr1c4b_axial_max(moves, stock[0], stock[3], 2280.0)
+    assert a <= 2.0 + 0.05, \
+        "axial engagement %.3f mm at cutting feed > stepdown + 0.05 at %s" \
+        % (a, where)
+    below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
+    assert below == 0, "gouge: %d pts (worst %.3f)" % (below, worst)
+    live = ed.LiveStock(stock[0], *stock[1:], 9.525 / 2.0)
+    mv = [dict(m, line=i) for i, m in enumerate(moves)]
+    entries = ed.estimate_entries(mv, live)
+    assert entries, "no entries recorded"
+    deep = [e for e in entries if not math.isfinite(e["depth_mm"])
+            or e["depth_mm"] > 0.5]
+    assert not deep, "deep entry (ZB): %s" % deep[:3]
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -1584,7 +1738,9 @@ def _main():
                test_rr1c_narrow_pocket_side_entry,
                test_rr1c2_cf_rapid_shapes_clear_stock,
                test_rr1c3_curved_thin_band_centre_line,
-               test_rr1c3_bay_deep_groove_top_down):
+               test_rr1c3_bay_deep_groove_top_down,
+               test_rr1c4b_plateau_topdown_axial_load,
+               test_rr1c4b_closed_pocket_bore_levels):
         try:
             fn()
         except AssertionError as e:

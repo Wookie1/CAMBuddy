@@ -100,7 +100,7 @@ def _at(G, xs, ys, x, y):
 
 
 def find_zones(Sg, Zd, floor_z, min_excess, xs, ys, dropped=None,
-               tool_r=0.0):
+               tool_d=0.0, link_ok=None):
     reach = np.maximum(Zd, floor_z)
     exc = np.where(np.isfinite(Sg) & (Sg > floor_z), Sg - reach, -1e3)
     mask = exc > min_excess
@@ -123,14 +123,15 @@ def find_zones(Sg, Zd, floor_z, min_excess, xs, ys, dropped=None,
             frags.append(rec)   # RR1c-4: plan fragments, never drop silently
             continue
         zones.append(rec)
-    # RR1c-4: merge a fragment within the tool radius into the nearest
-    # zone's mask; a lone fragment stays a mini-zone (entered, or reported
-    # in fragments_dropped when the ladder finds no legal entry there).
+    # RR1c-4b: merge a fragment within the tool DIAMETER D into the nearest
+    # zone only when the bridge at its cutting Z is CL-legal and stock-clear
+    # (link_ok); else it stays a mini-zone (entered, or reported as dropped).
     for f in sorted(frags, key=lambda z: -z["area_mm2"]):
         near = [(float(ndimage.distance_transform_edt(~z["mask"])[f["mask"]]
                        .min()) * CELL, z) for z in zones]
         d, z = min(near, key=lambda t_: t_[0]) if near else (1e30, None)
-        if d <= tool_r + 1e-9:
+        if d <= tool_d + 1e-9 and z is not None and \
+                (link_ok is None or link_ok(f, z)):
             m = z["mask"] | f["mask"]
             j2, i2 = np.nonzero(m)
             z.update({"mask": m, "stockmax": float(Sg[m].max()),
@@ -264,8 +265,29 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
     if clearance is None:
         clearance = float(np.nanmax(Sg[np.isfinite(Sg)])) + 2.0
     fragments = []
+
+    def link_clear(fr, zn):
+        """RR1c-4b fragment bridge at the cutting Z (fragment stockmax -
+        leave): every bridge point exact-CL-legal AND stock-clear - no live
+        column deeper than zb_floor; fail closed on unjudged stock."""
+        dt = ndimage.distance_transform_edt(~zn["mask"])
+        fi, fj = np.unravel_index(int(np.argmin(
+            np.where(fr["mask"], dt, 1e30))), dt.shape)
+        dtf = ndimage.distance_transform_edt(~fr["mask"])
+        zi_, zj_ = np.unravel_index(int(np.argmin(
+            np.where(zn["mask"], dtf, 1e30))), dtf.shape)
+        n8 = max(int(round(math.hypot(xs[zj_] - xs[fj],
+                                       ys[zi_] - ys[fi]) / (CELL / 2))), 2)
+        zc = fr["stockmax"] - rest_leave
+        pts = [(xs[fj] + (xs[zj_] - xs[fj]) * q / n8,
+                ys[fi] + (ys[zi_] - ys[fi]) * q / n8) for q in range(n8 + 1)]
+        if any(live.disk_top(px, py) > zc + zb_floor for px, py in pts):
+            return False
+        v = batch_drop(surf, make_cutter("ball", dia), pts, threads=1)
+        return all(math.isfinite(z_) and z_ <= zc + 0.005 for z_ in v)
+
     zones = find_zones(Sg, Zd, floor_z, min_excess, xs, ys, fragments,
-                       tool_r=R)
+                       tool_d=dia, link_ok=link_clear)
 
     moves = []
     stats = {"zones": [], "no_entry": [], "fragments_dropped": fragments,
@@ -575,7 +597,16 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 if len(jsr) >= 2:
                     ux, uy = ((1.0, 0.0) if xs[isr].max() - xs[isr].min()
                              >= ys[jsr].max() - ys[jsr].min() else (0.0, 1.0))
-            if enter(p0[0][0], p0[0][1], t0, ux, uy, zi):
+            if len(levels) > 1 and li0 == len(levels) - 1:
+                # RR1c-4b: a multi-level zone's entry is the BORE - the same
+                # 2-deg helix + floor circle, top down to the LOWEST legal
+                # level; time does not grow. No site: fall through reported.
+                hc = helix_entry(p0[0][0], p0[0][1], levels[0][0], zi)
+                if hc is not None:
+                    entered = True
+                    cx, cy, r_h = hc
+                    mode = "bore"
+            if not entered and enter(p0[0][0], p0[0][1], t0, ux, uy, zi):
                 entered = True
             if not entered:
                 # step 3: zig-zag along the zone's long axis (only if every
@@ -626,13 +657,14 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                                           "(r_max_cl=%.3f)" % r_max})
             continue
 
-        prev = (moves[-1]["x"], moves[-1]["y"], round(t0, 4))
-        # floor circle at r_h on t0 (step 5 companion), only where legal
+        tb = levels[0][0] if mode == "bore" else t0
+        prev = (moves[-1]["x"], moves[-1]["y"], round(tb, 4))
+        # floor circle at r_h on tb (step 5 companion), only where legal
         if r_h > 0.0:
             theta0 = math.atan2(prev[1] - cy, prev[0] - cx)
             rc = r_h
             while rc >= min_helix_r:
-                cp = circle_points(cx, cy, rc, t0, theta0)
+                cp = circle_points(cx, cy, rc, tb, theta0)
                 if cl_ok_path(cp):
                     for px, py, pz in cp:
                         g1(px, py, pz, ramp_feed)
@@ -647,8 +679,32 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
         order = list(range(li0, -1, -1))
         for li, idx in enumerate(order):
             t, reg = levels[idx]
-            if li and t >= prev[2] - 1e-9:
+            if t - prev[2] > 1e-9:
+                # bore mode: rise INSIDE the cleared bore to this level
                 g1(prev[0], prev[1], round(t, 4), ramp_feed)
+                prev = (prev[0], prev[1], round(t, 4))
+            if mode == "bore" and t < prev[2] - 1e-9:
+                # RR1c-4b: descend into each lower level INSIDE the bore -
+                # strict CL at every point + live ZB floor on LIVE stock.
+                bx, by = cx + r_h, cy
+                n8 = max(int(math.hypot(bx - prev[0], by - prev[1]) / .25), 1)
+                lp = [(prev[0] + (bx - prev[0]) * q / n8,
+                      prev[1] + (by - prev[1]) * q / n8, prev[2])
+                     for q in range(n8 + 1)]
+                okd, dd = cl_ok_path(lp), 0.0
+                if okd:
+                    g1(bx, by, round(prev[2], 4), ramp_feed)
+                    prev = (bx, by, round(prev[2], 4))
+                while okd and prev[2] - t > 1e-9:
+                    zn = max(t, round(prev[2] - (zb_floor - 0.05), 4))
+                    dd = live.disk_depth(bx, by, zn)
+                    okd = bool(cl_ok(bx, by, zn) and math.isfinite(dd)
+                              and dd <= zb_floor)
+                    if okd:
+                        g1(bx, by, zn, ramp_feed)
+                        prev = (bx, by, zn)
+                if okd:
+                    _record(zi, t, 5, "bore-descent", max(dd, 0.0))
             # a descent level is never a vertical drop at prev XY: the pass
             # loop re-enters it through the one enter() ladder below
             Dz = ndimage.distance_transform_edt(reg) * CELL
