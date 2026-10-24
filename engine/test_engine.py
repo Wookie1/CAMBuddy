@@ -2287,6 +2287,14 @@ def test_bs1a4d_credit0_lightest_option():
                       and abs(e["z"] - f[2]) < 1e-6 for e in fre), \
                 "credit-0 failure %r was silently dropped - not listed in " \
                 "failed_region_emitted: %s" % (f, fre)
+            e = [e for e in fre if abs(e["x"] - f[0]) < 1.5
+                 and abs(e["y"] - f[1]) < 1.5 and abs(e["z"] - f[2]) < 1e-6][0]
+            assert e["option"] != "drop_ring" and f[3] == "replan0_" + e["option"], \
+                "credit-0 failure %r not EMITTED as its lightest option: %s" % (f, e)
+            cut = [m for m in _m if m["g"] == 1 and m.get("z") is not None
+                   and abs(m["z"] - f[2]) < 1e-6
+                   and math.dist((m["x"], m["y"]), (f[0], f[1])) < 1.0]
+            assert cut, "credit-0 failure %r: no cut emitted at its start" % (f,)
     assert stats.get("clcheck_violations", 0) == 0, stats.get(
         "clcheck_violations")
     print("PASS bs1a4d(a0): credit-0 failures %s, listed %s" % (
