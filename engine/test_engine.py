@@ -1713,6 +1713,37 @@ def test_rr1c4b_closed_pocket_bore_levels():
     assert not deep, "deep entry (ZB): %s" % deep[:3]
 
 
+def test_rr1c5c_closed_pocket_bore_entry_no_deep_axial():
+    """RR1c-5c: the closed 20x20 pocket is bore-seeded (no open edge), so
+    EVERY level is entered through the bore - in-bore rise/descent with each
+    step exact-CL and live-ZB checked (RR1c-4b) - never by an axial plunge
+    into live stock: ZB, no scored entry deeper than 0.5 mm. On dda4ed0 the
+    front's level entry instead plunged 1.48 mm at (18.462, 18.70), Z 28.2
+    into the bore's uncut core (the coarse live model hides it)."""
+    try:
+        from engine import rest_rough as rr
+        from engine import entry_depth as ed
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    surf, stock, lo, hi = _rr1b_pocket_scene((10.0, 30.0))
+    moves, stats = rr.rest_rough(
+        surf, stock, ("ball", 9.525), floor_z=24.0, stepdown=2.0, ae=1.905,
+        rest_leave=0.2, min_excess=0.5, min_helix_r=1.903, ramp_angle_deg=2.0,
+        cut_feed=2280.0, ramp_feed=850.0)
+    assert moves and len(stats["zones"]) == 1 and not stats["no_entry"], \
+        "pocket must be bore-seeded: %r" % stats["no_entry"]
+    assert stats["zones"][0]["helix"] >= 1.903, \
+        "bore seed missing: %r" % stats["zones"][0]["helix"]
+    live = ed.LiveStock(stock[0], *stock[1:], 9.525 / 2.0)
+    mv = [dict(m, line=i) for i, m in enumerate(moves)]
+    entries = ed.estimate_entries(mv, live)
+    assert entries, "no entries recorded"
+    deep = [e for e in entries if not math.isfinite(e["depth_mm"])
+            or e["depth_mm"] > 0.5]
+    assert not deep, \
+        "bore-seed level entered by axial entry into live stock: %s" % deep[:3]
+
+
 def _rr1c4c_plateau_pocket_scene():
     """RR1c-4c scene: frame [0,40]^2, stock 30, pocket [8,32]^2 to floor
     24.0 whose +x half is a low plateau at 24.1 - a rising part surface
@@ -2139,7 +2170,8 @@ def _main():
                test_rr1c5b_varying_width_band_fronts,
                test_rr1c5b_open_edge_proud_block,
                test_rr1c5b_fully_walled_band_bore_seed,
-               test_rr1c5b_mixed_band_core_front):
+               test_rr1c5b_mixed_band_core_front,
+               test_rr1c5c_closed_pocket_bore_entry_no_deep_axial):
         try:
             fn()
         except AssertionError as e:

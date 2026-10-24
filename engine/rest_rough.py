@@ -353,7 +353,10 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
         if abs(x - px) > 1e-9 or abs(y - py) > 1e-9:
             g0r(x, y, round(pz, 4))
         ht = col_top(x, y)
-        z_land = round(min(zh, ht + 0.01), 4)
+        # RR1c-5c: land 0.2 above the coarse live top, not 0.01 - at cell
+        # 0.5 the planner's disk_top can under-read the true column top by
+        # ~0.1 (a G0 drop then grazes live stock, rr1c2 CF bays).
+        z_land = round(min(zh, ht + 0.2), 4)
         if z_land < pz - 1e-9:
             g0r(x, y, z_land)
 
@@ -814,10 +817,18 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                     dzd = prev[2] - t
                     # RR1c-5b: a feed link at depth must ALSO be stock-clear
                     # at the cutting Z (live disk, 0.05 tolerance) - a link
-                    # may never cut; else the ladder below.
-                    if cl_ok_path(lp) and all(
+                    # may never cut; else the ladder below. RR1c-5c: a bore-
+                    # seeded zone enters its level through the bore instead
+                    # (RR1c-4b): from the bore circle at level Z after the in-
+                    # bore rise/descent, a CL-checked feed-in replaces the
+                    # ladder - the coarse live model hides the bore's uncut
+                    # core, so step1 would plunge ~1.5 mm deep there.
+                    onbore = (mode == "bore" and r_h > 0.0 and dzd <= 1e-9
+                              and abs(math.hypot(prev[0] - cx, prev[1] - cy)
+                                     - r_h) <= CELL)
+                    if cl_ok_path(lp) and (onbore or all(
                             live.disk_top(px, py) <= t + 0.05
-                            for px, py, _ in lp) and (dzd <= 1e-9
+                            for px, py, _ in lp)) and (dzd <= 1e-9
                                           or d0 * tanr >= dzd - 1e-9):
                         g1(pts[0][0], pts[0][1], round(t, 4), ramp_feed)
                     else:
