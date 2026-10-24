@@ -1097,7 +1097,9 @@ def _main():
                test_bs1a4b_windows_align_zmap,
                test_bs1a4c_backed_credit,
                test_bs1a4c_fix_no_post_entry_helix,
-               test_bs1a4c2_band_chord_cl_checked):
+               test_bs1a4c2_band_chord_cl_checked,
+               test_bs1a4d_credit0_lightest_option,
+               test_bs1a4d_credit_real_bore):
         try:
             fn()
         except AssertionError as e:
@@ -2209,6 +2211,215 @@ def test_bs1a4c2_band_chord_cl_checked():
           "%d band region(s), %d listed failed piece(s)" % (
               stats.get("n_band_regions", 0),
               len(stats["failed_region_emitted"])))
+
+
+def test_bs1a4d_credit0_lightest_option():
+    """Task BS1a4d (a0): a credited band region that fails the credit-0
+    re-check at emit is NOT silently dropped - it takes Fix 1's lightest
+    option (the shrink ladder re-simulated at credit 0 on the LIVE stock vs
+    drop-to-ring, same ranking) and is listed in
+    stats["failed_region_emitted"] with place, Z, area, option and engine max
+    ae; the program still passes CLCHECK. The unbacked credit is forced
+    honestly: every single-point stock.link_clear([q,q], z) - the backing
+    check itself - reports False, i.e. no emitted move backed the credit.
+    FAILS on 22cdff7: there the failed re-check was an unconditional drop and
+    no credit-0 failure ever reaches failed_region_emitted."""
+    from opencamlib import ocl
+    import tempfile
+    import engine.band as B
+    from engine.rough import rough
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+    _orig_cr = B.channel_regions
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None,
+               **kw):
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats,
+                       **kw)
+        if not getattr(stock, "_bs1a4d_forced", False):
+            stock._bs1a4d_forced = True
+            lc0 = stock.link_clear
+
+            def lc(pts, h, eps=0.05):
+                if abs(h - z) <= 1e-6 and len(set(pts)) == 1:
+                    return False   # the credit-backing single-point check
+                return lc0(pts, h, eps)
+            stock.link_clear = lc
+        return res
+
+    B.channel_regions = cr_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d_a0.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            try:
+                _m, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0,
+                                         18.0), 6.343, 0.0, leave=0.381,
+                                 axial_leave=0.381, stepdown=19.05,
+                                 stepup=1.905, tolerance=0.05, threads=4,
+                                 stock_cell=0.5, min_rest=0.5, corner_r=0.0,
+                                 stl_path=stl)
+            except RuntimeError as e:
+                raise AssertionError(
+                    "rough refused on CL (a credit-0 fallback move gouged):"
+                    " %s" % str(e)[:200])
+    finally:
+        B.channel_regions = _orig_cr
+    acts = [f[3] for f in stats.get("credit_fallback", [])]
+    assert any(a.startswith("replan0_") for a in acts), \
+        "no credit-0 re-check fired - scenario vacuous: %s" % (acts,)
+    fre = stats.get("failed_region_emitted", [])
+    for f in stats["credit_fallback"]:
+        if f[3].startswith("replan0_") and f[3] != "replan0_ok":
+            assert any(abs(e["x"] - f[0]) < 1.5 and abs(e["y"] - f[1]) < 1.5
+                      and abs(e["z"] - f[2]) < 1e-6 for e in fre), \
+                "credit-0 failure %r was silently dropped - not listed in " \
+                "failed_region_emitted: %s" % (f, fre)
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    print("PASS bs1a4d(a0): credit-0 failures %s, listed %s" % (
+        [a for a in acts if a.startswith("replan0_")],
+        [(e["x"], e["y"], e["z"], e["option"], e["max_ae"]) for e in fre]))
+
+
+def test_bs1a4d_credit_real_bore():
+    """Task BS1a4d (c): at a helix-entered band start the planning sim's
+    credit is the REAL bore footprint - the cutter disk swept along the
+    emitted helix path plus its floor circle - not a tool_r disk centred on
+    the path start: every cell the emitted entry clears is credited, and the
+    credit is centred on the helix centre (offset from the start), covering
+    far more than the start disk. FAILS on 22cdff7: there the credit is a
+    tool_r disk about path[0] (bore_xy None) and hundreds of cells cleared by
+    the emitted helix are re-counted as fresh loop cut."""
+    import math
+    import tempfile
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.rough import rough
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+    caps, sims = [], []
+    _orig_cr, _orig_sim = B.channel_regions, B._simulate
+
+    def sim_spy(path, stock, z, tool_r, cell, bore_r, ends=None,
+                bore_xy=None):
+        w = _orig_sim(path, stock, z, tool_r, cell, bore_r, ends, bore_xy)
+        sims.append((round(z, 3), tuple(path[0]), bore_r,
+                     tuple(bore_xy) if bore_xy else None))
+        return w
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None,
+               **kw):
+        snap = stock.top.copy()
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats,
+                       **kw)
+        for r in res:
+            caps.append({"z": round(z, 3), "q": tuple(r["start"]),
+                        "credit": r.get("credit") or 0.0, "snap": snap,
+                        "x0": stock.x0, "y0": stock.y0, "cell": stock.cell})
+        return res
+
+    B._simulate = sim_spy
+    B.channel_regions = cr_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d_c.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            moves, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0,
+                                        18.0), 6.343, 0.0, leave=0.381,
+                                axial_leave=0.381, stepdown=19.05,
+                                stepup=1.905, tolerance=0.05, threads=4,
+                                stock_cell=0.5, min_rest=0.5, corner_r=0.0,
+                                stl_path=stl)
+    finally:
+        B.channel_regions = _orig_cr
+        B._simulate = _orig_sim
+
+    def entry_pts(q, z):
+        # the bore that matters for pre-crediting: cutter-disk sweep AT Z -
+        # the HB1v2 floor circle (ramp feed, z == Z) plus the landing point.
+        idx = next((i for i, mv in enumerate(moves) if mv.get("g") == 1
+                    and abs((mv.get("z") or 9e9) - z) < 1e-6
+                    and mv.get("x") is not None
+                    and abs(mv["x"] - q[0]) < 1e-4
+                    and abs(mv["y"] - q[1]) < 1e-4), None)
+        if idx is None:
+            return None
+        pts, j = [q], idx - 1
+        while j >= 0 and moves[j].get("g") == 1 \
+                and abs(moves[j].get("f", 0) - 1270.0) < 1e-6 \
+                and moves[j].get("x") is not None \
+                and abs(moves[j]["z"] - z) < 1e-6:
+            pts.append((moves[j]["x"], moves[j]["y"]))
+            j -= 1
+        return pts if len(pts) > 9 else None   # floor circle at Z + landing
+
+    def cells(cap, pts, rad):
+        out, c = set(), cap["cell"]
+        k = int(math.ceil(rad / c))
+        offs = [(di, dj) for dj in range(-k, k + 1)
+                for di in range(-k, k + 1)
+                if (di * di + dj * dj) * c * c <= rad * rad]
+        for (px, py) in pts:
+            i0 = int(math.floor((px - cap["x0"]) / c))
+            j0 = int(math.floor((py - cap["y0"]) / c))
+            for di, dj in offs:
+                a, b = i0 + di, j0 + dj
+                if 0 <= a < cap["snap"].shape[1] \
+                        and 0 <= b < cap["snap"].shape[0] \
+                        and cap["snap"][b, a] > cap["z"] + 0.05:
+                    out.add((a, b))
+        return out
+
+    checked = 0
+    for cap in caps:
+        if cap["credit"] <= 1e-9:
+            continue
+        pts = entry_pts(cap["q"], cap["z"])
+        if pts is None:
+            continue                      # entry without an emitted helix
+        sim = next((s for s in sims if s[0] == cap["z"]
+                    and math.dist(s[1], cap["q"]) < 0.5), None)
+        if sim is None:
+            continue                      # start != ladder path start
+        assert sim[3] is not None, \
+            "credited plan sim pre-cleared a disk about the path START " \
+            "(%r), not the real helix-centred bore" % (sim,)
+        credited = cells(cap, [sim[3][:2]], sim[2])
+        credited |= cells(cap, [cap["q"]], 6.343)   # return-feed landing disk
+        cleared = cells(cap, pts, 6.343)
+        assert len(cleared - credited) <= 20, \
+            "%d cell(s) cleared by the emitted entry are not credited at " \
+            "(%.3f,%.3f) (bound 20 = return-feed stadium between helix end " \
+            "and landing, not modelled at plan time)" % (
+                len(cleared - credited), cap["q"][0], cap["q"][1])
+        assert len(credited - cleared) <= 30, \
+            "credit exceeds the swept floor-circle bore by %d cells (grid " \
+            "chord sliver bound 30) at (%.3f,%.3f)" % (
+                len(credited - cleared), cap["q"][0], cap["q"][1])
+        start_disk = cells(cap, [cap["q"]], 6.343)
+        assert len(credited - start_disk) > 100, \
+            "credit is still (about) the tool_r start disk: extra %d" % \
+            len(credited - start_disk)
+        checked += 1
+    assert checked >= 1, "no helix-entered credited region was checked"
+    print("PASS bs1a4d(c): %d helix-entered region(s) - credited cells cover "
+          "the swept helix + floor-circle bore exactly (offset centre)"
+          % checked)
 
 
 if __name__ == "__main__":

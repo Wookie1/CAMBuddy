@@ -665,6 +665,33 @@ def hf_gouge_violation(points, stock, tool_r, tol=0.02):
     return None
 
 
+def _bore_pred(isl_ok, zone, stock, x, y, tool_r):
+    # BS1a4d (c): centre/radius of the entry helix helix_entry would bore at
+    # (x, y) - same tiers + static guards; real bore = disk(c, r + tool_r).
+    for d in (1.5, 3.0, 4.5, 6.0):
+        for q in range(16):
+            a = q * math.pi / 8.0
+            ux, uy = math.cos(a), math.sin(a)
+            for fr in (0.5, 0.8, 0.3):
+                rh = fr * tool_r   # emit clamps r >= dz/(pi*tan) - tiers here
+                # stay above it (d >= 1.5, r_min ~ 1.9 << fr*tool_r fails the
+                # circle check first, so the clamp never binds on this scan).
+                cx, cy = x + (d + rh) * ux, y + (d + rh) * uy
+                n = max(16, int(2.0 * math.pi * rh / 0.5))
+                a0 = math.atan2(y - cy, x - cx)   # circle_ok's phase + rounding
+                circ = [(round(cx + rh * math.cos(a0 + t * 2.0 * math.pi / n),
+                               4),
+                       round(cy + rh * math.sin(a0 + t * 2.0 * math.pi / n), 4))
+                      for t in range(n + 1)]
+                if all(isl_ok(circ)) and all(
+                        0 <= stock._ci(px) < stock.nx
+                        and 0 <= stock._cj(py) < stock.ny
+                        and zone[stock._cj(py), stock._ci(px)]
+                        for (px, py) in circ):
+                    return (cx, cy, rh)
+    return None
+
+
 def _helix_turns(r, dz, angle_deg=2.0):
     """Integer turn count so the LAST turn runs a full circle at the bottom
     and completes the bore at exactly z_bot (no separate depth circle needed:
@@ -2021,9 +2048,13 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 # full-width ring stretches against it now, then order bands
                 # (NN) and rings (NN from the last band).
                 from engine.band import (channel_regions, _simulate, AE_SS,
-                                       AE_SPIKE)
+                                       AE_SPIKE, shrink_ladder,
+                                       _split_at_jumps)
                 bands = channel_regions(rings, stock, isl_ok3, z, tool_r,
-                                      leave, stock.cell, stats)
+                                      leave, stock.cell, stats,
+                                      borefn=lambda p, zz: _bore_pred(
+                                          isl_ok, centre_zone, stock,
+                                          p[0], p[1], tool_r))
                 base = len(regions)
                 regions.extend(bands)
                 for res in bands:                 # candidate rule as above
@@ -2080,7 +2111,29 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                             ew0)[max(0, int(0.95 * len(ew0)) - 1)] <= AE_SS:
                         act = "replan0_ok"
                     else:
+                        # BS1a4d (a0): Fix 1's lightest option - shrink ladder
+                        # at credit 0 on the LIVE stock vs drop-ring, same
+                        # rank; recorded in BOTH lists. Same prep as at plan
+                        # time (isl_ok3 points, split at jumps): only a first
+                        # piece joining q4 by a segment-checked chord emits.
+                        opt, pnew, wn, ba, _g = shrink_ladder(
+                            res["seg"], stock, z, tool_r, stock.cell, 0.0,
+                            (res["dropkey"], "drop_ring", None, []))
                         act, drop_cut = "replan0_drop", True
+                        if pnew is not None:
+                            g2 = isl_ok3([(round(a, 4), round(b, 4))
+                                        for (a, b) in pnew])
+                            pp = [q4] + [(round(a, 4), round(b, 4))
+                                       for (a, b), ok in zip(pnew, g2) if ok]
+                            pcs = _split_at_jumps(isl_ok3, pp)
+                            if len(pcs[0]) >= 4:
+                                res["paths"][0][1] = pcs[0]
+                                act, drop_cut = "replan0_" + opt, False
+                        stats["failed_region_emitted"].append(
+                            {"x": q4[0], "y": q4[1], "z": round(z, 3),
+                             "area": round(ba, 2),
+                             "option": opt if not drop_cut else "drop_ring",
+                             "max_ae": round(max(wn), 3) if wn else None})
                     stats["credit_fallback"].append(
                         (q4[0], q4[1], round(z, 3), act))
             stats["entry_feed_mm"] += de

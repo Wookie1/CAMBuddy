@@ -145,11 +145,12 @@ def _advance(r, tool_r):
     return max(LOOP_R_MIN * 0.3, min(p, P_CAP))
 
 
-def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None):
+def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, bore_xy=None):
     """Replay ZE2 windowing on the engine stock grid: move-aligned windows of
     path travel; a window's area = distinct cells whose live top stands above
     z + 0.05 and that first fall under the cutter disk (applied at every
-    emitted point) inside it. The entry bore (disk bore_r about the start) is
+    emitted point) inside it. The entry bore (disk bore_r about the start or
+    bore_xy - BS1a4d (c) helix centre) is
     pre-cleared - the helix + floor circle cut it at entry feed. Returns the
     list of per-window ae_eff estimates (mm); ends collects each window's
     cumulative end-of-window travel (zmap _ae2_windows: moves merge until the
@@ -168,7 +169,14 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None):
     if i0 >= i1 or j0 >= j1:
         return []
     stand = stock.top[j0:j1, i0:i1] > z + 0.05
-    ci, cj = stock._ci(path[0][0]) - i0, stock._cj(path[0][1]) - j0
+    bx, by = (bore_xy[:2] if bore_xy else path[0][:2])
+    ci, cj = stock._ci(bx) - i0, stock._cj(by) - j0
+    if bore_xy:      # BS1a4d (c): the entry also sweeps tool_r about the
+        c0, s0 = stock._ci(path[0][0]) - i0, stock._cj(path[0][1]) - j0
+        for dj, di in offs:   # start via the helix return feed at Z
+            a, b = c0 + di, s0 + dj
+            if 0 <= a < stand.shape[1] and 0 <= b < stand.shape[0]:
+                stand[b, a] = False
     for dj, di in offs_b:
         a, b = ci + di, cj + dj
         if 0 <= a < stand.shape[1] and 0 <= b < stand.shape[0]:
@@ -235,6 +243,48 @@ def _opt_key(wins, ends, fw_min):
     return (sum(1 for v in wins if v >= fw_min), max(wins), over)
 
 
+def shrink_ladder(seg, stock, z, tool_r, cell, credit=None, dropopt=None,
+                  borefn=None):
+    """BS1a4d: channel_regions' shrink ladder AND Fix 1's lightest-option
+    ranking as one callable, so the emit-time credit-0 re-plan (a0) reuses
+    them: credit 0.0 on the LIVE stock vs drop-ring, same _opt_key rank
+    (FW windows at cutting feed, then max ae, then travel over SPIKE_MM).
+    credit None = entry_credit at each level's own start; with a borefn the
+    credit is the real bore footprint (BS1a4d (c)). Returns
+    (option, path-or-None, wins, best_area, gate_ok)."""
+    opts = []
+    best_area = 0.0
+    gate_ok = False
+    for shrink in (1.0, 0.75, 0.55, 0.4):
+        shrunk = [tuple(s[:4]) + (s[4] * shrink,) for s in seg]
+        path, _r = _trochoid(shrunk, tool_r)
+        if len(path) < 6:
+            break
+        we = []
+        cr = (entry_credit(stock, path[0], z, tool_r) if credit is None
+              else credit)
+        bxy = borefn(path[0], z) if (cr > 1e-9 and borefn) else None
+        wins = _simulate(path, stock, z, tool_r, cell,
+                        cr + (bxy[2] if bxy else 0.0), we, bore_xy=bxy)
+        if not wins:
+            break
+        best_area = max(best_area, sum(wins))
+        opts.append((shrink, path, wins, we))
+        if max(wins) <= AE_SPIKE and sorted(wins)[
+                max(0, int(0.95 * len(wins)) - 1)] <= AE_SS:
+            gate_ok = True
+            break
+    if gate_ok:
+        return ("shrink%g" % opts[-1][0], opts[-1][1], opts[-1][2],
+                best_area, True)
+    cand = [(_opt_key(w, e, FW_TRIGGER * 2.0 * tool_r), "shrink%g" % s,
+             p, w) for (s, p, w, e) in opts]
+    if dropopt is not None:
+        cand.append(dropopt)
+    _k, opt, path, wins = min(cand, key=lambda c: c[0])
+    return opt, path, wins, best_area, False
+
+
 def _trochoid(seg, tool_r):
     """Parametric trochoid along the centre-line segment: point(s, t) =
     C(s) + r(s) * (cos t * n(s) + sin t * t(s)), one loop per advance p(r).
@@ -294,7 +344,7 @@ def _trochoid(seg, tool_r):
 
 
 def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
-                    stats=None):
+                    stats=None, borefn=None):
     """rings: hug_regions output for this level; stock is the LIVE model AFTER
     this level's Adaptive2d regions have been emitted and milled. Per ring
     path the ZE2 windows are replayed on that live stock (entry bore
@@ -370,37 +420,12 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                 tot = max(1, len(seg[::4]))
                 if hits > 0.5 * tot:
                     continue       # opposite wall's ring of the same channel
-                gate_ok = False
-                best_area = 0.0
-                opts = []
-                for shrink in (1.0, 0.75, 0.55, 0.4):
-                    shrunk = [tuple(s[:4]) + (s[4] * shrink,) for s in seg]
-                    path, rmax = _trochoid(shrunk, tool_r)
-                    if len(path) < 6:
-                        break
-                    we = []
-                    cr = entry_credit(stock, path[0], z, tool_r)  # BS1a4c
-                    wins = _simulate(path, stock, z, tool_r, cell,
-                                    cr, we)
-                    if not wins:
-                        break
-                    spike = max(wins)
-                    ss = sorted(wins)[max(0, int(0.95 * len(wins)) - 1)]
-                    best_area = max(best_area, sum(wins))
-                    opts.append((shrink, path, wins, we))
-                    if ss <= AE_SS and spike <= AE_SPIKE:
-                        gate_ok = True
-                        break
+                opt, path, wins, best_area, gate_ok = shrink_ladder(
+                    seg, stock, z, tool_r, cell, None, drop_opt, borefn)
                 if not gate_ok:
-                    # BS1a4b: every shrink level failed the gate. Take the
-                    # LIGHTEST measured option among {tried levels, dropping
-                    # its stock to the ring}: fewest full-width windows at
-                    # cutting feed, then lowest max ae, then shortest travel
-                    # over SPIKE_MM. Never silent: place, Z, area, option and
-                    # engine max ae go into stats["failed_region_emitted"].
-                    cand = [(_opt_key(w, e, fw_min), "shrink%g" % s, p, w)
-                           for (s, p, w, e) in opts] + [drop_opt]
-                    opt, path, wins = min(cand, key=lambda c: c[0])[1:]
+                    # BS1a4b: every level failed; Fix 1's lightest option was
+                    # chosen in shrink_ladder. Never silent: place, Z, area,
+                    # option and engine max ae into failed_region_emitted.
                     if stats is not None:
                         stats.setdefault("failed_region_emitted", []).append(
                             {"x": round(seg[0][0], 3), "y": round(seg[0][1], 3),
@@ -417,8 +442,7 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                     continue
                 pieces = _split_at_jumps(isl_ok3, pts_out)   # BS1a4c-2
                 if stats is not None:      # stubs: no legal join -> reject,
-                    lbl = (opt if not gate_ok else
-                          "shrink%g" % shrink) + " split"     # list honestly
+                    lbl = opt + " split"   # BS1a4d: opt set on both routes
                     fre = stats.setdefault("failed_region_emitted", [])
                     for pc in pieces:
                         if len(pc) < 4:
@@ -439,6 +463,8 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                                    "paths": [["cutting", pc]]})
                     regions[-1]["credit"] = entry_credit(stock, pc[0], z,
                                                         tool_r)  # back at emit
+                    regions[-1]["seg"] = seg        # BS1a4d (a0): centre line
+                    regions[-1]["dropkey"] = drop_opt[0]   # + ring rank key
     if stats is not None:
         stats["n_band_regions"] = stats.get("n_band_regions", 0) + len(regions)
         # BS1a4b: every region that failed its gate at every shrink level is
