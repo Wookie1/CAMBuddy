@@ -1099,7 +1099,8 @@ def _main():
                test_bs1a4c_fix_no_post_entry_helix,
                test_bs1a4c2_band_chord_cl_checked,
                test_bs1a4d_credit0_lightest_option,
-               test_bs1a4d_credit_real_bore):
+               test_bs1a4d_credit_real_bore,
+               test_bs1a4d2b_centred_entry_bore):
         try:
             fn()
         except AssertionError as e:
@@ -2435,6 +2436,180 @@ def test_bs1a4d_credit_real_bore():
     print("PASS bs1a4d(c): %d helix-entered region(s) - credited cells cover "
           "the swept helix + floor-circle bore exactly (offset centre)"
           % checked)
+
+
+def test_bs1a4d2b_centred_entry_bore():
+    """Task BS1a4d2b: a band channel region's entry bores AT its trochoid
+    start (centred helix). On the test block and the L-channel scenes, every
+    credited band entry that bores (helix + HB1v2 floor circle emitted for
+    it) has NO fresh stock under its start disk at the cut Z: 0 cells
+    standing above Z + 0.05 inside disk(start, tool_r) that the entry did
+    not sweep (cells cleared earlier at <= Z do not count), and the bore
+    circle passes through the start (centre within r of it). An entry
+    without its own bore must either find the disk already clear at emit or
+    be listed in credit_fallback - never silent.
+    FAILS on 2c8e11d: the main-tier bore centre sits d >= 1.5 mm from the
+    start, so the start disk pokes past the bore edge - 43 fresh cells stand
+    under the test-block region's start disk."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    _need(TB_STL)
+    import tempfile
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.rough import rough
+    tool_r = 6.343
+    k_off = int(math.ceil(tool_r / 0.5))
+    offs = [(di, dj) for dj in range(-k_off, k_off + 1)
+            for di in range(-k_off, k_off + 1)
+            if (di * di + dj * dj) * 0.25 <= tool_r * tool_r]
+    l_tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+              + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+              + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+              + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+              + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+              + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+              + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+
+    def run_scene(name, stl_src, box, kw):
+        caps = []
+        _orig_cr = B.channel_regions
+
+        def cr_spy(rings, stock, isl_ok3, z, tr_, leave, cell, stats=None,
+                   **k2):
+            res = _orig_cr(rings, stock, isl_ok3, z, tr_, leave, cell, stats,
+                          **k2)
+            for r in res:
+                if (r.get("credit") or 0.0) > 1e-9:
+                    caps.append({"z": z, "q": tuple(r["start"]),
+                                "snap": stock.top.copy(), "x0": stock.x0,
+                                "y0": stock.y0, "cell": cell})
+            return res
+
+        B.channel_regions = cr_spy
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                stl = stl_src or os.path.join(td, "%s.stl" % name)
+                if stl_src is None:
+                    _write_stl(stl, l_tris)
+                surf = ocl.STLSurf()
+                ocl.STLReader(stl, surf)
+                try:
+                    mv, st = rough(surf, box, tool_r, **kw)
+                except RuntimeError as e:
+                    raise AssertionError("%s: rough refused: %s"
+                                       % (name, str(e)[:160]))
+        finally:
+            B.channel_regions = _orig_cr
+        checked, nlink, seen = [], 0, set()
+        fb = st.get("credit_fallback", [])
+        for cap in caps:
+            q, z = cap["q"], cap["z"]
+            key = (round(z, 3), round(q[0], 2), round(q[1], 2))
+            if key in seen:
+                continue
+            seen.add(key)
+            cands = [i for i, m in enumerate(mv) if m["g"] == 1
+                     and m["x"] is not None and m["z"] is not None
+                     and abs(m["z"] - z) < 1e-6
+                     and math.dist((m["x"], m["y"]), q) < 1e-4]
+            if not cands:
+                continue          # dropped region (listed by BS1a4d/-f tests)
+            # the entry's OWN bore = the contiguous ramp-feed run ending just
+            # before the return link (helix segments + HB1v2 floor circle;
+            # links and cutting paths run at cutting feed and break the run).
+            fz, own, idx = [], False, cands[0]
+            for i in cands:
+                run_fz, run_own = [], False
+                for m in reversed(mv[:i]):
+                    if m["g"] != 1 or m["x"] is None \
+                            or abs(m.get("f", 0.0) - 1270.0) > 1e-6:
+                        break
+                    if m["z"] > z + 0.05:
+                        run_own = True
+                    elif abs(m["z"] - z) <= 1e-6:
+                        run_fz.append((m["x"], m["y"]))
+                if run_own and len(run_fz) >= 4:
+                    fz, own, idx = run_fz, True, i
+                    break
+            # cells standing above Z+0.05 under the start disk: plan-time
+            # fresh stock minus everything a feed move at <= Z swept before
+            # the entry's landing move (the landing / return link itself is
+            # NOT credited - that bite is what this task removes).
+            ci = int(math.floor((q[0] - cap["x0"]) / cap["cell"]))
+            cj = int(math.floor((q[1] - cap["y0"]) / cap["cell"]))
+            fresh = set()
+            for di, dj in offs:
+                a, b = ci + di, cj + dj
+                if 0 <= a < cap["snap"].shape[1] \
+                        and 0 <= b < cap["snap"].shape[0] \
+                        and cap["snap"][b, a] > z + 0.05:
+                    fresh.add((a, b))
+            cleared = set()
+            for m in mv[:idx]:          # everything swept at <= Z beforehand
+                if m["g"] != 1 or m["x"] is None or m["z"] > z + 1e-6 \
+                        or math.dist((m["x"], m["y"]), q) > tool_r + 0.5:
+                    continue
+                mi = int(math.floor((m["x"] - cap["x0"]) / cap["cell"]))
+                mj = int(math.floor((m["y"] - cap["y0"]) / cap["cell"]))
+                cleared.update((mi + di, mj + dj) for di, dj in offs)
+            standing = fresh - cleared
+            if not own:
+                # entry without its own bore: the start disk must already be
+                # clear, else the entry must be recorded in credit_fallback.
+                if standing:
+                    assert any(abs(f[0] - q[0]) < 1.5 and abs(f[1] - q[1]) < 1.5
+                             and abs(f[2] - round(z, 3)) < 1e-6 for f in fb), \
+                        "%s: credited entry (%.3f,%.3f)@Z%.3f reached its " \
+                        "start through %d fresh cell(s) with no bore and no " \
+                        "credit_fallback listing - silent emit" % (
+                            name, q[0], q[1], z, len(standing))
+                else:
+                    nlink += 1          # disk already cleared at emit time
+                continue
+            checked.append(key)
+            cx = sum(p[0] for p in fz) / len(fz)
+            cy = sum(p[1] for p in fz) / len(fz)
+            rad = sum(math.dist(p, (cx, cy)) for p in fz) / len(fz)
+            assert not standing, \
+                "%s: %d cell(s) stand above Z+0.05 under the start disk " \
+                "(%.3f,%.3f)@Z%.3f after its entry bore (centre (%.2f,%.2f) " \
+                "r %.2f): the start disk pokes past the swept bore" % (
+                    name, len(standing), q[0], q[1], z, cx, cy, rad)
+            assert math.dist((cx, cy), q) <= rad + 0.3, \
+                "%s: entry bore at (%.3f,%.3f)@Z%.3f is not centred on the " \
+                "start: centre (%.2f,%.2f) is %.2f mm away > r + 0.3" % (
+                    name, q[0], q[1], z, cx, cy, math.dist((cx, cy), q))
+        return checked, nlink, st
+
+    chk_tb, nl_tb, st_tb = run_scene(
+        "bs1a4d2b_tb", TB_STL, (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0),
+        dict(floor_z=20.0, leave=0.381, axial_leave=0.381, stepdown=19.05,
+             stepover=0.16, stl_path=TB_STL, workers=None, threads=4,
+             stock_cell=0.5, final_zmin=20.381))
+    chk_ls, nl_ls, st_ls = run_scene(
+        "bs1a4d2b_lshape", None, (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0),
+        dict(floor_z=0.0, leave=0.381, axial_leave=0.381, stepdown=19.05,
+             stepup=1.905, tolerance=0.05, threads=4, stock_cell=0.5,
+             min_rest=0.5, corner_r=0.0))
+    assert any(abs(k[0] - 27.381) < 1e-6
+               and math.dist((k[1], k[2]), (6.276, -2.078)) < 1.0
+               for k in chk_tb), \
+        "test-block region (6.28,-2.08)@Z27.381 not helix-entered+checked: %s" \
+        % (chk_tb,)
+    assert any(abs(k[0] - 0.381) < 1e-6
+               and math.dist((k[1], k[2]), (-18.724, 0.685)) < 1.0
+               for k in chk_ls), \
+        "the L-channel arm start (-18.72,0.69)@Z0.381 was not helix-entered" \
+        "+checked: %s" % (chk_ls,)
+    assert len(chk_tb) >= 1 and len(chk_ls) >= 2, \
+        "too few centred-bore entries checked (TB %d, L %d): vacuous" % (
+            len(chk_tb), len(chk_ls))
+    print("PASS bs1a4d2b: centred entry bores - %d bore-entered region(s) "
+          "checked on the test block (+%d link-backed), %d on the L channel "
+          "(+%d link-backed); credit_fallback TB=%s LS=%s" % (
+              len(chk_tb), nl_tb, len(chk_ls), nl_ls,
+              [f[3] for f in st_tb.get("credit_fallback", [])],
+              [f[3] for f in st_ls.get("credit_fallback", [])]))
 
 
 if __name__ == "__main__":

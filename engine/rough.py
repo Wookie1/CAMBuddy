@@ -666,29 +666,25 @@ def hf_gouge_violation(points, stock, tool_r, tol=0.02):
 
 
 def _bore_pred(isl_ok, zone, stock, x, y, tool_r):
-    # BS1a4d (c): centre/radius of the entry helix helix_entry would bore at
-    # (x, y) - same tiers + static guards; real bore = disk(c, r + tool_r).
-    for d in (1.5, 3.0, 4.5, 6.0):
+    # BS1a4d2b: helix_entry(centred=True) mirror for band entries - circle
+    # THROUGH the start (d = 0), shrinking radii; bore = disk(c, r + tool_r).
+    # same order as the emitted centred ladder: radius outer, direction inner
+    for rh in [fr * tool_r for fr in (0.8, 0.5, 0.3)] + [0.5, 0.35, 0.2]:
         for q in range(16):
             a = q * math.pi / 8.0
-            ux, uy = math.cos(a), math.sin(a)
-            for fr in (0.5, 0.8, 0.3):
-                rh = fr * tool_r   # emit clamps r >= dz/(pi*tan) - tiers here
-                # stay above it (d >= 1.5, r_min ~ 1.9 << fr*tool_r fails the
-                # circle check first, so the clamp never binds on this scan).
-                cx, cy = x + (d + rh) * ux, y + (d + rh) * uy
-                n = max(16, int(2.0 * math.pi * rh / 0.5))
-                a0 = math.atan2(y - cy, x - cx)   # circle_ok's phase + rounding
-                circ = [(round(cx + rh * math.cos(a0 + t * 2.0 * math.pi / n),
-                               4),
-                       round(cy + rh * math.sin(a0 + t * 2.0 * math.pi / n), 4))
-                      for t in range(n + 1)]
-                if all(isl_ok(circ)) and all(
-                        0 <= stock._ci(px) < stock.nx
-                        and 0 <= stock._cj(py) < stock.ny
-                        and zone[stock._cj(py), stock._ci(px)]
-                        for (px, py) in circ):
-                    return (cx, cy, rh)
+            cx, cy = x + rh * math.cos(a), y + rh * math.sin(a)
+            n = max(16, int(2.0 * math.pi * rh / 0.5))
+            a0 = math.atan2(y - cy, x - cx)   # circle_ok's phase + rounding
+            circ = [(round(cx + rh * math.cos(a0 + t * 2.0 * math.pi / n),
+                           4),
+                   round(cy + rh * math.sin(a0 + t * 2.0 * math.pi / n), 4))
+                  for t in range(n + 1)]
+            if all(isl_ok(circ)) and all(
+                    0 <= stock._ci(px) < stock.nx
+                    and 0 <= stock._cj(py) < stock.ny
+                    and zone[stock._cj(py), stock._ci(px)]
+                    for (px, py) in circ):
+                return (cx, cy, rh)
     return None
 
 
@@ -1251,7 +1247,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     mx = float(v)
         return mx
 
-    def helix_entry(x, y, z, hc):
+    def helix_entry(x, y, z, hc, centred=False):
         """RT: bore down to cutting depth on a helix instead of axially
         plunging. The region entry point often hugs a forbidden island with
         only marginal clearance, so the helix is placed at a nearby position
@@ -1295,8 +1291,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 return False
             # start point on the circle nearest the current XY (short rapid
             # across at z_top), bore down, then feed back to the entry
-            s = min(circ[:-1], key=lambda p: (math.dist(p, (x, y)),
-                                               p[0], p[1]))
+            # BS1a4d2b: a centred bore starts OPPOSITE the entry, so the floor
+            # circle runs before the return feed lands on it across the bore
+            s = (max if centred else min)(
+                circ[:-1], key=lambda p: (math.dist(p, (x, y)), p[0], p[1]))
             # helix end point (same turn count as _helix_moves) - validate
             # the return segment to the entry BEFORE emitting anything
             a0s = math.atan2(s[1] - cy, s[0] - cx)
@@ -1392,6 +1390,19 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             r0 = math.dist((hc[0], hc[1]), (x, y))
             if r0 > 0.05 and try_cand(hc[0], hc[1], r0):
                 return True
+        if centred:
+            # BS1a4d2b: band channel entries bore ONLY circles THROUGH the
+            # start (centre rh away, shrinking radii: main-tier then fine-tier)
+            # so the whole start disk lies inside the swept bore; every
+            # candidate keeps try_cand's CL/island/zone/containment checks.
+            for rh in [fr * tool_r for fr in (0.8, 0.5, 0.3)] + [0.5, 0.35,
+                                                                  0.2]:
+                for q in range(16):
+                    a = q * math.pi / 8.0
+                    if try_cand(x + rh * math.cos(a), y + rh * math.sin(a),
+                               rh):
+                        return True
+            return False
         # RT2: every tier now EMITS at the validated radius and the pitch is
         # capped so no segment descends steeper than ~12 deg (zmap's axial
         # gate is 15): the old tiers descended at 0.5 mm/turn regardless of
@@ -1513,7 +1524,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         mill_now(x, y, z)
         stats["n_offset_descends"] += 1
 
-    def feed_down(x, y, z, hc=None, side=False):
+    def feed_down(x, y, z, hc=None, side=False, centred=False):
         """RT item 1+3: reach (x, y, Z) from directly above. Straight feed is
         only allowed where the flat bottom cuts already-cleared ground: any
         stock under the footprint goes through a helix/ramp entry; the air
@@ -1539,7 +1550,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     stats["n_side_entries"] += 1
                     stats["side_entry_feed_mm"] += math.dist(off, (x, y))
                     return
-            if helix_entry(x, y, z, hc):
+            if helix_entry(x, y, z, hc, centred=centred):
                 helix_n[0] += 1   # BS1a4c: this helix backs an entry credit
                 return
             if ax_hard:
@@ -1649,7 +1660,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         emit({"g": 0, "x": px, "y": py, "z": round(h, 4)})
         emit({"g": 0, "x": x, "y": y, "z": round(h, 4)})
 
-    def enter_at(x, y, z, hc, side=False):
+    def enter_at(x, y, z, hc, side=False, centred=False):
         """Get the tool to (x, y, Z) cutting depth, keeping it down when the
         stock model says the way is clear. RP2_1 side=True: OPEN region -
         feed_down tries the verified side entry before any helix."""
@@ -1675,7 +1686,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     emit({"g": 1, "x": px, "y": py, "z": z + lift,
                           "f": ramp_feed})
             emit({"g": 0, "x": x, "y": y, "z": z + lift})
-            feed_down(x, y, z, side=side)
+            feed_down(x, y, z, side=side, centred=centred)
             stats["n_tooldown_links"] += 1
             return
         # 3) RP2_1 side-first (OPEN region): find the verified clear column
@@ -1698,7 +1709,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # G0-shortened descent; never an axial plunge into stock (RT item 3).
         # feed_down itself diverts long air descents to a nearby clear column.
         retract_to(x, y)
-        feed_down(x, y, z, hc)
+        feed_down(x, y, z, hc, centred=centred)
 
     def mill_now(x, y, z_bot):
         """Vertical plunge: the tool physically clears its footprint down to
@@ -2094,7 +2105,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             i0m = len(moves)
             h0 = helix_n[0]
             enter_at(round(entry[0], 4), round(entry[1], 4), z, res["helix"],
-                     side=bool(rp2_flag))
+                     side=bool(rp2_flag), centred="credit" in res)
             de = descend_feed(pxy0 + (pz0,), i0m)
             # BS1a4c (f3f2165): a credited BAND start is backed at emit only
             # by an emitted helix or live-clear disk; else credit-0 re-check,

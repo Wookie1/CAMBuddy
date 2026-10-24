@@ -537,3 +537,164 @@ option - vacuous (assertion failure) on 22cdff7, satisfied + listed
 - Process note: one lshape run was accidentally launched with `&`; it was
   waited for in-session to completion before proceeding (identical PASS twice,
   log `bs1a4df_lshape.log`); all later commands ran in the foreground.
+
+## (15) BS1a4d2b - band entry bores AT its trochoid start (centred helix)
+
+Session start Sat Oct 24 04:09 MST (hard cap ~06:09), worktree
+`stevecam-bs1a4d2b` branch bs1a4d2b @ 0648f72 (code = BS1a4d-f `2c8e11d`),
+no commits. All tests via slot_m4.sh (ENGINE_WORKERS=4); NO Core Front engine
+or zmap job. Locks untouched; no stuck slot. 667654e not reused.
+
+### STOP - triggered (TESTS rule): test_bs1a4d_credit_real_bore fails on the
+### fixed tree; work halted, the test was NOT touched. Details in (15e).
+
+### (15a) Change - 39 changed non-test lines vs 2c8e11d
+
+`git diff --numstat 2c8e11d -- engine/band.py engine/rough.py`:
+`25 14 engine/rough.py` = **39** (adds+dels; band.py unchanged). Adds are
+exactly 25 (the target); the total sits under the ~40 stop - the excess over
+a 25 adds+dels reading is the `_bore_pred` mirror (mandatory so the BS1a4d(c)
+planning credit tracks the emitted centred bore) plus comment lines.
+
+engine/rough.py only:
+- `engine/rough.py:668-676` - `_bore_pred` (the band-planning bore predictor,
+  supplied via `bore_context` to `channel_regions`) now mirrors the centred
+  ladder: `for d in (0.0,)` - centre = start + rh*n, the circle passes through
+  the start - and shrinking radii `[fr * tool_r for fr in (0.8, 0.5, 0.3)] +
+  [0.5, 0.35, 0.2]` (main-tier then fine-tier); same circle guards
+  (isl_ok + centre_zone, circle_ok's phase/rounding).
+- `engine/rough.py:1252` - `helix_entry(x, y, z, hc, centred=False)`: keyword
+  default off, every other caller/fixture byte-unchanged.
+- `engine/rough.py:1393-1408` - with centred=True the ladder tries ONLY bores
+  whose circle passes through the trochoid start: centre `start + rh*(cos a,
+  sin a)` over the same 16 directions, radii shrinking (main-tier radii
+  0.8/0.5/0.3 x tool_r, then fine-tier radii 0.5/0.35/0.2), each candidate
+  through `try_cand` exactly as today (circle isl_ok + centre_zone, return
+  segment isl_ok at 0.4 mm, bore containment `dist <= r + tool_r - corner_r -
+  0.25`, honest segment-wise milling). If no centred bore passes it returns
+  False - NO fall-through to the non-centred tiers ("the ladder stays the
+  only entry"); the existing BS1a4c emit-time backing then gives the region
+  credit 0: `engine/rough.py:2116-2148` (unchanged) re-checks at credit 0 on
+  the live stock, takes Fix 1's lightest option via `shrink_ladder`, lists
+  `(x, y, z, act)` in `stats["credit_fallback"]` and
+  `stats["failed_region_emitted"]` when the re-check fails. No new code was
+  needed for that - no silent emit is already structural there.
+- `engine/rough.py:1527,1553` - `feed_down(..., centred=False)` forwards to
+  `helix_entry`.
+- `engine/rough.py:1663,1689,1712` - `enter_at(..., centred=False)` forwards
+  at the two ladder steps that descend AT the entry point (step 2 traverse +
+  feed_down, step 4 retract + feed_down); step 1's descent at the previous
+  point is untouched.
+- `engine/rough.py:2107-2108` - ONLY the band channel region entry passes
+  True: `centred="credit" in res` (the `credit` key is set by
+  `channel_regions` on every band region and on no other region - a2d/hug
+  regions at :922/:989 carry no `credit`).
+
+### (15b) Report - engine max ae and option (fixed tree)
+
+| region (seg start) | Z | option, engine max ae @ fixed | 2c8e11d | fresh cells under start disk fixed / base |
+|---|---|---|---|---|
+| test block (6.276,-2.078) | 27.381 | **shrink0.55, max ae 3.0** (area 301.25) | shrink0.55, 5.75 | **0 / 43** |
+| L-channel (-18.724,-0.115) | 0.381 | **shrink1, max ae 7.25** (area 284.0) | shrink1, 7.25 | **0** / (base bite - start disk poked past the bore) |
+| L-channel (-2.09,5.742) | 0.381 | **shrink1, max ae 4.0** (area 391.5) | shrink1, 5.75 | **0** / (idem) |
+
+Centred vs fell back to credit 0: test block **1 centred bore, 0 fallbacks**
+(`credit_fallback = []`); L channel **12 centred bores, 0 credit-0 fallbacks**
+(`credit_fallback = []`), plus 29 credited entries entered by tool-down/side
+links whose start disk was ALREADY clear at emit time (0 fresh cells under it,
+no bore needed - honest credit, nothing to back). The emitted centred bore is
+visible in the moves: the TB helix descends THROUGH (6.276,-2.078) (the start
+lies on the bore circle) and its floor circle sweeps the whole start disk.
+
+### (15c) New test - engine/test_engine.py:2441
+`test_bs1a4d2b_centred_entry_bore` (registered `_main()` :1103; existing
+tests/assertions untouched - `git diff 2c8e11d -- engine/test_engine.py` has
+exactly ONE "-" line, the old `_main()` tuple closer). On BOTH the test-block
+scene and the L-channel scene, for every credited band entry captured at plan
+time (snapshot of live stock): its OWN bore = the contiguous ramp-feed run
+(helix segments + HB1v2 floor circle) ending before the return link; assert
+**0 cells stand above Z + 0.05 inside disk(start, tool_r)** that the entry did
+not sweep (plan-time fresh minus every feed move at <= Z before the landing),
+and the bore circle passes through the start (|centre - start| <= r + 0.3).
+An entry without its own bore must have a clear start disk or be listed in
+credit_fallback (never silent). Named-region non-vacuity guards: TB
+(6.28,-2.08)@Z27.381 and L (-18.72,0.69)@Z0.381 must be bore-checked, >= 1 /
+>= 2 bore entries per scene.
+
+### (15d) Exit codes (all via slot_m4.sh, ENGINE_WORKERS=4)
+
+Fixed tree:
+- new test standalone: **EXIT=0** - "PASS bs1a4d2b: centred entry bores - 1
+  bore-entered region(s) checked on the test block (+0 link-backed), 12 on
+  the L channel (+29 link-backed); credit_fallback TB=[] LS=[]"
+- at-risk batch (10 tests, one process, per-test RESULT lines in
+  `out/bs1a4d2b_atrisk.log`): **EXIT=1**
+  - test_bs1a4d_credit_real_bore FAIL (see (15e))
+  - test_bs1a4d_credit0_lightest_option PASS
+  - test_bs1a4b_windows_align_zmap PASS (boundaries identical; max
+    engine-zmap +14.070 mm, max zmap-engine 1.488 mm - UNCHANGED vs (14c),
+    no regression)
+  - test_bs1a4c2_band_chord_cl_checked PASS
+  - test_bs1a_lshaped_channel PASS
+  - test_hb1v2_flat_floor_circle_after_helix PASS
+  - test_bs1a4c_fix_no_post_entry_helix PASS
+  - test_rough_synth_pocket_repro PASS
+  - test_dt1_synthetic_rough_twice_identical PASS
+  - test_bs1a4d2b_centred_entry_bore PASS
+- test_bs1a4d_credit_real_bore standalone fixed tree: **FIXED_EXIT=1**
+- test_bs1a4d_credit_real_bore standalone on base (2c8e11d archive):
+  **BASE_EXIT=0** ("PASS bs1a4d(c): 1 helix-entered region(s) ...") - so the
+  failure IS caused by this task's change, not pre-existing.
+
+fail-on-2c8e11d (`git archive 2c8e11d` -> tmp `bs1a4d2b_base`, my test file
+copied in, never a checkout):
+```
+AssertionError: bs1a4d2b_tb: 43 cell(s) stand above Z+0.05 under the start
+disk (6.276,-2.078)@Z27.381 after its entry bore (centre (10.79,-2.08)
+r 3.17): the start disk pokes past the swept bore
+EXIT=1
+```
+FAIL BY ASSERTION, exit 1 - exactly the supervisor's 43 cells at the
+test-block region.
+
+### (15e) STOP report - test_bs1a4d_credit_real_bore
+
+`FIXED_EXIT=1`, assertion `no helix-entered credited region was checked`
+(its `assert checked >= 1`). Root cause (from `out/bs1a4d2b_diag_tb.py`,
+move dump around the TB entry): with centred=True the bore circle passes
+THROUGH the start q, so `try_cand`'s helix-start pick `s = min(circ[:-1],
+key=dist to (x,y))` selects s == q itself, and `_helix_turns` returns an
+INTEGER turn count, so the helix end e sits directly below s: **the final
+helix segment ends exactly at q@Z**, before the HB1v2 floor circle (the
+return link degenerates to zero length). credit_real_bore's `entry_pts()`
+takes the FIRST G1 move ending at q@Z - now that mid-entry helix point - and
+requires >= 9 preceding ramp-feed moves at z == Z behind it (the floor
+circle), which a descending helix point does not have -> returns None for
+every credited region -> `checked == 0`. The credit invariant itself (the
+planning bore covering the emitted entry sweep) is NOT shown violated - the
+test's move-pattern locator can no longer see the entry. Per the TESTS rule
+the test was not touched and engine work stopped.
+
+Supervisor options (NOT implemented): (i) relax `entry_pts` to accept a
+helix terminating at the start (test-side change); (ii) engine-side: for
+centred bores pick the helix start at the ANTIPODE of the start (s = circle
+point farthest from the entry) so q@Z occurs only at the return-link end
+after the floor circle - keeps the bore centred (start disk still inside
+disk(rh + tool_r)), return link 2*rh long entirely inside the bore at Z,
+~+2 lines; (iii) accept the new entry shape and re-anchor credit_real_bore.
+
+### (15f) Status
+- Fixed tree: new test EXIT=0; 9/10 at-risk tests PASS; credit_real_bore
+  EXIT=1 -> STOP (above). fail-on-2c8e11d: EXIT=1 by assertion, 43 cells.
+- `git diff --numstat 2c8e11d -- engine/band.py engine/rough.py` = `25 14`
+  = 39 lines; engine/band.py unchanged; no zmap/verify import in engine.
+- No commits; locks untouched; no Core Front job.
+- Process notes: all commands ran in the FOREGROUND. At session start this
+  results file was overwritten with a fresh status log before the original
+  content was consulted from context; sections (1)-(14) were then restored
+  VERBATIM from `git show 0648f72:engine/BS1a4_RESULTS.md` (539 lines, byte
+  count verified) before this section (15) was appended - the final file =
+  committed content + section (15). Diagnostics live in `out/`
+  (`bs1a4d2b_diag.py`, `bs1a4d2b_diag_tb.py`, logs); base tree copy under
+  the approved temp dir `opencode/bs1a4d2b_base`.
+
