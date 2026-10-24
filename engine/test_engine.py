@@ -1789,6 +1789,324 @@ def test_rr1c4c_floor_circle_over_rising_surface():
                 "feed point over plateau inside its leave: %r" % (m,)
 
 
+def _rr1c5b_slab_tris(x0, x1, y0, y1, z0, z1):
+    v = {(sx, sy, sz): (x0 if sx < 0 else x1, y0 if sy < 0 else y1,
+                        z0 if sz < 0 else z1)
+         for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)}
+
+    def q(p1, p2, p3, p4):
+        return [(p1, p2, p3), (p1, p3, p4)]
+    A_, B_, C_, D_ = (v[(-1, -1, 1)], v[(1, -1, 1)], v[(1, 1, 1)],
+                      v[(-1, 1, 1)])
+    E_, F_, G_, H_ = (v[(-1, -1, -1)], v[(1, -1, -1)], v[(1, 1, -1)],
+                      v[(-1, 1, -1)])
+    return q(A_, B_, C_, D_) + q(E_, H_, G_, F_) + q(A_, E_, F_, B_) + \
+        q(D_, C_, G_, H_) + q(A_, D_, H_, E_) + q(B_, F_, G_, C_)
+
+
+def _rr1c5b_surf(tris):
+    from opencamlib import ocl
+    surf = ocl.STLSurf()
+    for t in tris:
+        surf.addTriangle(ocl.Triangle(*[ocl.Point(*p) for p in t]))
+    return surf
+
+
+def _rr1c5b_zmap_gate(moves, part, stock_init, cell, box):
+    """ZE2B load bar (verify/zmap.py read-only, padded part grid): 0 mm of
+    wide slots over engage-max 2.286 and 0 full-width windows at cutting
+    feed."""
+    from engine.gcode import moves_to_gcode
+    from verify import zmap
+    pg = zmap.parse_gcode(moves_to_gcode(moves, spindle_rpm=8000))
+    rep = zmap.simulate(pg, part, cell, box[0], box[2], box, tool="ball",
+                        dia=9.525, stock_init=stock_init, engage_max=2.286)
+    raw = rep["_ae2_raw"]
+    by_feed = {}
+    for w in raw:
+        if w.get("feed"):
+            by_feed[w["feed"]] = by_feed.get(w["feed"], 0.0) + w["length_mm"]
+    cut = max(by_feed, key=by_feed.get) if by_feed else None
+    over = sum(w["length_mm"] for w in raw if cut is not None
+               and w.get("feed", 0.0) >= 0.9 * cut
+               and w["ae_eff"] > 2.286 and w["a"] > 0.5)
+    assert over == 0.0, \
+        "ZE2B: %.1f mm of wide slots over 2.286 at cutting feed" % over
+    fw = rep["engagement"]["full_width_slots_ae2_cutting_feed"]
+    assert fw["count"] == 0, \
+        "ZE2B: %d full-width windows at cutting feed: %s" % (
+            fw["count"], fw["worst"][:2])
+
+
+def _rr1c5b_links_clear(moves, A, cell):
+    """No feed LINK at depth crosses standing stock: a horizontal ramp-feed
+    move whose endpoints sit exactly at the cutting Z and whose PREVIOUS
+    feed move was a cutting-feed pass (a reposition between passes at depth,
+    like chain4's 31 mm link through the raw spine) must be stock-clear at
+    that Z (live disk, 0.05 tolerance). Ladder entries are exempt: their
+    previous move is a descent into the level."""
+    from engine import entry_depth as ed
+    live = ed.LiveStock(A, 0.0, 0.0, cell, 9.525 / 2.0)
+    prev = None
+    prev_f = None
+    bad = []
+    for i, m in enumerate(moves):
+        cur = (m["x"], m["y"], m["z"])
+        if prev is not None and m["g"] == 1:
+            L = math.hypot(cur[0] - prev[0], cur[1] - prev[1])
+            if (abs(cur[2] - prev[2]) < 1e-9 and m.get("f") != 2280.0
+                    and prev_f == 2280.0 and L > 2.5):
+                # descent staging (this or the next feed move drops in Z) is
+                # a ladder continuation, not a pass-to-pass link
+                nxt = moves[i + 1] if i + 1 < len(moves) else None
+                staging = ((abs(cur[2] - prev[2]) < 1e-9
+                           and (nxt is not None and nxt["g"] == 1
+                                and nxt["z"] < cur[2] - 1e-9)))
+                if not staging:
+                    nq = max(int(L / 0.2), 1)
+                    for q in range(nq + 1):
+                        t_ = q / nq
+                        x = prev[0] + (cur[0] - prev[0]) * t_
+                        y = prev[1] + (cur[1] - prev[1]) * t_
+                        if live.disk_top(x, y) > cur[2] + 0.05:
+                            bad.append((round(x, 1), round(y, 1), cur[2]))
+                            break
+            live.stamp_chord(prev, cur)
+        prev = cur
+        prev_f = m.get("f") if m["g"] == 1 else None
+    assert not bad, "feed link at depth cuts standing stock: %s" % bad[:4]
+
+
+def _rr1c5b_first_pass_from_cleared(moves, edge_dist):
+    """RR1c-5b: passes are FRONTS grown from the CLEARED side - at every
+    level the FIRST cutting-feed move sits within 2*ae of cleared ground.
+    edge_dist(x, y) is the distance to the level's open side / bore."""
+    first = {}
+    for m in moves:
+        if m["g"] == 1 and m.get("f") == 2280.0:
+            z = round(m["z"], 3)
+            if z not in first:
+                first[z] = (m["x"], m["y"])
+    assert first, "no cutting-feed moves: vacuous"
+    for z, (x, y) in sorted(first.items()):
+        d = edge_dist(x, y)
+        assert d <= 2.0 * 1.905 + 3 * rr_CELL, \
+            "level Z %.3f starts %.2f mm from cleared ground (%.1f,%.1f): " \
+            "passes must grow as fronts FROM the cleared side" % (z, d, x, y)
+
+
+rr_CELL = 0.2
+
+
+def test_rr1c5b_varying_width_band_fronts():
+    """RR1c-5b item 1: a varying-width band (tiny innermost loops + an
+    uncut spine at the Core Front centre band). Rest 0.5 mm over a slab
+    with a walled north edge and an open south side. Passes are fronts
+    grown from the cleared side: stats report rr_ring_failed /
+    rr_axial_over, no feed link at depth crosses standing stock, the
+    spine is cut, ZE2B 0 mm over 2.286 and 0 full-width windows at
+    cutting feed, validate_exact 0. On 45d8685 the stats keys do not
+    exist and links joined the tiny loops straight through the raw
+    spine (chain4 fact 2)."""
+    try:
+        from engine import rest_rough as rr
+        from engine import entry_depth as ed
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    tris = _rr1c5b_slab_tris(0, 40, 0, 40, 20, 26.6)
+    surf = _rr1c5b_surf(tris)
+    cell = 0.5
+    n = int(40 / cell)
+    c = (np.arange(n) + 0.5) * cell
+    X, Y = np.meshgrid(c, c)
+    A = np.full((n, n), 26.6)
+    band = (X >= 4.0) & (X <= 36.0) & (Y >= 8.0) & (Y <= 24.0)
+    lobe = (X >= 28.0) & (X <= 36.0) & (Y >= 5.0) & (Y <= 27.0)
+    A[band | lobe] = 27.1
+    moves, stats = rr.rest_rough(
+        surf, (A, 0.0, 0.0, cell), ("ball", 9.525), floor_z=26.6,
+        stepdown=2.0, ae=1.905, rest_leave=0.2, min_excess=0.4,
+        min_helix_r=1.903, ramp_angle_deg=2.0, cut_feed=2280.0,
+        ramp_feed=850.0)
+    assert moves and stats["zones"] and not stats["no_entry"], \
+        "band must be entered: %r" % (stats["no_entry"],)
+    assert "rr_ring_failed" in stats and "rr_axial_over" in stats, \
+        "engagement/axial reports missing: %r" % sorted(stats)
+    _rr1c5b_links_clear(moves, A, cell)
+    below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
+    assert below == 0, "gouge: %d pts (worst %.3f)" % (below, worst)
+    # the spine of the band (centre rows) is cut to leave
+    live = ed.LiveStock(A, 0.0, 0.0, cell, 9.525 / 2.0)
+    prev = None
+    for m in moves:
+        cur = (m["x"], m["y"], m["z"])
+        if prev is not None and m["g"] == 1:
+            live.stamp_chord(prev, cur)
+        prev = cur
+    n_spine = n_cut = 0
+    for j, i in zip(*np.nonzero(band)):
+        x, y = float(c[i]), float(c[j])
+        if not (12.0 <= x <= 28.0 and 10.0 <= y <= 19.0):
+            continue
+        n_spine += 1
+        d = live.disk_depth(x, y, 26.8)
+        if math.isfinite(d) and d <= 0.35:
+            n_cut += 1
+    assert n_spine >= 40, "spine probe vacuous: %d" % n_spine
+    assert 100.0 * n_cut / n_spine >= 90.0, \
+        "spine not cut: %d/%d cells at leave" % (n_cut, n_spine)
+    pad = 4
+    ny = nx = n + 2 * pad
+    part = np.full((ny, nx), 26.6)
+    stock_init = np.full((ny, nx), 26.6)
+    xp = -pad * cell + (np.arange(nx) + 0.5) * cell
+    yp = -pad * cell + (np.arange(ny) + 0.5) * cell
+    Xp, Yp = np.meshgrid(xp, yp)
+    stock_init[(Xp >= 4.0) & (Xp <= 36.0) & (Yp >= 8.0) &
+               (Yp <= 24.0)] = 27.1
+    stock_init[(Xp >= 28.0) & (Xp <= 36.0) & (Yp >= 5.0) &
+               (Yp <= 27.0)] = 27.1
+    _rr1c5b_zmap_gate(moves, part, stock_init, cell,
+                      (0.0, 40.0, 0.0, 40.0, 20.0, 27.1))
+
+
+def test_rr1c5b_open_edge_proud_block():
+    """RR1c-5b item 2: an open-edge proud block (stock 30 over a slab top
+    26.6, stock cleared on every side at the level). The first cutting-feed
+    pass of EVERY level must hug the OPEN edge (fronts grow from the cleared
+    side), not start at the inscribed centre line like 45d8685's inside-out
+    rings; rr_ring_failed / rr_axial_over reported; links never cut; ZE2B
+    0 over 2.286, 0 full-width at cutting feed; validate_exact 0."""
+    try:
+        from engine import rest_rough as rr
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    surf = _rr1c5b_surf(_rr1c5b_slab_tris(0, 40, 0, 40, 20, 26.6))
+    cell = 0.5
+    n = int(40 / cell)
+    c = (np.arange(n) + 0.5) * cell
+    X, Y = np.meshgrid(c, c)
+    A = np.full((n, n), 26.6)
+    A[(X >= 8.0) & (X <= 32.0) & (Y >= 8.0) & (Y <= 24.0)] = 30.0
+    moves, stats = rr.rest_rough(
+        surf, (A, 0.0, 0.0, cell), ("ball", 9.525), floor_z=26.6,
+        stepdown=2.0, ae=1.905, rest_leave=0.2, min_excess=0.5,
+        min_helix_r=1.903, ramp_angle_deg=2.0, cut_feed=2280.0,
+        ramp_feed=850.0)
+    assert moves and stats["zones"] and not stats["no_entry"], \
+        "block must be entered: %r" % (stats["no_entry"],)
+    assert "rr_ring_failed" in stats and "rr_axial_over" in stats, \
+        "engagement/axial reports missing: %r" % sorted(stats)
+    _rr1c5b_first_pass_from_cleared(
+        moves, lambda x, y: min(y - 8.0, 24.0 - y, x - 8.0, 32.0 - x))
+    _rr1c5b_links_clear(moves, A, cell)
+    below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
+    assert below == 0, "gouge: %d pts (worst %.3f)" % (below, worst)
+    pad = 4
+    ny = nx = n + 2 * pad
+    part = np.full((ny, nx), 26.6)
+    stock_init = np.full((ny, nx), 26.6)
+    xp = -pad * cell + (np.arange(nx) + 0.5) * cell
+    yp = -pad * cell + (np.arange(ny) + 0.5) * cell
+    Xp, Yp = np.meshgrid(xp, yp)
+    stock_init[(Xp >= 8.0) & (Xp <= 32.0) & (Yp >= 8.0) &
+               (Yp <= 24.0)] = 30.0
+    _rr1c5b_zmap_gate(moves, part, stock_init, cell,
+                      (0.0, 40.0, 0.0, 40.0, 20.0, 30.0))
+
+
+def test_rr1c5b_fully_walled_band_bore_seed():
+    """RR1c-5b item 3: a fully walled band - stock stands on EVERY side at
+    every level (closed pocket), so C = the helix bore and the fronts grow
+    out of it through the necks (no spine trochoid). The first cutting-feed
+    pass of every level sits at the bore's cleared edge (within ~2*ae of
+    the bore circle, not at the inscribed centre line's raw stock);
+    rr_ring_failed / rr_axial_over reported; links never cut; ZE2B clean;
+    validate_exact 0."""
+    try:
+        from engine import rest_rough as rr
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    surf, stock, lo, hi = _rr1b_pocket_scene((10.0, 30.0))
+    moves, stats = rr.rest_rough(
+        surf, stock, ("ball", 9.525), floor_z=24.0, stepdown=2.0, ae=1.905,
+        rest_leave=0.2, min_excess=0.5, min_helix_r=1.903, ramp_angle_deg=2.0,
+        cut_feed=2280.0, ramp_feed=850.0)
+    assert moves and stats["zones"] and not stats["no_entry"], \
+        "pocket must be entered: %r" % (stats["no_entry"],)
+    assert "rr_ring_failed" in stats and "rr_axial_over" in stats, \
+        "engagement/axial reports missing: %r" % sorted(stats)
+    r_h = stats["zones"][0]["helix"]
+    assert r_h >= 1.903, "bore seed missing: %r" % r_h
+    first = {}
+    for m in moves:
+        if m["g"] == 1 and m.get("f") == 2280.0:
+            z = round(m["z"], 3)
+            if z not in first:
+                first[z] = (m["x"], m["y"])
+    assert first, "no cutting-feed moves: vacuous"
+    for z, (x, y) in sorted(first.items()):
+        d = abs(math.hypot(x - 20.0, y - 20.0) - r_h)
+        assert d <= 2.0 * 1.905 + 4 * rr_CELL, \
+            "level Z %.3f first pass %.2f mm off the bore edge (%.1f,%.1f): " \
+            "fronts must grow out of the seed bore" % (z, d, x, y)
+    _rr1c5b_links_clear(moves, stock[0], stock[3])
+    below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
+    assert below == 0, "gouge: %d pts (worst %.3f)" % (below, worst)
+
+
+def test_rr1c5b_mixed_band_core_front():
+    """RR1c-5b item 4: a MIXED band shaped like the Core Front centre band -
+    open south side, WALLED north edge (y ~ 0.4 in the part frame). Fronts
+    grow from the open south side, the wall-hug comes last; rr_ring_failed
+    never silent (walled-edge raw slots listed with place, Z, w_plan /
+    ae_eq); rr_axial_over reported; no feed link at depth crosses standing
+    stock; ZE2B 0 mm over 2.286 and 0 full-width windows at cutting feed;
+    validate_exact 0. On 45d8685 the stats keys do not exist."""
+    try:
+        from engine import rest_rough as rr
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    tris = _rr1c5b_slab_tris(0, 40, 0, 40, 20, 26.6)
+    tris += _rr1c5b_slab_tris(0, 40, 24.0, 26.0, 26.6, 30.0)
+    surf = _rr1c5b_surf(tris)
+    cell = 0.5
+    n = int(40 / cell)
+    c = (np.arange(n) + 0.5) * cell
+    X, Y = np.meshgrid(c, c)
+    A = np.full((n, n), 26.6)
+    band = (X >= 4.0) & (X <= 36.0) & (Y >= 8.0) & (Y <= 24.0)
+    A[band] = 30.0
+    moves, stats = rr.rest_rough(
+        surf, (A, 0.0, 0.0, cell), ("ball", 9.525), floor_z=26.6,
+        stepdown=2.0, ae=1.905, rest_leave=0.2, min_excess=0.5,
+        min_helix_r=1.903, ramp_angle_deg=2.0, cut_feed=2280.0,
+        ramp_feed=850.0)
+    assert moves and stats["zones"] and not stats["no_entry"], \
+        "mixed band must be entered: %r" % (stats["no_entry"],)
+    assert "rr_ring_failed" in stats and "rr_axial_over" in stats, \
+        "engagement/axial reports missing: %r" % sorted(stats)
+    _rr1c5b_first_pass_from_cleared(
+        moves, lambda x, y: min(y - 8.0, x - 4.0, 36.0 - x))
+    _rr1c5b_links_clear(moves, A, cell)
+    below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
+    assert below == 0, "gouge: %d pts (worst %.3f)" % (below, worst)
+    pad = 4
+    ny = nx = n + 2 * pad
+    part = np.full((ny, nx), 26.6)
+    xp = -pad * cell + (np.arange(nx) + 0.5) * cell
+    yp = -pad * cell + (np.arange(ny) + 0.5) * cell
+    Xp, Yp = np.meshgrid(xp, yp)
+    part[(Xp >= 0) & (Xp <= 40) & (Yp >= 24.0) & (Yp <= 26.0)] = 30.0
+    stock_init = part.copy()
+    stock_init[(Xp >= 4.0) & (Xp <= 36.0) & (Yp >= 8.0) &
+               (Yp <= 24.0)] = np.maximum(
+                   stock_init[(Xp >= 4.0) & (Xp <= 36.0) &
+                             (Yp >= 8.0) & (Yp <= 24.0)], 30.0)
+    _rr1c5b_zmap_gate(moves, part, stock_init, cell,
+                      (0.0, 40.0, 0.0, 40.0, 20.0, 30.0))
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -1817,7 +2135,11 @@ def _main():
                test_rr1c3_bay_deep_groove_top_down,
                test_rr1c4b_plateau_topdown_axial_load,
                test_rr1c4b_closed_pocket_bore_levels,
-               test_rr1c4c_floor_circle_over_rising_surface):
+               test_rr1c4c_floor_circle_over_rising_surface,
+               test_rr1c5b_varying_width_band_fronts,
+               test_rr1c5b_open_edge_proud_block,
+               test_rr1c5b_fully_walled_band_bore_seed,
+               test_rr1c5b_mixed_band_core_front):
         try:
             fn()
         except AssertionError as e:

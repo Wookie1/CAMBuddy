@@ -294,7 +294,8 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
     stats = {"zones": [], "no_entry": [], "fragments_dropped": fragments,
              "cut_len": 0.0, "ramp_len": 0.0,
              "rapid_len": 0.0, "n_levels": 0, "entry_steps": {},
-             "entries": [], "passes_skipped": []}
+             "entries": [], "passes_skipped": [],
+             "rr_ring_failed": [], "rr_axial_over": []}
 
     def g0r(x, y, z):
         prev = moves[-1] if moves else None
@@ -711,11 +712,24 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
             Dz = ndimage.distance_transform_edt(reg) * CELL
             reg_cur = reg
             maxc = float(Dz.max())
+            # RR1c-5b: passes are FRONTS grown from the CLEARED side. C =
+            # columns whose LIVE stock is clear at this Z (open boundary) plus
+            # the seed bore; pass k = offset(C, ae/2 + k*ae) clipped to the
+            # legal CL region, ascending c: each front's cleared side is C or
+            # the previous front; the wall-hug comes LAST. No open edge and no
+            # bore: inside-out fallback (engagement check reports raw slots).
+            seed = Sg < t + 0.05
+            if mode == "bore" and r_h > 0.0:
+                seed = seed | (np.hypot(xs[None, :] - cx,
+                                         ys[:, None] - cy) <= r_h + CELL)
+            fronts = bool((seed & ~reg).any())
+            F = ndimage.distance_transform_edt(~seed) * CELL if fronts else Dz
             rings = []
             clneed = []
             c = ae / 2.0
-            while c <= maxc + 1e-9:
-                for P, closed, _K in march_level(Dz, xs, ys, c, comp=reg):
+            maxf = float(F[reg].max()) if reg.any() else 0.0
+            while c <= maxf + 1e-9:
+                for P, closed, _K in march_level(F, xs, ys, c, comp=reg):
                     pts = [(float(a), float(b)) for a, b in P]
                     if len(pts) < 3:
                         continue
@@ -724,7 +738,8 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                     rings.append(pts)
                     clneed.append(False)
                 c += ae
-            rings.reverse()    # RR1c-4: rings INSIDE-OUT, largest c first
+            if not fronts:
+                rings.reverse()  # RR1c-4 fallback: largest c first
             ring_seq = False
             if li == 0 and mode == "zigzag":
                 paths = runs0 + rings          # zigzag first, then rings
@@ -771,6 +786,9 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                     clneed = [False] * len(paths)
             cut_here = 0
             skipped = 0
+            # RR1c-5b engagement model: cleared at this Z (seed) + fronts
+            clm = seed.copy()
+            dilk = int(round(ae / 2.0 / CELL)) + 1
             while paths:
                 if ring_seq:
                     k = 0   # RR1c-4: rings stay inside-out, not greedy
@@ -794,7 +812,12 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                          prev[1] + (pts[0][1] - prev[1]) * q / n, t)
                         for q in range(n + 1)]
                     dzd = prev[2] - t
-                    if cl_ok_path(lp) and (dzd <= 1e-9
+                    # RR1c-5b: a feed link at depth must ALSO be stock-clear
+                    # at the cutting Z (live disk, 0.05 tolerance) - a link
+                    # may never cut; else the ladder below.
+                    if cl_ok_path(lp) and all(
+                            live.disk_top(px, py) <= t + 0.05
+                            for px, py, _ in lp) and (dzd <= 1e-9
                                           or d0 * tanr >= dzd - 1e-9):
                         g1(pts[0][0], pts[0][1], round(t, 4), ramp_feed)
                     else:
@@ -854,6 +877,35 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                         "live_depth_mm": None,
                         "reason": "centre-line not CL-legal"})
                     continue
+                jj = np.clip(np.rint((np.asarray([p[0] for p in pts])
+                                       - xs[0]) / CELL).astype(int), 0,
+                                       len(xs) - 1)
+                ii = np.clip(np.rint((np.asarray([p[1] for p in pts])
+                                       - ys[0]) / CELL).astype(int), 0,
+                                       len(ys) - 1)
+                pm = np.zeros_like(reg)
+                pm[ii, jj] = True
+                # engagement check (RR1c-5b): fronts stay within ae of
+                # cleared ground; raw slots NEVER silent (rr_ring_failed).
+                if ring_seq and fronts:
+                    dv = ndimage.distance_transform_edt(~clm)[ii, jj] * CELL
+                    kx = int(np.argmax(dv))
+                    if float(dv[kx]) > ae + CELL:
+                        ad = live.disk_depth(pts[kx][0], pts[kx][1], t)
+                        ad = ad if math.isfinite(ad) else 0.0
+                        rc = math.sqrt(max(2.0 * R * ad - ad * ad, 0.0))
+                        stats["rr_ring_failed"].append(
+                            {"zone": zi, "t": round(t, 3), "place":
+                             [round(pts[kx][0], 2), round(pts[kx][1], 2)],
+                             "w_plan": round(float(dv[kx]) + rc, 3),
+                             "ae_eq": round(2.0 * rc, 3)})
+                clm |= ndimage.binary_dilation(pm, iterations=dilk)
+                ad0 = live.disk_depth(pts[0][0], pts[0][1], t)
+                if math.isfinite(ad0) and ad0 > stepdown + 1e-9:
+                    stats["rr_axial_over"].append(
+                        {"zone": zi, "t": round(t, 3), "place":
+                         [round(pts[0][0], 2), round(pts[0][1], 2)],
+                         "a": round(ad0, 3), "ap": stepdown})
                 for (px, py) in pts[1:]:
                     g1(px, py, round(t, 4), cut_feed)
                 prev = (pts[-1][0], pts[-1][1], round(t, 4))
