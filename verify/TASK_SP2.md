@@ -20,11 +20,19 @@ Remove the per-move overhead WITHOUT changing any number: move positions are not
 precompute is likely NOT bit-exact - if it is not, batch or vectorize the EXACT per-move arithmetic instead (same
 operations, same order, same dtype). Prove equality, do not argue it.
 ## Proof
-- The FULL zmap JSON output (every key, not only the gates) is BYTE-IDENTICAL before vs after, for every SMALL archived
-  program the supervisor lists for you in scratchpad/sp2_programs.txt (one command line per program; test-block set -
-  small-lane jobs only), plus all verify tests green. The supervisor runs the same cmp on the Core Front archives
-  (chain..chain4, bs1a3 CF) in the CF lane before merge. Write a small script that runs both versions (before = `git archive e5e783e` extract, never checkout) and
-  cmp's the JSON.
+- The FULL zmap JSON output (every key, not only the gates) is BYTE-IDENTICAL before vs after, for each of these SMALL
+  test-block programs (copied for you into out/sp2/, gitignored; run from the worktree root, small lane only):
+    P1 finish: python3 -m verify.zmap out/sp2/prof_tb_fin.nc --part out/test_block_hf_0.1.npy --tool ball --dia 9.525
+       --corner 4.7625 --stock -50 50 -40 40 0 38 --jobs 1 --out-json <json>
+    P2 rough:  python3 -m verify.zmap out/sp2/prof_tb_rough.nc --part out/test_block_hf_0.1.npy --tool flat --dia 12.686
+       --engage-max 2.438 --stock -50 50 -40 40 0 38 --jobs 1 --out-json <json>
+    P3 rest:   python3 -m verify.zmap out/sp2/prof_tb_rr.nc --part out/test_block_hf_0.1.npy --tool ball --dia 9.525
+       --corner 4.7625 --stock -50 50 -40 40 0 38 --jobs 1 --out-json <json>
+  plus the verify tests green (`/opt/homebrew/bin/python3 -m pytest verify -q` - the verify suite only, never the
+  engine suite). The supervisor runs the same cmp on the Core Front archives in the CF lane before merge. Write a small
+  script that runs both versions (before = `git archive e5e783e` extract, never checkout) and cmp's the JSON.
+- MEASURE FIRST: before any further optimisation, report the before/after wall time of P1 (the test-block finish) in
+  SP2_RESULTS.md - the supervisor needs the realistic saving before any Core Front proof.
 - Report the time per program before/after.
 ## verify/SP2_RESULTS.md: change with file:line, line count, per-program cmp results and times, PASTED exit codes.
 Then stop.
