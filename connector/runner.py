@@ -42,9 +42,9 @@ REST_ROUGH_DEFAULTS = {
     "rest_rough_min_excess": 0.5,        # mm stock above part = rest material
     "rest_rough_min_helix_r": 1.903,     # mm = (leave/2)*(1+sqrt(2))
     "rest_rough_ramp_angle_deg": 2.0,
-    "rest_rough_cut_feed": 2280.0,       # mm/min
-    "rest_rough_ramp_feed": 850.0,      # mm/min
-    "rest_rough_spindle": 9500,         # rpm
+    "rest_rough_cut_feed": 1920.0,       # mm/min (James 2026-10-24: S8000, same chip load)
+    "rest_rough_ramp_feed": 716.0,      # mm/min (850 x 8000/9500)
+    "rest_rough_spindle": 8000,         # rpm (James's 8000 tool-life default)
     "rest_rough_floor_z": 24.765,       # mm part floor
     "rest_rough_zb_floor": 0.5,         # mm axial-plunge floor
 }

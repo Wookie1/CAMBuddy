@@ -161,16 +161,16 @@ _REST_ROUGH_INPUTS = {
                                             "pockets below it are reported, not "
                                             "entered"},
     "rest_rough_cut_feed": {"type": "number", "minimum": 10.0,
-                            "maximum": 10000.0, "default": 2280.0,
+                            "maximum": 10000.0, "default": 1920.0,
                             "description": "cutting feed mm/min (aluminium, "
-                                         "0.06 mm/z x 4 flutes x 9500 rpm)"},
+                                         "0.06 mm/z x 4 flutes x 8000 rpm)"},
     "rest_rough_ramp_feed": {"type": "number", "minimum": 10.0,
-                             "maximum": 10000.0, "default": 850.0,
+                             "maximum": 10000.0, "default": 716.0,
                              "description": "ramp / helix feed mm/min"},
     "rest_rough_spindle": {"type": "integer", "minimum": 100,
-                           "maximum": 30000, "default": 9500,
-                           "description": "spindle rpm (vc ~285 m/min at D "
-                                        "9.525 in aluminium)"},
+                           "maximum": 10000, "default": 8000,
+                           "description": "spindle rpm (vc ~239 m/min at D "
+                                        "9.525 in aluminium; X7 max 10000)"},
 }
 
 SLOPE_ACTION_SPEC = {
