@@ -1945,7 +1945,12 @@ def _rr1c5b_zmap_gate(moves, part, stock_init, cell, box):
     from engine.gcode import moves_to_gcode
     from verify import zmap
     pg = zmap.parse_gcode(moves_to_gcode(moves, spindle_rpm=8000))
-    rep = zmap.simulate(pg, part, cell, box[0], box[2], box, tool="ball",
+    # grid origin = box corner minus the symmetric pad the caller added (the
+    # callers pad part/stock by 4 cells; passing box[0]/box[2] shifted the
+    # judge's grid by that pad)
+    ox = box[0] - (part.shape[1] * cell - (box[1] - box[0])) / 2.0
+    oy = box[2] - (part.shape[0] * cell - (box[3] - box[2])) / 2.0
+    rep = zmap.simulate(pg, part, cell, ox, oy, box, tool="ball",
                         dia=9.525, stock_init=stock_init, engage_max=2.286)
     raw = rep["_ae2_raw"]
     by_feed = {}
