@@ -20,9 +20,10 @@ Remove the per-move overhead WITHOUT changing any number: move positions are not
 precompute is likely NOT bit-exact - if it is not, batch or vectorize the EXACT per-move arithmetic instead (same
 operations, same order, same dtype). Prove equality, do not argue it.
 ## Proof
-- The FULL zmap JSON output (every key, not only the gates) is BYTE-IDENTICAL before vs after, for every archived
-  program the supervisor lists for you in scratchpad/sp2_programs.txt (one command line per program), plus all verify
-  tests green. Write a small script that runs both versions (before = `git archive e5e783e` extract, never checkout) and
+- The FULL zmap JSON output (every key, not only the gates) is BYTE-IDENTICAL before vs after, for every SMALL archived
+  program the supervisor lists for you in scratchpad/sp2_programs.txt (one command line per program; test-block set -
+  small-lane jobs only), plus all verify tests green. The supervisor runs the same cmp on the Core Front archives
+  (chain..chain4, bs1a3 CF) in the CF lane before merge. Write a small script that runs both versions (before = `git archive e5e783e` extract, never checkout) and
   cmp's the JSON.
 - Report the time per program before/after.
 ## verify/SP2_RESULTS.md: change with file:line, line count, per-program cmp results and times, PASTED exit codes.
