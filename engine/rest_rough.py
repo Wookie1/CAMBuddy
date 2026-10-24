@@ -770,7 +770,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
             if li == 0 and mode == "zigzag":
                 paths = runs0 + rings          # zigzag first, then rings
                 clneed = [False] * len(paths)
-                f1 = [False] * len(paths)
+                f1 = [False] * len(runs0) + f1   # runs are never front 1
             else:
                 paths = rings
                 ring_seq = True    # keep the inside-out order (no greedy)
@@ -817,6 +817,8 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
             clm = seed.copy()
             clmn = seed.copy()   # RR1c5d: near-groove mask for depth links
             dilk = int(round(ae / 2.0 / CELL)) + 1
+            if len(f1) != len(paths):   # thin-strip / zigzag fallback paths
+                f1 = [False] * len(paths)
             while paths:
                 if ring_seq:
                     k = 0   # RR1c-4: rings stay inside-out, not greedy
