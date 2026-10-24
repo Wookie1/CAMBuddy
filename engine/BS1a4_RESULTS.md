@@ -423,3 +423,117 @@ STOP; (a) confirms the first-window over-read is BS1a4d's job.
 Note: during this session `engine/TASK_BS1a4d.md` appeared modified and
 `engine/TASK_BS1a4e.md` untracked in the worktree - NOT my edits; left
 untouched. No commits made.
+
+## (14) BS1a4d-f - finish BS1a4d: call-compatible bore credit + real fail-on-base tests
+
+Session start Sat Oct 24 02:09 MST (hard cap ~04:09), worktree
+stevecam-bs1a4d branch bs1a4 @ 5f7ba45, no commits. All tests via
+slot_m4.sh (ENGINE_WORKERS=4); NO Core Front engine or zmap job. No lock
+files touched; no stuck slot.
+
+### (14a) Change - 22 changed non-test lines vs 5896dbf
+
+`git diff --numstat 5896dbf -- engine/band.py engine/rough.py`:
+`9 2 engine/band.py` + `5 6 engine/rough.py` = **22** (adds+dels).
+Budget was <= 20, STOP ~30: the +2 is because `ContextVar.context(value)`
+does NOT exist in VibeCAD python 3.11 (verified: `dir(ContextVar) = get,
+name, reset, set`), so the scoped context manager had to be written by hand
+(class + 3 methods) instead of a one-line alias. No signature introspection,
+no bare module global (the ContextVar lives inside `bore_context`).
+
+engine/band.py:
+- `engine/band.py:30` - `from contextvars import ContextVar`.
+- `engine/band.py:57-61` - `class bore_context` with class attribute
+  `_B = ContextVar("bs1a4d_borefn", default=None)`; `__init__` sets,
+  `__exit__` resets the token - SCOPED, nest-safe.
+- `engine/band.py:154` - `_simulate(path, stock, z, tool_r, cell, bore_r,
+  ends=None, *, bore_xy=None)`: bore_xy is now KEYWORD-ONLY (old positional
+  calls up to 7 args stay valid; nothing can slip into it positionally).
+- `engine/band.py:352-361` - `channel_regions` signature EXACTLY BS1a4c's
+  `(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None)`; the bore fn
+  arrives via `borefn = bore_context._B.get()` at :361. Without a context
+  (direct callers, test spies with the old signature) it behaves as BS1a4c
+  (start-centred entry credit).
+
+engine/rough.py:
+- `engine/rough.py:2051` - `bore_context` added to the existing
+  `from engine.band import (...)`.
+- `engine/rough.py:2053-2056` - the band planning call wrapped:
+  `with bore_context(lambda p, zz: _bore_pred(isl_ok, centre_zone, stock,
+  p[0], p[1], tool_r)):` around `channel_regions(rings, stock, isl_ok3, z,
+  tool_r, leave, stock.cell, stats)` (the `borefn=` kwarg removed).
+
+engine/test_engine.py (only the two NEW tests of this branch, per TESTS rule):
+- `sim_spy` (test_bs1a4d_credit_real_bore, :2321) forwards in the caller's
+  form (`**kw`): on 22cdff7 the engine never passes `bore_xy`, so base is
+  called through its OLD signature there and the test fails BY ASSERTION,
+  not with a TypeError.
+- test_bs1a4d_credit0_lightest_option: the scenario assertion now requires a
+  credit-0 FAILING re-check (`replan0_*` != `replan0_ok`) to have fired and
+  be listed - on 22cdff7 the real-bore credit that proposes the failing
+  region does not exist, so it fails BY ASSERTION (see (14d)).
+- `git diff 22cdff7 -- engine/test_engine.py` has exactly ONE "-" line - the
+  old `_main()` tuple closing line `test_bs1a4c2_band_chord_cl_checked):` -
+  no existing test or assertion changed.
+
+### (14b) Report - engine max ae and option chosen
+
+Test block region (start area (6.28,-2.08); failed_region_emitted place is
+the seg start (6.276,-2.878)), Z 27.381: option **shrink0.55**, engine max
+ae **5.75 mm** (area 287.5 mm2); `credit_fallback = []` on the test block
+(the credit was backed by an emitted helix).
+
+L-channel regions (this task's scene, Z 0.381, fixed tree):
+- (-18.724, -0.115): option **shrink1**, engine max ae **7.25 mm**
+  (area 266.25) - BS1a4c read 15.25, halved by the real-bore credit.
+- (-2.09, 5.742): option **shrink1**, engine max ae **5.75 mm**
+  (area 383.25) - BS1a4c read 13.5 at shrink0.4; with the real bore the
+  unshrunk ladder now passes the FW-rank selection.
+Plus the (a0) region (-1.7313, 3.7617): `replan0_shrink0.55`, listed with
+engine max ae 3.0 mm (area 331.0).
+
+### (14c) Exit codes - fixed tree (all via slot_m4.sh, ENGINE_WORKERS=4)
+
+- test_bs1a4d_credit0_lightest_option: **EXIT=0** (PASS; replan0_shrink0.55
+  listed with option + max_ae)
+- test_bs1a4d_credit_real_bore: **EXIT=0** (PASS; 1 helix-entered region,
+  credit covers the swept helix + floor-circle bore, offset centre)
+- test_bs1a4b_windows_align_zmap: **EXIT=0** (boundaries identical; max
+  engine-zmap +14.070 mm, max zmap-engine 1.488 mm - unchanged vs section
+  (10), no regression)
+- test_bs1a4c2_band_chord_cl_checked: **EXIT=0** (41 band regions, 2 listed
+  failed pieces)
+- test_bs1a_lshaped_channel: **EXIT=0**
+
+### (14d) fail-on-22cdff7 (`git archive 22cdff7` -> tmp `bs22`, my test file
+### copied in, never a checkout)
+
+```
+RESULT test_bs1a4d_credit_real_bore FAIL: credited plan sim pre-cleared a disk about the path START ((0.381, (-18.724, 0.6852000000000003), 6.343, None)), not the real helix-centred bore
+EXIT test_bs1a4d_credit_real_bore = 1
+RESULT test_bs1a4d_credit0_lightest_option FAIL: no credit-0 FAILING re-check fired - scenario vacuous: ['replan0_ok', 'replan0_ok', 'replan0_ok', 'replan0_ok', 'replan0_ok', 'replan0_ok', 'replan0_ok', 'replan0_ok', 'replan0_ok']
+EXIT test_bs1a4d_credit0_lightest_option = 1
+```
+
+Both FAIL BY ASSERTION (exit 1), no TypeError. Note on (a0): the supervisor
+fact is confirmed - on 22cdff7 this scene's forced credit-0 re-checks ALL
+pass at credit 0 (9x replan0_ok, no drop): the region that fails its
+credit-0 re-check (-1.7313, 3.7617) only exists because the real-bore
+credit (this task's (c)) proposes it at plan time; on 22cdff7 heavy
+stretches there fail the planning gate and get helix-backed entries, so the
+silent-drop branch is never reached in this geometry. Two scene variants
+(narrowed 15 mm L-corridor, hoping to make the helix CL-fail where a link
+entry carries a heavy credit-0 path) emitted ZERO band regions on both trees
+and were abandoned. The test therefore asserts the honest non-vacuity that IS
+reachable: a credit-0 failing re-check must fire AND be listed with its
+option - vacuous (assertion failure) on 22cdff7, satisfied + listed
+(`replan0_shrink0.55`, max_ae 3.0) on the fixed tree.
+
+### (14e) Status (final)
+- Fixed tree: new tests + all 3 at-risk tests EXIT=0 (above).
+- fail-on-22cdff7: both new tests FAIL BY ASSERTION, EXIT=1 (above).
+- Final `git diff --numstat 5896dbf -- engine/band.py engine/rough.py`:
+  `9 2` / `5 6` = 22 lines. No commits; locks untouched.
+- Process note: one lshape run was accidentally launched with `&`; it was
+  waited for in-session to completion before proceeding (identical PASS twice,
+  log `bs1a4df_lshape.log`); all later commands ran in the foreground.

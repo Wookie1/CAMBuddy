@@ -27,6 +27,7 @@ r >= 1.903 helix: they are REPORTED (stats["band_blocked"]) and left to the
 ring, never forced (no plunge).
 """
 import math
+from contextvars import ContextVar
 
 import numpy as np
 
@@ -53,6 +54,11 @@ P_CAP = 0.36          # empirical spike cap: the fresh lens at the channel-side
                       # advance on a 12.686 flat) - keep advance small
 MARCH_STEP = 0.25       # sliver march resolution
 FW_LEAD_PTS = 3         # lead-in/out (x 0.4 mm) around a full-width run
+class bore_context:     # BS1a4d-f: SCOPED bore fn (no bare module global):
+    _B = ContextVar("bs1a4d_borefn", default=None)
+    def __init__(self, fn): self._t = bore_context._B.set(fn)
+    def __enter__(self): return self
+    def __exit__(self, *e): bore_context._B.reset(self._t)
 
 
 def _march(p, ux, uy, isl_ok3, maxd):
@@ -145,7 +151,7 @@ def _advance(r, tool_r):
     return max(LOOP_R_MIN * 0.3, min(p, P_CAP))
 
 
-def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, bore_xy=None):
+def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None):
     """Replay ZE2 windowing on the engine stock grid: move-aligned windows of
     path travel; a window's area = distinct cells whose live top stands above
     z + 0.05 and that first fall under the cutter disk (applied at every
@@ -344,7 +350,7 @@ def _trochoid(seg, tool_r):
 
 
 def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
-                    stats=None, borefn=None):
+                    stats=None):
     """rings: hug_regions output for this level; stock is the LIVE model AFTER
     this level's Adaptive2d regions have been emitted and milled. Per ring
     path the ZE2 windows are replayed on that live stock (entry bore
@@ -352,6 +358,7 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
     FW_FRAC x D, plus a FW_LEAD_PTS-sample lead-in/out - are trochoided;
     light / over-load-only windows are left to the ring (BS1b's job). stats
     gets n_band_regions / band_cut_len_mm / band_cl_len_mm / band_blocked."""
+    borefn = bore_context._B.get()   # BS1a4d-f: set by rough.py, or None
     regions = []
     if not rings:
         return regions

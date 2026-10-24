@@ -2222,8 +2222,11 @@ def test_bs1a4d_credit0_lightest_option():
     ae; the program still passes CLCHECK. The unbacked credit is forced
     honestly: every single-point stock.link_clear([q,q], z) - the backing
     check itself - reports False, i.e. no emitted move backed the credit.
-    FAILS on 22cdff7: there the failed re-check was an unconditional drop and
-    no credit-0 failure ever reaches failed_region_emitted."""
+    FAILS on 22cdff7: there the real-bore planning credit (which proposes the
+    region that fails its credit-0 re-check at emit) does not exist, so no
+    credit-0 failure ever fires in this scene (every re-check passes at
+    credit 0) - vacuous there; and any credit-0 failure 22cdff7 did hit was
+    an unconditional drop, never listed in failed_region_emitted."""
     from opencamlib import ocl
     import tempfile
     import engine.band as B
@@ -2273,8 +2276,10 @@ def test_bs1a4d_credit0_lightest_option():
     finally:
         B.channel_regions = _orig_cr
     acts = [f[3] for f in stats.get("credit_fallback", [])]
-    assert any(a.startswith("replan0_") for a in acts), \
-        "no credit-0 re-check fired - scenario vacuous: %s" % (acts,)
+    bad = [f for f in stats.get("credit_fallback", [])
+           if f[3].startswith("replan0_") and f[3] != "replan0_ok"]
+    assert bad, \
+        "no credit-0 FAILING re-check fired - scenario vacuous: %s" % (acts,)
     fre = stats.get("failed_region_emitted", [])
     for f in stats["credit_fallback"]:
         if f[3].startswith("replan0_") and f[3] != "replan0_ok":
@@ -2313,11 +2318,13 @@ def test_bs1a4d_credit_real_bore():
     caps, sims = [], []
     _orig_cr, _orig_sim = B.channel_regions, B._simulate
 
-    def sim_spy(path, stock, z, tool_r, cell, bore_r, ends=None,
-                bore_xy=None):
-        w = _orig_sim(path, stock, z, tool_r, cell, bore_r, ends, bore_xy)
+    def sim_spy(path, stock, z, tool_r, cell, bore_r, ends=None, **kw):
+        # forward in the CALLER's form: on 22cdff7 the engine never passes
+        # bore_xy, so base is called through its OLD signature there and this
+        # test FAILS BY ASSERTION below, not with a TypeError.
+        w = _orig_sim(path, stock, z, tool_r, cell, bore_r, ends, **kw)
         sims.append((round(z, 3), tuple(path[0]), bore_r,
-                     tuple(bore_xy) if bore_xy else None))
+                     tuple(kw["bore_xy"]) if kw.get("bore_xy") else None))
         return w
 
     def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None,

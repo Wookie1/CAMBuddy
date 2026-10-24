@@ -2048,13 +2048,12 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 # full-width ring stretches against it now, then order bands
                 # (NN) and rings (NN from the last band).
                 from engine.band import (channel_regions, _simulate, AE_SS,
-                                       AE_SPIKE, shrink_ladder,
+                                       AE_SPIKE, shrink_ladder, bore_context,
                                        _split_at_jumps)
-                bands = channel_regions(rings, stock, isl_ok3, z, tool_r,
-                                      leave, stock.cell, stats,
-                                      borefn=lambda p, zz: _bore_pred(
-                                          isl_ok, centre_zone, stock,
-                                          p[0], p[1], tool_r))
+                with bore_context(lambda p, zz: _bore_pred(
+                        isl_ok, centre_zone, stock, p[0], p[1], tool_r)):
+                    bands = channel_regions(rings, stock, isl_ok3, z, tool_r,
+                                          leave, stock.cell, stats)
                 base = len(regions)
                 regions.extend(bands)
                 for res in bands:                 # candidate rule as above
