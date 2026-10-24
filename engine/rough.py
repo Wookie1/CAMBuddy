@@ -1439,6 +1439,21 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                         return True
         return False
 
+    def lnk_cut_ok(st, path, z, key):
+        """BS1a4d3 (e): a cutting-feed link that is NOT stock-clear on the
+        live stock at its Z is checked as a cut - the band planner's window
+        measure on the live stock at Z, credit 0. Max window <= SPIKE_MM
+        stays a link; over it the caller lifts and re-enters via enter_at."""
+        if st.link_clear(path, z):
+            return True
+        from engine.band import _simulate, SPIKE_MM
+        stats[key + "_chk"] = stats.get(key + "_chk", 0) + 1
+        w = _simulate(path, st, z, tool_r, st.cell, 0.0)
+        ok = not w or max(w) <= SPIKE_MM
+        if not ok:
+            stats[key + "_cvt"] = stats.get(key + "_cvt", 0) + 1
+        return ok
+
     def find_shift(x, y, z, force=False, flank=False):
         """RT item 1: when the descent column at (x, y) has tall material in
         its R5 pad ring beside it (long feed stretch), find a nearby point
@@ -1492,6 +1507,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     # when the path leaves the tracked stock record.
                     if not stock.link_clear(path, z + AXIAL_FLOOR):
                         continue     # feed-in crosses standing stock at depth
+                    if not lnk_cut_ok(stock, path, z, "fdin"):
+                        continue     # (e): the flank feed-in reads a heavy cut
                     # the G0 descent at (sx, sy) must itself be rapid-clear
                     # down to Z: max(stock, part) within tool_r + margin at the
                     # column <= Z + 0.05, else emit()'s R5 bump lifts the
@@ -2211,7 +2228,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                 # unbroken path would have (isl_ok): no gouge,
                                 # and the chord removes MORE material than the
                                 # detour it replaces, never less.
-                                if all(isl_ok3(chord + [tuple(pts[i])])):
+                                if all(isl_ok3(chord + [tuple(pts[i])])) and \
+                                        lnk_cut_ok(stock, [(prev[0], prev[1])] +
+                                                 chord + [tuple(pts[i])], z,
+                                                 "brdg"):
                                     bridge = chord
                             if bridge is not None:
                                 stats["n_clip_bridges"] += 1
@@ -2336,7 +2356,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                             all(isl_ok(corridor)) and \
                             stock.link_clear(corridor, z + lift) and \
                             math.dist(corridor[0], land) <= feed_link_max \
-                            and not wide:
+                            and not wide and (top <= z + 0.05 or lnk_cut_ok(
+                                stock, corridor, z, "flnk")):
                         # RT items 1+2: the corridor is island-clear and no
                         # material stands above z + lift. Where it shears only
                         # a THIN strip of stock this level may remove, feed

@@ -698,3 +698,41 @@ disk(rh + tool_r)), return link 2*rh long entirely inside the bore at Z,
   (`bs1a4d2b_diag.py`, `bs1a4d2b_diag_tb.py`, logs); base tree copy under
   the approved temp dir `opencode/bs1a4d2b_base`.
 
+
+---
+
+## (16) BS1a4d3 — non-stock-clear cutting-feed links checked as cuts
+
+Session start: Sat Oct 24 06:51 MST (hard cap ~08:51). Worktree
+`/Users/James/ai-sandbox/stevecam-bs1a4d2b`, branch bs1a4d2b @ e8dd1d4
+(code = d4ced08). No commits. All tests via slot_m4.sh (ENGINE_WORKERS=4);
+NO Core Front engine or zmap job. No lock touched.
+
+### Status (live)
+- Implementing: flink / clip-bridge / flank feed-in checked as cuts via
+  band._simulate on live stock at Z, credit 0, AE_SPIKE 2.44.
+### Change (implemented, 25 lines vs d4ced08: rough.py +23/-2, band.py 0)
+- engine/rough.py:1442 `lnk_cut_ok(st, path, z, key)`: not stock-clear at Z
+  -> band._simulate on live stock at Z, credit 0; max window > SPIKE_MM (2.44)
+  -> caller lifts + re-enters via enter_at's ladder. Counts stats[key+_chk/_cvt].
+- engine/rough.py:1509 find_shift flank feed-in: `if not lnk_cut_ok(stock,
+  path, z, "fdin"): continue` (candidate rejected -> helix ladder).
+- engine/rough.py:2231 clip bridge: chord accepted only if `lnk_cut_ok(stock,
+  prev+chord+pts[i], z, "brdg")` (else existing clip-break -> enter_at).
+- engine/rough.py:2352 flink gate: `and (top <= z + 0.05 or lnk_cut_ok(
+  stock, corridor, z, "flnk"))` (else existing lift path at :2401).
+### Scene findings (out/bs1a4d3_diag.py, band._simulate credit 0 on pre-mill
+### live-stock snapshots; link kinds identified by their link_clear gate
+### fingerprints z / z+lift / z+0.2 and bridge chaining)
+- L-channel @ d4ced08: the only >2.44 chained path (14.5, z=0.381) is the
+  helix RETURN FEED (rough.py:1386 try_cand) - covered by the brief, excluded.
+  flink=0, bridge=0, feed-ins all read 0.00 -> L-channel cannot fail-by-assert.
+- test-block @ d4ced08: flink=0, bridge=0, feed-in max 0.00 (3 bridge-chained
+  runs read 0.00) -> cannot fail either.
+- NEW synthetic pocket (40x30 open pocket, floor -1, stock top 2.0, stepdown
+  1.5 -> level links cross the previous level's shelf): @ d4ced08 a FLANK
+  FEED-IN link (z=0.381, 3.5 mm) measures max window 4.00 > 2.44.
+  Fixed tree: feedin max 1.00; fdin_chk=10, fdin_cvt=6; brdg_chk=2,
+  brdg_cvt=1 (a clip bridge converted to lift+re-entry); flnk site not
+  exercised by these scenes (no corridor clear at z+lift but not at Z).
+  Moves: base 2798 -> fixed 2894 (+3.4%); cut_len 792 -> 812 mm.

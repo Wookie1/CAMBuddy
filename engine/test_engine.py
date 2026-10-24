@@ -2612,5 +2612,136 @@ def test_bs1a4d2b_centred_entry_bore():
               [f[3] for f in st_ls.get("credit_fallback", [])]))
 
 
+def test_bs1a4d3_links_measured_as_cuts():
+    """Task BS1a4d3 (e): a cutting-feed link that is not stock-clear on the
+    cut-time stock at its Z is checked AS A CUT (band._simulate on the live
+    stock at Z, credit 0); over SPIKE_MM 2.44 it is not emitted as a link -
+    lift and re-entry through enter_at's ladder instead. Replay the emitted
+    link moves of this open pocket (40 x 30, floor -1, stock top Z2.0,
+    stepdown 1.5: links at the lower level cross the shelf the level above
+    left) on pre-mill live-stock snapshots and require EVERY emitted flink /
+    clip-bridge / flank-feed-in link to measure max window <= 2.44 mm.
+    FAILS BY ASSERTION on d4ced08: there a flank feed-in at Z 0.381 (3.5 mm,
+    past the descent column at (10.0, 5.4)) shears the shelf and measures
+    4.00 mm > 2.44 with no window check at all."""
+    import math
+    import tempfile
+    from opencamlib import ocl
+    import engine.stock as S
+    import engine.band as B
+    from engine.rough import rough, AXIAL_FLOOR
+    LIFT = 1.9                     # rough()'s default lift, unchanged here
+    snaps, lcs = [], []
+    orig_mp = S.StockField.mill_path
+    orig_lc = S.StockField.link_clear
+
+    def _snap(self):
+        st = S.StockField.__new__(S.StockField)
+        st.cell, st.x0, st.y0 = self.cell, self.x0, self.y0
+        st.nx, st.ny = self.nx, self.ny
+        st.top = self.top.copy()
+        return st
+
+    def spy_mp(self, pts, z, tool_r, corner_r=0.0):
+        snaps.append((list(pts), z, tool_r, _snap(self)))
+        return orig_mp(self, pts, z, tool_r, corner_r)
+
+    def spy_lc(self, pts, h, eps=0.05):
+        r = orig_lc(self, pts, h, eps)
+        lcs.append((list(pts), h, r))
+        return r
+
+    def key(pts):
+        return [(round(q[0], 4), round(q[1], 4)) for q in pts]
+
+    def lc_ok(pts, h):
+        kp = key(pts)
+        return any(lok and abs(lh - h) <= 1e-6 and key(lp) == kp
+                   for (lp, lh, lok) in lcs)
+
+    def chord(pts):
+        out, d0 = [pts[0]], None
+        for a, b in zip(pts[1:], pts[2:]):
+            d = math.dist(a, b)
+            if not (1e-9 < d <= 0.55):
+                break
+            v = ((b[0] - a[0]) / d, (b[1] - a[1]) / d)
+            if d0 is None:
+                d0, _ = v, out.append(a)
+            elif v[0] * d0[0] + v[1] * d0[1] < 0.7071:
+                break
+            else:
+                out.append(b)
+        ln = sum(math.dist(out[i], out[i + 1]) for i in range(len(out) - 1))
+        return out if len(out) >= 2 and ln <= 5.0 else None
+
+    tris = (_box_tris(-20.0, 20.0, -15.0, 15.0, -1.0, 0.0)     # pocket floor
+            + _box_tris(-40.0, -20.0, -30.0, 30.0, 0.0, 2.0)
+            + _box_tris(20.0, 40.0, -30.0, 30.0, 0.0, 2.0)
+            + _box_tris(-20.0, 20.0, -30.0, -15.0, 0.0, 2.0)
+            + _box_tris(-20.0, 20.0, 15.0, 30.0, 0.0, 2.0))
+    S.StockField.mill_path = spy_mp
+    S.StockField.link_clear = spy_lc
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d3.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            moves, stats = rough(
+                surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 2.0), 6.343, 0.0,
+                leave=0.381, axial_leave=0.381, stepdown=1.5, stepup=1.905,
+                tolerance=0.05, threads=4, stock_cell=0.5, min_rest=0.5,
+                corner_r=0.0, stl_path=stl)
+    finally:
+        S.StockField.mill_path = orig_mp
+        S.StockField.link_clear = orig_lc
+    # classify: dlink (stock-clear at Z - covered), flink (cleared only at
+    # z+lift), flank feed-in (floor-checked at z+AXIAL_FLOOR), clip bridge
+    # (run starting at the previous mill end, same Z, no stock check).
+    cls = [None] * len(snaps)
+    for k, (pts, z, tr, st) in enumerate(snaps):
+        if len(pts) < 2:
+            continue
+        if lc_ok(pts, z):
+            cls[k] = "dlink"
+        elif lc_ok(pts, z + LIFT):
+            cls[k] = "flink"
+        elif lc_ok(pts, z + AXIAL_FLOOR):
+            cls[k] = "feedin"
+        elif k + 1 < len(snaps) and abs(snaps[k + 1][1] - z) <= 1e-6 and \
+                key(pts[-1:]) == key(snaps[k + 1][0][:1]):
+            cls[k] = "helixret"          # inside the swept bore: covered
+    bad, nmeas = [], 0
+    for k, (pts, z, tr, st) in enumerate(snaps):
+        path = None
+        if cls[k] in ("flink", "feedin"):
+            path = pts
+        elif cls[k] is None and k and abs(snaps[k - 1][1] - z) <= 1e-6 \
+                and cls[k - 1] in (None, "bridge") and \
+                key(snaps[k - 1][0][-1:]) == key(pts[:1]):
+            path = chord(pts)          # the bridge chord only
+            if path is not None:
+                cls[k] = "bridge"
+        if path is None or len(path) < 2:
+            continue
+        nmeas += 1
+        wins = B._simulate([tuple(q[:2]) for q in path], st, z, tr,
+                           st.cell, 0.0)
+        mx = max(wins) if wins else 0.0
+        if mx > 2.44 + 1e-9:
+            bad.append((cls[k], round(z, 3), len(path), round(mx, 2),
+                       (round(path[0][0], 2), round(path[0][1], 2))))
+    assert nmeas >= 1, "no cutting-feed link was emitted/replayed: vacuous"
+    assert not bad, \
+        "cutting-feed link(s) cross stock at Z and measure over AE_SPIKE " \
+        "2.44 (not checked as a cut): %s" % bad[:6]
+    print("PASS bs1a4d3: %d cutting-feed link(s) replayed, all <= 2.44 mm; "
+          "checked/converted flnk %s/%s brdg %s/%s fdin %s/%s" % (
+              nmeas, stats.get("flnk_chk"), stats.get("flnk_cvt"),
+              stats.get("brdg_chk"), stats.get("brdg_cvt"),
+              stats.get("fdin_chk"), stats.get("fdin_cvt")))
+
+
 if __name__ == "__main__":
     sys.exit(_main())
