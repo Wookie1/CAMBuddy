@@ -433,6 +433,8 @@ TB_STL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
                       "out", "test_block.stl")
 TB_HF = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "out", "test_block_hf_0.5.npy")
+TB_HF_01 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "out", "test_block_hf_0.1.npy")   # padded judge grid
 
 
 def test_rough_testblock_r2():
@@ -1090,7 +1092,9 @@ def _main():
                test_bs1a_lshaped_channel,
                test_bs1a3_no_band_after_a2d,
                test_stl_cache_keyed_by_content,
-               test_rr1a_rough_cli_refuses_ball):
+               test_rr1a_rough_cli_refuses_ball,
+               test_bs1a4b_failed_region_lightest,
+               test_bs1a4b_windows_align_zmap):
         try:
             fn()
         except AssertionError as e:
@@ -1817,6 +1821,220 @@ def test_rr1a_rough_cli_refuses_ball():
         assert "G1" in text and len(text) > 1000, "flat program not written"
     print("PASS rr1a rough cli: ball and corner-less bull refused (no "
           "program), flat still roughs (%d bytes)" % len(text))
+
+
+def test_bs1a4b_failed_region_lightest():
+    """Task BS1a4b: on samples/test_block (James's cutting data) exactly one
+    band region fails its gate at every shrink level. It must take the
+    LIGHTEST measured option among {each shrink level, dropping it to the
+    ring} - fewest full-width windows at cutting feed, then lowest max ae,
+    then shortest travel over 2.44 mm - and the decision is NEVER silent:
+    the region is listed in stats["failed_region_emitted"] with place, Z,
+    area, option and engine max ae. On this part the trochoid (zmap 8.47)
+    is lighter than the full-width ring slot (zmap 12.6) that would inherit
+    its stock, so the trochoid is kept and FW at cutting feed on the padded
+    0.1 judge grid stays at main's level (0). FAILS on e5e783e: there the
+    stat does not exist (ungated emit happens silently)."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    _need(TB_STL, TB_HF_01)
+    import subprocess
+    import tempfile
+    import json as _json
+    from opencamlib import ocl
+    from engine.gcode import moves_to_gcode
+    from engine.rough import rough
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    stock_box = (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0)
+    tool_r = 6.343
+    dia = 2.0 * tool_r
+    surf = ocl.STLSurf()
+    ocl.STLReader(TB_STL, surf)
+    moves, stats = rough(surf, stock_box, tool_r, 20.0, leave=0.381,
+                         axial_leave=0.381, stepdown=19.05, stepover=0.16,
+                         stl_path=TB_STL, workers=None, threads=4,
+                         stock_cell=0.5, final_zmin=20.381)
+    fre = stats.get("failed_region_emitted")
+    assert fre is not None, \
+        "stats has no failed_region_emitted: a gate-failing region was " \
+        "emitted silently (main's fall-through)"
+    assert len(fre) >= 1, \
+        "expected the ungated test-block region in failed_region_emitted, " \
+        "got %r" % (fre,)
+    for e in fre:
+        assert set(("x", "y", "z", "area", "option", "max_ae")) <= set(e), \
+            "failed_region_emitted entry lacks fields: %r" % (e,)
+        assert e["option"] != "drop_ring", \
+            "the ungated region must keep its trochoid (zmap 8.47) instead " \
+            "of handing its stock to the full-width ring slot (zmap 12.6):" \
+            " %r" % (e,)
+    with tempfile.TemporaryDirectory() as td:
+        ngc = os.path.join(td, "tb.ngc")
+        with open(ngc, "w") as fh:
+            fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+        rj = os.path.join(td, "zmap.json")
+        dj = os.path.join(td, "ae2.json")
+        rr = subprocess.run(
+            [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+             "--part", TB_HF_01, "--tool", "flat", "--dia", "%.3f" % dia,
+             "--stock", *[str(v) for v in stock_box],
+             "--engage-max", "2.438", "--ae2-dump", dj, "--out-json", rj],
+            capture_output=True, text=True, cwd=repo)
+        assert rr.returncode == 0, "zmap failed: %s | %s" % (
+            rr.stdout[-800:], rr.stderr[-600:])
+        rep = _json.load(open(rj))
+        wins = _json.load(open(dj))
+        cut_feed = rep["engagement"]["ae2_cutting_feed"]
+        fw = [w for w in wins
+              if w["ae_eff"] >= 0.9 * dia and w["a"] > 0.5
+              and w.get("feed") is not None
+              and abs(w["feed"] - cut_feed) < 1e-6]
+        assert not fw, "FW at cutting feed rose to %d (main: 0): %s" % (
+            len(fw), [(w["x"], w["y"], round(w["ae_eff"], 2))
+                     for w in fw[:6]])
+    print("PASS bs1a4b failed region: %d ungated region(s) recorded %s, "
+          "0 full-width windows at cutting feed" % (
+              len(fre), [(e["x"], e["y"], e["z"], e["area"], e["option"],
+                         e["max_ae"]) for e in fre]))
+
+
+def test_bs1a4b_windows_align_zmap():
+    """Task BS1a4b alignment proof: replay the SAME emitted band moves on
+    samples/test_block through engine band._simulate and through zmap's AE2
+    engagement measure (--ae2-dump, on the 0.5 mm grid - the same cell the
+    engine stock model uses, so quantisation cannot fake a difference): the
+    window boundaries (closing move index within the region) must be identical
+    and the max per-window ae difference is reported BOTH ways. FAILS on
+    e5e783e: its first window is zero-length (the whole first-move disk), so
+    every engine boundary closes one move late."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    _need(TB_STL, TB_HF)
+    import subprocess
+    import tempfile
+    import json as _json
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.gcode import moves_to_gcode
+    from engine.rough import rough
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    replay = []
+    _orig_sim = B._simulate
+    _orig_cr = B.channel_regions
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None):
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats)
+        for r in res:                # replay the EMITTED moves, live stock
+            pts = [tuple(q) for q in r["paths"][0][1]]
+            e = []
+            w = _orig_sim(pts, stock, z, tool_r, cell, 1.3 * tool_r, e)
+            idxs = []
+            k = 0
+            tot = 0.0
+            prev = (pts[0][0], pts[0][1])
+            for j, p in enumerate(pts[1:], start=1):
+                tot += math.dist(prev, (p[0], p[1]))
+                prev = (p[0], p[1])
+                if k < len(e) and tot >= e[k] - 1e-9:
+                    idxs.append(j)
+                    k += 1
+            replay.append({"z": round(z, 3), "start": tuple(r["start"]),
+                          "pts": pts, "wins": w, "ends": e, "idxs": idxs})
+        return res
+
+    B.channel_regions = cr_spy
+    try:
+        stock_box = (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0)
+        tool_r = 6.343
+        dia = 2.0 * tool_r
+        surf = ocl.STLSurf()
+        ocl.STLReader(TB_STL, surf)
+        moves, stats = rough(surf, stock_box, tool_r, 20.0, leave=0.381,
+                             axial_leave=0.381, stepdown=19.05, stepover=0.16,
+                             stl_path=TB_STL, workers=None, threads=4,
+                             stock_cell=0.5, final_zmin=20.381)
+    finally:
+        B.channel_regions = _orig_cr
+    assert replay, "no band regions emitted on the test block"
+    with tempfile.TemporaryDirectory() as td:
+        ngc = os.path.join(td, "tb.ngc")
+        with open(ngc, "w") as fh:
+            fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+        # pad the 0.5 mm hf like the judge grid: edge values, tool_r + 5 mm
+        import numpy as _np
+        hf = _np.load(TB_HF)
+        with open(TB_HF[:-4] + ".json") as fh:
+            meta = _json.load(fh)
+        pad = int(math.ceil((tool_r + 5.0) / float(meta["cell"])))
+        hf_p = os.path.join(td, "part_hf_0.5_padded.npy")
+        _np.save(hf_p, _np.pad(hf, pad, mode="edge"))
+        with open(hf_p[:-4] + ".json", "w") as fh:
+            _json.dump({"x0": float(meta["x0"]) - pad * float(meta["cell"]),
+                       "y0": float(meta["y0"]) - pad * float(meta["cell"]),
+                       "cell": float(meta["cell"]),
+                       "tess_tol": meta.get("tess_tol", 0.01)}, fh)
+        rj = os.path.join(td, "zmap.json")
+        dj = os.path.join(td, "ae2.json")
+        rr = subprocess.run(
+            [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+             "--part", hf_p, "--tool", "flat", "--dia", "%.3f" % dia,
+             "--stock", *[str(v) for v in stock_box],
+             "--engage-max", "2.438", "--ae2-dump", dj, "--out-json", rj],
+            capture_output=True, text=True, cwd=repo)
+        assert rr.returncode == 0, "zmap failed: %s | %s" % (
+            rr.stdout[-800:], rr.stderr[-600:])
+        wins = _json.load(open(dj))
+    worst_ez = -9.0          # max (engine - zmap) over all windows
+    worst_ze = -9.0          # max (zmap - engine) over all windows
+    n_cmp = 0
+    for reg in replay:
+        pts = reg["pts"]
+        i0 = None
+        for i in range(len(moves) - len(pts)):
+            m = moves[i]
+            if (m["g"] == 1 and abs(m["x"] - pts[0][0]) < 1e-6
+                    and abs(m["y"] - pts[0][1]) < 1e-6):
+                if all(moves[i + k]["g"] == 1
+                       and abs(moves[i + k]["x"] - pts[k][0]) < 1e-6
+                       and abs(moves[i + k]["y"] - pts[k][1]) < 1e-6
+                       for k in range(min(len(pts), 40))):
+                    i0 = i
+                    break
+        assert i0 is not None, \
+            "emitted region %s not found in the moves" % (reg["start"],)
+        lo = 7 + i0   # moves[i0] ENDS at pts[0]; the region's own feed
+        # moves are lines lo+1.. (an earlier link move is not the region)
+        zw = sorted([w for w in wins if w["line"] >= lo + 1
+                     and w["end_line"] <= 7 + i0 + len(pts) - 1],
+                    key=lambda w: w["line"])
+        assert len(reg["wins"]) == len(zw), \
+            "window count differs for region %s: engine %d vs zmap %d" % (
+                reg["start"], len(reg["wins"]), len(zw))
+        zidx = [w["end_line"] - lo for w in zw]
+        assert zidx == reg["idxs"], \
+            "window boundaries differ for region %s: zmap %s vs engine %s" % (
+                reg["start"], zidx[:8], reg["idxs"][:8])
+        diffs = []
+        for k, w in enumerate(zw):
+            elen = reg["ends"][k] - (reg["ends"][k - 1] if k else 0.0)
+            diffs.append(reg["wins"][k] / elen - w["ae_eff"])
+        worst_ez = max(worst_ez, max(diffs))
+        worst_ze = max(worst_ze, -min(diffs))
+        n_cmp += 1
+    assert n_cmp == len(replay), "some region could not be compared"
+    # BS1a4b finding: the per-window AREAS still differ both ways (max
+    # zmap-minus-engine and engine-minus-zmap below). Root cause is NOT the
+    # windowing (boundaries are identical): it is the entry-bore pre-clear
+    # convention in _simulate (1.3 x tool_r assumed pre-cut by the helix)
+    # plus engine-live-stock vs judge-replay divergence - the disk-sampling
+    # under-read already documented in BS1a4 Step 0, present on e5e783e too.
+    # The supervisor's 0.15 mm bar is therefore NOT met by window alignment
+    # alone; both directions are reported (see BS1a4_RESULTS.md section 4).
+    print("bs1a4b max diff both ways: engine-zmap %+.3f mm, zmap-engine "
+          "%.3f mm" % (worst_ez, worst_ze))
+    print("PASS bs1a4b alignment: %d region(s), window boundaries identical;"
+          " max engine-zmap %+.3f mm, max zmap-engine %.3f mm" % (
+              n_cmp, worst_ez, worst_ze))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ Session start: Fri Oct 23 18:19 MST (hard cap ~20:19). Worktree
 No commits made. All tests/jobs run through `slot_m4.sh` (ENGINE_WORKERS=4);
 no Core Front engine or zmap job.
 
-## STOP - triggered (see section 6)
+## STOP - triggered (see section 6) - RESOLVED by BS1a4b (sections 7-9)
 
 Fix 1 + Fix 2 are implemented and behave as specified on the TEST BLOCK, but
 **FW at cutting feed rises 0 -> 8 and spike-overload windows rise 14 -> 32**
@@ -13,6 +13,11 @@ when the ungated region is dropped (the hug ring slots that stock at ae_eff up
 to 12.60 mm = full width). Per the brief's STOP rule I halted **before any
 further change**: no new tests were added to engine/test_engine.py, and the
 engine code is left as described below pending supervisor decision.
+
+**BS1a4b follow-up (this session, branch bs1a4 @ d41c89d + uncommitted):** the
+supervisor decision arrived as TASK_BS1a4b.md - a gate-failing region now takes
+its LIGHTEST measured option among {each shrink level, dropping to the ring}
+and is never silent. See sections (1) [updated count], (4), (5), (7), (8), (9).
 
 ## (0) Step-0 report - TEST BLOCK on main (e5e783e)
 
@@ -46,8 +51,10 @@ above); later levels' a2d/rings would reach the deeper stock below.
 ## (1) Line count
 
 `git diff --numstat e5e783e -- engine/band.py engine/rough.py` ->
-`38 14  engine/band.py` = **52 changed non-test lines** (budget <= 60;
-STOP at ~80). engine/rough.py unchanged.
+BS1a4 WIP: `38 14 engine/band.py` = 52 changed lines.
+After BS1a4b (revised Fix 1 + alignment split in `_simulate`):
+**`61 15 engine/band.py` = 76 changed non-test lines** (budget <= ~80 vs
+e5e783e IN TOTAL). engine/rough.py unchanged.
 
 ## (2) Changes (all in engine/band.py)
 
@@ -89,11 +96,35 @@ added - STOP fired first):
 
 ## (4) Max engine-vs-zmap window difference, both ways
 
-(pending - filled from bs1a4_align_{base,fixed}.json below)
+Measured on the TEST BLOCK, emitted band region (start 6.276,-2.078, Z27.381),
+engine `_simulate` on the EMITTED moves vs zmap `--ae2-dump`, both on the
+0.5 mm grid (the same cell the engine stock model uses; the 0.5 hf padded
+tool_r+5 mm like the judge grid) - from `test_bs1a4b_windows_align_zmap` /
+scratchpad `bs1a4b_diag2.py`:
+
+- **Window boundaries: IDENTICAL** - 791 engine windows vs 791 zmap windows,
+  closing-move index equal for every window (after Fix 2 + the >45 deg
+  chord-break link rule added in BS1a4b; on e5e783e the counts were 555 vs
+  529 and every boundary was shifted).
+- **max (engine - zmap) = +3.883 mm** (window k=17, xy~(8.52,-3.76): engine
+  counts 4.00 mm2 removed where zmap had already counted those cells in an
+  earlier window - engine live-stock vs judge-replay divergence).
+- **max (zmap - engine) = +3.865 mm** (window k=1, xy~(6.59,-3.66): zmap
+  counts 5.00 mm2 at a=10.62 mm that `_simulate`'s entry-bore pre-clear
+  (1.3 x tool_r assumed pre-cut by the helix) makes the engine blind to).
+
+The 0.15 mm bar is **NOT met**: the residual is not windowing (boundaries are
+exact) but the bore pre-clear convention + disk-sampling/stock-model
+divergence - the planner blind spot already documented in Step 0, present on
+e5e783e as well (there it is compounded by the one-move boundary offset).
+Closing this needs a measurement change in `_simulate` (real bore geometry /
+swept-disk on the judge grid), outside this task's budget and scope.
 
 ## (5) Existing test suite
 
-(pending - filled from bs1a4_fullsuite_fixed.log)
+Full `engine/test_engine.py` (34 tests incl. the 2 new BS1a4b tests) via
+slot_m4.sh on the fixed tree: **SUITE_EXIT=__** (per-test lines in
+scratchpad `bs1a4b_fullsuite.log`; exit codes pasted in section (8)).
 
 ## (6) STOP report
 
@@ -116,3 +147,69 @@ when a lighter fallback is confirmed to exist (ring load cap check against the
 spike bar before dropping), multi-pass channel clearing, or gate retune. The
 dropped region's stock IS seen by a later planner (the ring), so the first
 STOP clause ("stock unseen") is not the problem - the load is.
+
+## (7) BS1a4b - revised Fix 1 (supervisor decision), file:line
+
+All in engine/band.py (engine/rough.py untouched; no zmap/verify import):
+
+- `engine/band.py:44-45` - constants `SPIKE_MM = 2.44` (judge overload bar,
+  zmap OVERLOAD_WIDTH_MM) and `DIR_COS = cos(45 deg)` (zmap AE2_DIR_MAX_DEG
+  link rule).
+- `engine/band.py:168-177` - `_simulate` now breaks a window at a chord
+  direction change > 45 deg and drops the sub-1 mm fragment there, exactly
+  like zmap `_ae2_windows` link/close; with Fix 2's non-zero first window
+  (`:165`) every engine window spans what the judge's window spans.
+- `engine/band.py:199-206` - `_opt_key(wins, ends, fw_min)`: rank key of an
+  option = (# windows >= FW_TRIGGER x D at cutting feed, max ae, travel in
+  windows over SPIKE_MM), measured on the aligned `_simulate` windows.
+- `engine/band.py:292` - the DROP option per ring path = the ring's own
+  simulated windows over the live stock (`wins`/`wb`, already computed for FW
+  marking) keyed by `_opt_key` -> `("drop_ring", None, wins)`.
+- `engine/band.py:344-360` - the shrink ladder records every tried level
+  (`opts`: shrink, path, wins, ends) and `best_area`.
+- `engine/band.py:364-381` - supervisor decision, replacing the WIP reject:
+  when NO shrink level passes the gate, take `min` of
+  {each tried level, drop_ring} by (FW windows, max ae, over-2.44 travel);
+  ties keep the trochoid (drop is last). The region is recorded in
+  `stats["failed_region_emitted"]` as `{x, y, z, area, option, max_ae}`
+  (place = segment start, Z, best removed area, chosen option, engine max ae
+  of the chosen option) - never silent. `option == "drop_ring"` emits
+  nothing (stock stays live for the ring, seg not marked done); a
+  `shrink*` option emits that level's trochoid (marked done, counted in
+  n_band_regions / band_cut_len_mm). `bs1a_rejected` (WIP) is subsumed by
+  this ledger's option field.
+- `engine/band.py:399` - `stats["failed_region_emitted"]` key is always
+  present (list, possibly empty).
+
+Decision on the test block: dropping to the ring has FW >= 1 at cutting feed
+(it is the FW windows that proposed the region; judge reads them at 12.60 =
+full width), every shrink level has FW = 0 with max ae 4.25-4.75 -> lightest
+= **shrink0.55** (max ae 4.25): the trochoid (zmap 8.47 there) is kept over
+the ring slot, and FW at cutting feed on the padded 0.1 judge grid stays 0 =
+main's level. Gates AE_SS / AE_SPIKE untouched; no feed/margin/leave change.
+
+New tests (engine/test_engine.py, both registered in `_main()`):
+`test_bs1a4b_failed_region_lightest` (region listed with all fields, option
+is a trochoid not drop_ring, FW@cutfeed == main's 0 on the padded 0.1 grid)
+and `test_bs1a4b_windows_align_zmap` (boundaries identical, max difference
+both ways reported - see section (4) for why the 0.15 mm area bar is not met
+and is reported rather than asserted).
+
+## (8) BS1a4b exit codes (all run by me via slot_m4.sh, ENGINE_WORKERS=4)
+
+- `test_bs1a4b_failed_region_lightest` (fixed tree, standalone): **T1_EXIT=0**
+- full `engine/test_engine.py` (fixed tree): **SUITE_EXIT=__**
+- fail-on-e5e783e (`git archive e5e783e` into scratchpad `bs1a4b_e5e`, my
+  test file copied in, never a checkout):
+  - `test_bs1a4b_failed_region_lightest`: **BASE_T1_EXIT=__**, assertion:
+    `__`
+  - `test_bs1a4b_windows_align_zmap`: **BASE_T2_EXIT=__**, assertion:
+    `__`
+
+## (9) failed_region_emitted on the test block
+
+One region (the only ungated one, matching Step 0):
+`{x: 6.276, y: -2.878, z: 27.381, area: __ mm2, option: "shrink0.55",
+max_ae: 4.25 mm}` - emitted as a trochoid (zmap max 8.47 on its own moves,
+below the 11.42 mm FW bar), ring keeps its lighter skim; FW at cutting feed
+over the whole program: 0 (= main).

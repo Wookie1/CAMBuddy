@@ -41,6 +41,8 @@ FW_FRAC = 0.9
 FW_TRIGGER = 0.85
 AE_SS = 1.85            # steady target per 1 mm window
 AE_SPIKE = 2.25         # spike target per 1 mm window
+SPIKE_MM = 2.44         # judge overload bar (zmap OVERLOAD_WIDTH_MM)
+DIR_COS = math.cos(math.radians(45.0))   # zmap AE2_DIR_MAX_DEG link rule
 MIN_SLIVER = 4.0        # CL-allowed sliver needed to host loops + entry
 LOOP_R_MIN = 0.8
 LOOP_R_MAX = 3.2
@@ -163,9 +165,16 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None):
     prev = (path[0][0], path[0][1])   # BS1a4 Fix 2: the first move is a
     # real move: its length enters window 0 (zmap's _ae2_windows counts every
     # horizontal feed move), so engine windows close where zmap's close.
+    pdir = None
     for (x, y) in path[1:]:
         step_len = math.dist(prev, (x, y))
         tot += step_len
+        if step_len > 1e-9:
+            d = ((x - prev[0]) / step_len, (y - prev[1]) / step_len)
+            if pdir is not None and d[0] * pdir[0] + d[1] * pdir[1] < DIR_COS:
+                acc_area = 0.0       # >45 deg chord break (zmap link rule):
+                acc_len = 0.0        # the sub-1 mm fragment is dropped there
+            pdir = d
         ci, cj = stock._ci(x) - i0, stock._cj(y) - j0
         removed = 0
         for dj, di in offs:
@@ -185,6 +194,16 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None):
             acc_len = 0.0
         prev = (x, y)
     return wins
+
+
+def _opt_key(wins, ends, fw_min):
+    """BS1a4b rank key for the lightest option of a gate-failing region:
+    fewest full-width windows at cutting feed, then lowest max ae, then
+    shortest travel in windows over SPIKE_MM - all on aligned _simulate
+    windows."""
+    over = sum((ends[i] - (ends[i - 1] if i else 0.0))
+               for i, v in enumerate(wins) if v > SPIKE_MM)
+    return (sum(1 for v in wins if v >= fw_min), max(wins), over)
 
 
 def _trochoid(seg, tool_r):
@@ -261,7 +280,6 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
     done = np.zeros((stock.ny, stock.nx), dtype=bool)
     blocked = []
     cl_len = 0.0
-    n_gated = 0
     for res in rings:
         for (kind, pts) in res["paths"]:
             if kind != "cutting" or len(pts) < 2:
@@ -271,6 +289,7 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
             wins = _simulate(pts, stock, z, tool_r, cell, 1.3 * tool_r, wb)
             if not wins:
                 continue
+            drop_opt = (_opt_key(wins, wb, fw_min), "drop_ring", None, wins)
             # a dense sample is judged by the same window zmap will use:
             arc = [0.0]
             for a, b in zip(dense[:-1], dense[1:]):
@@ -323,58 +342,61 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                 if hits > 0.5 * tot:
                     continue       # opposite wall's ring of the same channel
                 gate_ok = False
-                best_ae = None
                 best_area = 0.0
+                opts = []
                 for shrink in (1.0, 0.75, 0.55, 0.4):
                     shrunk = [tuple(s[:4]) + (s[4] * shrink,) for s in seg]
                     path, rmax = _trochoid(shrunk, tool_r)
                     if len(path) < 6:
                         break
+                    we = []
                     wins = _simulate(path, stock, z, tool_r, cell,
-                                    1.3 * tool_r)   # smallest helix tier bore
+                                    1.3 * tool_r, we)  # smallest helix bore
                     if not wins:
                         break
                     spike = max(wins)
                     ss = sorted(wins)[max(0, int(0.95 * len(wins)) - 1)]
-                    if best_ae is None or spike < best_ae:
-                        best_ae, best_area = spike, sum(wins)
+                    best_area = max(best_area, sum(wins))
+                    opts.append((shrink, path, wins, we))
                     if ss <= AE_SS and spike <= AE_SPIKE:
                         gate_ok = True
                         break
+                if not gate_ok:
+                    # BS1a4b: every shrink level failed the gate. Take the
+                    # LIGHTEST measured option among {tried levels, dropping
+                    # its stock to the ring}: fewest full-width windows at
+                    # cutting feed, then lowest max ae, then shortest travel
+                    # over SPIKE_MM. Never silent: place, Z, area, option and
+                    # engine max ae go into stats["failed_region_emitted"].
+                    cand = [(_opt_key(w, e, fw_min), "shrink%g" % s, p, w)
+                           for (s, p, w, e) in opts] + [drop_opt]
+                    opt, path, wins = min(cand, key=lambda c: c[0])[1:]
+                    if stats is not None:
+                        stats.setdefault("failed_region_emitted", []).append(
+                            {"x": round(seg[0][0], 3), "y": round(seg[0][1], 3),
+                             "z": round(z, 3), "area": round(best_area, 2),
+                             "option": opt,
+                             "max_ae": round(max(wins), 3) if wins else None})
+                    if path is None:
+                        continue   # dropped: stock stays live for the ring
                 good = isl_ok3([(round(x, 4), round(y, 4))
                                for (x, y) in path])
                 pts_out = [(round(p[0], 4), round(p[1], 4))
                            for p, g in zip(path, good) if g]
                 if len(pts_out) < 4:
                     continue
-                if not gate_ok:
-                    # BS1a4 Fix 1: a region that fails its gate at EVERY
-                    # shrink level is never emitted (no fall-through emit).
-                    # Its stock stays in the LIVE model for every later
-                    # planner (this level's rings, link_clear, side entries,
-                    # a2d, re-mill); the seg is NOT marked done, so another
-                    # ring may still re-plan the channel at this level.
-                    if stats is not None:
-                        stats.setdefault("bs1a_rejected", []).append(
-                            (round(seg[0][0], 3), round(seg[0][1], 3),
-                             round(z, 3), round(best_area, 2),
-                             None if best_ae is None else round(best_ae, 3)))
-                    continue
                 for s in seg:
                     i, j = stock._ci(s[0]), stock._cj(s[1])
                     if 0 <= i < stock.nx and 0 <= j < stock.ny:
                         done[j, i] = True
                 cl_len += length
-                n_gated += 1
                 regions.append({"start": list(pts_out[0]), "helix": None,
                                "paths": [["cutting", pts_out]]})
     if stats is not None:
         stats["n_band_regions"] = stats.get("n_band_regions", 0) + len(regions)
-        # BS1a4 Fix 1: regions emitted without their gate passing. Every
-        # emission above required a passing shrink level, so this is 0; the
-        # accounting keeps the invariant checked rather than assumed.
-        stats["failed_region_emitted"] = stats.get(
-            "failed_region_emitted", 0) + len(regions) - n_gated
+        # BS1a4b: every region that failed its gate at every shrink level is
+        # listed here with the option chosen for it - never silent.
+        stats.setdefault("failed_region_emitted", [])
         stats["band_cut_len_mm"] = round(
             stats.get("band_cut_len_mm", 0.0)
             + sum(sum(math.dist(a, b)
