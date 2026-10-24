@@ -1095,7 +1095,8 @@ def _main():
                test_rr1a_rough_cli_refuses_ball,
                test_bs1a4b_failed_region_lightest,
                test_bs1a4b_windows_align_zmap,
-               test_bs1a4c_backed_credit):
+               test_bs1a4c_backed_credit,
+               test_bs1a4c_fix_no_post_entry_helix):
         try:
             fn()
         except AssertionError as e:
@@ -2039,6 +2040,42 @@ def test_bs1a4b_windows_align_zmap():
     print("PASS bs1a4b alignment: %d region(s), window boundaries identical;"
           " max engine-zmap %+.3f mm, max zmap-engine %.3f mm" % (
               n_cmp, worst_ez, worst_ze))
+
+
+def test_bs1a4c_fix_no_post_entry_helix():
+    """BS1a4c-fix (supervisor): a credited band start that is not backed at
+    emit must never get a helix emitted AFTER enter_at (the tool is already
+    at depth there): the L-shaped channel must rough without a CLCHECK
+    refusal (no sample below CL + axial_leave) and record no 'ladder_helix'
+    fallback. FAILS on a29696d (CLCHECK: 18 mm below CL at X-4.208 Y-0.704)."""
+    from opencamlib import ocl
+    import tempfile
+    from engine.rough import rough
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a4c_fix.stl")
+        _write_stl(stl, tris)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        try:
+            _m, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0),
+                              6.343, 0.0, leave=0.381, axial_leave=0.381,
+                              stepdown=19.05, stepup=1.905, tolerance=0.05,
+                              threads=4, stock_cell=0.5, min_rest=0.5,
+                              corner_r=0.0, stl_path=stl)
+        except RuntimeError as e:
+            raise AssertionError("rough refused on CL (a backing move gouged): %s"
+                                 % str(e)[:200])
+    acts = [f[3] for f in stats.get("credit_fallback", [])]
+    assert "ladder_helix" not in acts, "post-entry helix emitted: %s" % acts
+    assert stats.get("clcheck_violations", 0) == 0, stats.get("clcheck_violations")
+    print("PASS bs1a4c-fix: L channel roughs CL-clean, fallbacks %s" % acts)
 
 
 def test_bs1a4c_backed_credit():
