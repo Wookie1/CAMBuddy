@@ -27,8 +27,9 @@ top-down (Z 42.965, a 2.07-2.20). 42 of the 44 windows are new vs the previous c
 
 ## Step 0 - REPORT ONLY, before any code change (write it in the results file)
 Per level of the centre-band-like zones you reproduce: is each boundary segment OPEN (live stock clear just outside at
-that Z) or WALLED? If your synthetic cases are MIXED (some open, some walled) say so explicitly - the supervisor sends
-that answer to the coordinator before the fix is accepted.
+that Z) or WALLED? Also answer it for the Core Front centre band from the facts above (its band edges at y ~ 0.4 and
+the ends). If the answer is MIXED (some edges open, some walled), write Step 0 and STOP - the supervisor takes that
+answer to the coordinator before any fix.
 ## Change
 (1) Open from cleared stock - a spine / centre-line pass in uncut stock is itself a slot (fails full width; ae_eq
     ~0.67 x chord), so never cut a gap from inside raw stock:
