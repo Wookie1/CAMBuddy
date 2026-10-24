@@ -34,8 +34,7 @@ that depth. CF centre band: Z 44.965, a 0.755: 0.95 + 2.57 = 3.5 mm engaged (ZE2
   program and judge it with verify/'s ZE2B (as existing tests use verify.zmap): every front-1 window at cutting feed
   has ae_eq <= 2.286 and no full-width flag. The assertion is on MEASURED ae_eq, not on a stats key.
 ## Report
-For the CF centre band at Z 44.965 and 42.965: each front 1's a1 and c0 (from a run of the engine on the CF rest stage,
-CF lane only via slot.sh - or, if you cannot, from the synthetic test, and say which). Generation time of the new test
-scene before/after.
+Each front 1's a1, c0 and estimated width in the new test scene (NO Core Front job - the supervisor measures the CF
+centre band at Z 44.965 / 42.965 in the next chain). Generation time of the new test scene before/after.
 ## engine/RR1c5d_RESULTS.md: change with file:line, line count, the Report items, PASTED exit codes of the at-risk + new
 tests and the fail-on-035e590 output. Then stop.
