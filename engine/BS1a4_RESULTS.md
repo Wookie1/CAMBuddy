@@ -304,3 +304,122 @@ PENDING_PLACEHOLDER_BASE
 old `_main()` tuple closing line `test_rr1a_rough_cli_refuses_ball):` - no
 existing test or assertion changed.
 
+
+## (12) BS1a4c-2 - every emitted band cutting chord is CL-checked; a
+## discontinuous trochoid is split or rejected
+
+Session Fri Oct 23 21:00 - 22:15 MST (hard cap 23:00), worktree
+stevecam-bs1a4 branch bs1a4, base 351ce50 read with `git show` (never
+checkout). NO commits. All tests via slot_m4.sh (ENGINE_WORKERS=4); NO Core
+Front engine or zmap job. No lock files touched; no stuck slot.
+
+### Change (40 non-test lines vs 351ce50: band.py +35/-5, rough.py +0/-0;
+### 30-line target exceeded by the mandated reject-and-list bookkeeping,
+### kept under the ~45 hard stop; rough.py unchanged - the fix sits at the
+### emitter source, band-path emission only)
+
+engine/band.py:
+- `engine/band.py:89-101` - `_split_at_jumps(isl_ok3, pts)`: splits a band
+  path at every chord that fails a segment-sampled CL check, sampling every
+  <= 0.25 mm (n = ceil(dist/0.25), endpoints inclusive) - the way
+  validate_exact samples segments. Every chord that survives into emission is
+  therefore segment-sampled CL-clean, not just its two points.
+- `engine/band.py:418` - the chosen (gate-passed or lightest gate-failed)
+  shrink path is split with `_split_at_jumps` after the existing isl_ok3
+  point filter (filter first, so chords created by dropping forbidden points
+  are the jumps the splitter sees).
+- `engine/band.py:419-431` - a piece shorter than 4 points has no legal join
+  (cannot host a loop and is not worth an entry): REJECTED, never silent -
+  place/Z/area/option (+ " split") appended to
+  stats["failed_region_emitted"]; if every piece is a stub the whole seg is
+  skipped (stock stays live for the ring, done-marking not applied).
+- `engine/band.py:437-441` - each surviving piece is emitted as its OWN
+  region (own honest `credit`, own start): rough.py's existing per-region
+  `enter_at` ladder (link / side / helix, each CL-checked) joins the pieces
+  in place of the raw chord. Per-region stats needed no change (a region
+  still carries exactly one cutting path).
+
+### (a) max window = FIRST window at entry? (instrumented `_simulate` on the
+### L-channel case, Z 0.381, honest credit bore = tool_r = 6.343)
+- region (-18.724,-0.115) shrink1, max_ae 15.25: FIRST window IS the max -
+  argmax = 0, w0 = 15.25 (window 0 of 996/743/502/348 at shrink
+  1.0/0.75/0.55/0.4 - the same 15.25 at EVERY shrink level).
+- region (-2.09,5.742) shrink0.4, max_ae 13.5: argmax = 1 (second window),
+  w0 = 12.75 - the max sits in the first ~2 mm of travel at entry, and is
+  likewise identical (13.50) at every shrink level.
+Both maxima are INVARIANT under trochoid shrinkage - the load is fixed by the
+entry geometry, not by the loops: consistent with the suspected start-centred
+credit disk vs the real off-centre helix bore + floor circle over-read (the
+sim pre-clears a tool_r disk about path[0]; the actual entry bores about the
+helix centre and the floor circle sweeps an annulus, so cells the disk missed
+are counted as fresh loop cut). Confirms the BS1a4d target; no engine change
+made here for it (report only).
+
+### (b) other emit paths checked only by their points (or sampled coarser
+### than the judge's 0.25 mm), grep of engine/rough.py + engine/band.py
+- engine/rough.py:2112 - generic cutting-run emit for EVERY non-band region
+  (a2d paths AND hug rings): `good = isl_ok(pts)` gates POINTS only; chords
+  between consecutive good points are emitted as G1 cutting moves without
+  segment sampling (band paths now arrive chord-clean from band.py:89).
+- engine/rough.py:2137-2147 - clip-bridge chord sampled at ~0.5 mm
+  (`ns = ceil(d/0.5)`, isl_ok3) - coarser than 0.25 mm.
+- engine/rough.py:2233 - a2d deep linkclear corridor: isl_ok3 on corridor
+  POINTS + corridor_ok per segment (engine/rough.py:1885-1900, 0.4 mm +
+  midpoints) - coarser than 0.25 mm.
+- engine/rough.py:2269 - RT at-depth feed link: `all(isl_ok(corridor))` on
+  corridor points only (+ stock.link_clear at z+lift); chords not
+  part-sampled.
+- engine/rough.py:2301 - link landing point checked by isl_ok([land]) alone.
+- engine/rough.py:1634,1642 - enter_at ladder steps 1-2 straight links use
+  corridor_ok = 0.4 mm + midpoint sampling - coarser than 0.25 mm.
+- engine/rough.py:1246 - HB1v2 floor circle: isl_ok(circ) with
+  n = max(16, 2*pi*r/0.5) -> ~0.5 mm point spacing.
+- engine/rough.py:1284 - helix candidate return segment: sampled at 0.4 mm.
+- engine/rough.py:1438 - SE2 side feed-in path: isl_ok3 at ~0.4 mm spacing.
+- engine/rough.py:864 - hug_regions keeps ring points by isl_ok at POINTS
+  only (ring chords are later emitted through rough.py:2112 unchecked).
+- engine/rough.py:1997, 2034 - region entry candidates chosen by isl_ok on
+  points only (the entry move itself still passes the enter_at ladder).
+- engine/band.py:412-415 - band path points gated by isl_ok3 (points only);
+  as of this task complemented by the chord splitter at engine/band.py:418.
+- (not a gap) engine/band.py:64 `_march` samples at MARCH_STEP = 0.25 mm -
+  already judge resolution.
+
+### Test (NEW, no existing test/assertion/tolerance touched)
+`test_bs1a4c2_band_chord_cl_checked` (engine/test_engine.py:2142, registered
+in `_main()` engine/test_engine.py:1100): L-channel part; spies
+channel_regions and asserts EVERY emitted band cutting chord passes the
+segment-sampled (<= 0.25 mm) isl_ok3 check; rough() must complete without a
+CL refusal and with clcheck_violations == 0; failed_region_emitted present.
+
+### Exit codes (all run by me via slot_m4.sh, ENGINE_WORKERS=4)
+- test_bs1a_lshaped_channel BEFORE the change (tree @ 351ce50 + briefs):
+  RuntimeError "rough CLCHECK FAILED: 28 sample(s) ... worst move 2068 at
+  X-4.208 Y-0.704 Z0.381 sits 18.000 mm below CL -17.238" (exit 1,
+  uncaught traceback).
+- test_bs1a_lshaped_channel AFTER the change: PASS (25 band region(s),
+  1628.9 mm trochoidal cut, 0 full-width windows) - PIPESTATUS EXIT=0.
+- test_bs1a4c2_band_chord_cl_checked AFTER the change: PASS (25 band
+  region(s), 2 listed failed piece(s)) - EXIT=0.
+- full engine/test_engine.py AFTER the change: `37 PASS`, `0 failure(s)` -
+  SUITE_EXIT=0.
+
+### fail-on-351ce50 (`git archive 351ce50` -> tmp `bs1a4c2_base351`, my new
+### test file copied in, never a checkout)
+```
+AssertionError: rough refused on CL (an unsegment-checked chord gouged):
+rough CLCHECK FAILED: 28 sample(s) below CL + axial_leave 0.381 - 0.005,
+worst move 2068 at X-4.208 Y-0.704 Z0.381 sits 18.000 mm below CL -17.238
+EXIT=1
+```
+(the spy's chord assertion also fires on that tree; the CL-refusal
+AssertionError is raised first, from the except-runtimeerror guard).
+`git diff 351ce50 -- engine/test_engine.py` has exactly ONE "-" line - the
+old `_main()` tuple closing line `test_bs1a4c_fix_no_post_entry_helix):` -
+no existing test or assertion changed.
+
+STOP rule check: test_bs1a_lshaped_channel passes (not a LOAD failure), so no
+STOP; (a) confirms the first-window over-read is BS1a4d's job.
+Note: during this session `engine/TASK_BS1a4d.md` appeared modified and
+`engine/TASK_BS1a4e.md` untracked in the worktree - NOT my edits; left
+untouched. No commits made.

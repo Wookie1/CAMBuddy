@@ -1096,7 +1096,8 @@ def _main():
                test_bs1a4b_failed_region_lightest,
                test_bs1a4b_windows_align_zmap,
                test_bs1a4c_backed_credit,
-               test_bs1a4c_fix_no_post_entry_helix):
+               test_bs1a4c_fix_no_post_entry_helix,
+               test_bs1a4c2_band_chord_cl_checked):
         try:
             fn()
         except AssertionError as e:
@@ -2135,6 +2136,79 @@ def test_bs1a4c_backed_credit():
             "unknown credit fallback action: %r" % (f,)
     print("PASS bs1a4c backed credit: %d region(s) %s, fallbacks %s" % (
         len(captured), captured, stats["credit_fallback"]))
+
+
+
+def test_bs1a4c2_band_chord_cl_checked():
+    """Task BS1a4c-2: every emitted band cutting chord is CL-checked
+    SEGMENT-SAMPLED (every <= 0.25 mm, the way validate_exact samples
+    segments), not only its points; a discontinuous trochoid is split at the
+    jump into separate regions joined through enter_at's CL-checked ladder,
+    and a piece with no legal join is rejected AND listed in
+    stats["failed_region_emitted"]. FAILS on 351ce50: with honest credit both
+    L-channel regions fail every shrink level and the chosen shrunk path
+    carries a 5.4 mm straight chord across the part that reaches CLCHECK
+    (bad moves 2068/2107, 18 mm below CL)."""
+    import math
+    import os
+    from opencamlib import ocl
+    import tempfile
+    import engine.band as B
+    from engine.rough import rough
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)       # floor
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)     # left wall
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)      # bottom wall
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)          # inner crn
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)          # right wall
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)         # upr-left
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))         # top cap
+    jumps = []
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None):
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats)
+        for r in res:
+            for (kind, pts) in r["paths"]:
+                if kind != "cutting":
+                    continue
+                for a, b in zip(pts[:-1], pts[1:]):
+                    d = math.dist(a, b)
+                    n = max(1, int(math.ceil(d / 0.25)))
+                    if not all(isl_ok3([(a[0] + (b[0] - a[0]) * t / n,
+                                          a[1] + (b[1] - a[1]) * t / n)
+                                         for t in range(n + 1)])):
+                        jumps.append((round(z, 3), a, b, round(d, 2)))
+        return res
+
+    _orig_cr = B.channel_regions
+    B.channel_regions = cr_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4c2.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            try:
+                _m, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0,
+                                         18.0), 6.343, 0.0, leave=0.381,
+                                 axial_leave=0.381, stepdown=19.05,
+                                 stepup=1.905, tolerance=0.05, threads=4,
+                                 stock_cell=0.5, min_rest=0.5, corner_r=0.0,
+                                 stl_path=stl)
+            except RuntimeError as e:
+                raise AssertionError(
+                    "rough refused on CL (an unsegment-checked chord gouged):"
+                    " %s" % str(e)[:200])
+    finally:
+        B.channel_regions = _orig_cr
+    assert not jumps, "emitted band chord fails the segment-sampled CL check" \
+                      " (or an unsplit jump): %s" % jumps[:4]
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    assert "failed_region_emitted" in stats, "no failed_region_emitted list"
+    print("PASS bs1a4c-2: every emitted band chord CL-checked at 0.25 mm; "
+          "%d band region(s), %d listed failed piece(s)" % (
+              stats.get("n_band_regions", 0),
+              len(stats["failed_region_emitted"])))
 
 
 if __name__ == "__main__":

@@ -86,6 +86,21 @@ def _resample(pts, step=0.4):
     return out
 
 
+def _split_at_jumps(isl_ok3, pts):
+    """BS1a4c-2: split a band path at every chord failing a segment-sampled
+    CL check (every <= 0.25 mm, the way validate_exact samples segments)."""
+    out = [[pts[0]]]
+    for a, b in zip(pts[:-1], pts[1:]):
+        n = max(1, int(math.ceil(math.dist(a, b) / 0.25)))
+        if all(isl_ok3([(a[0] + (b[0] - a[0]) * t / n,
+                          a[1] + (b[1] - a[1]) * t / n)
+                         for t in range(n + 1)])):
+            out[-1].append(b)
+        else:
+            out.append([b])
+    return out
+
+
 def _centreline(pts, isl_ok3, tool_r, leave):
     """For each resampled ring point march both normals; return one entry per
     point on the sliver centre line - (cx, cy, tx, ty, half_width) - or None
@@ -400,15 +415,30 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                            for p, g in zip(path, good) if g]
                 if len(pts_out) < 4:
                     continue
-                for s in seg:
+                pieces = _split_at_jumps(isl_ok3, pts_out)   # BS1a4c-2
+                if stats is not None:      # stubs: no legal join -> reject,
+                    lbl = (opt if not gate_ok else
+                          "shrink%g" % shrink) + " split"     # list honestly
+                    fre = stats.setdefault("failed_region_emitted", [])
+                    for pc in pieces:
+                        if len(pc) < 4:
+                            fre.append({"x": round(pc[0][0], 3),
+                                      "y": round(pc[0][1], 3), "z": round(z, 3),
+                                      "area": round(best_area, 2),
+                                      "option": lbl})
+                pieces = [pc for pc in pieces if len(pc) >= 4]
+                if not pieces:
+                    continue   # every piece a stub: nothing emitted, ring's
+                for s in seg:      # stock stays live; done-marking would lie
                     i, j = stock._ci(s[0]), stock._cj(s[1])
                     if 0 <= i < stock.nx and 0 <= j < stock.ny:
                         done[j, i] = True
                 cl_len += length
-                regions.append({"start": list(pts_out[0]), "helix": None,
-                               "paths": [["cutting", pts_out]]})
-                regions[-1]["credit"] = entry_credit(stock, pts_out[0], z,
-                                                    tool_r)  # back at emit
+                for pc in pieces:  # BS1a4c-2: piece = own region, own ladder
+                    regions.append({"start": list(pc[0]), "helix": None,
+                                   "paths": [["cutting", pc]]})
+                    regions[-1]["credit"] = entry_credit(stock, pc[0], z,
+                                                        tool_r)  # back at emit
     if stats is not None:
         stats["n_band_regions"] = stats.get("n_band_regions", 0) + len(regions)
         # BS1a4b: every region that failed its gate at every shrink level is
