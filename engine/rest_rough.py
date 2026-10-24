@@ -852,13 +852,16 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                     onbore = (mode == "bore" and r_h > 0.0 and dzd <= 1e-9
                               and abs(math.hypot(prev[0] - cx, prev[1] - cy)
                                      - r_h) <= CELL)
-                    if cl_ok_path(lp) and (onbore or all(
-                            live.disk_top(px, py) <= t + 0.05
-                            for px, py, _ in lp)) and (dzd <= 1e-9
-                                          or d0 * tanr >= dzd - 1e-9) and all(
-                            clmn[int(round((py - ys[0]) / CELL)),
-                               int(round((px - xs[0]) / CELL))]
-                            for px, py, _ in lp):
+                    lok = cl_ok_path(lp) and (onbore or all(
+                        live.disk_top(px, py) <= t + 0.05
+                        for px, py, _ in lp)) and (dzd <= 1e-9
+                                                   or d0 * tanr >= dzd - 1e-9)
+                    gok = all(clmn[int(round((py - ys[0]) / CELL)),
+                                   int(round((px - xs[0]) / CELL))]
+                              for px, py, _ in lp)
+                    if lok and not gok:   # RR1c-5d guard sent it to the ladder
+                        stats["rr_clmn_ladder"] = stats.get("rr_clmn_ladder", 0) + 1
+                    if lok and gok:
                         g1(pts[0][0], pts[0][1], round(t, 4), ramp_feed)
                     else:
                         ldx = ldy = 0.0
@@ -929,8 +932,9 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 # cleared ground; raw slots NEVER silent (rr_ring_failed).
                 if ring_seq and fronts:
                     # RR1c-5d front 1: SIGNED dv, flag when dv+c(a1)/2>ae+CELL
-                    dv = (Sv if isf1 else ndimage.distance_transform_edt(
-                        ~clm))[ii, jj] * CELL
+                    # Sv is already in mm; the EDT is in cells
+                    dv = Sv[ii, jj] if isf1 else ndimage.distance_transform_edt(
+                        ~clm)[ii, jj] * CELL
                     kx = int(np.argmax(dv))
                     if float(dv[kx]) > ((ae - hch) if isf1 else ae) + CELL:
                         ad = live.disk_depth(pts[kx][0], pts[kx][1], t)
