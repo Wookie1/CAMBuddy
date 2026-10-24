@@ -672,7 +672,8 @@ def _bore_pred(isl_ok, zone, stock, x, y, tool_r):
     for rh in [fr * tool_r for fr in (0.8, 0.5, 0.3)] + [0.5, 0.35, 0.2]:
         for q in range(16):
             a = q * math.pi / 8.0
-            cx, cy = x + rh * math.cos(a), y + rh * math.sin(a)
+            cx = x + (rh - 0.05) * math.cos(a)   # as the centred ladder
+            cy = y + (rh - 0.05) * math.sin(a)
             n = max(16, int(2.0 * math.pi * rh / 0.5))
             a0 = math.atan2(y - cy, x - cx)   # circle_ok's phase + rounding
             circ = [(round(cx + rh * math.cos(a0 + t * 2.0 * math.pi / n),
@@ -1399,8 +1400,11 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                                                   0.2]:
                 for q in range(16):
                     a = q * math.pi / 8.0
-                    if try_cand(x + rh * math.cos(a), y + rh * math.sin(a),
-                               rh):
+                    # centre 0.05 short of rh: the start lies just INSIDE
+                    # the circle, so no helix/floor-circle vertex lands on it
+                    # and the one landing is the return feed after the floor
+                    if try_cand(x + (rh - 0.05) * math.cos(a),
+                               y + (rh - 0.05) * math.sin(a), rh):
                         return True
             return False
         # RT2: every tier now EMITS at the validated radius and the pitch is
