@@ -76,6 +76,10 @@ AE2_CARRY_EXTRA_MM = 1.0
 # Removed heights are binned per move at FWD_BIN_MM (resolution of the result).
 FWD_BIN_MM = 0.25
 FWD_NBINS = 100
+# Task ZE2B (report-only, ball only): engagement vs the pre-move stock zmap;
+# descent = horizontal travel < ZE2B_DESCENT_FRAC of 3D travel (u undefined,
+# never full-width: axial plunges stay ZB's job).
+ZE2B_DESCENT_FRAC = 0.1
 TOOLS_JSON = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "tools", "x7_tools.json")
 
@@ -1150,6 +1154,95 @@ def _ae2_engagement_keys(win_recs, dia):
     }
 
 
+def _ze2b_chord(a, dia):
+    """Task ZE2B: the ball's chord at axial depth a: c(a) = 2*sqrt(a*(dia-a))."""
+    return 2.0 * math.sqrt(max(a, 0.0) * max(dia - a, 0.0))
+
+
+def _ze2b_windows(moves, dia):
+    """Task ZE2B: merge consecutive ball cutting-feed moves (no rapid between,
+    direction change <= AE2_DIR_MAX_DEG on u, ANY Z change) into ZE2's minimal
+    windows of >= AE2_WINDOW_MM 3D travel (short tail dropped). vol = mm^3
+    removed (live-stock telescope), a = max stock_top - tip over engaged cells
+    (clipped [0,R]), ext/dext = extent perp to u / bbox diagonal."""
+    windows = []
+    cur = None
+
+    def close(w):
+        if w["length_3d"] >= AE2_WINDOW_MM:
+            w["ae_eq"] = round(w["vol"] / w["length_3d"] / w["a"], 4) if w["a"] > 0.0 else 0.0
+            w["w_plan"] = round(min(w["dext"] if w["descent"] else w["ext"], dia), 4)
+            w["c_a"] = round(_ze2b_chord(w["a"], dia), 4)
+            w["theta"] = round(math.degrees(math.acos(1.0 - w["a"] / (dia / 2.0))), 3)
+            windows.append(w)
+
+    for e in moves:
+        if not (cur is not None and e["idx"] == cur["idx"] + 1
+                and e["dx"] * cur["dx"] + e["dy"] * cur["dy"]
+                >= math.cos(math.radians(AE2_DIR_MAX_DEG))):
+            if cur is not None:
+                close(cur)
+            cur = dict(e, n_moves=1, end_line=e["line"])
+        else:
+            cur.update(idx=e["idx"], end_line=e["line"], x=e["x"], y=e["y"])
+            cur["length_3d"] += e["length_3d"]
+            cur["horiz"] += e["horiz"]
+            cur["vol"] += e["vol"]
+            cur["a"] = max(cur["a"], e["a"])
+            cur["ext"] = max(cur["ext"], e["ext"])
+            cur["dext"] = max(cur["dext"], e["dext"])
+            cur["n_moves"] += 1
+        cur["descent"] = cur["horiz"] < ZE2B_DESCENT_FRAC * cur["length_3d"]
+        if cur["length_3d"] >= AE2_WINDOW_MM:
+            close(cur)
+            cur = None
+    if cur is not None:
+        close(cur)
+    return windows
+
+
+def _ze2b_keys(wins, dia, engage_max):
+    """Task ZE2B (report-only): engagement.ze2b for ball programs, with ZE2F's
+    cutting/entry-feed split; full_width = not descent AND a >= 0.05 AND
+    w_plan >= FULL_WIDTH_FRAC x c(a); overload = ae_eq > engage_max."""
+    def brief(w):
+        return {"line": w["line"], "x": w["x"], "y": w["y"], "z": w["z"],
+                "a": round(w["a"], 4), "theta": w["theta"],
+                "w_plan": w["w_plan"], "c_a": w["c_a"], "ae_eq": w["ae_eq"],
+                "length_3d": round(w["length_3d"], 3), "feed": w["feed"],
+                "descent": w["descent"]}
+
+    fw = sorted([w for w in wins if not w["descent"] and w["a"] >= 0.05
+                 and w["w_plan"] >= FULL_WIDTH_FRAC * w["c_a"]],
+                key=lambda w: -(w["w_plan"] / max(w["c_a"], 1e-9)))
+    ov = sorted([w for w in wins if engage_max is not None
+                 and w["ae_eq"] > engage_max], key=lambda w: -w["ae_eq"])
+    by_feed = {}
+    for w in wins:
+        if w.get("feed"):
+            by_feed[w["feed"]] = by_feed.get(w["feed"], 0.0) + w["length_3d"]
+    cut_feed = max(by_feed, key=by_feed.get) if by_feed else None
+    fw_cut = [w for w in fw if cut_feed is None or (w.get("feed") is not None
+                and w["feed"] >= AE2_ENTRY_FEED_FRAC * cut_feed)]
+
+    def cls(ws):
+        return {"count": len(ws),
+                "length_mm": round(sum(w["length_3d"] for w in ws), 1)}
+    return {
+        "n_windows": len(wins),
+        "full_width": dict(cls(fw), worst=[brief(w) for w in fw[:10]]),
+        "overload": dict(cls(ov), worst=[brief(w) for w in ov[:10]]),
+        "ae_eq": _engage_stats([w["ae_eq"] for w in wins]),
+        "w_plan_over_chord": _engage_stats([w["w_plan"] / w["c_a"]
+                                            for w in wins if w["c_a"] > 0.0]),
+        "a": _engage_stats([w["a"] for w in wins]),
+        "descent": cls([w for w in wins if w["descent"]]),
+        "ae2b_cutting_feed": cut_feed,
+        "full_width_cutting_feed": cls(fw_cut),
+        "full_width_entry_feed": cls([w for w in fw if w not in fw_cut]),
+    }
+
+
 def _axial_report(raw):
     """Task ZA: summarize axial plunges (descents steeper than MAX_RAMP_DEG) that removed
     more than AXIAL_FLOOR mm under the tool's flat bottom:
@@ -1267,6 +1360,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     bottom_r = R - corner if tool == "bull" else R
     engage_track = engage_max is not None or engage_report
     k = int(math.ceil(R / cell)) + 1  # +1 so the padded engagement mask fits
+    zb_on = engage_track and tool == "ball"  # task ZE2B (ball only)
+    zb_moves = []
     # shank/over-flute check (only with flute): radius S/2, its own window
     shank_on = flute is not None
     Rs = (shank_dia if shank_dia else dia) / 2.0
@@ -1415,6 +1510,17 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         # task ZE2: plan area of the cells this move removes material from
         # (cells counted once: stock update makes later samples cut 0 there)
         move_area = 0.0
+        # task ZE2B: engagement vs the stock BEFORE this move stamps it (copy)
+        zb_vol = zb_a = zb_ext = zb_dext = 0.0
+        zb_pre = None
+        if cutting and zb_on:
+            bx = np.asarray(samples)
+            zb_ilo = max(0, int(math.floor((bx[:, 0].min() - x0) / cell)) - k)
+            zb_ihi = min(nx, int(math.floor((bx[:, 0].max() - x0) / cell)) + k + 1)
+            zb_jlo = max(0, int(math.floor((bx[:, 1].min() - y0) / cell)) - k)
+            zb_jhi = min(ny, int(math.floor((bx[:, 1].max() - y0) / cell)) + k + 1)
+            if zb_ilo < zb_ihi and zb_jlo < zb_jhi:
+                zb_pre = stock[zb_jlo:zb_jhi, zb_ilo:zb_ihi].copy()
         # travel direction for engagement (perpendicular chord width)
         dx_t = x1 - cur[0]
         dy_t = y1 - cur[1]
@@ -1577,6 +1683,22 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                                     .astype(np.int64), FWD_NBINS - 1)
                     hh = np.bincount(hb, minlength=FWD_NBINS).astype(np.uint32)
                     move_hist = hh if move_hist is None else move_hist + hh
+            if cutting and zb_on:
+                # task ZE2B: vol = live cut (telescopes, each cell once); a/ext
+                # vs the pre-move snapshot where r = stock - z_b > 0.01
+                cb = msk & np.isfinite(cut) & (cut > REMOVE_EPS)
+                if cb.any():
+                    zb_vol += float(cut[cb].sum()) * cell * cell
+                if zb_pre is not None:
+                    sub = zb_pre[jlo - zb_jlo:jhi - zb_jlo, ilo - zb_ilo:ihi - zb_ilo]
+                    eb = msk & np.isfinite(sub) & (sub - newv > 0.01)
+                    if eb.any():
+                        zb_a = max(zb_a, float(np.max(sub[eb] - sz)))
+                        pu = (dx_t * dxg + dy_t * dyg)[eb]
+                        pv = (-dy_t * dxg + dx_t * dyg)[eb]
+                        zb_ext = max(zb_ext, float(pv.max() - pv.min()))
+                        zb_dext = max(zb_dext, math.hypot(float(pu.max() - pu.min()),
+                                                        float(pv.max() - pv.min())))
             if cutting and engage_track:
                 # task ZE: axial depth at this sample = deepest column of
                 # stock removed above the tool surface under the footprint
@@ -1725,6 +1847,15 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     "depth_mm": round(max(move_max_depth, 0.0), 4),
                     "width_mm": round(move_max_engage, 4),
                 })
+            if zb_on and length > 0.0:
+                zb_moves.append({
+                    "idx": mi + idx_offset, "line": mv["line"],
+                    "x": round(x1, 4), "y": round(y1, 4), "z": round(z1, 3),
+                    "dx": dx_t, "dy": dy_t, "length_3d": length,
+                    "horiz": horiz,
+                    "vol": zb_vol, "a": min(max(zb_a, 0.0), R),
+                    "ext": zb_ext, "dext": zb_dext, "feed": mv.get("f"),
+                })
             if engage_max is not None and move_max_engage > engage_max:
                 engage_count += 1
                 engage_spikes.append({
@@ -1779,6 +1910,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         cur = [x1, y1, z1]
 
     ae2_windows = _ae2_windows(ae2_moves) if engage_track else []
+    zb_windows = _ze2b_windows(zb_moves, dia) if zb_on else []
     result = {
         "stock": stock,
         "rapid_collisions": {"count": rapid_collisions,
@@ -1827,6 +1959,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         # task ZE2: raw per-feed area records + built ae2 windows
         "_ae2_move_raw": ae2_moves,
         "_ae2_raw": ae2_windows,
+        "_zb_move_raw": zb_moves,
+        "_zb_raw": zb_windows,
         # raw per-bucket values for exact parallel merging (not reported)
         "_engage_raw": {"horizontal": engage_horiz, "entry": engage_entry},
         # task ZA: report-only for every tool; a FAILING gate for flat/bull
@@ -1841,6 +1975,9 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                            reverse=True)[:10],
         },
     }
+    if tool == "ball" and engage_track:
+        result["engagement"]["semantics"] = "flat-only, see ze2b"
+        result["engagement"]["ze2b"] = _ze2b_keys(zb_windows, dia, engage_max)
     result.update(analyze(stock, part, cell, x0, y0,
                           restrict=window if window is not None else in_box))
     return result
@@ -2028,6 +2165,13 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
     ae2_windows = _ae2_windows(ae2_all)
     combined["_ae2_move_raw"] = ae2_all
     combined["_ae2_raw"] = ae2_windows
+    zb_all = [e for res in results for e in res["_zb_move_raw"]]
+    combined["_zb_move_raw"] = zb_all
+    combined["_zb_raw"] = _ze2b_windows(zb_all, dia) if zb_all else []
+    if tool == "ball" and combined["engagement"] is not None:
+        combined["engagement"]["semantics"] = "flat-only, see ze2b"
+        combined["engagement"]["ze2b"] = _ze2b_keys(combined["_zb_raw"], dia,
+                                                    engage_max)
     if combined["engagement"] is not None:
         combined["engagement"].update(
             _ze_engagement_keys(hw_all, engage_max, dia))
@@ -2230,6 +2374,9 @@ def main(argv=None):
                    help="task ZE2 (report-only extra): write the raw ae2 "
                         "window records (res[_ae2_raw]) to this JSON path in "
                         "addition to the report; changes nothing else")
+    p.add_argument("--ae2b-dump", dest="ae2b_dump", default=None,
+                   help="task ZE2B (report-only extra, ball): write the raw "
+                        "ze2b window records to this JSON path")
     args = p.parse_args(argv)
 
     gtext = None
@@ -2385,6 +2532,9 @@ def main(argv=None):
         # ae_eff, a, old width, length) for post-hoc per-line analysis
         with open(args.ae2_dump, "w") as f:
             json.dump(_sanitize(res["_ae2_raw"]), f, indent=1)
+    if args.ae2b_dump:
+        with open(args.ae2b_dump, "w") as f:
+            json.dump(_sanitize(res.get("_zb_raw", [])), f, indent=1)
     if args.stock_out:
         np.save(args.stock_out, res["stock"])
     if args.png:
