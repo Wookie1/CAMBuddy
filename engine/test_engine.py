@@ -2238,6 +2238,45 @@ def test_rr1c5b_mixed_band_core_front():
                       (0.0, 40.0, 0.0, 40.0, 20.0, 30.0))
 
 
+def test_rr1c5d_live_grid_fine_for_coarse_stock():
+    """RR1c-5d (A): a 0.5 mm input stock must not make the rest-rough's own
+    live checks (descent / link / front-1 confirmation) run on a 0.5 grid -
+    the live grid is the ZB estimator's 0.1. On 07f0c7e it was the input
+    cell (0.5) and under-read the estimator by up to 0.64 mm at a block
+    rim (plateau scene)."""
+    from engine import rest_rough as rr
+    from engine import entry_depth as ed
+    seen = []
+    _orig = ed.LiveStock
+
+    class Spy(_orig):
+        def __init__(self, *a, **k):
+            seen.append(k.get("fine", ed.FINE))
+            _orig.__init__(self, *a, **k)
+    box = _rr1c_boxes()
+    surf = _rr1c_surf(box(0, 40, 0, 40, 20, 26.6))
+    cell = 0.5
+    n = int(40 / cell)
+    cxv = (np.arange(n) + 0.5) * cell
+    X, Y = np.meshgrid(cxv, cxv)
+    A = np.full((n, n), 26.6)
+    A[(X >= 14.0) & (X <= 26.0) & (Y >= 14.0) & (Y <= 26.0)] = 30.0
+    ed.LiveStock = Spy
+    try:
+        rr.rest_rough(surf, (A, 0.0, 0.0, cell), ("ball", 9.525),
+                      floor_z=26.6, stepdown=2.0, ae=1.905, rest_leave=0.2,
+                      min_excess=0.5, min_helix_r=1.903, ramp_angle_deg=2.0,
+                      cut_feed=2280.0, ramp_feed=850.0)
+    finally:
+        ed.LiveStock = _orig
+    assert seen, "rest_rough built no LiveStock"
+    assert seen[0] <= ed.FINE + 1e-12, \
+        "rest-rough live grid %.3f mm for a %.1f mm input stock (must be "\
+        "<= %.1f, the ZB estimator's grid)" % (seen[0], cell, ed.FINE)
+    print("PASS rr1c5d live grid: %.3f mm for a %.1f mm input stock"
+          % (seen[0], cell))
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -2272,7 +2311,8 @@ def _main():
                test_rr1c5b_fully_walled_band_bore_seed,
                test_rr1c5b_mixed_band_core_front,
                test_rr1c5c_closed_pocket_bore_entry_no_deep_axial,
-               test_rr1c5d_front1_chord_offset_slabs):
+               test_rr1c5d_front1_chord_offset_slabs,
+               test_rr1c5d_live_grid_fine_for_coarse_stock):
         try:
             fn()
         except AssertionError as e:

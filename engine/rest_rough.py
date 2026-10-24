@@ -260,8 +260,10 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
     Sg = _resample_stock(stock, xs, ys)
     Zraw = part_cl(surf, dia, xs, ys, workers)
     Zd = cl_dilated(Zraw)
+    # the live grid is never coarser than the ZB estimator's (0.1): a coarse
+    # input stock must not make the engine's own checks read under the gate
     live = fin.LiveStock(stock[0], stock[1], stock[2], stock[3], R,
-                        fine=stock[3])
+                        fine=min(stock[3], fin.FINE))
     if clearance is None:
         clearance = float(np.nanmax(Sg[np.isfinite(Sg)])) + 2.0
     fragments = []
