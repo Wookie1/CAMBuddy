@@ -1118,7 +1118,9 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
              "n_entry_descends": 0, "entry_feed_mm": 0.0,
              "n_reentry_descends": 0, "reentry_feed_mm": 0.0,
              "n_side_entries": 0, "side_entry_feed_mm": 0.0,
+             "credit_fallback": [],  # BS1a4c: every credit fallback at emit
              "mandatory_levels": sorted(round(z, 3) for z in mand)}
+    helix_n = [0]   # BS1a4c: successful entry helices emitted (f3f2165)
     # RP0 diagnosis (engine/TASK_RP0.md): env-gated instrumentation only, no
     # behavior change when RT_RP is unset.
     _RP = bool(os.environ.get("RT_RP"))
@@ -1511,6 +1513,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     stats["side_entry_feed_mm"] += math.dist(off, (x, y))
                     return
             if helix_entry(x, y, z, hc):
+                helix_n[0] += 1   # BS1a4c: this helix backs an entry credit
                 return
             if ax_hard:
                 stats["n_axial_plunge"] += 1
@@ -2017,7 +2020,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 # level is emitted and milled into the LIVE stock - detect the
                 # full-width ring stretches against it now, then order bands
                 # (NN) and rings (NN from the last band).
-                from engine.band import channel_regions
+                from engine.band import (channel_regions, _simulate, AE_SS,
+                                       AE_SPIKE)
                 bands = channel_regions(rings, stock, isl_ok3, z, tool_r,
                                       leave, stock.cell, stats)
                 base = len(regions)
@@ -2058,9 +2062,27 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             pxy0 = (prev[0], prev[1])
             pz0 = prev[2]
             i0m = len(moves)
+            h0 = helix_n[0]
             enter_at(round(entry[0], 4), round(entry[1], 4), z, res["helix"],
                      side=bool(rp2_flag))
             de = descend_feed(pxy0 + (pz0,), i0m)
+            # BS1a4c (f3f2165): a credited BAND start is backed at emit only
+            # by an emitted helix or live-clear disk; else ladder helix,
+            # credit-0 re-check, or not emitted.
+            drop_cut = False
+            if (res.get("credit") or 0.0) > 1e-9 and helix_n[0] == h0:
+                pts_c, q4 = res["paths"][0][1], tuple(res["start"])
+                if not stock.link_clear([q4, q4], z):
+                    ew0 = _simulate(pts_c, stock, z, tool_r, stock.cell, 0.0)
+                    if helix_entry(q4[0], q4[1], z, res["helix"]):
+                        act = "ladder_helix"
+                    elif ew0 and max(ew0) <= AE_SPIKE and sorted(
+                            ew0)[max(0, int(0.95 * len(ew0)) - 1)] <= AE_SS:
+                        act = "replan0_ok"
+                    else:
+                        act, drop_cut = "replan0_drop", True
+                    stats["credit_fallback"].append(
+                        (q4[0], q4[1], round(z, 3), act))
             stats["entry_feed_mm"] += de
             if de > 1e-6:
                 stats["n_entry_descends"] += 1
@@ -2086,7 +2108,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             region_dump.append({"start": entry, "helix": res["helix"],
                               "paths": [[k, len(p)] for (k, p) in res["paths"]]})
             for (kind, pts) in res["paths"]:
-                if kind == "cutting":
+                if kind == "cutting" and not drop_cut:  # BS1a4c: unbacked
                     good = isl_ok(pts)
                     i = 0
                     gap = False

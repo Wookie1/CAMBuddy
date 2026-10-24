@@ -213,3 +213,94 @@ One region (the only ungated one, matching Step 0):
 max_ae: 4.25 mm}` - emitted as a trochoid (zmap max 8.47 on its own moves,
 below the 11.42 mm FW bar), ring keeps its lighter skim; FW at cutting feed
 over the whole program: 0 (= main).
+
+## (10) BS1a4c - honest (backed) entry credit + alignment bar
+
+Session start Fri Oct 23 19:51 MST (hard cap ~21:51), branch bs1a4 @ 39c01b4,
+no commits. All tests via slot_m4.sh (ENGINE_WORKERS=4); no Core Front engine
+or zmap job. Reference f3f2165 read with `git show` only (never
+cherry-pick/checkout).
+
+### Change (45 non-test lines vs 72ea825: band.py +18/-1, rough.py +24/-2;
+### 30-line target exceeded by the mandated emit-time backing - stopped at the
+### ~45 hard stop, no further engine change)
+
+engine/band.py:
+- `engine/band.py:199-211` - `entry_credit(stock, p0, z, tool_r)`, ported to
+  MATCH bs1b f3f2165 (`git show f3f2165:engine/band.py` lines 192-206):
+  credit exactly the radius-tool_r disk an emitted helix really bores -
+  `tool_r` ONLY where standing material (`top > z + 0.05`) under the start
+  disk forces that helix at emit time, else 0. The synthetic 1.3 x tool_r
+  pre-clear is gone from the region planning sims.
+- `engine/band.py:367-369` - the shrink ladder simulates with
+  `cr = entry_credit(stock, path[0], z, tool_r)` instead of `1.3 * tool_r`.
+- `engine/band.py:410-411` - every emitted band region carries
+  `"credit"` = entry_credit at the EMITTED start point (backed at emit time).
+
+engine/rough.py (emit-time backing of BAND regions ONLY; `_stepdown_rings`
+sims ~959/~994 untouched - BS1b's):
+- `engine/rough.py:1121` - `stats["credit_fallback"]` always present (list);
+  `:1123` `helix_n` counter of emitted entry helices; `:1516` successful
+  `helix_entry` increments it.
+- `engine/rough.py:2065,2068-2085` - after `enter_at`: a region carrying
+  credit whose entry emitted NO helix (`helix_n` unchanged) must have a
+  live-clear start disk (`stock.link_clear([q4,q4], z)`); otherwise
+  `ladder_helix` (emit the helix now), else credit-0 re-check of the region's
+  cutting path against AE_SS/AE_SPIKE -> `replan0_ok`, else `replan0_drop`
+  and the cutting path is NOT emitted (`:2111`). Every fallback recorded in
+  `stats["credit_fallback"]` as `(x, y, z, act)`.
+- `engine/rough.py:2023-2024` - imports `_simulate`, `AE_SS`, `AE_SPIKE`
+  from engine.band (engine -> engine only; no zmap/verify import).
+
+Tests (engine/test_engine.py, registered in `_main()`):
+- NEW `test_bs1a4c_backed_credit`: `stats["credit_fallback"]` exists; every
+  emitted band region carries a credit in {0, tool_r} EQUAL to
+  `entry_credit` on the live planning stock (never the synthetic bore); every
+  recorded fallback act is one of ladder_helix/replan0_ok/replan0_drop.
+- `test_bs1a4b_windows_align_zmap` (new in this branch, mine): spy replay now
+  uses the region's carried credit instead of `1.3 * tool_r`; stale root-cause
+  comment replaced with the BS1a4c finding. The 0.15 mm bar is NOT asserted
+  - the STOP below fired.
+
+### Both max differences (test block, emitted region start (6.276,-2.0778),
+### Z 27.381, credit 6.343 = tool_r, `credit_fallback = []` - the credit was
+### backed at emit by the entry helix actually emitted; boundaries identical,
+### option unchanged `shrink0.55`):
+
+- max (engine - zmap) = **+14.070 mm** (over-read, REPORT-ONLY per brief;
+  145 windows > 0.15). Worst at k=0, xy (7.10,-2.63): the engine counts the
+  fresh channel disk in the region's first window while zmap's replay had
+  already removed those cells during the emitted entry (helix + floor circle
+  sweep an offset-centre stadium, not the credit disk about the start point).
+- max (zmap - engine) = **+1.488 mm** (under-read; was +3.865 in BS1a4b -
+  the entry-bore pre-clear under-read at k=1 is GONE, replaced by an
+  over-read there; the remaining under-read moved to the light-load windows).
+
+### STOP (brief item 3): under-read still over 0.15 -> no more fixes.
+All 70 windows over 0.15 BELOW zmap (full listing scratchpad
+`bs1a4c_diag.log`, cause per window):
+- **credit / bore geometry - 1 window**: k=19, xy (6.72,-4.00), -0.250 mm:
+  the tool_r credit disk about the START pre-clears a cell that the emitted
+  helix's real bore (offset centre + floor circle) left standing, so zmap
+  re-counts it inside the region.
+- **grid resolution / disk sampling - 69 windows**: k=163..714 along the
+  trochoid advance (x 14.2..20.2, y -5.9..+2.2), diffs -0.188..-1.488 mm,
+  all light-load (both engine and zmap ae <= 1.5 mm; deltas are single
+  0.25 mm2 cells over ~1 mm windows): the engine's cell-centre disk sampling
+  on its 0.5 mm stock grid misses partial cells zmap's replay counts - the
+  disk-sampling under-read documented in BS1a4 Step 0. No earlier MOVE KIND
+  is missed by the engine stock here (engine cumulative removed area tracks
+  zmap's; no stock-divergence class window appeared), and NO windowing cause
+  remains (boundaries identical, asserted).
+
+### Exit codes (all run by me via slot_m4.sh, ENGINE_WORKERS=4)
+PENDING_PLACEHOLDER_EXITCODES
+
+### fail-on-e5e783e (`git archive e5e783e` -> scratchpad `bs1a4c_e5e`, my
+### test file copied in, never a checkout)
+PENDING_PLACEHOLDER_BASE
+
+`git diff e5e783e -- engine/test_engine.py` has exactly ONE "-" line - the
+old `_main()` tuple closing line `test_rr1a_rough_cli_refuses_ball):` - no
+existing test or assertion changed.
+

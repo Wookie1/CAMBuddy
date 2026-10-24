@@ -196,6 +196,20 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None):
     return wins
 
 
+def entry_credit(stock, p0, z, tool_r):
+    """BS1a4c honest entry credit (bs1b f3f2165): tool_r only where standing
+    stock under the start disk forces a helix at emit; else 0."""
+    k = int(math.ceil(tool_r / stock.cell))
+    ci, cj = stock._ci(p0[0]), stock._cj(p0[1])
+    for dj in range(-k, k + 1):
+        for di in range(-k, k + 1):
+            if (di * di + dj * dj) * stock.cell ** 2 <= tool_r * tool_r \
+                    and 0 <= ci + di < stock.nx and 0 <= cj + dj < stock.ny \
+                    and stock.top[cj + dj, ci + di] > z + 0.05:
+                return tool_r
+    return 0.0
+
+
 def _opt_key(wins, ends, fw_min):
     """BS1a4b rank key for the lightest option of a gate-failing region:
     fewest full-width windows at cutting feed, then lowest max ae, then
@@ -350,8 +364,9 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                     if len(path) < 6:
                         break
                     we = []
+                    cr = entry_credit(stock, path[0], z, tool_r)  # BS1a4c
                     wins = _simulate(path, stock, z, tool_r, cell,
-                                    1.3 * tool_r, we)  # smallest helix bore
+                                    cr, we)
                     if not wins:
                         break
                     spike = max(wins)
@@ -392,6 +407,8 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                 cl_len += length
                 regions.append({"start": list(pts_out[0]), "helix": None,
                                "paths": [["cutting", pts_out]]})
+                regions[-1]["credit"] = entry_credit(stock, pts_out[0], z,
+                                                    tool_r)  # back at emit
     if stats is not None:
         stats["n_band_regions"] = stats.get("n_band_regions", 0) + len(regions)
         # BS1a4b: every region that failed its gate at every shrink level is

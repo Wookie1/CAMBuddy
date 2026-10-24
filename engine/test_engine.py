@@ -1094,7 +1094,8 @@ def _main():
                test_stl_cache_keyed_by_content,
                test_rr1a_rough_cli_refuses_ball,
                test_bs1a4b_failed_region_lightest,
-               test_bs1a4b_windows_align_zmap):
+               test_bs1a4b_windows_align_zmap,
+               test_bs1a4c_backed_credit):
         try:
             fn()
         except AssertionError as e:
@@ -1927,7 +1928,8 @@ def test_bs1a4b_windows_align_zmap():
         for r in res:                # replay the EMITTED moves, live stock
             pts = [tuple(q) for q in r["paths"][0][1]]
             e = []
-            w = _orig_sim(pts, stock, z, tool_r, cell, 1.3 * tool_r, e)
+            w = _orig_sim(pts, stock, z, tool_r, cell, r.get("credit") or 0.0,
+                          e)
             idxs = []
             k = 0
             tot = 0.0
@@ -2022,19 +2024,80 @@ def test_bs1a4b_windows_align_zmap():
         worst_ze = max(worst_ze, -min(diffs))
         n_cmp += 1
     assert n_cmp == len(replay), "some region could not be compared"
-    # BS1a4b finding: the per-window AREAS still differ both ways (max
-    # zmap-minus-engine and engine-minus-zmap below). Root cause is NOT the
-    # windowing (boundaries are identical): it is the entry-bore pre-clear
-    # convention in _simulate (1.3 x tool_r assumed pre-cut by the helix)
-    # plus engine-live-stock vs judge-replay divergence - the disk-sampling
-    # under-read already documented in BS1a4 Step 0, present on e5e783e too.
-    # The supervisor's 0.15 mm bar is therefore NOT met by window alignment
-    # alone; both directions are reported (see BS1a4_RESULTS.md section 4).
+    # BS1a4c finding: with the honest entry credit (entry_credit, replayed
+    # here at the region's carried credit) the entry-bore under-read of
+    # BS1a4b (3.865 mm at k=1) is GONE - the residual under-read (~1.5 mm,
+    # max window 0.25..1.49 mm) is the engine's cell-centre disk sampling on
+    # the 0.5 mm grid vs zmap's replay, spread over light-load windows along
+    # the trochoid, plus one credit-geometry window at the start (the credit
+    # disk about the start point vs the emitted helix's stadium). Boundaries
+    # stay identical (asserted above). The 0.15 mm bar is therefore NOT met
+    # by the credit port alone; per the brief's STOP rule both directions are
+    # reported, not asserted (see BS1a4_RESULTS.md section 10).
     print("bs1a4b max diff both ways: engine-zmap %+.3f mm, zmap-engine "
           "%.3f mm" % (worst_ez, worst_ze))
     print("PASS bs1a4b alignment: %d region(s), window boundaries identical;"
           " max engine-zmap %+.3f mm, max zmap-engine %.3f mm" % (
               n_cmp, worst_ez, worst_ze))
+
+
+def test_bs1a4c_backed_credit():
+    """Task BS1a4c: honest (backed) entry credit. channel_regions plans its
+    ZE2 replays with entry_credit - tool_r ONLY where standing stock under
+    the start disk forces a helix descent at emit time, else 0 (never the
+    synthetic 1.3 x tool_r pre-clear) - and every band region carries that
+    credit; rough.py backs it at emit time (ladder helix, else credit-0
+    re-check against the gates, else not emitted) and records every fallback
+    in stats["credit_fallback"]. Assert here: the stat exists, every emitted
+    band region carries an honest credit (0 or tool_r) equal to
+    entry_credit on the LIVE planning stock, and every recorded fallback is
+    one of the three backed actions. FAILS on e5e783e: there the stat does
+    not exist and regions carry no credit (the sim pre-clears 1.3 x tool_r
+    unconditionally)."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    _need(TB_STL)
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.rough import rough
+    captured = []
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None):
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats)
+        for r in res:
+            assert "credit" in r, \
+                "band region carries no honest entry credit: the planning " \
+                "sim still assumes the synthetic 1.3 x tool_r entry bore"
+            assert -1e-9 <= r["credit"] <= tool_r + 1e-9, \
+                "credit %r exceeds the disk an emitted helix can bore " \
+                "(tool_r = %r)" % (r["credit"], tool_r)
+            assert abs(r["credit"] - B.entry_credit(stock, r["start"], z,
+                                                    tool_r)) < 1e-9, \
+                "region credit %r != entry_credit on the live stock at %s" % (
+                    r["credit"], r["start"])
+            captured.append((round(z, 3), tuple(r["start"]), r["credit"]))
+        return res
+
+    _orig_cr = B.channel_regions
+    B.channel_regions = cr_spy
+    try:
+        stock_box = (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0)
+        tool_r = 6.343
+        surf = ocl.STLSurf()
+        ocl.STLReader(TB_STL, surf)
+        moves, stats = rough(surf, stock_box, tool_r, 20.0, leave=0.381,
+                             axial_leave=0.381, stepdown=19.05, stepover=0.16,
+                             stl_path=TB_STL, workers=None, threads=4,
+                             stock_cell=0.5, final_zmin=20.381)
+    finally:
+        B.channel_regions = _orig_cr
+    assert "credit_fallback" in stats, \
+        "stats has no credit_fallback: emit does not back entry credits"
+    assert captured, "no band regions emitted on the test block"
+    for f in stats["credit_fallback"]:
+        assert f[3] in ("ladder_helix", "replan0_ok", "replan0_drop"), \
+            "unknown credit fallback action: %r" % (f,)
+    print("PASS bs1a4c backed credit: %d region(s) %s, fallbacks %s" % (
+        len(captured), captured, stats["credit_fallback"]))
 
 
 if __name__ == "__main__":
