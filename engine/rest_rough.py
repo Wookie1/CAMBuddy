@@ -811,6 +811,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                 else:
                     paths = zigzag_runs(reg, xs, ys, ae, 2 * CELL)
                     clneed = [False] * len(paths)
+                f1 = [False] * len(paths)   # strip/zigzag paths are not fronts
             cut_here = 0
             skipped = 0
             # RR1c-5b engagement model: cleared at this Z (seed) + fronts
@@ -818,6 +819,9 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
             clmn = seed.copy()   # RR1c5d: near-groove mask for depth links
             dilk = int(round(ae / 2.0 / CELL)) + 1
             if len(f1) != len(paths):   # thin-strip / zigzag fallback paths
+                stats.setdefault("rr_f1_mismatch", []).append(
+                    {"zone": zi, "t": round(t, 3), "n_f1": len(f1),
+                     "n_paths": len(paths)})
                 f1 = [False] * len(paths)
             while paths:
                 if ring_seq:
