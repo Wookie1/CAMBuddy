@@ -1709,8 +1709,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     eb = msk & np.isfinite(sub) & (sub - newv > 0.01)
                     if eb.any():
                         zb_a = max(zb_a, float(np.max(sub[eb] - sz)))
-                        pu = (dx_t * dxg + dy_t * dyg)[eb]
-                        pv = (-dy_t * dxg + dx_t * dyg)[eb]
+                        pu = (dx_t * gx[None, :] + dy_t * gy[:, None])[eb]
+                        pv = (-dy_t * gx[None, :] + dx_t * gy[:, None])[eb]
                         zb_ext = max(zb_ext, float(pv.max() - pv.min()))
                         zb_dext = max(zb_dext, math.hypot(float(pu.max() - pu.min()),
                                                         float(pv.max() - pv.min())))
