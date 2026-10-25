@@ -2168,7 +2168,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                         # piece joining q4 by a segment-checked chord emits.
                         opt, pnew, wn, ba, _g = shrink_ladder(
                             res["seg"], stock, z, tool_r, stock.cell, 0.0,
-                            (res["dropkey"], "drop_ring", None, []))
+                            (res["dropkey"], "drop_ring", None, []),
+                            approach=q4)   # BS1a4d6d: pcs[0] emits from q4
                         act, drop_cut = "replan0_drop", True
                         if pnew is not None:
                             g2 = isl_ok3([(round(a, 4), round(b, 4))

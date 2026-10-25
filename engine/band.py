@@ -152,7 +152,7 @@ def _advance(r, tool_r):
 
 
 def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None,
-              entry="bore"):
+              entry="bore", approach=None):
     """Replay ZE2 windowing on the engine stock grid: move-aligned windows of
     path travel; a window's area = distinct cells whose live top stands above
     z + 0.05 and that first fall under the cutter disk (applied at every
@@ -161,7 +161,14 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None,
     pre-cleared when entry="bore"; "side"/"link" not (BS1a4d6c). Returns the
     list of per-window ae_eff estimates (mm); ends collects each window's
     cumulative end-of-window travel (zmap _ae2_windows: moves merge until the
-    window reaches 1 mm, a move >= 1 mm is its own window)."""
+    window reaches 1 mm, a move >= 1 mm is its own window).
+    approach (BS1a4d6d): the emitted entry move's start point; for
+    "side"/"link" it is replayed as the first move into path[0]."""
+    if approach is not None and entry in ("side", "link"):
+        # BS1a4d6d: the emitter FEEDS INTO path[0] from `approach`; replay
+        # that move through the live stock so window 0 holds the approach's
+        # own engagement, not the whole standing start disk.
+        path = [tuple(approach[:2])] + list(path)
     k = int(math.ceil(tool_r / cell))
     offs = [(dj, di) for dj in range(-k, k + 1) for di in range(-k, k + 1)
             if (dj * dj + di * di) * cell * cell <= tool_r * tool_r]
@@ -246,7 +253,7 @@ def _opt_key(wins, ends, fw_min):
 
 
 def shrink_ladder(seg, stock, z, tool_r, cell, credit=None, dropopt=None,
-                  borefn=None):
+                  borefn=None, approach=None):
     """BS1a4d: channel_regions' shrink ladder AND Fix 1's lightest-option
     ranking as one callable, so the emit-time credit-0 re-plan (a0) reuses
     them: credit 0.0 on the LIVE stock vs drop-ring, same _opt_key rank
@@ -270,7 +277,8 @@ def shrink_ladder(seg, stock, z, tool_r, cell, credit=None, dropopt=None,
             cr = 0.0   # BS1a4d4 (c): no predicted bore = unbacked credit
         wins = _simulate(path, stock, z, tool_r, cell,
                         cr + (bxy[2] if bxy else 0.0), we, bore_xy=bxy,
-                        entry="bore" if cr > 1e-9 else "side")
+                        entry="bore" if cr > 1e-9 else "side",
+                        approach=approach)
         if not wins:
             break
         best_area = max(best_area, sum(wins))

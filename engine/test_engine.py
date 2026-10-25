@@ -1098,7 +1098,10 @@ def test_bs1a4d6c_side_entry_no_under_read():
     p0 = (-17.0, 3.0)
     path = [(p0[0], round(p0[1] - 0.4 * i, 4)) for i in range(16)]
     ends = []
-    wins = B._simulate(path, st, z, tr, cell, 0.0, ends=ends, entry="side")
+    # BS1a4d6d: the emitted arrival feeds sideways at depth from (-17.0, 0.0)
+    # onto P0 (the offset_down shape below), so predict that approach too.
+    wins = B._simulate(path, st, z, tr, cell, 0.0, ends=ends, entry="side",
+                       approach=(-17.0, 0.0))
     # window value is AREA (mm^2); as a width: area / that window's travel
     lens = [e - (ends[i - 1] if i else 0.0) for i, e in enumerate(ends)]
     pred = max((a / ln for a, ln in zip(wins, lens)), default=0.0)
@@ -1151,15 +1154,66 @@ def test_bs1a4d6c_side_entry_no_under_read():
            and (round(w["x"], 3), round(w["y"], 3)) in key]
     assert own, "no judged arrival window at the side entry: vacuous test"
     judged = max(w["ae_eff"] for w in own)
-    print("BS1a4d6c side entry into standing stock: predictor max width "
-          "%.3f mm vs zmap-judged max ae_eff %.3f mm (arrival windows %d)"
-          % (pred, judged, len(own)))
+    D = 2.0 * tr
+    print("BS1a4d6c/d side entry into standing stock: predictor max width "
+          "%.3f mm vs zmap-judged max ae_eff %.3f mm (arrival windows %d, "
+          "D %.3f mm)" % (pred, judged, len(own), D))
     assert pred >= judged, \
         "UNDER-READ: credit-0 side arrival predictor width %.3f mm < " \
         "zmap-judged %.3f mm (the entry's own engagement is missing from the " \
         "prediction)" % (pred, judged)
+    assert pred <= D, \
+        "OVER-READ: credit-0 side arrival predictor width %.3f mm > " \
+        "D %.3f mm - impossible as an engagement width (the approach move " \
+        "into path[0] is not being simulated)" % (pred, D)
     print("PASS bs1a4d6c side-entry no-under-read: predictor %.3f mm >= "
-          "judged %.3f mm" % (pred, judged))
+          "judged %.3f mm and <= D %.3f mm" % (pred, judged, D))
+
+
+def test_bs1a4d6d_approach_simulated_in_window0():
+    """BS1a4d6d item 1 (pure engine, no zmap): for entry="side"/"link" with
+    approach=A, band._simulate replays the move A -> path[0] through the live
+    stock, so window 0 holds the approach's own engagement (width <= D)
+    instead of the whole standing start disk (width > D). entry="bore" must
+    ignore approach (pre-clear route unchanged)."""
+    import engine.band as B
+    from engine.stock import StockField
+    tr, cell, z = 6.343, 0.5, 6.0
+    D = 2.0 * tr
+
+    def fresh():
+        st = StockField((-25.0, 25.0, -20.0, 20.0, 0.0, 6.15), cell=cell)
+        st.mill_segment(-20.0, 0.0, -20.0, 0.0, z, tr, 0.0)
+        st.mill_path([(-20.0, 0.0), (-17.0, 0.0)], z, tr, 0.0)
+        return st
+    p0 = (-17.0, 3.0)
+    path = [(p0[0], round(p0[1] - 0.4 * i, 4)) for i in range(16)]
+    A = (-17.0, 0.0)
+
+    def widths(bore_r=0.0, **kw):
+        ends = []
+        wins = B._simulate(path, fresh(), z, tr, cell, bore_r, ends=ends,
+                           **kw)
+        lens = [e - (ends[i - 1] if i else 0.0) for i, e in enumerate(ends)]
+        return [a / ln for a, ln in zip(wins, lens)]
+    w_no = widths(entry="side")
+    w_ap = widths(entry="side", approach=A)
+    print("BS1a4d6d window0 width: no-approach %.3f mm, with-approach "
+          "%.3f mm (D %.3f mm)" % (w_no[0], w_ap[0], D))
+    assert w_no[0] > D, "today's bug should over-read window 0 (> D): %.3f" \
+        % w_no[0]
+    assert 0.0 < w_ap[0] <= D, "approach's own engagement must be in window " \
+        "0 and a possible width: %.3f mm (D %.3f)" % (w_ap[0], D)
+    assert w_ap[0] < w_no[0], "simulating the approach must lower window 0 " \
+        "below the standing disk"
+    assert max(w_ap) <= max(w_no), "the approach may not invent load"
+    # entry="bore" keeps its pre-clear route and ignores approach
+    b_plain = [round(v, 6) for v in widths(entry="bore", bore_r=tr)]
+    b_appr = [round(v, 6) for v in widths(entry="bore", bore_r=tr,
+                                           approach=A)]
+    assert b_plain == b_appr, "approach must not touch entry='bore'"
+    print("PASS bs1a4d6d approach simulated in window 0: %.3f -> %.3f mm"
+          % (w_no[0], w_ap[0]))
 
 
 def _main():
@@ -1198,7 +1252,8 @@ def _main():
                test_bs1a4d4_entry_pinned_to_stored_start,
                test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load,
                test_bs1a4d6b_q4_entry_bore_in_live_stock,
-               test_bs1a4d6c_side_entry_no_under_read):
+               test_bs1a4d6c_side_entry_no_under_read,
+               test_bs1a4d6d_approach_simulated_in_window0):
         try:
             fn()
         except AssertionError as e:

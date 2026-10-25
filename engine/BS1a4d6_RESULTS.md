@@ -457,3 +457,118 @@ chord (cutting feed), not a unit error, and the emitted piece is unchanged
   pre-clear restored for side/link): 9.375 < 11.458 mm, FAIL by an under-read of 2.083 mm.
 - Open: the clean predictor width 23.958 mm exceeds D 12.686 - for entry="side" the approach move into path[0] is not
   simulated, so the standing start disk lands in window 0 (an over-read).
+
+## BS1a4d6d (started 10:55 MST, fresh session, 2 h cap)
+
+### Cause (written before any code change)
+For entry="side"/"link", band._simulate() starts the replay at path[0] = P0 and
+never simulates the approach move the emitter actually feeds INTO P0 (side
+entry: offset_down() feeds sideways at depth from the verified-clear column
+`off` onto P0, rough.py offset_down(); link: the link path itself). The live
+stock under P0 therefore still shows the WHOLE standing start disk, and that
+disk's area lands in window 0: the side-entry test measures predictor width
+23.958 mm > D = 12.686 mm - impossible as an engagement width (an over-read).
+The approach's own sweep (which removes most of that disk before the tool
+reaches P0) is missing from the prediction.
+
+### Change (file:line, vs 5b6e6b0)
+- engine/band.py:155 _simulate(..., approach=None); band.py:167-171: for
+  entry="side"/"link" with approach given, prepend approach as the first
+  replayed move (approach -> path[0]) through the live stock; band.py:255-256
+  shrink_ladder(..., approach=None); band.py:280-281 forwards it to _simulate.
+- engine/rough.py:2169-2172 emit re-check credit-0 re-plan: shrink_ladder(...,
+  approach=q4) - pcs[0] is emitted FROM q4 (rough.py:2186), so q4 IS the
+  emitted approach start for the re-planned path.
+- Callers that CANNOT know the emitted approach start (kept today's
+  behaviour, not guessed):
+  * engine/band.py:438 shrink_ladder call in channel_regions (PLAN time: the
+    entry method/column is only chosen later at emit).
+  * engine/rough.py:1461 lnk_cut_ok (w = _simulate at 1461): every caller
+    passes a path that STARTS
+    where the tool physically stands (fdin rough.py:1520 path begins at the
+    find_shift column off after a vertical descent; brdg rough.py:2258 and
+    flnk rough.py:2385 begin at prev) - no approach segment precedes path[0].
+  * engine/rough.py:2156 ew0 re-check _simulate(entry="link"): the emitted
+    approach into q4 (offset_down's off column) is computed inside
+    find_shift/feed_down and is not exposed here; moreover the LIVE stock
+    passed there is already milled by that approach (offset_down mills it),
+    so re-simulating it would double-remove.
+- engine/test_engine.py: side-entry test now passes approach=(-17.0, 0.0)
+  (the emitted feed-in move's start) and asserts BOTH pred >= judged and
+  pred <= D, printing both; NEW test_bs1a4d6d_approach_simulated_in_window0
+  (pure engine) wired into _main.
+
+### Progress log
+- Baseline (before change): side-entry test EXIT=0, pred 23.958 vs judged
+  11.458 (4 arrival windows). Diagnostic (scratch/diag_bs1a4d6d.py): judged
+  11.458 = the LAST piece window (crossing the channel's far edge); the
+  feed-in window itself is judged 10.167 mm; single-step approach replay
+  gives engine window 0 = 11.583 mm (>= 10.167, no under-read).
+- After change: test_bs1a4d6c_side_entry_no_under_read EXIT=0 (pred 11.583
+  mm >= judged 11.458 mm, <= D 12.686 mm).
+- NEW test_bs1a4d6d_approach_simulated_in_window0 EXIT=0 (window0 23.958 ->
+  11.583 mm; entry="bore" unaffected by approach).
+- NOTE: slot_m4.sh MASKS exit codes (missing-pytest probe returned EXIT=0
+  with a traceback); runner scratch/run_d.sh captures rc INSIDE the slot.
+- git diff --numstat vs 5b6e6b0: band.py 12/4, rough.py 2/1 (= 19 engine
+  lines, budget <= 20), test_engine.py in progress.
+
+### Item 2 result
+test_bs1a4d6c_side_entry_no_under_read (final version, after the assertion
+change) EXIT=0:
+"predictor max width 11.583 mm vs zmap-judged max ae_eff 11.458 mm
+(arrival windows 4, D 12.686 mm)" - asserts BOTH 11.583 >= 11.458 (no
+under-read) and 11.583 <= 12.686 (possible width), prints both.
+
+### Item 3 mutation (scratch copy scratch/mut_d, reverted by removal)
+Copy of engine/+verify/ with the _simulate prepend disabled
+("and False" - skip the approach, BS1a4d6c behaviour). Both tests FAIL:
+- test_bs1a4d6c_side_entry_no_under_read EXIT=1, BY THE MEASURED WIDTH:
+  "OVER-READ: credit-0 side arrival predictor width 23.958 mm > D 12.686 mm"
+  (printed: predictor 23.958 mm vs judged 11.458 mm, D 12.686 mm).
+- test_bs1a4d6d_approach_simulated_in_window0 EXIT=1: "with-approach 23.958
+  mm (D 12.686)" - window 0 identical to no-approach (23.958 -> 23.958).
+scratch/mut_d removed after recording.
+
+### At-risk battery (all 19) + new test - exit codes captured INSIDE the
+slot by scratch/run_d.sh (slot_m4.sh masks exit codes; see Progress log):
+test_bs1a4d_credit0_lightest_option EXIT=0
+test_bs1a_lshaped_channel EXIT=0
+test_bs1a4d_credit_real_bore EXIT=0
+test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load EXIT=0
+test_bs1a4d2b_centred_entry_bore EXIT=0
+test_bs1a4d4_credit_entry_matches_prediction EXIT=0
+test_bs1a4d4_entry_pinned_to_stored_start EXIT=0
+test_bs1a4c_backed_credit EXIT=0
+test_bs1a4b_failed_region_lightest EXIT=0
+test_bs1a4b_windows_align_zmap EXIT=0
+test_bs1a4c2_band_chord_cl_checked EXIT=0
+test_bs1a4c_fix_no_post_entry_helix EXIT=0
+test_bs1a4d3_links_measured_as_cuts EXIT=0
+test_bs1a_straight_channel EXIT=0
+test_bs1a3_no_band_after_a2d EXIT=0
+test_rough_synth_pocket_repro EXIT=0
+test_dt1_synthetic_rough_twice_identical EXIT=0
+test_bs1a4d6b_q4_entry_bore_in_live_stock EXIT=0
+test_bs1a4d6c_side_entry_no_under_read EXIT=0 (final version, re-run after
+the assertion change; also run pre-change at baseline EXIT=0)
+NEW test_bs1a4d6d_approach_simulated_in_window0 EXIT=0
+import engine.test_engine (with the new test wired into _main) EXIT=0.
+19/19 at-risk GREEN + new test GREEN.
+
+### Close-out (BS1a4d6d)
+- Started 10:55 MST, finished 11:58 MST (within the 2 h cap).
+- git diff --numstat vs 5b6e6b0: engine/band.py 12/4, engine/rough.py 2/1
+  = 19 changed non-test engine lines (budget <= 20);
+  engine/test_engine.py 61/6 (tests only: the item-2 assertions in the
+  side-entry test + the new test + its _main wiring);
+  BS1a4d6_RESULTS.md append-only; TASK brief + opencode.json pre-existing.
+- No locks touched; no Core Front job; no commit; no git
+  stash/reset/clean/restore/checkout/rebase/cherry-pick; no bypass flags;
+  no gate relaxed; no limit/floor raised (ZE2B 2.286 / ZE2 2.44 / ZA 0.2 /
+  ZB 0.5 / AE_SPIKE / AE_SS untouched); no margin/leave/feed change;
+  verify/ and opencode.json NOT edited; engine code imports nothing from
+  zmap/verify; edits confined to engine/band.py, engine/rough.py,
+  engine/test_engine.py; scratch only under scratch/ (diag_bs1a4d6d.py,
+  run_d.sh, run_mut_d.sh, mut_d/ created-then-removed).
+- BS1a4d6d DONE.
