@@ -1039,6 +1039,7 @@ def _ae2_windows(moves):
         else:
             tgt["area_mm2"] += w["area_mm2"]
             tgt["length_mm"] += w["length_mm"]
+            tgt["n_moves"] += w["n_moves"]
             tgt["a"] = max(tgt["a"], w["a"])
             if w["hist"] is not None:
                 tgt["hist"] = (w["hist"] if tgt["hist"] is None
