@@ -541,3 +541,18 @@ Scratch (all under scratch/): rr1c5g_probe.py, rr1c5g_scene.py, rr1c5g_scan.py, 
 rr1c5g_replay.py, rr1c5g_atrisk.py, rr1c5g_mut_run.py, rr1c5g_rr_mut.py + .out files. Nothing committed.
 Lane note: one scan invocation exceeded the 15-min shell timeout (validate_exact on pathological wide-channel
 scenes); the slot cleared the dead owner itself; no lock was touched. Subsequent scans dropped validate_exact.
+
+## RR1c5d front-1 test retired (supervisor, 2026-10-25, coordinator decision)
+test_rr1c5d_front1_chord_offset_slabs is removed (no replacement). Why:
+- Vacuous since the commit that added it (8d96cea): supervisor bisect over 7 rr1b commits, deep cutting-feed windows
+  0 in every one; its "deep" windows came only from the guard sim's 2 mm grid misregistration (RR1c5f facts).
+- Unreachable on the aligned grid (RR1c5g, shared _rr1c5b_zmap_origin kept): ~30 scenes, gate deep 0 in all, max a
+  (feed) <= 0.303; a deep front-1 needs ~2 mm of legal CL inside the channel (pocket A admits |c0| < 0.24).
+- No engine mechanism pins it: a replacement asserting "entries/links at ramp feed keep cutting-feed max a <= 0.5"
+  was tried; with every entry/link run at cutting feed (rest_rough ramp_feed = cut_feed, scratch wrapper) the
+  measured gate sim still reads max a 0.154 (clean 0.145), ZE2B over 0.0 mm, full-width 0 - ZE2 windows are
+  horizontal-only, so entry feed is not what keeps max a low. The test could only fail on its own feed assert.
+- Engagement stays covered by the other _rr1c5b_zmap_gate callers (test_rr1c5b_varying_width_band_fronts,
+  test_rr1c5b_open_edge_proud_block, test_rr1c5b_mixed_band_core_front), all passing on 782859f.
+- Latent follow-up RR-FRONT1: in a channel wide enough for ~2 mm of front-1 CL, the next front would bite raw over
+  ae/2 + hch >= 3.2 mm > 2.286. Unreachable on any scene today; revisit if channel geometry changes.
