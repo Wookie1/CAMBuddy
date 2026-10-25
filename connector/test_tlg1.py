@@ -326,3 +326,17 @@ def test_t_number_collision_library_tool_wins(home, tmp_path):
     assert r3.returncode == 0, r3.stderr[-800:]
     hd = json.load(open(str(zj)))["holder"]
     assert hd["status"] == "checked" and hd["stickout_mm"] == pytest.approx(33.0), hd
+
+
+def test_repo_tool_with_null_holder_keeps_tl2_behaviour(home, tmp_path):
+    """Coordinator (TLG1 review 1): the completeness check applies only to
+    library-only tools. A used REPO-table tool whose row has a null holder /
+    stick-out (T3 bull-12.700-r0.127) is not refused by the geometry check,
+    exactly as on 98a5706 (TL2: mismatch compare only)."""
+    t3 = next(t for t in json.load(open(os.path.join(
+        REPO, "tools", "x7_tools.json")))["tools"] if t.get("number") == 3)
+    assert t3.get("holder") is None and t3.get("stickout_mm") is None, t3
+    cfg = {"engine_python": PY, "repo_root": REPO, "home": home}
+    run = runner_mod.EngineRun(cfg, str(tmp_path / "run"))
+    run._load_tools({})
+    run._check_library_geometry({3})       # must not raise

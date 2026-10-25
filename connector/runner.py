@@ -365,7 +365,8 @@ class EngineRun:
                         % (e.get("tool_id"), key, a, b),
                         code="tool_geometry_mismatch", field=key, got=a,
                         allowed=b)
-            missing = [k for k in _GEOMETRY_KEYS if e.get(k) is None]
+            missing = [k for k in _GEOMETRY_KEYS if e.get(k) is None] \
+                if r is None else []   # repo-table rows: TL2 compare only
             if missing:
                 raise EngineError(
                     "tool %s (T%s) has no complete geometry in the tool "

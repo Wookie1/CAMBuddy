@@ -518,15 +518,17 @@ def main(argv=None):
 
     a = p.parse_args(argv)
 
-    # TLG1: --tools-json redirects the table constant the lookups of this
-    # call read (finish.py geometry/holder, post_lnc lookup_tool). Unset:
-    # nothing is imported or changed (byte-identical).
+    # TLG1: --tools-json redirects BOTH table constants (finish.py
+    # geometry/holder, post_lnc lookup_tool; both read at call time), so no
+    # call can read two tables. Unset: nothing is changed (byte-identical).
     if getattr(a, "tools_json", None):
-        if a.cmd == "finish":
-            from engine import finish as _tool_table
-        else:
-            from engine import post_lnc as _tool_table
-        _tool_table.TOOL_TABLE_PATH = a.tools_json
+        from engine import post_lnc as _pl
+        _pl.TOOL_TABLE_PATH = a.tools_json
+        try:
+            from engine import finish as _fin
+            _fin.TOOL_TABLE_PATH = a.tools_json
+        except ImportError:   # no opencamlib: no finish lookup can run here
+            pass
 
     if a.cmd == "finish":
         return finish_main(a)
