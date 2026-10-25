@@ -1354,12 +1354,17 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         stock[~window] = -np.inf
     R = dia / 2.0
     dz = tool_dz(tool, dia, corner)
+    # task SP2: for a ball, the exact dz(d) op chain is replayed in-place on
+    # one scratch buffer per sample (same ops, same order, same dtype) so the
+    # per-sample closure allocates nothing.
+    ball_surf = tool == "ball"
     # task ZA: bottom disk radius for the axial plunge check -- the flat part
     # of the tool's bottom: R for flat, R - corner for bull; a ball has no
     # flat bottom, so its full disk is judged against the spherical surface
     bottom_r = R - corner if tool == "bull" else R
     engage_track = engage_max is not None or engage_report
     k = int(math.ceil(R / cell)) + 1  # +1 so the padded engagement mask fits
+    surf_buf = np.empty((2 * k + 1, 2 * k + 1)) if ball_surf else None
     zb_on = engage_track and tool == "ball"  # task ZE2B (ball only)
     zb_moves = []
     # shank/over-flute check (only with flute): radius S/2, its own window
@@ -1557,7 +1562,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             if ilo < ihi and jlo < jhi:
                 dxa = xs[ilo:ihi] - x1
                 dya = ys[jlo:jhi] - y1
-                da = np.hypot(*np.meshgrid(dxa, dya))
+                da = np.hypot(dxa, dya[:, None])
                 win_a = stock[jlo:jhi, ilo:ihi]
                 keep = (da <= bottom_r + 1e-9) & np.isfinite(win_a)
                 if keep.any():
@@ -1592,8 +1597,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 slo, shi = max(0, i0 - ks), min(nx, i0 + ks + 1)
                 tlo, thi = max(0, j0 - ks), min(ny, j0 + ks + 1)
                 if slo < shi and tlo < thi:
-                    dsg = np.meshgrid(xs[slo:shi] - sx, ys[tlo:thi] - sy)
-                    dd = np.hypot(dsg[0], dsg[1])
+                    dd = np.hypot(xs[slo:shi] - sx, (ys[tlo:thi] - sy)[:, None])
                     dsh = dd <= Rs + 0.75 * cell
                     vsh = np.where(dsh, np.maximum(stock[tlo:thi, slo:shi],
                                                    part[tlo:thi, slo:shi]),
@@ -1626,8 +1630,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     slo, shi = max(0, i0 - kH), min(nx, i0 + kH + 1)
                     tlo, thi = max(0, j0 - kH), min(ny, j0 + kH + 1)
                     if slo < shi and tlo < thi:
-                        dsg = np.meshgrid(xs[slo:shi] - sx, ys[tlo:thi] - sy)
-                        dd = np.hypot(dsg[0], dsg[1])
+                        dd = np.hypot(xs[slo:shi] - sx, (ys[tlo:thi] - sy)[:, None])
                         dH = dd <= Rh
                         mat = np.maximum(
                             np.where(np.isfinite(stock[tlo:thi, slo:shi]),
@@ -1662,16 +1665,28 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 if cutting:
                     air_length += seg_len
                 continue
-            dxg, dyg = np.meshgrid(gx, gy)
-            d = np.hypot(dxg, dyg)
+            d = np.hypot(gx[None, :], gy[:, None])
             msk = d <= R + 1e-9
             if window is not None:
                 msk &= window[jlo:jhi, ilo:ihi]
             if not msk.any():
                 continue
-            newv = np.where(msk, sz + dz(d), np.inf)
+            if ball_surf:
+                # exact dz(d) chain into scratch, then sz + dz (same ops)
+                t = surf_buf[:gy.size, :gx.size]
+                np.multiply(d, d, out=t)
+                np.subtract(R * R, t, out=t)
+                np.maximum(t, 0.0, out=t)
+                np.sqrt(t, out=t)
+                np.subtract(R, t, out=t)
+                np.add(sz, t, out=t)
+                newv = np.where(msk, t, np.inf)
+            else:
+                newv = np.where(msk, sz + dz(d), np.inf)
             cut = win - newv
-            removed = float(np.sum(np.clip(np.where(msk, cut, 0.0), 0.0, None)))
+            # task SP2: outside msk newv is +inf so cut is -inf and the clip
+            # to >= 0 yields the same 0.0 the masked where wrote there
+            removed = float(np.sum(np.clip(cut, 0.0, None)))
             if cutting and engage_track:
                 # task ZE2: cells this sample actually removes (finite positive
                 # cut height); each cell is counted at most once per move since
@@ -1694,8 +1709,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     eb = msk & np.isfinite(sub) & (sub - newv > 0.01)
                     if eb.any():
                         zb_a = max(zb_a, float(np.max(sub[eb] - sz)))
-                        pu = (dx_t * dxg + dy_t * dyg)[eb]
-                        pv = (-dy_t * dxg + dx_t * dyg)[eb]
+                        pu = (dx_t * gx[None, :] + dy_t * gy[:, None])[eb]
+                        pv = (-dy_t * gx[None, :] + dx_t * gy[:, None])[eb]
                         zb_ext = max(zb_ext, float(pv.max() - pv.min()))
                         zb_dext = max(zb_dext, math.hypot(float(pu.max() - pu.min()),
                                                         float(pv.max() - pv.min())))
@@ -1718,8 +1733,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 msk_e = d <= R + 0.75 * cell
                 if window is not None:
                     msk_e &= window[jlo:jhi, ilo:ihi]
-                engaged = (msk_e.any() and
-                         float(np.max(np.where(msk_e, win, -np.inf))) > sz + 1e-6)
+                # task SP2: msk_e.any() is implied -- with an empty msk_e the
+                # masked max is -inf and the comparison is False either way
+                engaged = (float(np.max(np.where(msk_e, win, -np.inf)))
+                           > sz + 1e-6)
                 # radial engagement: chord width of engaged arc perpendicular to
                 # travel (dx_t, dy_t); equivalent radial width = 2*R*sin(theta/2)
                 if engaged and engage_track:
@@ -1749,7 +1766,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 if not engaged:
                     air_length += seg_len
             else:  # rapid
-                if np.any(np.where(msk, cut > REMOVE_EPS, False)):
+                # task SP2: outside msk cut is -inf, never > REMOVE_EPS
+                if np.any(cut > REMOVE_EPS):
                     move_collided = True
         if cutting:
             cut_length += length
