@@ -2746,7 +2746,7 @@ def test_bs1a4d4_credit_entry_matches_prediction():
                 "r %.4f, not its stored bore centre (%.4f,%.4f) r %.4f: " \
                 "the emit re-searched its own ladder" % (
                     q[0], q[1], z, own[0], own[1], own[2], b[2], b[3], b[4])
-        elif c["credit"] > 1e-9:
+        else:   # BS1a4d4 (c): every region WITHOUT a stored bore (credit now 0)
             own = own_helix(q, z)
             if own is None:
                 continue
