@@ -220,9 +220,22 @@ def _job_path(home, doc_id, *sub):
     return os.path.join(home, "jobs", *sub, doc_id + ".json")
 
 
-def load_job(home, doc_id):
+def _load_job_file(home, doc_id):
     p = _job_path(home, doc_id)
     return _read(p) if os.path.exists(p) else {}
+
+
+def _save_job_file(home, doc_id, renumber_map, setup):
+    obj = dict(renumber_map)
+    if setup is not None:
+        obj["setup"] = setup  # reserved key: never a tool_id
+    write_json(_job_path(home, doc_id), obj)
+
+
+def load_job(home, doc_id):
+    """The job's renumbering {tool_id: T} (the file's `setup` key aside)."""
+    return {k: v for k, v in _load_job_file(home, doc_id).items()
+            if k != "setup"}
 
 
 def job_get(home, doc_id):
@@ -230,7 +243,64 @@ def job_get(home, doc_id):
         raise ToolLibError("no_library", "no state dir for jobs")
     used = _job_path(home, doc_id, "used")
     return {"document_id": doc_id, "renumber": load_job(home, doc_id),
-            "tools_used": _read(used) if os.path.exists(used) else []}
+            "tools_used": _read(used) if os.path.exists(used) else [],
+            "setup": _load_job_file(home, doc_id).get("setup")}
+
+
+# job.setup (track 2 c): the setup fields, validated against the cutting
+# actions' own catalog specs (mm values). blank = raw blank size or null.
+SETUP_FIELDS = ("orientation", "units", "stock_xy", "stock_x", "stock_y",
+                "stock_top", "stock_bottom", "floor_z")
+
+
+def _validate_setup(setup):
+    import catalog as catalog_mod  # connector-local module, no cycle
+    if not isinstance(setup, dict):
+        raise ToolLibError("invalid_field", "setup must be an object")
+    bad = sorted(k for k in setup if k not in SETUP_FIELDS + ("blank",))
+    if bad:
+        raise ToolLibError("invalid_field",
+                           "not a setup field: %s" % ", ".join(bad))
+    props = catalog_mod.get_action(catalog_mod.ACTION)["inputs"]["properties"]
+    out = {}
+    for k in SETUP_FIELDS:
+        spec = props[k]
+        v = setup.get(k, spec.get("default"))
+        if v is None:
+            out[k] = None
+            continue
+        if "enum" in spec:
+            if v not in spec["enum"]:
+                raise ToolLibError("out_of_range", "%s=%r not in %s"
+                                   % (k, v, spec["enum"]))
+        else:
+            if not _is_num(v):
+                raise ToolLibError("invalid_field", "%s must be a number "
+                                   "(mm)" % k)
+            lo, hi = spec.get("minimum"), spec.get("maximum")
+            if (lo is not None and v < lo) or (hi is not None and v > hi):
+                raise ToolLibError("out_of_range", "%s=%s outside %s..%s mm"
+                                   % (k, v, lo, "" if hi is None else hi))
+        out[k] = v
+    blank = setup.get("blank")
+    if blank is not None:
+        if not isinstance(blank, dict) or set(blank) != {"x", "y", "z"} or \
+                not all(_is_num(blank[a]) and blank[a] > 0 for a in "xyz"):
+            raise ToolLibError("invalid_field",
+                               "blank must be {x, y, z} > 0 mm or null")
+        blank = {a: blank[a] for a in "xyz"}
+    out["blank"] = blank
+    return out
+
+
+def set_setup(home, doc_id, setup):
+    """job.setup: save the document's setup (mm values); returns the job."""
+    if not home:
+        raise ToolLibError("no_library", "no state dir for jobs")
+    _job_path(home, doc_id)  # validates the id first
+    clean = _validate_setup(setup)
+    _save_job_file(home, doc_id, load_job(home, doc_id), clean)
+    return job_get(home, doc_id)
 
 
 def renumber(home, repo_root, doc_id, tool_id, t):
@@ -252,7 +322,8 @@ def renumber(home, repo_root, doc_id, tool_id, t):
         job.pop(tool_id, None)
     else:
         job[tool_id] = t
-    write_json(_job_path(home, doc_id), job)
+    _save_job_file(home, doc_id, job,
+                   _load_job_file(home, doc_id).get("setup"))
     return job_get(home, doc_id)
 
 

@@ -94,3 +94,79 @@ T word through the effective table.
   {T20}/{H20}, rest.nc {T31}/{H31}; library + repo table sha256 unchanged;
   check_program of check_ok_t5.nc resolves T5 -> flat 12.686 BT30-ER32-70
   and passes; without the job (doc-1) it fails naming T5.
+
+## (a) Omitted units mean inch
+- Fix: `catalog.to_mm(values, action)` applies the action's units default
+  (inch) BEFORE converting; the connector's input pipeline is now
+  `connector.prepare_values(values_in, action)` (to_mm -> document_id
+  fallback -> validate_inputs). check_program has no units input: unchanged.
+- Tests: test_track2.py `test_a_omitted_units_mean_inch` (fake engine: rough
+  `--tool` diameter and `--cut-feed` equal the inch values x 25.4, no
+  --metric) and E2E `TestOmittedUnitsE2E` (real post, no units input:
+  G20 only, header `(T13 D=0.5 ...`, max F = 135 in/min).
+- Injected fault (`test_a_injected_fault_is_measured`): the old order
+  (to_mm ignoring the default): diameter off by 24.4 mm (1.0 read as mm vs
+  25.4), feed off by 2440 mm/min (100 vs 2540).
+
+## (b) model.measure
+- New action `model.measure {model, orientation}` (confirm false) ->
+  `{size_mm:{x,y,z}, bbox_mm:{min:[x,y,z], max:[x,y,z]}}`; runner
+  `run_measure` runs the same `engine.cli prepare` (zero allowances) every
+  cutting action uses and reads its bbox; nothing uploaded.
+- Tests: fast `test_b_*` (shape, prepare argv) and E2E
+  `TestModelMeasureE2E` (measured bbox + GOOD_INPUTS allowances = the rough's
+  stock_box_mm within 2e-4 mm).
+- Injected fault (`test_b_injected_fault_is_measured`): measuring the
+  stock box instead of the part -> off by 2.0 mm (largest allowance).
+
+## (c) Setup memory
+- `jobs/<doc_id>.json` gains a reserved `setup` key next to the
+  `{tool_id: T}` overrides. `setup = {orientation, units, stock_xy,
+  stock_x, stock_y, stock_top, stock_bottom, floor_z, blank:{x,y,z}|null}`
+  in mm, validated with adaptive_rough's own catalog specs (enums and
+  mm ranges; omitted fields take the action defaults).
+- New action `job.setup {document_id, setup}` -> the job. `job.get` now
+  also returns `setup` (null if never saved). NOTE: this changed the
+  job.get shape I committed in the contract step; my own two equality
+  asserts (test_toollib.py:94, test_connector.py TestToolLibE2E) gained
+  `"setup": None` - no pre-existing test was touched.
+- Errors: out_of_range (range/enum), invalid_field (non-number, unknown
+  key, bad blank), bad_document_id.
+- Injected fault (`test_c_injected_fault_is_measured`): validation
+  skipped -> stock_top 30.0 saved, 4.6 mm above the 25.4 mm maximum.
+- Runs do not read the saved setup yet (the panel fills inputs from it).
+
+## (d) Orientation rot_x_90 / rot_x_270 / rot_y_90 / rot_y_270
+- Touched outside connector/: engine/_orient.py (the four rotations, about
+  the bbox centre like the flips, right-hand rule) and engine/cli.py
+  (`prepare --orient` choices only). Catalog orientation enum + one plain
+  description, shared by all three actions, model.measure and job.setup.
+- Sign check (one-off freecadcmd): rotating a +Y boss +90 deg about X puts
+  it at z 10..12 (+Z); a +Z boss +90 deg about Y lands at x 10..12 (+X).
+- New fixture connector/testdata/box_off_centre.step (40x20x10, x 5..45,
+  y -3..17, z -10..0: off-centre, Z0 at its top; built with
+  Part.makeBox).
+- E2E `TestOrientationE2E`: measured sizes for all 8 orientations
+  (rot_x: 40x10x20, rot_y: 10x20x40) within 1e-3 mm, box centre stays
+  (25, 7, -5); a rough on the rot_x_90 box passes every gate, stock box
+  42 x 12 x 21.4.
+- Injected fault (`test_injected_fault_is_measured`): rot_x_90 mapped to
+  the 180 flip -> the real measurement misses by 10 mm in Y and Z.
+
+### (a)-(d) status at commit
+- Fast: test_track2.py + test_toollib.py + engine/test_post.py green
+  (51 + 19, exit 0).
+- E2E first run (slot_m4): TestToolLibE2E 3/3 and TestOmittedUnitsE2E
+  passed; TestModelMeasureE2E and the measure tests of TestOrientationE2E
+  FAILED - real bug: prepare_values injected the model's document_id into
+  model.measure (which has no such input) -> input_unknown. Fixed (only
+  actions that declare document_id get the fallback) + fast regression
+  test `test_b_measure_inputs_get_no_document_fallback`. Direct runner
+  measurement of box_off_centre: as_modeled 40x20x10, rot_x_90 40x10x20,
+  box centre kept.
+- The (d) rough on the plain turned box FAILED its gates (2 rapid
+  collisions at line 16, `G43 Z0.`): the roughing engine clears only
+  enclosed regions, so a plain exterior box posts an empty program (all
+  levels region 0 mm2) - same on as_modeled, not an orientation bug. The
+  fixture is now box_turn.step (block with a pocket that faces up after
+  rot_x_90). E2E re-run is queued behind the merge gate (slot_m4).

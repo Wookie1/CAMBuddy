@@ -91,7 +91,7 @@ def test_renumber_t13_to_t5_job_only(home):
     repo_before = _sha(REPO_TABLE)
     job = toollib.renumber(home, REPO, DOC, ROUGH, 5)
     assert job == {"document_id": DOC, "renumber": {ROUGH: 5},
-                   "tools_used": []}
+                   "tools_used": [], "setup": None}
     with open(os.path.join(home, "jobs", DOC + ".json")) as fh:
         assert json.load(fh) == {ROUGH: 5}
     assert _sha(os.path.join(home, "tools.json")) == lib_before

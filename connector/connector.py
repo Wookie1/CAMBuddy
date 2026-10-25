@@ -28,6 +28,23 @@ VERSION = "1.0.0"
 PANEL_NAME = catalog_mod.ACTION
 
 
+def prepare_values(values_in, action):
+    """Run inputs -> (ok, code, mm values). Task UN: convert inch inputs to
+    mm FIRST (an omitted units input is the catalog default, inch: task
+    (a)), then validate the mm values against the catalog's mm ranges.
+    Track 2: job renumbering follows the STEVE document - an explicit
+    document_id, else the model's own document."""
+    values_in = catalog_mod.to_mm(values_in, action)
+    spec = catalog_mod.get_action(action) or {}
+    takes_doc = "document_id" in spec.get("inputs", {}).get("properties", {})
+    if takes_doc and not values_in.get("document_id"):
+        doc = (values_in.get("model") or {}).get("document") \
+            if isinstance(values_in.get("model"), dict) else None
+        if isinstance(doc, dict) and doc.get("id"):
+            values_in = dict(values_in, document_id=str(doc["id"]))
+    return catalog_mod.validate_inputs(values_in, action)
+
+
 class Connector:
     def __init__(self, home_override=None):
         self.cfg = config_mod.load(home_override)
@@ -203,7 +220,7 @@ class Connector:
             return  # never act twice
         self._remember_nonce(env.get("nonce"))
         action = env.get("action")
-        if action not in catalog_mod.ACTIONS + catalog_mod.TOOL_ACTIONS:
+        if action not in catalog_mod.ENGINE_ACTIONS + catalog_mod.TOOL_ACTIONS:
             self._remember_run(run_id)
             self._safe_reject(run_id, "action_unknown")
             return
@@ -227,6 +244,9 @@ class Connector:
                                        values.get("pockets"))
         if action == catalog_mod.JOB_GET:
             return toollib.job_get(home, values["document_id"])
+        if action == catalog_mod.JOB_SETUP:
+            return toollib.set_setup(home, values["document_id"],
+                                     values["setup"])
         return toollib.renumber(home, repo, values["document_id"],
                                 values["tool_id"], values["t"])
 
@@ -330,20 +350,7 @@ class Connector:
                     step_path = dest
                 with open(dest, "wb") as fh:
                     fh.write(data)
-            values_in = env.get("inputs", {})
-            # task UN: convert inch inputs to mm FIRST, then validate the
-            # mm values against the catalog's mm ranges (unchanged) -- the
-            # ranges are mm-valued, so validating raw inch numbers would
-            # reject or misjudge sensible inch inputs
-            values_in = catalog_mod.to_mm(values_in)
-            # track 2: job renumbering follows the STEVE document - an
-            # explicit document_id, else the model's own document
-            if not values_in.get("document_id"):
-                doc = (values_in.get("model") or {}).get("document") \
-                    if isinstance(values_in.get("model"), dict) else None
-                if isinstance(doc, dict) and doc.get("id"):
-                    values_in = dict(values_in, document_id=str(doc["id"]))
-            ok, code, values = catalog_mod.validate_inputs(values_in, action)
+            ok, code, values = prepare_values(env.get("inputs", {}), action)
             if not ok:
                 self.client.report_run(run_id, "rejected",
                                      error={"code": code, "message": values})
@@ -352,6 +359,9 @@ class Connector:
 
             if action == catalog_mod.ACTION:
                 result, files = engine.run(step_path, values, on_progress)
+            elif action == catalog_mod.MEASURE_ACTION:
+                result, files = engine.run_measure(step_path, values,
+                                                   on_progress)
             elif action == catalog_mod.CHECK_ACTION:
                 # task CP: judge a posted program; no .nc is uploaded or
                 # copied (the program came FROM STEVE and goes nowhere else)

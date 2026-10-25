@@ -229,7 +229,8 @@ def main(argv=None):
     pr.add_argument("--out-dir", dest="out_dir", required=True)
     pr.add_argument("--orient", default="as_modeled",
                     choices=("as_modeled", "flip_x_180", "flip_y_180",
-                           "flip_z_180"))
+                           "flip_z_180", "rot_x_90", "rot_x_270",
+                           "rot_y_90", "rot_y_270"))
     pr.add_argument("--stock-xy", dest="stock_xy", type=float, default=1.0,
                    help="XY stock offset per side mm")
     pr.add_argument("--stock-x", dest="stock_x", type=float, default=None,

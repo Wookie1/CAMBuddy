@@ -2749,7 +2749,7 @@ class TestToolLibE2E:
         assert final == "succeeded", body
         assert body["result"] == {"document_id": self.DOC,
                                   "renumber": {self.ROUGH: 5},
-                                  "tools_used": []}
+                                  "tools_used": [], "setup": None}
         # refusals come back as {code, message}
         for rid, t, code in ((1303, 3, "duplicate_t"),
                              (1304, 0, "out_of_range"),
@@ -2821,3 +2821,147 @@ class TestToolLibE2E:
                                          mock, "check_ok_t5.nc")))
         final, body = _final_body(mock, 1321, timeout=600)
         assert final == "failed" and "T5" in body["error"]["message"], body
+
+
+class TestOmittedUnitsE2E:
+    """Track 2 (a): an adaptive_rough with NO units input reads every
+    length/feed as inch and posts G20: the posted header diameter and the
+    cutting feed match the inch interpretation."""
+
+    def test_omitted_units_post_inch(self, live):
+        mock, home, _ = live
+        inputs = dict(GOOD_INPUTS, model=model_input(mock))
+        del inputs["units"]
+        inputs.update({"stock_xy": 1.0 / 25.4, "stock_top": 0.4 / 25.4,
+                       "stock_bottom": 1.0 / 25.4,
+                       "floor_z": GOOD_INPUTS["floor_z"] / 25.4,
+                       "tool_diameter": 0.5, "flute_length": 2.0,
+                       "stepdown": GOOD_INPUTS["stepdown"] / 25.4,
+                       "optimal_load": GOOD_INPUTS["optimal_load"] / 25.4,
+                       "stock_to_leave": GOOD_INPUTS["stock_to_leave"] / 25.4,
+                       "rest_stepup": GOOD_INPUTS["rest_stepup"] / 25.4,
+                       "feed": 135.0, "ramp_feed": 50.0})
+        mock.enqueue_run(1401, inputs=inputs)
+        final = mock.wait_terminal(1401, timeout=600)
+        assert final == "succeeded", mock.states_for(1401)
+        text = open(home / "runs" / "1401" / "rough.nc").read()
+        assert "G20" in text and "G21" not in text
+        head = re.search(r"\(T13 D=([0-9.]+) ", text)
+        assert head and float(head.group(1)) == pytest.approx(0.5), head
+        feeds = {float(f) for f in re.findall(r"\bF([0-9.]+)", text)}
+        assert 135.0 in feeds, sorted(feeds)
+        assert max(feeds) == pytest.approx(135.0)
+
+
+class TestModelMeasureE2E:
+    """Track 2 (b): model.measure returns the oriented model's box from the
+    same prepare path a rough uses: measured box + the rough's allowances =
+    the rough's stock box (within 0.0001 mm rounding)."""
+
+    def test_measure_matches_rough_stock_box(self, live):
+        mock, home, _ = live
+        mock.enqueue_run(1501, action=catalog_mod.MEASURE_ACTION,
+                         inputs={"model": model_input(mock),
+                                 "orientation": "as_modeled"})
+        final, body = _final_body(mock, 1501, timeout=300)
+        assert final == "succeeded", body
+        m = body["result"]
+        assert set(m) >= {"size_mm", "bbox_mm"}
+        lo, hi = m["bbox_mm"]["min"], m["bbox_mm"]["max"]
+        for i, k in enumerate("xyz"):
+            assert m["size_mm"][k] == pytest.approx(hi[i] - lo[i], abs=1e-4)
+        assert mock.file_names(1501) == []
+
+        mock.enqueue_run(1502, inputs=dict(GOOD_INPUTS,
+                                           model=model_input(mock)))
+        final, body = _final_body(mock, 1502, timeout=600)
+        assert final == "succeeded", body
+        sb = body["result"]["stock_box_mm"]
+        g = GOOD_INPUTS
+        want = [lo[0] - g["stock_xy"], hi[0] + g["stock_xy"],
+                lo[1] - g["stock_xy"], hi[1] + g["stock_xy"],
+                lo[2] - g["stock_bottom"], hi[2] + g["stock_top"]]
+        assert max(abs(a - b) for a, b in zip(sb, want)) < 2e-4, (sb, want)
+
+
+BOX_STEP = os.path.join(HERE, "testdata", "box_off_centre.step")
+# box_off_centre.step: 40 x 20 x 10 mm, x 5..45, y -3..17, z -10..0
+# (off-centre in XY, Z0 at its top), centre (25, 7, -5)
+BOX_SIZE = {"as_modeled": (40, 20, 10), "flip_x_180": (40, 20, 10),
+            "flip_y_180": (40, 20, 10), "flip_z_180": (40, 20, 10),
+            "rot_x_90": (40, 10, 20), "rot_x_270": (40, 10, 20),
+            "rot_y_90": (10, 20, 40), "rot_y_270": (10, 20, 40)}
+
+
+def box_input(mock, path=BOX_STEP):
+    m = model_input(mock)
+    with open(path, "rb") as fh:
+        data = fh.read()
+    name = os.path.basename(path)
+    m.update({"name": name,
+              "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
+              "url": mock.base_url + "/files/" + name,
+              "document": {"id": "doc-box"}})
+    return m
+
+
+# box_turn.step: 60 x 30 x 24 mm block (x -30..30, y -15..15, z 3..27)
+# with a 30 x 16 x 6 mm pocket in its +Y face. After rot_x_90 (about its
+# centre) it stands 60 x 24 x 30 on Z0 (z 0..30) with the pocket on top:
+# the roughing engine only clears enclosed regions, so a plain exterior box
+# posts an empty program, which the gates refuse (measured: G43 Z0. ->
+# 2 rapid collisions)
+BOX_TURN_STEP = os.path.join(HERE, "testdata", "box_turn.step")
+
+
+def _measure(mock, run_id, orientation):
+    mock.enqueue_run(run_id, action=catalog_mod.MEASURE_ACTION,
+                     inputs={"model": box_input(mock),
+                             "orientation": orientation})
+    final, body = _final_body(mock, run_id, timeout=300)
+    assert final == "succeeded", body
+    return body["result"]
+
+
+class TestOrientationE2E:
+    """Track 2 (d): rot_x_90/270 and rot_y_90/270 on a non-cube box swap
+    the measured axes as expected (about the box centre), and a rough on
+    the turned box passes every gate."""
+
+    def test_measured_sizes_swap(self, live):
+        mock, _, _ = live
+        worst = 0.0
+        for i, (o, size) in enumerate(sorted(BOX_SIZE.items())):
+            m = _measure(mock, 1600 + i, o)
+            got = [m["size_mm"][k] for k in "xyz"]
+            worst = max(worst, max(abs(a - b) for a, b in zip(got, size)))
+            centre = [(lo + hi) / 2 for lo, hi in
+                      zip(m["bbox_mm"]["min"], m["bbox_mm"]["max"])]
+            assert centre == pytest.approx([25, 7, -5], abs=1e-3), (o, m)
+        assert worst < 1e-3, worst
+
+    def test_injected_fault_is_measured(self, live):
+        """Fault: rot_x_90 mapped to the 180 deg flip. The real measurement
+        of that box misses rot_x_90's expected size by 10 mm in Y and Z."""
+        mock, _, _ = live
+        m = _measure(mock, 1620, "flip_x_180")
+        err = [abs(m["size_mm"][k] - e)
+               for k, e in zip("xyz", BOX_SIZE["rot_x_90"])]
+        assert err == pytest.approx([0.0, 10.0, 10.0], abs=1e-3)
+
+    def test_rough_on_turned_box_passes_gates(self, live):
+        mock, home, _ = live
+        mock.enqueue_run(1630, inputs=dict(
+            GOOD_INPUTS, model=box_input(mock, BOX_TURN_STEP),
+            orientation="rot_x_90", floor_z=1.0, program_number=1630))
+        final, body = _final_body(mock, 1630, timeout=900)
+        assert final == "succeeded", body
+        r = body["result"]
+        assert r["zmap_gouges"]["count"] == 0
+        assert r["rapid_collisions"]["count"] == 0
+        assert r["over_flute"]["count"] == 0
+        assert r["holder_hits"]["count"] == 0
+        sb = r["stock_box_mm"]
+        assert [sb[1] - sb[0], sb[3] - sb[2], sb[5] - sb[4]] == \
+            pytest.approx([62.0, 26.0, 31.4], abs=1e-3)
+        assert r["cut_length_mm"] > 100

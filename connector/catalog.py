@@ -13,7 +13,11 @@ TOOLS_LIST = "tools.list"
 TOOLS_UPDATE = "tools.update"
 JOB_GET = "job.get"
 JOB_RENUMBER = "job.renumber"
-TOOL_ACTIONS = (TOOLS_LIST, TOOLS_UPDATE, JOB_GET, JOB_RENUMBER)
+JOB_SETUP = "job.setup"
+TOOL_ACTIONS = (TOOLS_LIST, TOOLS_UPDATE, JOB_GET, JOB_RENUMBER, JOB_SETUP)
+# track 2 (b): measure the oriented model (engine prepare path, no cutting)
+MEASURE_ACTION = "model.measure"
+ENGINE_ACTIONS = ACTIONS + (MEASURE_ACTION,)
 EVENT = "engine_state"
 
 # inputs whose numeric value is a length/feeds in mm (or mm/min):
@@ -29,7 +33,14 @@ MM_FIELDS = ("stock_xy", "stock_x", "stock_y", "stock_top", "stock_bottom",
 
 _ORIENTATION = {"type": "string",
                 "enum": ["as_modeled", "flip_x_180", "flip_y_180",
-                         "flip_z_180"],
+                         "flip_z_180", "rot_x_90", "rot_x_270", "rot_y_90",
+                         "rot_y_270"],
+                "description": "how the model stands on the table before "
+                               "the stock box is built: flip_*_180 turns it "
+                               "over about that axis; rot_x/rot_y_90/270 "
+                               "turn it about X or Y by that angle "
+                               "(right-hand rule: rot_x_90 carries +Y to "
+                               "+Z), all about the model's box centre",
                 "default": "as_modeled",
                 "title": "Orientation"}
 
@@ -264,6 +275,23 @@ CHECK_ACTION_SPEC = {
                "with their lines; files: check.json, preview.png."),
 }
 
+MEASURE_ACTION_SPEC = {
+    "name": MEASURE_ACTION,
+    "title": "Measure the model",
+    "description": "Stands the STEP model the way you choose and returns "
+                   "its size and bounding box in mm, from the same "
+                   "orientation code the cutting actions use to build the "
+                   "stock box. Nothing is cut or posted.",
+    "confirm": False,
+    "inputs": {"type": "object", "properties": {
+        "model": {"x-steve": "file", "format": "step",
+                  "title": "STEP model"},
+        "orientation": _ORIENTATION},
+        "required": ["model"]},
+    "result": "{size_mm: {x, y, z}, bbox_mm: {min: [x, y, z], max: "
+              "[x, y, z]}} after orientation",
+}
+
 TOOL_ACTION_SPECS = [
     {"name": TOOLS_LIST, "title": "List the tool library",
      "description": "The X7 tool library (~/.stevecam/tools.json): every "
@@ -294,7 +322,7 @@ TOOL_ACTION_SPECS = [
                 "properties": {"document_id": _DOC_ID_INPUT},
                 "required": ["document_id"]},
      "result": "{document_id, renumber: {tool_id: t}, tools_used: "
-               "[tool_id]}"},
+               "[tool_id], setup: {...} or null}"},
     {"name": JOB_RENUMBER, "title": "Renumber a tool for this job",
      "description": "Posts tool_id as T t (and H/D) for this document "
                     "only; the library is unchanged. Refused when another "
@@ -307,10 +335,22 @@ TOOL_ACTION_SPECS = [
          "t": {"type": "integer"}},
          "required": ["document_id", "tool_id", "t"]},
      "result": "the job (as job.get) or {code, message}"},
+    {"name": JOB_SETUP, "title": "Save this job's setup",
+     "description": "Remembers the document's setup: orientation, units, "
+                    "stock allowances and floor (mm values, same ranges as "
+                    "the cutting actions) and the raw blank size {x, y, z} "
+                    "mm or null. job.get returns it.",
+     "confirm": False,
+     "inputs": {"type": "object", "properties": {
+         "document_id": _DOC_ID_INPUT,
+         "setup": {"type": "object"}},
+         "required": ["document_id", "setup"]},
+     "result": "the job (as job.get, with setup) or {code, message}"},
 ]
 
 CATALOG = {"actions": [ROUGHING_ACTION, SLOPE_ACTION_SPEC,
-                       CHECK_ACTION_SPEC] + TOOL_ACTION_SPECS,
+                       CHECK_ACTION_SPEC, MEASURE_ACTION_SPEC]
+           + TOOL_ACTION_SPECS,
            "events": [{
                "name": EVENT,
                "description": "Engine state: idle or busy, the current "
@@ -383,9 +423,17 @@ def validate_inputs(values, action=ACTION):
     return True, "", out
 
 
-def to_mm(values: dict) -> dict:
-    """Convert mm-valued inputs from inch to mm when units == 'inch'."""
+def to_mm(values: dict, action=None) -> dict:
+    """Convert mm-valued inputs from inch to mm when units == 'inch'. With
+    `action`, an omitted units input first takes the action's catalog
+    default (inch), so omitted units mean inch everywhere: values, post and
+    G20 agree (task (a): defaults used to be applied only after this
+    conversion, so omitted units were read as mm but posted G20)."""
     out = dict(values)
+    spec = get_action(action) if action else None
+    units = (spec or {}).get("inputs", {}).get("properties", {}).get("units")
+    if units and out.get("units") is None and "default" in units:
+        out["units"] = units["default"]
     if out.get("units") == "inch":
         for k in MM_FIELDS:
             if isinstance(out.get(k), (int, float)):

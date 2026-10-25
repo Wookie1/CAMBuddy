@@ -194,6 +194,16 @@ def check_tool_entry(number, path=None):
                             if e.get("stickout_mm") is not None else None)}
 
 
+def measure_result(bbox):
+    """prepare's bbox [xmin, xmax, ymin, ymax, zmin, zmax] -> the
+    model.measure result (mm, rounded to 0.0001)."""
+    lo = [round(bbox[i], 4) for i in (0, 2, 4)]
+    hi = [round(bbox[i], 4) for i in (1, 3, 5)]
+    return {"size_mm": {k: round(h - l, 4)
+                        for k, l, h in zip("xyz", lo, hi)},
+            "bbox_mm": {"min": lo, "max": hi}}
+
+
 class EngineRun:
     """Runs one roughing job; .cancel() stops the active subprocess."""
 
@@ -439,6 +449,22 @@ class EngineRun:
                  "preview.png": (png_path, "image/png")}
         self._record_used(values, [number])
         return result, files
+
+    # -------------------------------------------------- model.measure ----
+    def run_measure(self, step_path, values, on_progress=None):
+        """model.measure (track 2 b): the oriented model's bounding box from
+        the same engine prepare path every cutting action uses (zero stock
+        allowances, so the box is the part itself). Nothing is cut."""
+        py = self.cfg["engine_python"]
+        self._spawn([py, "-m", "engine.cli", "prepare",
+                     "--step", step_path, "--out-dir", self.work,
+                     "--orient", values["orientation"],
+                     "--stock-xy", "0", "--stock-top", "0",
+                     "--stock-bottom", "0", "--cell", "0.5"],
+                    0.05, 0.95, on_progress)
+        with open(os.path.join(self.work, "prepare.json")) as fh:
+            bb = json.load(fh)["bbox"]
+        return measure_result(bb), {}
 
     # -------------------------------------------------- check_program ----
     def run_check_program(self, program_path, step_path, values,
