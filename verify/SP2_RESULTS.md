@@ -22,3 +22,15 @@ and every comparison kept identical.
 ## Test/run record
 
 (to be appended after each run)
+
+### Supervisor verification (2026-10-24/25, from frozen detached copies)
+- verify suite at the sp2 merge fix 4ab9320: 115 passed.
+- Test block, sp2 vs main 681f551: fin, rough, rr, fin with ZE2B (--engage-max 2.286), rr with ZE2B: all 5
+  judge JSONs byte-identical.
+- Core Front: 18/18 judge JSONs byte-identical, sp2 4ab9320 vs main 681f551, every judge rc 0/0. Inputs:
+  chain..chain4 x (rr, t33, fin_after, fin_before), the bs1a3 CF flat rough, and the chain4 finish under ZE2B.
+- Timing: each input was judged back to back on one lane (main, then sp2). Two pairs overlapped a contended window
+  (2026-10-24 19:23-20:02, stray background sessions) and are excluded. The 16 uncontended pairs:
+  main 11230 s, sp2 9721 s, 13.4 % less in total, mean per-pair saving 15.4 %. The 8 pairs of 60 s or more: mean
+  13.4 % (10.1-17.8 %). One short pair (chain4 rr, 9 s vs 9 s) showed no saving at 1 s resolution.
+- Peak RSS: at most +0.45 GB (bs1a3 CF rough, 2.24 -> 2.69 GB); the ZE2B finish went 4.77 -> 4.60 GB.
