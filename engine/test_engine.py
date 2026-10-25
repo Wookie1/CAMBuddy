@@ -2845,8 +2845,11 @@ def test_bs1a4d4_entry_pinned_to_stored_start():
     for (z, dxy, b) in decoys:
         at_z = [h for h in helixes if abs(h[3] - z) < 1e-6]
         for (cx, cy, r, _zb) in at_z:
-            thru_decoy = abs(math.dist((cx, cy), dxy) - r) < 0.06
-            thru_start = abs(math.dist((cx, cy), b[:2]) - r) < 0.06
+            # the centred ladder's exact signature: centre = pick + (r - 0.05) u
+            # (an off-centre normal-ladder bore of another region can pass
+            # near a decoy, but not at exactly r - 0.05 from it)
+            thru_decoy = abs(math.dist((cx, cy), dxy) - (r - 0.05)) < 1e-3
+            thru_start = abs(math.dist((cx, cy), b[:2]) - (r - 0.05)) < 1e-3
             assert not (thru_decoy and not thru_start), \
                 "band entry (%.3f,%.3f)@Z%.3f bored through the emitter's own " \
                 "pick (%.3f,%.3f) with centre (%.4f,%.4f), not the stored start " \
