@@ -7,7 +7,10 @@ edit verify/ or opencode.json; engine code never imports zmap/verify (tests may)
 SCRATCH: scratch files and mutation copies go ONLY in /Users/James/ai-sandbox/stevecam-bs1a4d5/scratch/ - never /tmp.
 LIMITS: No limit or floor is raised (ZE2B 2.286 mm, ZE2 2.44, ZA 0.2, ZB 0.5, AE_SPIKE, AE_SS).
 CAUSE FIRST: append a section "BS1a4d6b" to engine/BS1a4d6_RESULTS.md with the cause of the two red tests below BEFORE
-any code change. CONTINUE: continue from your plan; don't stop before every test has run.
+any code change. It must also explain the max_ae 36.25 mm on the shrink1 record for (-2.5924, 3.2481): is it a real
+measured engagement (36 mm is far beyond the 12.686 tool diameter, so probably not), a sentinel or unit mix-up, or an
+unbounded sum? If the measurement itself is wrong, the lightest-option choice built on it is wrong too: fix the measure
+FIRST and say so. CONTINUE: continue from your plan; don't stop before every test has run.
 Edit engine/band.py, engine/rough.py and engine/test_engine.py only.
 BUDGET: <= 45 changed non-test engine lines vs b6c48e1 IN TOTAL (BS1a4d6 WIP already uses 20 in rough.py); STOP and
 report at ~60. FRESH session, HARD CAP 2 h (run `date` at start). Worktree /Users/James/ai-sandbox/stevecam-bs1a4d5,
