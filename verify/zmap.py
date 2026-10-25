@@ -1470,6 +1470,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     # footprint-outside-grid tracking (cells outside the grid are unjudged)
     outside_grid = 0
     first_outside_line = None
+    bsb_raw = []  # task ZG1: {line, x, y, depth} below the stock bottom
 
     for mi, mv in enumerate(resolved):
         if mv.get("comp"):
@@ -1502,6 +1503,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             if first_outside_line is None:
                 first_outside_line = mv["line"]
         cutting = mv["motion"] in ("G1", "G2", "G3")
+        if cutting and min(z1, cur[2]) < szmin - 1e-9:  # task ZG1
+            bz, bxy = ((z1, [x1, y1]) if z1 <= cur[2] else (cur[2], cur[:2]))
+            bsb_raw.append({"line": mv["line"], "x": bxy[0], "y": bxy[1],
+                            "depth": szmin - bz})
         move_collided = False
         move_over_flute = False
         move_shank = False
@@ -1935,6 +1940,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                             "first_line": first_rapid_line},
         "outside_grid": {"count": outside_grid,
                          "first_line": first_outside_line},
+        "below_stock_bottom": _bsb_report(bsb_raw),
+        "_bsb_raw": bsb_raw,
         "plunge_over_flute": ({"count": over_flute, "flute_mm": flute,
                                "first_line": first_over_flute_line}
                               if flute is not None else None),
@@ -2160,6 +2167,8 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
         "axial_plunges": _axial_report(
             [e for r in results for e in r["_axial_raw"]]),
         "_axial_raw": [e for r in results for e in r["_axial_raw"]],
+        "below_stock_bottom": _bsb_report(
+            [e for r in results for e in r["_bsb_raw"]]),
     }
     zbands = {}
     for r in results:
@@ -2213,16 +2222,25 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
 # Analysis / report
 # --------------------------------------------------------------------------
 
+def _bsb_report(raw):  # task ZG1: below_stock_bottom block from raw records
+    w = max(raw, key=lambda e: e["depth"], default=None)
+    return {"count": len(raw), "max_depth": w["depth"] if w else 0.0,
+            "worst_xy": [w["x"], w["y"]] if w else None,
+            "first_line": min((e["line"] for e in raw), default=None)}
+
+
 def analyze(stock, part, cell, x0, y0, restrict=None):
     ny, nx = part.shape
     valid = np.isfinite(stock)
+    hit = getattr(part, "hit", None)
     bottom = float(np.min(part))
     footprint = part > bottom + 1e-9
     mask = valid & footprint
     if restrict is not None:
         mask &= restrict
     depth = part - stock
-    gouge_mask = mask & (stock < part - GOUGE_TOL)
+    gouge_mask = (valid & hit if hit is not None else valid) \
+        & (stock < part - GOUGE_TOL)
     if gouge_mask.any():
         flat = np.argmax(np.where(gouge_mask, depth, -np.inf))
         gj, gi = np.unravel_index(flat, part.shape)
@@ -2245,6 +2263,7 @@ def analyze(stock, part, cell, x0, y0, restrict=None):
     return {
         "gouges": {"count": int(gouge_mask.sum()), "max_depth": max_depth,
                    "worst_xy": worst},
+        "part_mask": "present" if hit is not None else "missing",
         "leftover": lv,
         "within_0p5mm_fraction": within,
     }
@@ -2275,6 +2294,9 @@ def write_png(stock, part, cell, x0, y0, path):
 # CLI
 # --------------------------------------------------------------------------
 
+class PartField(np.ndarray): hit = None  # ndarray + .hit bool mask (task ZG1)
+
+
 def load_part(path):
     part = np.load(path)
     sidecar = re.sub(r"\.npy$", "", path) + ".json"
@@ -2287,6 +2309,9 @@ def load_part(path):
             "vertical walls carry unbounded chord error and the judgement "
             "would be silently optimistic. Regenerate the heightfield with "
             "TESS_TOL=0.01." % (sidecar, tess))
+    part = part.view(PartField)
+    if os.path.exists(hp := re.sub(r"\.npy$", "", path) + ".hit.npy"):
+        part.hit = np.load(hp)
     return part, float(meta["cell"]), float(meta["x0"]), float(meta["y0"])
 
 
@@ -2322,9 +2347,10 @@ def main(argv=None):
     p.add_argument("--out-json", default=None, help="write report JSON here")
     p.add_argument("--png", default=None, help="optional leftover heatmap PNG")
     p.add_argument("--window", action="store_true",
-                   help="only simulate/evaluate cells within 2 mm of steep "
-                        "walls (|dZ| > 1 mm between part heightfield "
-                        "neighbours); faster at fine cell sizes")
+                   help="speed option: only cells within 2 mm of steep walls "
+                        "are simulated and judged; gouges and every other "
+                        "check outside the window are NOT judged; never use "
+                        "for a gate or a verdict")
     p.add_argument("--rapid-feed", dest="rapid_feed", type=float,
                    default=RAPID_FEED,
                    help="assumed G0 feed mm/min for the cycle-time estimate")
@@ -2449,7 +2475,18 @@ def main(argv=None):
     stock_init = None
     if args.stock_in:
         stock_init = np.load(args.stock_in)
+    # task ZG1b: the true stock bottom travels through chains via the stock
+    # sidecar's "stock_box" key (never nanmin of the remaining grid)
+    side_box = None
+    if args.stock_in and os.path.exists(si := os.path.splitext(args.stock_in)[0] + ".json"):
+        with open(si) as fh:
+            side_box = json.load(fh).get("stock_box")
+        side_box = tuple(map(float, side_box)) if side_box else None
     if args.stock is not None:
+        if side_box and any(abs(a - b) > 1e-6 for a, b in zip(args.stock, side_box)):
+            print("error: --stock box %s and --stock-in sidecar stock_box %s disagree"
+                  " by more than 1e-6 mm" % (list(args.stock), list(side_box)), file=sys.stderr)
+            return 1
         stock_box = tuple(args.stock)
     else:
         # Derive the box from the saved state's finite cells.
@@ -2458,8 +2495,11 @@ def main(argv=None):
             p.error("--stock-in file has no finite cells")
         stock_box = (x0 + ii.min() * cell, x0 + (ii.max() + 1) * cell,
                     y0 + jj.min() * cell, y0 + (jj.max() + 1) * cell,
-                    float(np.nanmin(stock_init)),
+                    # unknown bottom = -inf: the gate can never fire on a guess
+                    float(side_box[4]) if side_box else float("-inf"),
                     float(np.nanmax(stock_init)))
+    # --stock-out records this ORIGINAL box; --stock wins over the sidecar
+    orig_box = tuple(args.stock) if args.stock is not None else side_box
     # a judge must never silently judge less than the whole stock: the part
     # grid has to cover the stock box (within half a cell per side), or the
     # moves out there are unjudged. No option to skip this.
@@ -2509,8 +2549,17 @@ def main(argv=None):
         "stock_in": os.path.abspath(args.stock_in) if args.stock_in else None,
         "holder": _holder_report(args, holder_name, holder_stick),
         "cell": cell,
-        "window": ("steep walls |dZ|>1mm dilated 2mm" if args.window else None),
+        "window": ("speed option: only cells within 2 mm of steep walls are "
+                   "simulated and judged; gouges and every other check outside "
+                   "the window are NOT judged; never use for a gate or a "
+                   "verdict" if args.window else None),
         "gouges": res["gouges"],
+        "part_mask": res["part_mask"],
+        "below_stock_bottom": res["below_stock_bottom"] if orig_box else {
+            "status": "unknown", "count": 0, "max_depth": 0.0, "worst_xy": None,
+            "first_line": None, "reason": "stock bottom check NOT done: no "
+            "--stock and no stock_box in the --stock-in sidecar", "next_step":
+            "pass --stock or regenerate the stock file with this version"},
         "outside_grid": res["outside_grid"],
         "leftover": res["leftover"],
         "within_0p5mm_fraction": res["within_0p5mm_fraction"],
@@ -2555,6 +2604,15 @@ def main(argv=None):
             json.dump(_sanitize(res.get("_zb_raw", [])), f, indent=1)
     if args.stock_out:
         np.save(args.stock_out, res["stock"])
+        if orig_box is not None:  # the ORIGINAL box; merge existing sidecar keys
+            sc = os.path.splitext(args.stock_out)[0] + ".json"
+            meta = {}
+            if os.path.exists(sc):
+                with open(sc) as f:
+                    meta = json.load(f)
+            meta["stock_box"] = [float(v) for v in orig_box]
+            with open(sc, "w") as f:
+                json.dump(meta, f)
     if args.png:
         ok = write_png(res["stock"], part, cell, x0, y0, args.png)
         if not ok:
@@ -2568,6 +2626,12 @@ def main(argv=None):
                   res["outside_grid"]["count"], args.dia / 2.0,
                   gxmin, gxmax, gymin, gymax,
                   res["outside_grid"]["first_line"]), file=sys.stderr)
+        return 1
+    if (bs := res["below_stock_bottom"])["count"] > 0:
+        print("error: %d cutting move(s) drive the tip below the stock "
+              "bottom Z %.3f (max %.3f mm below at XY %s, first line %s)"
+              % (bs["count"], stock_box[4], bs["max_depth"],
+                 bs["worst_xy"], bs["first_line"]), file=sys.stderr)
         return 1
     ap = res["axial_plunges"]
     if args.tool != "ball" and ap["count"] > 0:
