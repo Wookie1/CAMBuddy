@@ -397,6 +397,7 @@ class Connector:
             result = dict(result, **env_)
             if check is not None:
                 check.update(env_)
+                check["setup"] = {"origin": values.get("origin")}
                 with open(files["check.json"][0], "w") as fh:
                     json.dump(check, fh, indent=2)
             for fname, (path, media) in files.items():

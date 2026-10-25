@@ -174,6 +174,18 @@ def _tool_number(cfg, values, table=None):
 
 T_WORD_RE = re.compile(r"\bT\s*(\d+)", re.IGNORECASE)
 
+
+def _origin_flags(values):
+    """TL2 item 2: posts name their work origin in a header comment (P3)."""
+    return ["--header-comment",
+            "ORIGIN: " + (values.get("origin") or "model_origin")
+            .replace("_", " ").upper()]
+
+
+# TL2 item 4: geometry fields compared between library and repo table.
+_GEOMETRY_KEYS = ("diameter_mm", "corner_radius_mm", "flute_mm",
+                  "shank_diameter_mm", "holder", "stickout_mm")
+
 # task CPc: check_program input fields judged in this order
 CHECK_PROGRAM_FIELDS = ("program", "program_2", "program_3")
 
@@ -321,6 +333,30 @@ class EngineRun:
         except (toollib.ToolLibError, OSError, ValueError):
             pass  # bookkeeping only: never fails a finished run
 
+    def _check_library_geometry(self, numbers):
+        """TL2 item 4: the library geometry of every tool this run posts or
+        judges must equal the repo table the engine and judges read; a
+        difference refuses the run, naming the field and both values."""
+        if not self.cfg.get("home"):
+            return  # no library: the effective table IS the repo table
+        repo = {t.get("tool_id"): t for t in toollib._read(
+            toollib.repo_table_path(self.cfg["repo_root"]))["tools"]}
+        for e in self.tools.get("tools", []):
+            r = repo.get(e.get("tool_id"))
+            if r is None or e.get("number") not in numbers:
+                continue
+            for key in _GEOMETRY_KEYS:
+                a, b = e.get(key), r.get(key)
+                if not (abs(a - b) <= toollib.TOL if isinstance(
+                        a, (int, float)) and isinstance(b, (int, float))
+                        else a == b):
+                    raise EngineError(
+                        "tool %s: the library has %s %r but the engine and "
+                        "judges read %r from tools/x7_tools.json"
+                        % (e.get("tool_id"), key, a, b),
+                        code="tool_geometry_mismatch", field=key, got=a,
+                        allowed=b)
+
     def cancel(self):
         self.cancelled = True
         with self._lock:
@@ -402,6 +438,7 @@ class EngineRun:
         cell = 0.5
         self._load_tools(values)
         number = _tool_number(self.cfg, values, self.tools["tools"])
+        self._check_library_geometry([number])
         # 1) orient + stock box + part heightfield (grid covers the run's
         #    stock + tool radius + margin via STOCK_BOX/TOOL_R, task Z5b)
         self._spawn([py, "-m", "engine.cli", "prepare",
@@ -443,12 +480,19 @@ class EngineRun:
                  str(int(values["program_number"])),
                  "--tool-number", str(number),
                  "--json-progress", "--stats-json", stats_path]
+        argv_r += _origin_flags(values)
         if metric:
             argv_r += ["--metric"]
         self._spawn(argv_r, 0.2, 0.85, on_progress)
         posted = {"rough.nc": posted_units(nc, values["units"])}
         with open(stats_path) as fh:
             stats = json.load(fh)
+        if not stats.get("n_moves"):
+            # TL2 item 5: an exterior box leaves roughing an empty program.
+            raise EngineError(
+                "nothing to cut: the roughing program has no moves (every "
+                "level found 0 mm2 of stock region) - adaptive roughing "
+                "only clears enclosed stock", code="nothing_to_cut")
 
         # 3) independent zmap check + leftover preview. The zmap part grid
         #    must cover stock + tool radius (zmap exits non-zero if the
@@ -606,6 +650,7 @@ class EngineRun:
                                   field="tool_number", got=number,
                                   allowed=[numbers[0]])
             resolved.append((pname, ppath, number, tool))
+        self._check_library_geometry([n for _, _, n, _ in resolved])
         cell = 0.1  # judge grid: same 0.1 mm as the finishing chain
 
         # 2) orient + stock box + part heightfield (shared builder grid:
@@ -831,6 +876,8 @@ class EngineRun:
                     % (rest_number, rest["diameter_mm"],
                        values["tool_diameter"]), code="rest_tool_too_big",
                     field="rest_tool_number", got=rest_number)
+        self._check_library_geometry([rough_number, finish_number]
+                                     + ([rest_number] if rest else []))
 
         # stage boundaries: with the rest pass the generation stages are
         # squeezed so progress stays monotone and ends at 1.0
@@ -928,6 +975,7 @@ class EngineRun:
         # adds 1 mm over the part and rapids crossed roughing terraces
         fr.remove_stale(rough_stock_out)
         argv += ["--stock-out", rough_stock_out]
+        argv += _origin_flags(values)
         if metric:
             argv += ["--metric"]
         self._spawn(argv, *P["rough"], on_progress)
@@ -976,6 +1024,7 @@ class EngineRun:
                    "--program", str(int(values["program_number"])),
                    "--op-name", "SLOPE SPLIT FINISH (RUN AFTER ROUGHING)",
                    "--tool-number", str(finish_number)]
+        argv_fp += _origin_flags(values)
         if metric:
             argv_fp += ["--metric"]
         self._spawn(argv_fp, 0.72, 0.76, on_progress)
@@ -1117,6 +1166,7 @@ class EngineRun:
                       "--tool-kind", "ball",
                       "--dia", "%.4f" % rest["diameter_mm"],
                       "--corner", "%.4f" % (rest["diameter_mm"] / 2.0)]
+            argv_rp += _origin_flags(values)
             if metric:
                 argv_rp += ["--metric"]
             self._spawn(argv_rp, *P["post_rest"], on_progress)

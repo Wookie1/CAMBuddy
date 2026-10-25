@@ -2059,6 +2059,9 @@ def test_zz_print_e2e_result(live):
 CHECK_INPUTS = {
     "orientation": "as_modeled", "stock_xy": 1.0, "stock_top": 0.4,
     "stock_bottom": 1.0,
+    # TL2 item 1: origin is required for check_program (approved edit: the
+    # fixtures were posted in the model frame)
+    "origin": "model_origin",
 }
 
 
@@ -2093,7 +2096,8 @@ class TestCheckProgramCatalog:
 
     def test_validate_inputs(self):
         ok, code, v = catalog_mod.validate_inputs(
-            {"program": {"url": "u"}, "model": {"url": "u"}},
+            {"program": {"url": "u"}, "model": {"url": "u"},
+             "origin": "model_origin"},
             catalog_mod.CHECK_ACTION)
         assert ok, code
         ok, code, _ = catalog_mod.validate_inputs(
@@ -2101,11 +2105,13 @@ class TestCheckProgramCatalog:
         assert not ok and code == "input_missing"
         ok, code, _ = catalog_mod.validate_inputs(
             {"program": {"url": "u"}, "model": {"url": "u"},
-             "floor_z": 4.0}, catalog_mod.CHECK_ACTION)
+             "origin": "model_origin", "floor_z": 4.0},
+            catalog_mod.CHECK_ACTION)
         assert not ok and code == "input_unknown"
         ok, code, _ = catalog_mod.validate_inputs(
             {"program": {"url": "u"}, "model": {"url": "u"},
-             "tool_number": 5000}, catalog_mod.CHECK_ACTION)
+             "origin": "model_origin", "tool_number": 5000},
+            catalog_mod.CHECK_ACTION)
         assert not ok and code == "input_out_of_range"
 
 
@@ -2277,6 +2283,7 @@ class TestCheckProgramSequenceCatalog:
     def test_validate_accepts_program_2_and_3(self):
         ok, code, v = catalog_mod.validate_inputs(
             {"program": {"url": "u"}, "model": {"url": "u"},
+             "origin": "model_origin",
              "program_2": {"url": "u"}, "program_3": {"url": "u"}},
             catalog_mod.CHECK_ACTION)
         assert ok, code
@@ -3199,3 +3206,112 @@ class TestAgentEnvelopeE2E:
                             sorted({a["code"] for a in r["attention"]}))
         E2E["tb_envelopes"] = summary
         assert results[1810][0] == "succeeded", results[1810]
+
+
+# ==================================== TL2: toollib follow-ups (E2E) =======
+
+class TestTl2CheckOriginE2E:
+    """Item 1 E2E: a check_program without origin is rejected before any
+    engine work; the error names field origin and the check.json hint."""
+
+    def test_missing_origin_rejected(self, live):
+        mock, _, _ = live
+        mock.enqueue_run(1900, action=catalog_mod.CHECK_ACTION,
+                         inputs={"orientation": "as_modeled",
+                                 "stock_xy": 1.0, "stock_top": 0.4,
+                                 "stock_bottom": 1.0,
+                                 "model": model_input(mock),
+                                 "program": program_input(mock)})
+        final, body = _final_body(mock, 1900, timeout=120)
+        assert final == "rejected", body
+        err = body["error"]
+        assert err["code"] == "input_missing" and err["field"] == "origin"
+        assert "check.json setup" in err["next_step"]
+        assert mock.file_names(1900) == []
+
+
+class TestNothingToCutE2E:
+    """Item 5 E2E: the plain exterior box (box_off_centre.step) roughs to
+    an empty program: the run fails with a nothing_to_cut blocker
+    (verdict failed), and no .nc is uploaded or copied anywhere."""
+
+    def test_exterior_box_fails_nothing_to_cut(self, live):
+        mock, home, programs = live
+        mock.enqueue_run(1901, inputs=dict(
+            GOOD_INPUTS, model=box_input(mock), program_number=1901))
+        final, body = _final_body(mock, 1901, timeout=900)
+        assert final == "failed", body
+        err = body["error"]
+        assert err["code"] == "nothing_to_cut"
+        assert err["message"].startswith("nothing to cut") and err["next_step"]
+        r = body["result"]
+        assert r["verdict"] == "failed"
+        assert [a["code"] for a in r["attention"]] == ["nothing_to_cut"]
+        assert r["attention"][0]["severity"] == "blocker"
+        assert r["attention"][0]["next_step"]
+        assert mock.file_names(1901) == []
+        assert not list(programs.glob("O1901*"))
+
+
+class TestTl2OriginHeaderE2E:
+    """Items 1+2 E2E on TB: the runner posts the origin line and records
+    the origin in check.json's setup; the identical engine rough WITHOUT
+    --header-comment (what main's byte-identical default post produces,
+    proven in engine/test_post.py) differs by EXACTLY that one added line
+    and nothing else."""
+
+    def test_tb_rough_one_origin_line_vs_no_flag(self, live, tmp_path):
+        import difflib
+        import shutil
+        mock, home, _ = live
+        serve = tmp_path / "serve_tl2"
+        serve.mkdir()
+        shutil.copy(TB_STEP, serve / "test_block.step")
+        old = mock.serve_dir
+        mock.serve_dir = str(serve)
+        try:
+            tb = box_input(mock, TB_STEP)
+            tb["document"] = {"id": "doc-tl2"}
+            mock.enqueue_run(1910, inputs=dict(
+                GOOD_INPUTS, model=dict(tb), origin="stock_bottom_centre",
+                program_number=1910))
+            final, body = _final_body(mock, 1910, timeout=3600)
+            assert final == "succeeded", body
+        finally:
+            mock.serve_dir = old
+        run = home / "runs" / "1910"
+        text = open(run / "rough.nc", newline="").read()
+        assert text.count("(ORIGIN: STOCK BOTTOM CENTRE)") == 1
+        with open(run / "check.json") as fh:
+            assert json.load(fh)["setup"] == {"origin": "stock_bottom_centre"}
+        # the same engine job without the flag: engine.cli rough with the
+        # run's own prepare.json artifacts and the runner's argv (minus
+        # --header-comment); the default post is byte-identical to main
+        prep = json.load(open(run / "prepare.json"))
+        g = GOOD_INPUTS
+        out2 = str(tmp_path / "rough_noflag.nc")
+        subprocess.run(
+            [VIBE_PY, "-m", "engine.cli", "rough", "--step", prep["step"],
+             "--stock", *[("%.4f" % v) for v in prep["stock"]],
+             "--tool", "flat:%.4f:%.4f" % (g["tool_diameter"],
+                                           g["corner_radius"]),
+             "--out", out2,
+             "--floor", "%.4f" % (prep["stock"][4] + g["floor_z"]),
+             "--leave", "%.4f" % g["stock_to_leave"],
+             "--stepdown", "%.4f" % g["stepdown"],
+             "--optimal-load-mm", "%.4f" % g["optimal_load"],
+             "--stepup", "%.4f" % g["rest_stepup"],
+             "--hf", prep["hf"], "--min-rest", "0.5",
+             "--cut-feed", "%.1f" % g["feed"],
+             "--ramp-feed", "%.1f" % g["ramp_feed"],
+             "--spindle", str(g["rpm"]), "--post", "lnc",
+             "--program", "1910", "--tool-number", "13", "--metric",
+             "--stats-json", str(tmp_path / "noflag_stats.json")],
+            cwd=REPO, check=True, env=dict(os.environ, ENGINE_WORKERS="4"),
+            stdout=subprocess.DEVNULL)
+        base = open(out2, newline="").read()
+        a = text.replace("\r\n", "\n").split("\n")
+        b = base.replace("\r\n", "\n").split("\n")
+        added = [l[2:] for l in difflib.ndiff(b, a) if l.startswith("+ ")]
+        removed = [l[2:] for l in difflib.ndiff(b, a) if l.startswith("- ")]
+        assert added == ["(ORIGIN: STOCK BOTTOM CENTRE)"] and removed == []

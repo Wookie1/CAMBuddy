@@ -28,8 +28,9 @@ CODES = {
     "duplicate_t": ("error", "Pick a T no other tool uses in this job "
                     "(job.get / tools.list show the T numbers in use), or "
                     "renumber the other tool first."),
-    "out_of_range": ("error", "Use a T inside `allowed` (1..pockets); "
-                     "tools.update {pockets} changes the pocket count."),
+    "out_of_range": ("error", "Use a T inside `allowed` (job.renumber: "
+                     "1..pockets; tools.update: 1..999); tools.update "
+                     "{pockets} changes the pocket count."),
     "invalid_field": ("error", "Fix the field named in `field` (see "
                       "`allowed`)."),
     "unknown_holder": ("error", "Use a holder name from `allowed`, or null."),
@@ -62,6 +63,8 @@ CODES = {
                   "tool_number."),
     "tool_number_mismatch": ("error", "Leave tool_number empty or set it to "
                              "the program's own T."),
+    "tool_geometry_mismatch": ("error", "Set that library tool's field to "
+                               "the value tools/x7_tools.json shows."),
     # --- gates (blockers: the run fails, no .nc is uploaded) ---
     "gouges": ("blocker", "Check orientation, tool size and stepdown at the "
                "spot in `where`, then run again."),
@@ -89,6 +92,9 @@ CODES = {
                        "was refused."),
     "engine_failed": ("blocker", "Read the message; fix the inputs it "
                       "names, or report it with the run id."),
+    "nothing_to_cut": ("blocker", "Nothing was cleared: finish or rest the "
+                       "exterior instead, or check the orientation, stock "
+                       "and floor inputs."),
     "internal_error": ("blocker", "Report it with the run id; the details "
                        "are in the connector's run log."),
     # --- review items (verdict needs_review) ---

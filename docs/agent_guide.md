@@ -65,7 +65,7 @@ rewrites this table; a test fails when it drifts).
 | `input_digest_mismatch` | error | Send the run again: the downloaded file did not match its sha256/size. |
 | `unknown_tool` | error | Use a tool_id from tools.list. |
 | `duplicate_t` | error | Pick a T no other tool uses in this job (job.get / tools.list show the T numbers in use), or renumber the other tool first. |
-| `out_of_range` | error | Use a T inside `allowed` (1..pockets); tools.update {pockets} changes the pocket count. |
+| `out_of_range` | error | Use a T inside `allowed` (job.renumber: 1..pockets; tools.update: 1..999); tools.update {pockets} changes the pocket count. |
 | `invalid_field` | error | Fix the field named in `field` (see `allowed`). |
 | `unknown_holder` | error | Use a holder name from `allowed`, or null. |
 | `duplicate_tool` | error | Change the type, diameter or corner so the tool differs from the one named in the message. |
@@ -82,6 +82,7 @@ rewrites this table; a test fails when it drifts).
 | `multi_tool_program` | error | Split the program into one program per tool (program, program_2, program_3). |
 | `no_t_word` | error | Add a T word to the program or pass tool_number. |
 | `tool_number_mismatch` | error | Leave tool_number empty or set it to the program's own T. |
+| `tool_geometry_mismatch` | error | Set that library tool's field to the value tools/x7_tools.json shows. |
 | `gouges` | blocker | Check orientation, tool size and stepdown at the spot in `where`, then run again. |
 | `rapid_collisions` | blocker | Check floor_z and the stock sizes; the first offending line is in `where`. |
 | `over_flute` | blocker | Use a longer-flute or necked tool, or split the depth. |
@@ -94,6 +95,7 @@ rewrites this table; a test fails when it drifts).
 | `posted_units_mismatch` | blocker | Report this: the post did not honour `units`. |
 | `stale_artifact` | blocker | Run again; a stale intermediate file was refused. |
 | `engine_failed` | blocker | Read the message; fix the inputs it names, or report it with the run id. |
+| `nothing_to_cut` | blocker | Nothing was cleared: finish or rest the exterior instead, or check the orientation, stock and floor inputs. |
 | `internal_error` | blocker | Report it with the run id; the details are in the connector's run log. |
 | `engagement_overload` | review | Look at the listed lines; lower optimal_load or stepover if they chatter. |
 | `steep_plunge` | review | Check the entries at the listed lines before running. |

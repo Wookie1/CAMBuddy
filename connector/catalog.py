@@ -58,12 +58,12 @@ _ORIGIN_TEXT = ("where X0 Y0 Z0 of the program sits: stock_bottom_centre = "
 _ORIGIN = {"type": "string", "enum": ORIGINS,
            "default": "stock_bottom_centre", "title": "Work origin",
            "description": _ORIGIN_TEXT}
-# check_program judges a program that was posted elsewhere: by default in
-# the model's own frame (today's behaviour); pass the origin it was
-# posted with to judge it in that frame
+# check_program judges a program that was posted elsewhere: TL2 item 1 makes
+# origin REQUIRED there - validate() refuses a check_program that omits it
+# (the property keeps model_origin as its catalog default value only).
 _ORIGIN_CHECK = dict(_ORIGIN, default="model_origin",
-                     description=_ORIGIN_TEXT + "; give the origin the "
-                     "program was posted with (default model_origin)")
+                     description=_ORIGIN_TEXT + "; REQUIRED: give the "
+                     "origin the program was posted with")
 
 _DOCUMENT_ID = {"type": "string", "maxLength": 128,
                 "title": "STEVE document id",
@@ -471,6 +471,14 @@ def validate(values, action=ACTION, raw=None):
             return False, errors.make_error(
                 "input_missing", "missing required input %s" % name,
                 field=name)
+    if action == CHECK_ACTION and values.get("origin") is None:
+        # TL2 item 1: check_program has no origin default.
+        err = errors.make_error("input_missing", "missing required input "
+                                "origin", field="origin")
+        err["next_step"] = ("pass the origin the program was posted with; "
+                            "runs from this connector record it in their "
+                            "check.json setup")
+        return False, err
     for name in values:
         if name not in props:
             close = difflib.get_close_matches(name, list(props), n=3)

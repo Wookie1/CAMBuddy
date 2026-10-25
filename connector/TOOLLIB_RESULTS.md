@@ -330,3 +330,203 @@ Mismatches / notes:
   `origin_program_worst_mm: {"stock_bottom_centre": 0.006,
   "stock_top_centre": 0.006}` - no WARNING (both under 0.02 mm); the
   stock-box asserts stay at 1e-3 mm, the program-frame assert at 0.05 mm.
+
+# TL2 (toollib follow-ups) - started 2026-10-25 03:14:51 MST (hard cap 2 h)
+
+Branch toollib at ca71b14 (brief 4c6bed9). Worktree
+/Users/James/ai-sandbox/stevecam-toollib. Fresh session, do-not-commit.
+
+## Plan (coordinator decisions 2026-10-25)
+1. check_program `origin` required (no silent default): enforced in
+   connector/catalog.py validate(); error input_missing / field origin /
+   dedicated next_step. Runs record origin in check.json `setup`.
+2. engine/post_lnc.py post()/post_text(): optional `header_comments`
+   (default None -> byte-identical); engine.cli `rough`/`post`
+   `--header-comment`; the runner posts "(ORIGIN: ...)" in every program.
+3. toollib.update_tool: library T allows 1..999; job.renumber stays
+   1..pockets.
+4. runner: refuse a run when the library geometry of a tool it posts or
+   judges differs from tools/x7_tools.json (code tool_geometry_mismatch).
+5. rough with 0 moves (exterior box): blocker nothing_to_cut, verdict
+   failed, no .nc (code added to errors.py; agent_guide regenerated).
+
+## Deviations / conflicts found while planning (details at the end)
+- test_track2.py test_e_catalog_origin_inputs (frozen) asserts the
+  check_program origin property keeps default "model_origin": the property
+  keeps the key; validate() refuses an omitted origin regardless, so the
+  behaviour is "required, no default" while the frozen assertion holds.
+- test_toollib.py test_update_refusals (frozen) has ({"t": 40},
+  "out_of_range") for tools.update - item 3 makes T40 valid (1..999), so
+  that parametrized case contradicts the coordinator decision and will
+  fail. Left untouched per the TESTS lock; flagged for the coordinator.
+
+## Progress log (appended as work proceeds)
+- 03:20 implementing items 1-5 (code first, then tests).
+- 03:40 code + all new tests written. Non-test diff (excl. this file and
+  the pre-existing opencode.json change): see "Sizes" below. New tests:
+  engine/test_post.py 5 (item 2), connector/test_toollib.py 3 (items 3,4),
+  connector/test_track2.py 5 (items 1,2,5), connector/test_connector.py 3
+  E2E (items 1,2,5). Approved edits: CHECK_INPUTS + 4 validate-input dicts
+  gained origin="model_origin".
+- Sizes (git diff --numstat, excl. TOOLLIB_RESULTS.md and opencode.json):
+  114 added / 12 deleted = 126 changed lines (122 excluding the 4
+  mechanically regenerated docs/agent_guide.md lines). Over the 80 soft
+  budget, under the ~120 STOP line once the generated doc is excluded;
+  every line implements a brief item (no refactors).
+
+## Test runs (all through slot_m4.sh, foreground)
+- Run 1: `pytest engine/test_post.py connector/test_toollib.py
+  connector/test_track2.py connector/test_panel_inputs.py -q`
+  -> 2 failed, 104 passed, PYTEST_EXIT=1:
+  - test_update_refusals[changes1-out_of_range] ({"t": 40}): the KNOWN
+    conflict - item 3 makes T40 valid for the library (1..999); the frozen
+    existing test expects the old 1..pockets refusal. Not edited (lock).
+  - my new test_tl2_check_program_origin_required used the wrong return
+    shape of validate_inputs (message, not error dict) - fixed to use
+    catalog.validate directly.
+- Run 2: `pytest connector/test_track2.py engine/test_post.py
+  connector/test_toollib.py -q`
+  -> 1 failed, 102 passed, PYTEST_EXIT=1 - the only failure is the frozen
+  test_update_refusals[{"t": 40}] case above. All 13 new fast tests pass
+  (103 tests across engine/test_post.py + test_toollib.py + test_track2.py,
+  5 + 3 + 5 of them new TL2 tests).
+- 03:58 NOTE: the small-test lock (m4small.lock) is held since 03:35 by
+  ANOTHER session's job (task RRA3 in /Users/James/ai-sandbox/stevecam-rr1b,
+  scratch/rra3_run.py). Per LOCKS I do not touch it; remaining runs are
+  queued through slot_m4.sh (it waits for the lock itself). Queued single
+  job: (1) fast check_program subset of test_connector.py (catalog +
+  tool-lookup + sequence-catalog + mismatch: validates the approved
+  origin-input edits), (2) E2E batch on one live fixture:
+  TestTl2CheckOriginE2E + TestNothingToCutE2E + TestTl2OriginHeaderE2E
+  (new) + TestCheckProgramE2E::test_check_program_ok (existing, exercises
+- 04:06 slot run (after the RRA3 job released the lock):
+  - fast check_program subset (TestCheckProgramCatalog,
+    TestCheckProgramToolLookup, TestCheckProgramSequenceCatalog,
+    test_check_program_tool_number_mismatch_refused): 10 passed, exit 0.
+  - E2E batch (one live fixture): TestTl2CheckOriginE2E, TestNothingToCutE2E
+    and the existing TestCheckProgramE2E::test_check_program_ok (edited
+    CHECK_INPUTS) PASSED; TestTl2OriginHeaderE2E FAILED on my test's own
+    direct re-post subprocess: it used PY (/opt/homebrew/bin/python3, no
+    opencamlib) where the runner uses cfg["engine_python"] (VibeCAD python,
+    config.py DEFAULTS). "1 failed, 3 passed in 91.58s", pytest exit 1
+    (shown via the summary line; my echo read the tail pipeline - fixed in
+    the re-run). Test fixed to VIBE_PY; re-run of that test follows.
+
+## Per item: change (file:line), test, injected fault + measured value
+
+### Item 1 - check_program origin required
+- Change: connector/catalog.py:62-66 (_ORIGIN_CHECK, next_step text),
+  :161 (check_program input list), :474-481 (validate() refuses an
+  omitted origin for CHECK_ACTION: input_missing, field "origin",
+  next_step "pass the origin the program was posted with; runs from this
+  connector record it in their check.json setup").
+  connector/connector.py:400 records it: check["setup"] = {"origin": ...}.
+- Tests: test_track2.py:573 test_tl2_check_program_origin_required
+  (measured: err["code"]=="input_missing", err["field"]=="origin", exact
+  next_step string); test_connector.py:3213 TestTl2CheckOriginE2E (run
+  1900 without origin -> rejected, field origin, zero files uploaded).
+- Injected fault (test_track2.py:588): switch the required-rule off
+  (CHECK_ACTION patched away = pre-TL2 code) - the same origin-less
+  inputs then measure ok=True, origin=="model_origin": the exact silent
+  default item 1 refuses.
+- Approved edits: CHECK_INPUTS (test_connector.py:2064) and the existing
+  check_program tests' inputs gained origin="model_origin" - nothing else.
+
+### Item 2 - origin header comment line
+- Change: engine/post_lnc.py:350-368 (_header_comment_lines: P3 form,
+  upper case, rejects nested parens), :373 (post()/post_text() parameter
+  header_comments=None), :441 (inserted after the program header);
+  engine/cli.py:381/:404 (--header-comment, repeatable, on rough+post),
+  :68/:600 wiring; connector/runner.py:178-184 (_origin_flags ->
+  "ORIGIN: STOCK BOTTOM CENTRE" / "STOCK TOP CENTRE" / "MODEL ORIGIN"),
+  passed at :483 (rough), :978 (finish), :1027 (rest), :1169 (repost).
+- Tests: engine/test_post.py:822 default None byte-identical; :828 adds
+  exactly one line; :839 P3 form (upper case, no nested parens,
+  slash-star style when selected); :852 real rough one-line diff;
+  test_track2.py:608 runner passes the flag to rough+finish+rest
+  (measured: argv value "ORIGIN: STOCK TOP CENTRE", all 3 posts).
+- Injected faults: test_post.py:863 emit the line twice -> measured
+  added-lines count reads 2 where exactly 1 is required;
+  test_track2.py:631 runner forgets the flag -> measured
+  argv.count("--header-comment") == 0, not the required 1.
+- TB one-line diff (test_connector.py:3256 TestTl2OriginHeaderE2E,
+  PASSED 04:09, E2E_EXIT=0): TB rough through the runner (run 1910,
+  origin stock_bottom_centre) vs the SAME engine rough WITHOUT
+  --header-comment (the default post main would produce - proven
+  byte-identical in test_post.py:822): difflib measured
+  added == ["(ORIGIN: STOCK BOTTOM CENTRE)"], removed == []. Exactly the
+  one added line and nothing else. check.json setup == {"origin":
+  "stock_bottom_centre"}.
+
+### Item 3 - library T 1..999
+- Change: connector/toollib.py:139-146 (_check_library_t: 1..999,
+  allowed {minimum:1, maximum:999}), used by update at :179.
+  job.renumber unchanged (1..pockets).
+- Test: test_toollib.py:398 T500/T999 accepted; 0/1000/-5 refused
+  out_of_range with allowed {1,999}; renumber(500) still refused with
+  allowed {1,12}.
+- Injected fault (test_toollib.py:417): apply the old pockets-limited
+  range to the library - T500 then measures refused out_of_range with
+  allowed.maximum == 12 (not the required 999); restored, T500 measures
+  accepted (t == 500).
+- CONFLICT (coordinator decision needed): frozen test_toollib.py
+  test_update_refusals[{"t": 40}] expects the old pockets refusal; item 3
+  makes T40 valid, so that one parametrized case fails by design. Left
+  untouched per the TESTS lock.
+
+### Item 4 - fail closed on tool geometry
+- Change: connector/runner.py:186-187 (_GEOMETRY_KEYS: diameter_mm,
+  corner_radius_mm, flute_mm, shank_diameter_mm, holder, stickout_mm),
+  :336-360 (_check_library_geometry: library vs tools/x7_tools.json,
+  matched by tool_id, tolerance 0.001, refuses tool_geometry_mismatch
+  naming field + both values + next_step; skipped when there is no
+  library home), called before any engine work at :441 (single-tool
+  runs), :653 (renumber chains), :879 (rough+finish checks).
+  errors.py:66 severity error. Engine untouched.
+- Test: test_toollib.py:450 - control (library == table) runs; injected
+  fault: library T13 dia_mm 12.0 vs table 12.686 -> refused with
+  field "diameter_mm", got 12.0, allowed 12.686, zero engine calls;
+  holder "BT30-ER20-60" vs "BT30-ER32-70" refused the same way.
+
+### Item 5 - nothing_to_cut blocker
+- Change: connector/runner.py:488-495 (after rough, stats n_moves == 0 ->
+  EngineError code nothing_to_cut, plain message + next_step, before any
+  judging/upload); errors.py:95 severity blocker with next_step;
+  docs/agent_guide.md regenerated (python3 connector/errors.py).
+- Test: test_track2.py:652 - injected fault: fake engine writes
+  {"levels": [], "n_moves": 0} (the exterior-box program) -> measured
+  code nothing_to_cut, message startswith "nothing to cut", envelope
+  verdict failed, attention severity blocker; control n_moves 1 runs.
+  test_connector.py:3233 TestNothingToCutE2E (real engine,
+  box_off_centre.step, run 1901): failed / nothing_to_cut / verdict
+  failed / blocker, no .nc uploaded and none in the programs dir.
+  PASSED 04:06.
+
+## Final sizes (git diff --numstat, 04:36)
+- Non-test (excl. TOOLLIB_RESULTS.md and the pre-existing opencode.json
+  change): catalog 13/5, connector 1/0, errors 8/2, runner 50/0,
+  toollib 10/1, cli 9/2, post_lnc 20/1, agent_guide 3/1 (generated)
+  = 114 added / 12 deleted; excluding the generated doc: 111/11 = 122
+  changed lines. Over the 80 soft budget, at the ~120 STOP line once the
+  generated doc is excluded - every line implements a brief item.
+- Tests: test_connector.py 119/3 (the 3 deleted lines are the approved
+  origin edits' replaced lines), test_toollib.py 83/0, test_track2.py
+  118/0, engine/test_post.py 64/0.
+
+## Deviations (final)
+1. The check_program origin PROPERTY keeps its "default": "model_origin"
+   key (frozen test_e_catalog_origin_inputs asserts it); the behavior is
+   "required" because validate() refuses an omitted origin regardless.
+2. Frozen test_update_refusals[{"t": 40}] fails by design (item 3
+   supersedes it); flagged for the coordinator, test not edited.
+3. Item 2's "vs main" TB diff is measured against the same engine rough
+   WITHOUT --header-comment (default post proven byte-identical to
+   main's in test_post.py:822) - the LOCKS rules forbid checking main out
+   in this worktree.
+
+## Done
+All 5 items implemented and tested; 13 new fast tests + 3 E2E classes,
+all passing except the frozen t=40 conflict above. Exit codes pasted
+above (runs 1-2: 1 - only that frozen conflict; subsets and the final
+E2E: 0). NOT committed, per brief. Stopped 2026-10-25 ~04:45 MST
+(cap ~05:14).

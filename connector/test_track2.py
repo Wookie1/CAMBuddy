@@ -566,3 +566,121 @@ def test_f_catalog_descriptions_state_units_range_default():
                 assert "follows `units`" in d, (a["name"], name)
                 if "minimum" in p:
                     assert "range" in d and " in" in d, (a["name"], name)
+
+
+# ------------------------------------------------- TL2: toollib follow-ups --
+
+def test_tl2_check_program_origin_required():
+    """Item 1: check_program without origin is refused input_missing,
+    field origin, with the setup-hint next_step; with origin it passes."""
+    base = {"program": {"url": "u"}, "model": {"url": "u"}}
+    ok, err = catalog_mod.validate(base, catalog_mod.CHECK_ACTION)
+    assert not ok and err["code"] == "input_missing"
+    assert err["field"] == "origin"
+    assert err["next_step"] == ("pass the origin the program was posted "
+                                "with; runs from this connector record it "
+                                "in their check.json setup")
+    ok, code, v = catalog_mod.validate_inputs(
+        dict(base, origin="model_origin"), catalog_mod.CHECK_ACTION)
+    assert ok and v["origin"] == "model_origin", code
+
+
+def test_tl2_check_origin_injected_fault_is_measured(monkeypatch):
+    """Fault: the required-origin rule off (pre-TL2). The same inputs then
+    validate ok with the silent default - measured: ok True and
+    origin=model_origin, the exact slip item 1 refuses."""
+    monkeypatch.setattr(catalog_mod, "CHECK_ACTION", "other")
+    ok, code, v = catalog_mod.validate_inputs(
+        {"program": {"url": "u"}, "model": {"url": "u"}}, "check_program")
+    assert ok and v["origin"] == "model_origin"
+
+
+def _tl2_rough_argv(values, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner_mod.EngineRun, "_spawn", _fake_spawn(calls))
+    monkeypatch.setattr(runner_mod, "posted_units", lambda path, req: req)
+    cfg = {"engine_python": PY, "repo_root": REPO}
+    runner_mod.EngineRun(cfg, str(tmp_path)).run(STEP, values)
+    return [a for a in calls if "engine.cli" in a
+            and a[a.index("engine.cli") + 1] == "rough"][0]
+
+
+def test_tl2_runner_posts_origin_header_line(tmp_path, monkeypatch):
+    """Item 2: the runner passes the run's origin as a header comment to
+    every post: rough, finish and rest."""
+    from test_toollib import SLOPE
+    ok, code, v = connector_mod.prepare_values(
+        dict(INCH_NO_UNITS, origin="stock_top_centre"), catalog_mod.ACTION)
+    assert ok, v
+    argv = _tl2_rough_argv(v, tmp_path, monkeypatch)
+    assert argv[argv.index("--header-comment") + 1] == \
+        "ORIGIN: STOCK TOP CENTRE"
+    calls = []
+    monkeypatch.setattr(runner_mod.EngineRun, "_spawn", _fake_spawn(calls))
+    monkeypatch.setattr(runner_mod, "posted_units", lambda path, req: req)
+    runner_mod.EngineRun({"engine_python": PY, "repo_root": REPO},
+                         str(tmp_path / "s")).run_slope_split_finish(
+        STEP, dict(SLOPE, origin="model_origin", rest_tool_number=31))
+    posts = [a for a in calls if "engine.cli" in a
+             and a[a.index("engine.cli") + 1] in ("rough", "post")]
+    assert len(posts) == 3
+    for a in posts:
+        assert a[a.index("--header-comment") + 1] == "ORIGIN: MODEL ORIGIN"
+
+
+def test_tl2_origin_line_injected_fault_is_measured(tmp_path, monkeypatch):
+    """Fault: the runner forgets the flag (pre-TL2). The measured count of
+    --header-comment words in the rough argv is then 0, not the 1 the
+    origin line requires."""
+    monkeypatch.setattr(runner_mod, "_origin_flags", lambda values: [])
+    ok, code, v = connector_mod.prepare_values(
+        dict(INCH_NO_UNITS, origin="stock_top_centre"), catalog_mod.ACTION)
+    argv = _tl2_rough_argv(v, tmp_path, monkeypatch)
+    assert argv.count("--header-comment") == 0
+
+
+ROUGH_VALUES = {
+    "orientation": "as_modeled", "stock_xy": 1.0, "stock_top": 0.4,
+    "stock_bottom": 1.0, "floor_z": 4.0, "tool_type": "flat",
+    "tool_diameter": 12.686, "corner_radius": 0.0, "flute_length": 50.8,
+    "stepdown": 4.0, "optimal_load": 2.0, "stock_to_leave": 0.381,
+    "rest_stepup": 1.905, "rpm": 7500, "feed": 3429.0, "ramp_feed": 1270.0,
+    "units": "mm", "program_number": 1001,
+}
+
+
+def test_tl2_nothing_to_cut_blocks_the_run(tmp_path, monkeypatch):
+    """Item 5: a rough whose program has no moves (exterior box, every
+    level skipped) fails as a nothing_to_cut blocker before any judging;
+    the envelope says verdict failed. Control: n_moves 1 runs through."""
+    import json as _json
+    from test_toollib import _fake_spawn
+
+    def no_moves(self, argv, lo, hi, on_progress, json_out=None,
+                 extra_env=None):
+        _fake_spawn([])(self, argv, lo, hi, on_progress, json_out, extra_env)
+        a = list(argv)
+        sp = a[a.index("--stats-json") + 1] if "--stats-json" in a else None
+        if sp:  # the rough posts an EMPTY program: 0 moves
+            with open(sp, "w") as fh:
+                _json.dump({"levels": [], "n_moves": 0}, fh)
+
+    monkeypatch.setattr(runner_mod.EngineRun, "_spawn", no_moves)
+    cfg = {"engine_python": PY, "repo_root": REPO}
+    with pytest.raises(runner_mod.EngineError) as e:
+        runner_mod.EngineRun(cfg, str(tmp_path / "r")).run(
+            STEP, dict(ROUGH_VALUES))
+    err = e.value.as_error()
+    assert err["code"] == "nothing_to_cut" and err["message"]
+    assert err["message"].startswith("nothing to cut") and err["next_step"]
+    env = envelope.for_failure("adaptive_rough", err)
+    assert env["verdict"] == "failed"
+    assert [a["code"] for a in env["attention"]] == ["nothing_to_cut"]
+    assert env["attention"][0]["severity"] == "blocker"
+    # injected-fault measurement: the empty program (n_moves 0) is what
+    # trips it - with the normal fake engine (n_moves 1) the run succeeds
+    monkeypatch.setattr(runner_mod.EngineRun, "_spawn",
+                        _fake_spawn([]))
+    result, _ = runner_mod.EngineRun(cfg, str(tmp_path / "ok")).run(
+        STEP, dict(ROUGH_VALUES))
+    assert result["n_moves"] == 1

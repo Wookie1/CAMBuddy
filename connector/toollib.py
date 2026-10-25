@@ -136,6 +136,15 @@ def _check_t(t, n_pockets):
                            allowed={"minimum": 1, "maximum": n_pockets})
 
 
+def _check_library_t(t):
+    # TL2 item 3: library T allows 1..999; only job.renumber is 1..pockets.
+    if not _is_int(t) or not 1 <= t <= 999:
+        raise ToolLibError("out_of_range",
+                           "T%s is outside 1..999 (library)" % (t,),
+                           field="t", got=t,
+                           allowed={"minimum": 1, "maximum": 999})
+
+
 def update_tool(home, repo_root, tool_id=None, changes=None, new_pockets=None):
     """tools.update: edit one library tool and/or the pocket count. Returns
     {tool: <tools.list entry or null>, pockets}. Saved to <home>/tools.json
@@ -167,7 +176,7 @@ def update_tool(home, repo_root, tool_id=None, changes=None, new_pockets=None):
         for k, v in changes.items():
             if k == "t":
                 if v is not None:
-                    _check_t(v, pockets(lib))
+                    _check_library_t(v)
                     other = next((o for o in lib["tools"] if o is not old
                                   and o.get("number") == v), None)
                     if other is not None:

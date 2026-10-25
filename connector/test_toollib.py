@@ -391,3 +391,86 @@ def test_check_program_resolves_job_t(home, tmp_path, monkeypatch):
             str(prog), step, dict(vals, document_id="doc-other"))
     assert "T5" in str(e.value)
     assert calls == []
+
+
+# ------------------------------------------------ TL2: toollib follow-ups --
+
+def test_tl2_library_t_allows_1_to_999(home):
+    """Item 3: tools.update library T numbers allow 1..999; only
+    job.renumber stays limited to 1..pockets."""
+    assert toollib.update_tool(home, REPO, "ball-19.050",
+                               {"t": 500})["tool"]["t"] == 500
+    assert toollib.update_tool(home, REPO, "ball-12.700",
+                               {"t": 999})["tool"]["t"] == 999
+    for bad in (0, 1000, -5):
+        with pytest.raises(toollib.ToolLibError) as e:
+            toollib.update_tool(home, REPO, "ball-19.050", {"t": bad})
+        assert e.value.code == "out_of_range"
+        assert e.value.detail["allowed"] == {"minimum": 1, "maximum": 999}
+    # job.renumber: still 1..pockets (12 here)
+    with pytest.raises(toollib.ToolLibError) as e:
+        toollib.renumber(home, REPO, DOC, ROUGH, 500)
+    assert e.value.code == "out_of_range"
+    assert e.value.detail["allowed"] == {"minimum": 1, "maximum": 12}
+
+
+def test_tl2_library_t_injected_fault_is_measured(home):
+    """Fault: the old pockets-limited range still applied to the library.
+    T500 - valid for the library per item 3 - is then refused
+    out_of_range against 12 pockets: measured allowed.maximum 12, not
+    the required 999."""
+    monkey = toollib._check_library_t
+    toollib._check_library_t = lambda t: toollib._check_t(t, 12)
+    try:
+        with pytest.raises(toollib.ToolLibError) as e:
+            toollib.update_tool(home, REPO, "ball-19.050", {"t": 500})
+        assert e.value.code == "out_of_range"
+        assert e.value.detail["allowed"]["maximum"] == 12
+    finally:
+        toollib._check_library_t = monkey
+    assert toollib.update_tool(home, REPO, "ball-19.050",
+                               {"t": 500})["tool"]["t"] == 500
+
+
+CP_VALS = {"orientation": "as_modeled", "stock_xy": 1.0, "stock_top": 0.4,
+           "stock_bottom": 1.0}
+
+
+def _tl2_check_run(home, tmp_path, monkeypatch):
+    """run_check_program on the fake engine; returns (calls, work dir)."""
+    calls = []
+    monkeypatch.setattr(runner_mod.EngineRun, "_spawn", _fake_spawn(calls))
+    work = tmp_path / "geom"
+    work.mkdir(exist_ok=True)
+    (work / "program.nc").write_text("%\nO1\nT13 M06\nG0 X0.\nM30\n%\n")
+    cfg = {"engine_python": PY, "repo_root": REPO, "home": home}
+    return calls, runner_mod.EngineRun(cfg, str(work)), work / "program.nc"
+
+
+def test_tl2_geometry_mismatch_refuses_the_run(home, tmp_path, monkeypatch):
+    """Item 4: library geometry differing from the repo table for a tool
+    the run judges refuses the run before any engine work, naming the
+    field and both values. Control first: a library equal to the repo
+    table runs (0 refusals)."""
+    step = os.path.join(HERE, "testdata", "synth_pocket.step")
+    calls, eng, prog = _tl2_check_run(home, tmp_path, monkeypatch)
+    eng.run_check_program(str(prog), step, dict(CP_VALS))
+    assert calls, "control run must proceed"
+    # fault: the library's T13 diameter edited away from the repo table
+    toollib.update_tool(home, REPO, ROUGH, {"dia_mm": 12.0})
+    calls.clear()
+    with pytest.raises(runner_mod.EngineError) as e:
+        eng.run_check_program(str(prog), step, dict(CP_VALS))
+    err = e.value.as_error()
+    assert err["code"] == "tool_geometry_mismatch"
+    assert err["field"] == "diameter_mm" and err["got"] == 12.0
+    assert err["allowed"] == 12.686 and err["next_step"]
+    assert calls == [], "refused before any engine work"
+    # holder differs the same way (both values named)
+    toollib.update_tool(home, REPO, ROUGH, {"dia_mm": 12.686,
+                                            "holder": "BT30-ER20-60"})
+    with pytest.raises(runner_mod.EngineError) as e:
+        eng.run_check_program(str(prog), step, dict(CP_VALS))
+    err = e.value.as_error()
+    assert err["field"] == "holder" and err["got"] == "BT30-ER20-60"
+    assert err["allowed"] == "BT30-ER32-70"

@@ -64,7 +64,8 @@ def _run_post(a):
     kw = dict(metric=a.metric, program=a.program, op_name=a.op_name,
               wcs=a.wcs, dwell_ms=a.dwell_ms, dwell_p_ms=not getattr(a, "dwell_x_s", False),
               comment_style=getattr(a, "comment_style", "paren"),
-              tool_desc=a.tool_desc, crlf=not a.lf, arcs=a.arcs)
+              tool_desc=a.tool_desc, crlf=not a.lf, arcs=a.arcs,
+              header_comments=a.header_comments)
     if a.tool_number is not None:
         kw["tool_number"] = a.tool_number
     if a.rpm is not None:
@@ -377,6 +378,9 @@ def main(argv=None):
     r.add_argument("--tool-number", dest="tool_number", type=int, default=None,
                    help="LNC tool number (T/H) with --post lnc; default: look "
                         "the tool up in tools/x7_tools.json")
+    r.add_argument("--header-comment", dest="header_comments",
+                   action="append", default=None,
+                   help="extra LNC header comment line (P3 form); repeatable")
     r.add_argument("--json-progress", dest="json_progress", action="store_true",
                    help='emit JSON progress lines '
                        '{"progress":0.4,"message":"level 3/7"} for callers')
@@ -397,6 +401,9 @@ def main(argv=None):
     pp.add_argument("--corner", type=float, default=None, help="corner radius mm")
     pp.add_argument("--tool-kind", dest="tool_kind", default=None,
                    choices=("bull", "flat", "ball", "endmill"))
+    pp.add_argument("--header-comment", dest="header_comments",
+                    action="append", default=None,
+                    help="extra LNC header comment line (P3 form); repeatable")
     pp.add_argument("--clear", type=float, default=None,
                    help="clearance/retract height mm (default: max Z of path)")
     pp.add_argument("--wcs", type=int, default=54, help="work offset G-code (54)")
@@ -590,7 +597,7 @@ def main(argv=None):
         text = post_lnc.post(moves, metric=a.metric, program=a.program,
                              op_name=a.op_name, tool_number=a.tool_number,
                              rpm=a.spindle, dia_mm=dia, corner_mm=corner,
-                             tool_kind=kind)
+                             tool_kind=kind, header_comments=a.header_comments)
     else:
         text = moves_to_gcode(moves, spindle_rpm=a.spindle,
                               tool_comment="T1 %s D=%.3f CR=%.3f" % (kind, dia, corner))
