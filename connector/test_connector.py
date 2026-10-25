@@ -2747,9 +2747,12 @@ class TestToolLibE2E:
                                  "tool_id": self.ROUGH, "t": 5})
         final, body = _final_body(mock, 1302)
         assert final == "succeeded", body
-        assert body["result"] == {"document_id": self.DOC,
-                                  "renumber": {self.ROUGH: 5},
-                                  "tools_used": [], "setup": None}
+        job = {k: body["result"][k] for k in ("document_id", "renumber",
+                                               "tools_used", "setup")}
+        assert job == {"document_id": self.DOC,
+                       "renumber": {self.ROUGH: 5},
+                       "tools_used": [], "setup": None}
+        assert body["result"]["verdict"] == "ready"  # task f envelope
         # refusals come back as {code, message}
         for rid, t, code in ((1303, 3, "duplicate_t"),
                              (1304, 0, "out_of_range"),
@@ -3075,3 +3078,104 @@ class TestWorkOriginE2E:
                     assert final == "failed", body
         finally:
             mock.serve_dir = old
+
+
+TB_STEP = os.path.join(REPO, "samples", "test_block.step")
+
+
+class TestAgentEnvelopeE2E:
+    """Track 2 (f): a scripted agent walk-through on mock_steve, and the
+    envelope schema on real TB rough, finish and check runs."""
+
+    def test_agent_walk_through(self, live):
+        """The agent sends a mm diameter while units is inch (default):
+        the refusal names the field and the allowed range in inch; the
+        agent converts, retries, and gets ready or needs_review with every
+        item explained."""
+        from test_track2 import envelope_issues
+        mock, home, _ = live
+        inch = {k: v / 25.4 if k in catalog_mod.MM_FIELDS else v
+                for k, v in GOOD_INPUTS.items() if k != "units"}
+        first = dict(inch, tool_diameter=12.686, model=model_input(mock))
+        mock.enqueue_run(1801, inputs=first)
+        assert mock.wait_state(1801, "rejected", 60), mock.states_for(1801)
+        err = [r["body"] for r in mock.reports
+               if str(r["run_id"]) == "1801"][-1]["error"]
+        assert err["code"] == "input_out_of_range"
+        assert err["field"] == "tool_diameter" and err["got"] == 12.686
+        allowed = err["allowed"]
+        assert allowed["units"] == "inch" and err["next_step"]
+        # agent: 12.686 is above the inch maximum, so it was mm - convert
+        assert err["got"] > allowed["maximum"]
+        retry = dict(first, tool_diameter=err["got"] / 25.4,
+                     model=model_input(mock))
+        assert allowed["minimum"] <= retry["tool_diameter"] <= \
+            allowed["maximum"]
+        mock.enqueue_run(1802, inputs=retry)
+        final, body = _final_body(mock, 1802, timeout=900)
+        assert final == "succeeded", body
+        r = body["result"]
+        assert envelope_issues(r) == [], r
+        assert r["verdict"] in ("ready", "needs_review")
+        if r["verdict"] == "needs_review":
+            assert [a for a in r["attention"] if a["severity"] == "review"]
+        E2E["walk_through"] = {"verdict": r["verdict"],
+                               "summary": r["summary"],
+                               "codes": [a["code"] for a in r["attention"]]}
+        with open(home / "runs" / "1802" / "check.json") as fh:
+            cj = json.load(fh)
+        assert {k: cj[k] for k in ("verdict", "summary", "attention")} == \
+            {k: r[k] for k in ("verdict", "summary", "attention")}
+
+    def test_envelope_schema_on_tb_runs(self, live, tmp_path):
+        from test_track2 import envelope_issues
+        import shutil
+        mock, home, _ = live
+        serve = tmp_path / "serve"
+        serve.mkdir()
+        shutil.copy(TB_STEP, serve / "test_block.step")
+        old = mock.serve_dir
+        mock.serve_dir = str(serve)
+        try:
+            tb = box_input(mock, TB_STEP)
+            tb["document"] = {"id": "doc-tb"}
+            mock.enqueue_run(1810, inputs=dict(
+                GOOD_INPUTS, model=dict(tb), program_number=1810))
+            fin = dict(SLOPE_GOOD_INPUTS, model=dict(tb), stepover=1.0,
+                       stepdown=1.0, program_number=1820)
+            mock.enqueue_run(1811, action=catalog_mod.SLOPE_ACTION,
+                             inputs=fin)
+            results = {}
+            for rid in (1810, 1811):
+                final, body = _final_body(mock, rid, timeout=3600)
+                results[rid] = (final, body)
+            shutil.copy(home / "runs" / "1810" / "rough.nc",
+                        serve / "tb_rough.nc")
+            data = (serve / "tb_rough.nc").read_bytes()
+            prog = program_input(mock, "check_ok.nc")
+            prog.update({"name": "tb_rough.nc", "bytes": len(data),
+                         "sha256": hashlib.sha256(data).hexdigest(),
+                         "url": mock.base_url + "/files/tb_rough.nc"})
+            mock.enqueue_run(1812, action=catalog_mod.CHECK_ACTION,
+                             inputs=dict(CHECK_INPUTS, model=dict(tb),
+                                         program=prog,
+                                         origin="stock_bottom_centre"))
+            results[1812] = _final_body(mock, 1812, timeout=3600)
+        finally:
+            mock.serve_dir = old
+        summary = {}
+        for rid, (final, body) in results.items():
+            r = body.get("result") or {}
+            assert envelope_issues(r) == [], (rid, final, r)
+            if final == "failed":
+                assert r["verdict"] == "failed" and body["error"][
+                    "next_step"], body
+                assert not any(n.endswith(".nc")
+                               for n in mock.file_names(rid))
+            else:
+                with open(home / "runs" / str(rid) / "check.json") as fh:
+                    assert envelope_issues(json.load(fh)) == []
+            summary[rid] = (final, r.get("verdict"),
+                            sorted({a["code"] for a in r["attention"]}))
+        E2E["tb_envelopes"] = summary
+        assert results[1810][0] == "succeeded", results[1810]

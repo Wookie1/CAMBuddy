@@ -317,3 +317,252 @@ def test_e_runner_passes_origin_to_prepare(tmp_path, monkeypatch):
         runner_mod.EngineRun(cfg, str(tmp_path / "m")).run_measure(
             STEP, {"orientation": "as_modeled"})
     assert "--origin" not in calls[0]  # measure: the model's own frame
+
+
+# ------------------------------------------- (f) agent errors + envelope --
+
+import errors  # noqa: E402
+import envelope  # noqa: E402
+
+
+def _rough_err(values_in):
+    ok, code, err = connector_mod.prepare_values(values_in,
+                                                 catalog_mod.ACTION)
+    assert not ok
+    return err
+
+
+def _engine_err(fn):
+    with pytest.raises(runner_mod.EngineError) as e:
+        fn()
+    return e.value.as_error()
+
+
+def _lib_err(fn):
+    with pytest.raises(toollib.ToolLibError) as e:
+        fn()
+    return e.value.as_dict()
+
+
+def error_paths(home, tmp_path, monkeypatch):
+    """{path name: (agent error, expected field or None)} - one entry per
+    refusal path an agent can hit."""
+    out = {}
+    base = dict(INCH_NO_UNITS)
+    out["input_missing"] = (connector_mod.prepare_values(
+        {}, catalog_mod.ACTION)[2], "model")
+    out["input_unknown"] = (_rough_err(dict(base, tool_diamter=1.0)),
+                            "tool_diamter")
+    out["input_out_of_range_inch"] = (_rough_err(
+        dict(base, tool_diameter=2.0)), "tool_diameter")
+    out["input_out_of_range_enum"] = (_rough_err(
+        dict(base, tool_type="ball")), "tool_type")
+    out["bull_corner"] = (_rough_err(dict(base, tool_type="bull",
+                                          tool_diameter=0.5,
+                                          corner_radius=0.3)),
+                          "corner_radius")
+    out["action_unknown"] = (catalog_mod.validate({}, "nope")[1], "action")
+    # tool library / jobs
+    out["duplicate_t"] = (_lib_err(lambda: toollib.renumber(
+        home, REPO, "d", "flat-12.686", 3)), "t")
+    out["out_of_range"] = (_lib_err(lambda: toollib.renumber(
+        home, REPO, "d", "flat-12.686", 40)), "t")
+    out["unknown_tool"] = (_lib_err(lambda: toollib.renumber(
+        home, REPO, "d", "nope", 4)), "tool_id")
+    out["bad_document_id"] = (_lib_err(lambda: toollib.renumber(
+        home, REPO, "../x", "flat-12.686", 4)), "document_id")
+    out["unknown_holder"] = (_lib_err(lambda: toollib.update_tool(
+        home, REPO, "flat-12.686", {"holder": "X"})), "holder")
+    out["invalid_field"] = (_lib_err(lambda: toollib.update_tool(
+        home, REPO, "flat-12.686", {"h": 1})), "h")
+    out["setup_range"] = (_lib_err(lambda: toollib.set_setup(
+        home, "d", {"stock_top": 99})), "setup.stock_top")
+    # runner fail-closed paths (no engine: they refuse before it)
+    out["tool_not_in_table"] = (_engine_err(lambda: runner_mod.check_tool_entry(
+        99, os.path.join(REPO, "tools", "x7_tools.json"))), "tool_number")
+    cfg = {"engine_python": PY, "repo_root": REPO}
+    monkeypatch.setattr(runner_mod.EngineRun, "_spawn",
+                        lambda *a, **k: None)
+    slope = {"tool_diameter": 9.525, "rough_tool_type": "flat",
+             "rough_tool_diameter": 12.686, "rough_corner_radius": 0.0}
+    for code, rest in (("rest_tool_no_holder", 3),
+                       ("rest_tool_not_ball", 13), ("rest_tool_too_big", 20)):
+        out[code] = (_engine_err(lambda: runner_mod.EngineRun(
+            cfg, str(tmp_path / code)).run_slope_split_finish(
+                STEP, dict(slope, tool_number=20, rest_tool_number=rest))),
+            "rest_tool_number")
+    out["finish_tool_not_in_table"] = (_engine_err(
+        lambda: runner_mod.EngineRun(cfg, str(tmp_path / "f"))
+        .run_slope_split_finish(STEP, dict(slope, tool_diameter=7.7))),
+        "tool_number")
+    work = tmp_path / "cp"
+    work.mkdir()
+    for code, text, over in (("multi_tool_program", "T13 M06\nT20 M06\n",
+                              {}),
+                             ("no_t_word", "G0 X0\n", {}),
+                             ("tool_number_mismatch", "T13 M06\n",
+                              {"tool_number": 20})):
+        (work / "program.nc").write_text(text)
+        out[code] = (_engine_err(lambda: runner_mod.EngineRun(
+            cfg, str(work)).run_check_program(
+                str(work / "program.nc"), STEP,
+                dict({"orientation": "as_modeled", "stock_xy": 1.0,
+                      "stock_top": 1.0, "stock_bottom": 1.0}, **over))),
+            {"multi_tool_program": "program", "no_t_word": "program",
+             "tool_number_mismatch": "tool_number"}[code])
+    for code, check in (("gouges", {"gouges": {"count": 2, "max_depth": .1,
+                                               "worst_xy": [1, 2]}}),
+                        ("rapid_collisions",
+                         {"rapid_collisions": {"count": 1,
+                                               "first_line": 16}}),
+                        ("holder_unknown", {"holder": {"status": "none"}})):
+        out[code] = (_engine_err(lambda: runner_mod._check_zmap_gates(check)),
+                     None)
+    out["unsupported_code"] = (runner_mod._engine_error(
+        2, "Traceback (most recent call last):\n  File x\nunsupported: G81 "
+           "at line 7\n").as_error(), None)
+    out["engine_failed"] = (runner_mod._engine_error(
+        1, "Traceback (most recent call last):\n  File \"x.py\"\n"
+           "ValueError: boom\n").as_error(), None)
+    return out
+
+
+def path_issues(paths):
+    bad = {}
+    for name, (err, field) in paths.items():
+        issues = errors.error_issues(err)
+        if field is not None and err.get("field") != field:
+            issues.append("field %r != %r" % (err.get("field"), field))
+        if issues:
+            bad[name] = issues
+    return bad
+
+
+def test_f_every_error_path_is_agent_ready(home, tmp_path, monkeypatch):
+    paths = error_paths(home, tmp_path, monkeypatch)
+    assert path_issues(paths) == {}
+    # spot checks of the agent fields
+    e = paths["input_out_of_range_inch"][0]
+    assert e["got"] == 2.0 and e["allowed"]["units"] == "inch"
+    assert e["allowed"]["maximum"] == pytest.approx(32.0 / 25.4, abs=1e-4)
+    assert paths["input_unknown"][0]["allowed"][0] == "tool_diameter"
+    assert "did you mean tool_diameter" in paths["input_unknown"][0][
+        "message"]
+    assert paths["bull_corner"][0]["allowed"]["exclusive_maximum"] == \
+        pytest.approx(0.25)
+    assert paths["bull_corner"][0]["got"] == 0.3
+    assert paths["out_of_range"][0]["allowed"] == {"minimum": 1,
+                                                   "maximum": 12}
+    assert paths["rapid_collisions"][0]["where"] == {"line": 16}
+    assert paths["unsupported_code"][0]["where"] == {"line": 7}
+    assert "Traceback" not in paths["engine_failed"][0]["message"]
+    assert "ValueError: boom" in paths["engine_failed"][0]["message"]
+
+
+def test_f_injected_missing_next_step_is_caught(home, tmp_path, monkeypatch):
+    """Fault: input_out_of_range loses its next_step. Exactly the paths
+    with that code are flagged."""
+    monkeypatch.setitem(errors.NEXT_STEPS, "input_out_of_range", "")
+    bad = path_issues(error_paths(home, tmp_path, monkeypatch))
+    assert sorted(bad) == ["bull_corner", "input_out_of_range_enum",
+                           "input_out_of_range_inch"]
+    assert all(v == ["missing next_step"] for v in bad.values())
+
+
+def test_f_codes_table_and_guide_in_sync():
+    assert all(step.strip() for step in errors.NEXT_STEPS.values())
+    with open(errors.GUIDE) as fh:
+        section = errors.guide_codes_section(fh.read())
+    assert section == errors.render_code_table(), \
+        "docs/agent_guide.md drifted: run python3 connector/errors.py"
+
+
+# hand-written schema check of the envelope (no new packages)
+def envelope_issues(r):
+    out = []
+    if r.get("verdict") not in ("ready", "needs_review", "failed"):
+        out.append("verdict %r" % r.get("verdict"))
+    if not (isinstance(r.get("summary"), str) and r["summary"].strip()):
+        out.append("summary")
+    att = r.get("attention")
+    if not isinstance(att, list):
+        return out + ["attention not a list"]
+    for i, a in enumerate(att):
+        if set(a) - {"code", "severity", "message", "where", "next_step"}:
+            out.append("attention[%d] extra keys" % i)
+        for k in ("code", "message", "next_step"):
+            if not (isinstance(a.get(k), str) and a[k].strip()):
+                out.append("attention[%d].%s" % (i, k))
+        if a.get("severity") not in ("blocker", "review", "info"):
+            out.append("attention[%d].severity" % i)
+        w = a.get("where")
+        if w is not None and (not isinstance(w, dict) or set(w) - {
+                "program", "line", "x", "y", "z"}):
+            out.append("attention[%d].where" % i)
+    sev = {a.get("severity") for a in att if isinstance(a, dict)}
+    want = ("failed" if "blocker" in sev else
+            "needs_review" if "review" in sev else "ready")
+    if r.get("verdict") != want:
+        out.append("verdict %s but attention says %s" % (r.get("verdict"),
+                                                         want))
+    return out
+
+
+CHECK_OK = {"gouges": {"count": 0}, "leftover": {"mean": 0.2, "p95": 0.4,
+                                                 "max": 0.6},
+            "within_0p5mm_fraction": 0.9,
+            "engagement": {"threshold_mm": 2.4, "count": 0, "max_mm": 2.0},
+            "plunge": {"count": 0}}
+
+
+def test_f_envelope_mapping():
+    r = envelope.for_result("adaptive_rough", CHECK_OK)
+    assert envelope_issues(r) == [] and r["verdict"] == "ready"
+    assert {a["code"] for a in r["attention"]} == {"leftover",
+                                                    "area_left_for_next_op"}
+    hot = dict(CHECK_OK, engagement={"threshold_mm": 2.4, "count": 3,
+                                     "max_mm": 5.0,
+                                     "spikes": [{"line": 40}]},
+               credit_fallback={"count": 1})
+    r = envelope.for_result("adaptive_rough", hot)
+    assert envelope_issues(r) == [] and r["verdict"] == "needs_review"
+    eng = next(a for a in r["attention"]
+               if a["code"] == "engagement_overload")
+    assert eng["where"] == {"program": "rough.nc", "line": 40}
+    assert "credit_fallback" in {a["code"] for a in r["attention"]}
+    chain = {"chain": ["rough", "finish"], "rough": CHECK_OK,
+             "finish": CHECK_OK}
+    r = envelope.for_result("slope_split_finish", chain)
+    assert {a["where"]["program"] for a in r["attention"]} == \
+        {"rough.nc", "finish.nc"}
+    err = runner_mod._engine_error(
+        2, "unsupported: G81 at line 7").as_error()
+    r = envelope.for_failure("check_program", err)
+    assert envelope_issues(r) == [] and r["verdict"] == "failed"
+    assert r["attention"][0]["code"] == "unsupported_code"
+    r = envelope.for_tool_action("tools.list",
+                                 toollib.tools_list(None, REPO))
+    assert envelope_issues(r) == [] and r["verdict"] == "ready"
+
+
+def test_f_injected_envelope_fault_is_caught():
+    """Fault: a review item reported as verdict ready."""
+    r = envelope.for_result("adaptive_rough", dict(
+        CHECK_OK, plunge={"count": 2, "ramp_angle_deg": 3.0}))
+    r["verdict"] = "ready"
+    assert envelope_issues(r) == ["verdict ready but attention says "
+                                  "needs_review"]
+
+
+def test_f_catalog_descriptions_state_units_range_default():
+    for a in catalog_mod.CATALOG["actions"]:
+        assert 20 < len(a["description"]) < 400, a["name"]
+        for name, p in a["inputs"]["properties"].items():
+            if "x-steve" in p or p.get("type") == "object":
+                continue
+            d = p["description"]
+            assert "default" in d or "optional" in d, (a["name"], name)
+            if name in catalog_mod.MM_FIELDS:
+                assert "follows `units`" in d, (a["name"], name)
+                if "minimum" in p:
+                    assert "range" in d and " in" in d, (a["name"], name)

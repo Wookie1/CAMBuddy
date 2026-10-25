@@ -33,13 +33,17 @@ _POSITIVE = ("flute_mm", "reach_mm", "rpm", "feed_mm_min", "plunge_mm_min")
 
 
 class ToolLibError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, field=None, got=None, allowed=None):
         super().__init__("%s: %s" % (code, message))
         self.code = code
         self.message = message
+        self.detail = {"field": field, "got": got, "allowed": allowed}
 
     def as_dict(self):
-        return {"code": self.code, "message": self.message}
+        """The agent error {code, message, field?, got?, allowed?,
+        next_step} (task f)."""
+        import errors
+        return errors.make_error(self.code, self.message, **self.detail)
 
 
 def _read(path):
@@ -87,7 +91,10 @@ def _find(lib, tool_id):
               if t.get("tool_id") == tool_id), None)
     if t is None:
         raise ToolLibError("unknown_tool",
-                           "no tool %r in the library" % (tool_id,))
+                           "no tool %r in the library" % (tool_id,),
+                           field="tool_id", got=tool_id,
+                           allowed=[x.get("tool_id")
+                                    for x in lib.get("tools", [])])
     return t
 
 
@@ -124,7 +131,9 @@ def tools_list(home, repo_root):
 def _check_t(t, n_pockets):
     if not _is_int(t) or not 1 <= t <= n_pockets:
         raise ToolLibError("out_of_range",
-                           "T%s is outside 1..%d (pockets)" % (t, n_pockets))
+                           "T%s is outside 1..%d (pockets)" % (t, n_pockets),
+                           field="t", got=t,
+                           allowed={"minimum": 1, "maximum": n_pockets})
 
 
 def update_tool(home, repo_root, tool_id=None, changes=None, new_pockets=None):
@@ -137,18 +146,22 @@ def update_tool(home, repo_root, tool_id=None, changes=None, new_pockets=None):
     if new_pockets is not None:
         if not _is_int(new_pockets) or not 1 <= new_pockets <= 999:
             raise ToolLibError("out_of_range",
-                               "pockets %r is outside 1..999" % (new_pockets,))
+                               "pockets %r is outside 1..999" % (new_pockets,),
+                               field="pockets", got=new_pockets,
+                               allowed={"minimum": 1, "maximum": 999})
         lib["pockets"] = new_pockets
     out = None
     if tool_id is not None:
         changes = changes or {}
         if not isinstance(changes, dict):
-            raise ToolLibError("invalid_field", "changes must be an object")
+            raise ToolLibError("invalid_field", "changes must be an object",
+                               field="changes", got=changes)
         bad = sorted(k for k in changes if k not in FIELDS)
         if bad:
             raise ToolLibError("invalid_field",
                                "not editable: %s (h and d follow t; tool_id "
-                               "never changes)" % ", ".join(bad))
+                               "never changes)" % ", ".join(bad),
+                               field=bad[0], allowed=sorted(FIELDS))
         old = _find(lib, tool_id)
         new = copy.deepcopy(old)
         for k, v in changes.items():
@@ -160,7 +173,10 @@ def update_tool(home, repo_root, tool_id=None, changes=None, new_pockets=None):
                     if other is not None:
                         raise ToolLibError(
                             "duplicate_t", "T%d is already %s in the library"
-                            % (v, other.get("tool_id")))
+                            % (v, other.get("tool_id")), field="t", got=v,
+                            allowed={"not": sorted(
+                                o.get("number") for o in lib["tools"]
+                                if o.get("number") is not None)})
                 _set_t(new, v)
             else:
                 new[FIELDS[k]] = v
@@ -172,12 +188,14 @@ def update_tool(home, repo_root, tool_id=None, changes=None, new_pockets=None):
                         - new["corner_radius_mm"]) <= TOL:
                 raise ToolLibError("duplicate_tool",
                                    "same type/diameter/corner as %s"
-                                   % o.get("tool_id"))
+                                   % o.get("tool_id"), field="dia_mm",
+                                   got=new["diameter_mm"])
         old.clear()
         old.update(new)
         out = list_entry(old)
     elif new_pockets is None:
-        raise ToolLibError("invalid_field", "give tool_id and/or pockets")
+        raise ToolLibError("invalid_field", "give tool_id and/or pockets",
+                           field="tool_id")
     write_json(os.path.join(home, "tools.json"), lib)
     return {"tool": out, "pockets": pockets(lib)}
 
@@ -185,29 +203,45 @@ def update_tool(home, repo_root, tool_id=None, changes=None, new_pockets=None):
 def _validate_shape(e, lib):
     if e.get("type") not in TOOL_TYPES:
         raise ToolLibError("invalid_field", "type must be one of %s"
-                           % ", ".join(TOOL_TYPES))
+                           % ", ".join(TOOL_TYPES), field="type",
+                           got=e.get("type"), allowed=list(TOOL_TYPES))
     dia, cr = e.get("diameter_mm"), e.get("corner_radius_mm")
     if not _is_num(dia) or dia <= 0:
-        raise ToolLibError("invalid_field", "dia_mm must be > 0")
+        raise ToolLibError("invalid_field", "dia_mm must be > 0",
+                           field="dia_mm", got=dia,
+                           allowed={"exclusive_minimum": 0})
     if not _is_num(cr) or cr < 0:
-        raise ToolLibError("invalid_field", "corner_r_mm must be >= 0")
+        raise ToolLibError("invalid_field", "corner_r_mm must be >= 0",
+                           field="corner_r_mm", got=cr,
+                           allowed={"minimum": 0})
     if e["type"] == "flat" and cr > TOL:
-        raise ToolLibError("invalid_field", "a flat has corner_r_mm 0")
+        raise ToolLibError("invalid_field", "a flat has corner_r_mm 0",
+                           field="corner_r_mm", got=cr, allowed=[0])
     if e["type"] == "ball" and abs(cr - dia / 2.0) > TOL:
-        raise ToolLibError("invalid_field", "a ball has corner_r_mm = dia/2")
+        raise ToolLibError("invalid_field", "a ball has corner_r_mm = dia/2",
+                           field="corner_r_mm", got=cr, allowed=[dia / 2.0])
     if e["type"] == "bull" and not 0 < cr < dia / 2.0:
-        raise ToolLibError("invalid_field", "a bull needs 0 < corner < dia/2")
+        raise ToolLibError("invalid_field", "a bull needs 0 < corner < dia/2",
+                           field="corner_r_mm", got=cr,
+                           allowed={"exclusive_minimum": 0,
+                                    "exclusive_maximum": dia / 2.0})
     for k in _POSITIVE:
         v = e.get(k)
         if v is not None and (not _is_num(v) or v <= 0):
-            raise ToolLibError("invalid_field", "%s must be > 0 or null" % k)
+            raise ToolLibError("invalid_field", "%s must be > 0 or null" % k,
+                               field=next(f for f, key in FIELDS.items()
+                                          if key == k), got=v,
+                               allowed={"exclusive_minimum": 0})
     name = e.get("description")
     if name is not None and (not isinstance(name, str) or len(name) > 120):
-        raise ToolLibError("invalid_field", "name must be text <= 120 chars")
+        raise ToolLibError("invalid_field", "name must be text <= 120 chars",
+                           field="name", allowed={"maxLength": 120})
     h = e.get("holder")
     if h is not None and h not in lib.get("holders", {}):
         raise ToolLibError("unknown_holder",
-                           "holder %r is not in the library holders" % (h,))
+                           "holder %r is not in the library holders" % (h,),
+                           field="holder", got=h,
+                           allowed=sorted(lib.get("holders", {})))
 
 
 # --------------------------------------------------------------- jobs ----
@@ -216,7 +250,8 @@ def _job_path(home, doc_id, *sub):
     if not isinstance(doc_id, str) or not DOC_ID_RE.match(doc_id):
         raise ToolLibError("bad_document_id",
                            "document id %r is not [A-Za-z0-9._-], <= 128"
-                           % (doc_id,))
+                           % (doc_id,), field="document_id", got=doc_id,
+                           allowed={"pattern": DOC_ID_RE.pattern})
     return os.path.join(home, "jobs", *sub, doc_id + ".json")
 
 
@@ -256,11 +291,14 @@ SETUP_FIELDS = ("orientation", "origin", "units", "stock_xy", "stock_x",
 def _validate_setup(setup):
     import catalog as catalog_mod  # connector-local module, no cycle
     if not isinstance(setup, dict):
-        raise ToolLibError("invalid_field", "setup must be an object")
+        raise ToolLibError("invalid_field", "setup must be an object",
+                           field="setup")
     bad = sorted(k for k in setup if k not in SETUP_FIELDS + ("blank",))
     if bad:
         raise ToolLibError("invalid_field",
-                           "not a setup field: %s" % ", ".join(bad))
+                           "not a setup field: %s" % ", ".join(bad),
+                           field="setup." + bad[0],
+                           allowed=list(SETUP_FIELDS) + ["blank"])
     props = catalog_mod.get_action(catalog_mod.ACTION)["inputs"]["properties"]
     out = {}
     for k in SETUP_FIELDS:
@@ -272,22 +310,28 @@ def _validate_setup(setup):
         if "enum" in spec:
             if v not in spec["enum"]:
                 raise ToolLibError("out_of_range", "%s=%r not in %s"
-                                   % (k, v, spec["enum"]))
+                                   % (k, v, spec["enum"]),
+                                   field="setup." + k, got=v,
+                                   allowed={"enum": spec["enum"]})
         else:
             if not _is_num(v):
                 raise ToolLibError("invalid_field", "%s must be a number "
-                                   "(mm)" % k)
+                                   "(mm)" % k, field="setup." + k, got=v)
             lo, hi = spec.get("minimum"), spec.get("maximum")
             if (lo is not None and v < lo) or (hi is not None and v > hi):
                 raise ToolLibError("out_of_range", "%s=%s outside %s..%s mm"
-                                   % (k, v, lo, "" if hi is None else hi))
+                                   % (k, v, lo, "" if hi is None else hi),
+                                   field="setup." + k, got=v,
+                                   allowed={"minimum": lo, "maximum": hi,
+                                            "units": "mm"})
         out[k] = v
     blank = setup.get("blank")
     if blank is not None:
         if not isinstance(blank, dict) or set(blank) != {"x", "y", "z"} or \
                 not all(_is_num(blank[a]) and blank[a] > 0 for a in "xyz"):
             raise ToolLibError("invalid_field",
-                               "blank must be {x, y, z} > 0 mm or null")
+                               "blank must be {x, y, z} > 0 mm or null",
+                               field="setup.blank", got=blank)
         blank = {a: blank[a] for a in "xyz"}
     out["blank"] = blank
     return out
@@ -317,7 +361,14 @@ def renumber(home, repo_root, doc_id, tool_id, t):
         oid = o.get("tool_id")
         if oid != tool_id and job.get(oid, o.get("number")) == t:
             raise ToolLibError("duplicate_t",
-                               "T%d is already %s in this job" % (t, oid))
+                               "T%d is already %s in this job" % (t, oid),
+                               field="t", got=t,
+                               allowed={"not": sorted(
+                                   job.get(x.get("tool_id"), x.get("number"))
+                                   for x in lib["tools"]
+                                   if x.get("tool_id") != tool_id and
+                                   job.get(x.get("tool_id"),
+                                           x.get("number")) is not None)})
     if t == tool.get("number"):
         job.pop(tool_id, None)
     else:
@@ -343,7 +394,8 @@ def effective_table(home, repo_root, doc_id=None):
         if n is not None:
             if n in seen:
                 raise ToolLibError("duplicate_t", "T%d is both %s and %s"
-                                   % (n, seen[n], e.get("tool_id")))
+                                   % (n, seen[n], e.get("tool_id")),
+                                   field="t", got=n)
             seen[n] = e.get("tool_id")
     return tab
 

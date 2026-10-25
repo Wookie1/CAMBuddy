@@ -215,3 +215,42 @@ T word through the effective table.
   data with a 0.5 mm wrong expectation measures 0.5 mm, and check_program
   passes the bottom-centre program at stock_bottom_centre and fails it at
   model_origin.
+
+## (f) Agent-facing envelope, errors, catalog text, guide
+- New: connector/errors.py (the code table CODES / NEXT_STEPS,
+  make_error, error_issues, the guide generator), connector/envelope.py
+  (verdict / summary / attention), docs/agent_guide.md (code table
+  generated: `python3 connector/errors.py`).
+- Envelope on every action's result (cutting actions, model.measure and
+  the five tool/job actions) and written into check.json before upload.
+  Mapping: zmap/clcheck/unsupported/posted-units/... gate failures =
+  blocker (run failed, error + failed envelope in the report, no .nc);
+  engagement over threshold, steep plunges and - when an engine emits
+  them - reduced_feed_windows / credit_fallback / failed_region_emitted =
+  review; leftover summary and "area left for the next operation"
+  (within_0p5mm_fraction < 1) = info; tools without a holder in
+  tools.list = info. NOTE: this engine base emits none of the three
+  engine review counters yet; the envelope reads them when present.
+- Errors: every refusal is `{code, message, field?, got?, allowed?,
+  next_step}`: input_missing, input_unknown (closest names in `allowed`
+  and "did you mean"), input_out_of_range (range in the caller's units:
+  inch callers get inch bounds), the bull corner rule, every toollib code,
+  and every runner fail-closed path (26 raise sites, each with its own
+  code). Engine stderr never reaches the caller: a known gate line
+  (unsupported / outside grid) or the last non-traceback line; the full
+  stderr goes to runs/<id>/engine_stderr.log, unexpected exceptions to
+  runs/<id>/connector_error.log (internal_error).
+- Catalog: action descriptions rewritten to 1-2 sentences (when to use,
+  what it returns); every value input's description now ends with its
+  unit ("length/feed, follows `units`"), range in mm and inch, and
+  default; units and origin are explained once (their own inputs).
+- Contract note: tool/job results gained verdict/summary/attention; my
+  own TestToolLibE2E exact-equality assert now compares the job keys and
+  checks verdict ready (no pre-existing test touched).
+- Fast tests (test_track2.py `test_f_*`): 30 error paths each checked for
+  non-empty code/message/next_step and the expected `field`; injected
+  fault: input_out_of_range's next_step blanked -> exactly the 3 paths
+  using it are flagged ("missing next_step"). Envelope mapping + a
+  hand-written envelope schema check; injected fault: a review item with
+  verdict ready -> "verdict ready but attention says needs_review".
+  Guide drift test: the generated table must equal the doc section.

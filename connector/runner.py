@@ -38,7 +38,62 @@ def _stock_args(values):
 
 
 class EngineError(Exception):
-    pass
+    """A refused or failed run. `code` (errors.CODES) + optional field /
+    got / allowed / where make the agent error (task f); str(e) stays the
+    plain message."""
+
+    def __init__(self, message, code="engine_failed", field=None, got=None,
+                 allowed=None, where=None):
+        super().__init__(message)
+        self.code = code
+        self.field = field
+        self.got = got
+        self.allowed = allowed
+        self.where = where
+
+    def as_error(self):
+        import errors
+        return errors.make_error(self.code, str(self), field=self.field,
+                                 got=self.got, allowed=self.allowed,
+                                 where=self.where)
+
+
+def _xy_where(d):
+    """{line, x, y} from a zmap gate dict (worst_xy / first_line)."""
+    w = {}
+    if isinstance(d, dict):
+        if d.get("first_line") is not None:
+            w["line"] = d["first_line"]
+        xy = d.get("worst_xy")
+        if isinstance(xy, (list, tuple)) and len(xy) >= 2:
+            w["x"], w["y"] = xy[0], xy[1]
+    return w or None
+
+
+_UNSUPPORTED_RE = re.compile(r"unsupported: (\S+) at line (\d+)")
+
+
+def _engine_error(rc, stderr):
+    """The caller-facing error for a failed engine subprocess: a known
+    gate line when there is one, else the last non-traceback line; the
+    raw stderr goes to the run dir log, never to the caller."""
+    lines = [l.rstrip() for l in stderr.splitlines() if l.strip()]
+    m = next((_UNSUPPORTED_RE.search(l) for l in lines
+              if _UNSUPPORTED_RE.search(l)), None)
+    if m:
+        line = next(l for l in lines if _UNSUPPORTED_RE.search(l))
+        return EngineError("engine failed (rc=%d): %s" % (rc, line.strip()),
+                           code="unsupported_code",
+                           where={"line": int(m.group(2))})
+    grid = next((l for l in lines if "outside the part grid" in l), None)
+    if grid:
+        lm = re.search(r"first line (\d+)", grid)
+        return EngineError("engine failed (rc=%d): %s" % (rc, grid.strip()),
+                           code="outside_grid",
+                           where={"line": int(lm.group(1))} if lm else None)
+    plain = [l for l in lines if not l.startswith((" ", "Traceback"))]
+    return EngineError("engine failed (rc=%d): %s"
+                       % (rc, (plain[-1] if plain else "no message")[:300]))
 
 
 def _check_zmap_gates(check):
@@ -51,29 +106,34 @@ def _check_zmap_gates(check):
     if isinstance(gouges, dict) and gouges.get("count", 0) > 0:
         raise EngineError(
             "zmap gate: %d gouges (max %.3f mm)"
-            % (gouges["count"], gouges.get("max_depth", 0.0)))
+            % (gouges["count"], gouges.get("max_depth", 0.0)),
+            code="gouges", where=_xy_where(gouges))
     rapids = check.get("rapid_collisions", {})
     if isinstance(rapids, dict) and rapids.get("count", 0) > 0:
         raise EngineError(
             "zmap gate: %d rapid collisions (first line %s)"
-            % (rapids["count"], rapids.get("first_line", "?")))
+            % (rapids["count"], rapids.get("first_line", "?")),
+            code="rapid_collisions", where=_xy_where(rapids))
     of = check.get("over_flute")
     if isinstance(of, dict) and of.get("count", 0) > 0:
         raise EngineError(
             "zmap gate: %d over-flute/shank hits (max %.3f mm)"
-            % (of["count"], of.get("max_depth", 0.0)))
+            % (of["count"], of.get("max_depth", 0.0)),
+            code="over_flute", where=_xy_where(of))
     hd = check.get("holder") or {}
     if hd.get("status") != "checked" or not isinstance(check.get("holder_hits"), dict):
         raise EngineError(
             "zmap gate: holder unknown (%s) - a run is never judged without "
-            "the holder clearance check" % hd.get("reason", hd.get("status", "no holder report")))
+            "the holder clearance check" % hd.get("reason", hd.get("status", "no holder report")),
+            code="holder_unknown")
     hh = check.get("holder_hits")
     if isinstance(hh, dict) and hh.get("count", 0) > 0:
         raise EngineError(
             "zmap gate: %d holder hits (max intrusion %.3f mm, first line "
             "%s) - the holder cannot keep 1.0 mm clearance"
             % (hh["count"], hh.get("max_intrusion", 0.0),
-               hh.get("first_line", "?")))
+               hh.get("first_line", "?")),
+            code="holder_hits", where=_xy_where(hh))
     # task ZA: axial plunges fail flat/bull roughing programs; for a ball
     # they stay report-only (count + depths in check.json)
     ap = check.get("axial_plunges")
@@ -84,7 +144,8 @@ def _check_zmap_gates(check):
             "zmap gate: %d axial plunges (max %.3f mm, first line %s) - a "
             "%s program must not drive its flat bottom straight into solid "
             "stock" % (ap["count"], ap.get("max_depth_mm", 0.0),
-                       ap.get("first_line", "?"), ttype))
+                       ap.get("first_line", "?"), ttype),
+            code="axial_plunges", where=_xy_where(ap))
 
 
 def _tool_number(cfg, values, table=None):
@@ -152,7 +213,8 @@ def posted_units(path, requested):
         raise EngineError(
             "posted units mismatch in %s: units %r was requested but the "
             "program posts %s - the run failed"
-            % (os.path.basename(path), requested, other))
+            % (os.path.basename(path), requested, other),
+            code="posted_units_mismatch", field="units", got=requested)
     return requested
 
 
@@ -169,18 +231,23 @@ def check_tool_entry(number, path=None):
         with open(path) as fh:
             data = json.load(fh)
     except (IOError, OSError, ValueError) as e:
-        raise EngineError("cannot read tool table %s: %s" % (path, e))
+        raise EngineError("cannot read tool table %s: %s" % (path, e),
+                          code="tool_table_unreadable")
     e = next((t for t in data.get("tools", [])
               if t.get("number") == int(number)), None)
     if e is None:
         raise EngineError(
             "tool T%d is not in tools/x7_tools.json: unknown tool - add it "
             "to the X7 table (or pass a tool_number that is in the table)"
-            % int(number))
+            % int(number), code="tool_not_in_table", field="tool_number",
+            got=int(number),
+            allowed=sorted(t["number"] for t in data.get("tools", [])
+                           if t.get("number") is not None))
     for k in ("type", "diameter_mm"):
         if e.get(k) is None:
             raise EngineError("tool T%d entry in %s has no %s"
-                              % (int(number), path, k))
+                              % (int(number), path, k),
+                              code="tool_entry_incomplete", field=k)
     return {"number": int(number), "type": e["type"],
             "diameter_mm": float(e["diameter_mm"]),
             "corner_radius_mm": float(e.get("corner_radius_mm") or 0.0),
@@ -227,8 +294,13 @@ class EngineRun:
             self.tools = toollib.effective_table(
                 self.cfg.get("home"), self.cfg["repo_root"],
                 values.get("document_id"))
-        except (toollib.ToolLibError, OSError, ValueError) as e:
-            raise EngineError("tool library: %s" % e)
+        except toollib.ToolLibError as e:
+            d = e.as_dict()
+            raise EngineError("tool library: %s" % e, code=e.code,
+                              field=d.get("field"), got=d.get("got"),
+                              allowed=d.get("allowed"))
+        except (OSError, ValueError) as e:
+            raise EngineError("tool library: %s" % e, code="library_error")
         self.tools_path = None
         if self.cfg.get("home"):
             self.tools_path = os.path.join(self.work, "tools_effective.json")
@@ -314,8 +386,15 @@ class EngineRun:
         if self.cancelled:
             raise Cancelled("cancelled")
         if proc.returncode != 0:
-            raise EngineError("engine failed (rc=%d): %s"
-                             % (proc.returncode, "".join(err_lines[-25:])))
+            # full stderr stays server-side, in the run dir
+            try:
+                with open(os.path.join(self.work, "engine_stderr.log"),
+                          "a") as fh:
+                    fh.write("$ %s\n%s\n" % (" ".join(argv),
+                                              "".join(err_lines)))
+            except OSError:
+                pass
+            raise _engine_error(proc.returncode, "".join(err_lines[-25:]))
         return proc
 
     def run(self, step_path, values, on_progress=None):
@@ -397,7 +476,7 @@ class EngineRun:
             fr.require_fresh(hf_zmap, step_sha256=step_sha, cell=cell,
                              tess_tol=0.01)
         except OSError as e:
-            raise EngineError(str(e))
+            raise EngineError(str(e), code="stale_artifact")
         check_path = os.path.join(self.work, "check.json")
         png_path = os.path.join(self.work, "preview.png")
         self._spawn([py, "-m", "verify.zmap", nc,
@@ -506,21 +585,26 @@ class EngineRun:
                 raise EngineError("multi-tool programs not supported yet "
                                   "(%s T words: %s)"
                                   % (pname, ", ".join("T%d" % n
-                                                   for n in numbers)))
+                                                   for n in numbers)),
+                                  code="multi_tool_program", field=pname,
+                                  got=["T%d" % n for n in numbers])
             number = (int(values["tool_number"])
                      if i == 0 and values.get("tool_number")
                      else (numbers[0] if numbers else None))
             if number is None:
                 raise EngineError("no T word in the program and no "
                                   "tool_number override: the tool cannot be "
-                                  "resolved")
+                                  "resolved", code="no_t_word", field=pname)
             # track 2: the T word resolves through the document's job
             # renumbering (effective table), else the library T
             tool = check_tool_entry(number, self._table_file())
             if numbers and number != numbers[0]:
                 raise EngineError("tool_number T%d does not match the "
                                   "program's T%d: refusing to judge with a "
-                                  "different tool" % (number, numbers[0]))
+                                  "different tool" % (number, numbers[0]),
+                                  code="tool_number_mismatch",
+                                  field="tool_number", got=number,
+                                  allowed=[numbers[0]])
             resolved.append((pname, ppath, number, tool))
         cell = 0.1  # judge grid: same 0.1 mm as the finishing chain
 
@@ -563,7 +647,7 @@ class EngineRun:
             fr.require_fresh(hf_zmap, step_sha256=step_sha, cell=cell,
                              tess_tol=0.01)
         except OSError as e:
-            raise EngineError(str(e))
+            raise EngineError(str(e), code="stale_artifact")
 
         # 4) zmap --strict per program, in order, carrying the stock: each
         #    program is judged with --stock-in = the previous program's
@@ -613,7 +697,8 @@ class EngineRun:
                     check = json.load(fh)
                 _check_zmap_gates(check)
             except EngineError as e:
-                raise EngineError("%s failed: %s" % (pname, e))
+                raise EngineError("%s failed: %s" % (pname, e), code=e.code,
+                                  where=dict(e.where or {}, program=pname))
             entries.append({"name": pname,
                             "tool": {"number": number, "type": tool["type"],
                                      "diameter_mm": tool["diameter_mm"],
@@ -693,7 +778,8 @@ class EngineRun:
         raise EngineError(
             "finish tool ball D=%.3f mm is not in tools/x7_tools.json and "
             "no tool_number was given: pass a tool_number or add the tool "
-            "to the X7 table" % values["tool_diameter"])
+            "to the X7 table" % values["tool_diameter"],
+            code="finish_tool_not_in_table", field="tool_number")
 
     def run_slope_split_finish(self, step_path, values, on_progress=None):
         """Roughing first, then slope-split finishing (a finishing ball must
@@ -730,18 +816,21 @@ class EngineRun:
                 raise EngineError(
                     "rest tool T%d has no holder in tools/x7_tools.json: the "
                     "rest pass is never judged without the holder clearance "
-                    "check" % rest_number)
+                    "check" % rest_number, code="rest_tool_no_holder",
+                    field="rest_tool_number", got=rest_number)
             if rest["type"] != "ball":
                 raise EngineError(
                     "rest tool T%d is a %s, not a ball: the corner rest pass "
                     "runs with a ball nose from tools/x7_tools.json"
-                    % (rest_number, rest["type"]))
+                    % (rest_number, rest["type"]), code="rest_tool_not_ball",
+                    field="rest_tool_number", got=rest_number)
             if rest["diameter_mm"] >= values["tool_diameter"]:
                 raise EngineError(
                     "rest tool T%d D=%.3f mm is not smaller than the finishing "
                     "ball D=%.3f mm: the rest pass cuts with the smaller ball"
                     % (rest_number, rest["diameter_mm"],
-                       values["tool_diameter"]))
+                       values["tool_diameter"]), code="rest_tool_too_big",
+                    field="rest_tool_number", got=rest_number)
 
         # stage boundaries: with the rest pass the generation stages are
         # squeezed so progress stays monotone and ends at 1.0
@@ -802,7 +891,7 @@ class EngineRun:
             fr.require_fresh(hf01, step_sha256=step_sha, cell=0.1,
                              tess_tol=0.01)
         except OSError as e:
-            raise EngineError(str(e))
+            raise EngineError(str(e), code="stale_artifact")
 
         # 3) adaptive roughing (LNC post, full stock); the finish and the rest
         #    pass need the engine's own post-roughing stock for their rapid /
@@ -855,7 +944,7 @@ class EngineRun:
         try:
             fr.require_stl(stl)
         except OSError as e:
-            raise EngineError(str(e))
+            raise EngineError(str(e), code="stale_artifact")
 
         # 5) slope-split finishing (neutral G-code). PQ: the engine snaps the
         #    emitted points to the output grid matching this op's post units
@@ -902,7 +991,8 @@ class EngineRun:
             raise EngineError(
                 "probe_clcheck: %d points below CL by >0.005 mm in the "
                 "finish program (max %.3f mm) - run failed"
-                % (cl["below_cl"], cl.get("max_depth_mm", 0.0)))
+                % (cl["below_cl"], cl.get("max_depth_mm", 0.0)),
+                code="clcheck", where={"program": "finish.nc"})
 
         # 8) chained zmap: roughing from full stock (--stock-out), then the
         #    finish with the roughed stock as --stock-in
@@ -1045,7 +1135,8 @@ class EngineRun:
                 raise EngineError(
                     "probe_clcheck: %d points below CL by >0.005 mm in the "
                     "rest program (max %.3f mm) - run failed"
-                    % (cl_rest["below_cl"], cl_rest.get("max_depth_mm", 0.0)))
+                    % (cl_rest["below_cl"], cl_rest.get("max_depth_mm", 0.0)),
+                    code="clcheck", where={"program": "rest.nc"})
 
             # 9d) chained zmap of the rest program on the stock the finish
             #     left, with the rest tool's geometry + holder; preview.png is

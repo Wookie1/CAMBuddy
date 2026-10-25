@@ -21,6 +21,8 @@ import catalog as catalog_mod  # noqa: E402
 import config as config_mod    # noqa: E402
 import crypto                  # noqa: E402
 import toollib                 # noqa: E402
+import envelope                # noqa: E402
+import errors                  # noqa: E402
 from client import SteveClient, SteveError  # noqa: E402
 from runner import EngineRun, EngineError, Cancelled  # noqa: E402
 
@@ -34,6 +36,7 @@ def prepare_values(values_in, action):
     (a)), then validate the mm values against the catalog's mm ranges.
     Track 2: job renumbering follows the STEVE document - an explicit
     document_id, else the model's own document."""
+    raw = values_in
     values_in = catalog_mod.to_mm(values_in, action)
     spec = catalog_mod.get_action(action) or {}
     takes_doc = "document_id" in spec.get("inputs", {}).get("properties", {})
@@ -42,7 +45,10 @@ def prepare_values(values_in, action):
             if isinstance(values_in.get("model"), dict) else None
         if isinstance(doc, dict) and doc.get("id"):
             values_in = dict(values_in, document_id=str(doc["id"]))
-    return catalog_mod.validate_inputs(values_in, action)
+    ok, out = catalog_mod.validate(values_in, action, raw=raw)
+    if not ok:
+        return False, out["code"], out  # out = the agent error (task f)
+    return True, "", out
 
 
 class Connector:
@@ -255,34 +261,46 @@ class Connector:
             self.client.report_run(run_id, "received")
         except SteveError:
             pass
-        ok, code, values = catalog_mod.validate_inputs(
-            env.get("inputs", {}), action)
+        ok, values = catalog_mod.validate(env.get("inputs", {}), action)
         try:
             if not ok:
-                self.client.report_run(run_id, "rejected",
-                                       error={"code": code, "message": values})
+                self.client.report_run(run_id, "rejected", error=values)
                 return
             self.client.report_run(run_id, "running", progress=0.5,
                                    message=action)
             try:
                 result = self.tool_action(action, values)
             except toollib.ToolLibError as e:
-                self.client.report_run(run_id, "failed", error=e.as_dict())
+                err = e.as_dict()
+            except Exception as e:  # never a raw traceback to the caller
+                self._log_exception(run_id)
+                err = errors.make_error("library_error", type(e).__name__)
+            else:
+                result = dict(result, **envelope.for_tool_action(action,
+                                                                 result))
+                self.client.report_run(run_id, "succeeded", result=result,
+                                       message="done")
                 return
-            except (OSError, ValueError) as e:
-                self.client.report_run(
-                    run_id, "failed",
-                    error={"code": "library_error", "message": str(e)[:400]})
-                return
-            self.client.report_run(run_id, "succeeded", result=result,
-                                   message="done")
+            self.client.report_run(run_id, "failed", error=err,
+                                   result=envelope.for_failure(action, err))
         except SteveError:
+            pass
+
+    def _log_exception(self, run_id):
+        """Full traceback server-side only: <home>/runs/<id>/connector_error.log."""
+        import traceback
+        try:
+            d = os.path.join(self.home, "runs", str(run_id))
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "connector_error.log"), "a") as fh:
+                fh.write(traceback.format_exc())
+        except OSError:
             pass
 
     def _safe_reject(self, run_id, code):
         try:
             self.client.report_run(run_id, "rejected",
-                                  error={"code": code, "message": code})
+                                  error=errors.make_error(code, code))
         except SteveError:
             pass
 
@@ -332,8 +350,9 @@ class Connector:
                 if digest != inp.get("sha256") or len(data) != inp.get("bytes"):
                     self.client.report_run(
                         run_id, "rejected",
-                        error={"code": "input_digest_mismatch",
-                             "message": "download failed sha256/bytes check"})
+                        error=errors.make_error(
+                            "input_digest_mismatch",
+                            "download failed sha256/bytes check", field=name))
                     self.emit_state("idle")
                     return
                 os.makedirs(work, exist_ok=True)
@@ -352,8 +371,7 @@ class Connector:
                     fh.write(data)
             ok, code, values = prepare_values(env.get("inputs", {}), action)
             if not ok:
-                self.client.report_run(run_id, "rejected",
-                                     error={"code": code, "message": values})
+                self.client.report_run(run_id, "rejected", error=values)
                 self.emit_state("idle")
                 return
 
@@ -370,6 +388,17 @@ class Connector:
             else:
                 result, files = engine.run_slope_split_finish(
                     step_path, values, on_progress)
+            # task f: the envelope joins the result and check.json
+            check = None
+            if "check.json" in files:
+                with open(files["check.json"][0]) as fh:
+                    check = json.load(fh)
+            env_ = envelope.for_result(action, check)
+            result = dict(result, **env_)
+            if check is not None:
+                check.update(env_)
+                with open(files["check.json"][0], "w") as fh:
+                    json.dump(check, fh, indent=2)
             for fname, (path, media) in files.items():
                 with open(path, "rb") as fh:
                     self.client.put_file(run_id, fname, fh.read(), media)
@@ -387,11 +416,18 @@ class Connector:
             except SteveError:
                 pass
             self.emit_state("idle")
-        except (EngineError, SteveError, OSError, KeyError) as e:
+        except Exception as e:  # noqa: BLE001 - every path reports
+            if isinstance(e, EngineError):
+                err = e.as_error()
+            else:  # never a raw traceback to the caller: logged here
+                self._log_exception(run_id)
+                err = errors.make_error(
+                    "internal_error", "%s: %s" % (type(e).__name__,
+                                                  str(e)[:200]))
             try:
                 self.client.report_run(
-                    run_id, "failed",
-                    error={"code": "engine_failed", "message": str(e)[:400]})
+                    run_id, "failed", error=err,
+                    result=envelope.for_failure(action, err))
             except SteveError:
                 pass
             self.emit_state("idle")
