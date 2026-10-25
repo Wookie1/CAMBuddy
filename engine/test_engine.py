@@ -1216,6 +1216,100 @@ def test_bs1a4d6d_approach_simulated_in_window0():
           % (w_no[0], w_ap[0]))
 
 
+def test_bs1a4d7_sub1mm_tail_merges_not_dropped():
+    """Task BS1a4d7 item 2: ZG2's pushed-over synthetic THROUGH
+    band._simulate. A 1.2 mm side cut along a wall whose face sits 0.865 mm
+    inside the tool radius (ZG2's _zg2_wall_stock width) plus a 0.99 mm tail
+    turned >45 deg into fresh standing wall below the path's disk - the
+    engine's chain break where ZG2's case has the rapid+plunge. ZG2 merges
+    the sub-1 mm tail into the kept window (zg2 zmap merged ae_eff 5.857 mm
+    vs dropped-tail 0.800 mm), so the engine must read the merged window
+    over the 2.25 spike bar too. Engine value = area / that window's travel
+    (mm), like the side-entry test; the ZG2 zmap value is measured by
+    feeding the SAME per-move cell areas through zg2 verify/zmap's
+    _ae2_windows. Both printed. Dropping the tail again (mutation) leaves
+    ~0.6 mm and the measured-value assert fails."""
+    import importlib.util as ilu
+    import numpy as np
+    import engine.band as B
+    from engine.stock import StockField
+    tr, cell, z = 6.343, 0.5, 6.0
+    box = (-25.0, 25.0, -20.0, 20.0, 0.0, 6.15)
+    face = tr - 0.865            # ZG2 wall: face 0.865 mm inside the radius
+
+    def wall_stock():
+        st = StockField(box, cell=cell)
+        ys = st.y0 + (np.arange(st.ny) + 0.5) * cell
+        st.top = np.where(st.inb & (ys <= -face + 1e-9)[:, None], 6.15,
+                          -np.inf)
+        return st
+    # chain: 2 x 0.6 mm side cut along y=0 (start disk pre-cleared = the
+    # plunge), then a 0.99 mm tail turned 90 deg into fresh wall (< 1 mm).
+    path = [(-20.0, 0.0), (-19.4, 0.0), (-18.8, 0.0), (-18.8, -0.99)]
+    ends = []
+    wins = B._simulate(path, wall_stock(), z, tr, cell, tr, ends=ends,
+                       entry="bore", bore_xy=(-20.0, 0.0))
+    assert len(wins) == 1, "ZG2 keeps ONE window (tail merges): %r" % (wins,)
+    lens = [e - (ends[i - 1] if i else 0.0) for i, e in enumerate(ends)]
+    assert abs(lens[0] - 1.2) < 1e-9, "kept window must close at 1.2 mm"
+    eng_w = wins[0] / lens[0]
+    # the same cell areas move by move (plunge clears the start disk, then
+    # the engine's cell-centre disk sampling), fed through ZG2's own
+    # _ae2_windows; the tail chain breaks on a non-consecutive idx, exactly
+    # where the engine's chord break fires.
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    zp = os.path.normpath(os.path.join(repo, "..", "stevecam-zg2", "verify",
+                                       "zmap.py"))
+    assert os.path.exists(zp), "zg2 worktree zmap missing: %s" % zp
+    spec = ilu.spec_from_file_location("zg2_zmap", zp)
+    zm = ilu.module_from_spec(spec)
+    spec.loader.exec_module(zm)
+    st = wall_stock()
+    xs = st.x0 + (np.arange(st.nx) + 0.5) * cell
+    ys = st.y0 + (np.arange(st.ny) + 0.5) * cell
+    wall = st.inb & (ys <= -face + 1e-9)[:, None]
+    gone = np.zeros(wall.shape, dtype=bool)
+
+    def cut(x, y):               # cells this move's disk newly removes
+        nonlocal gone
+        ax = st.x0 + (st._ci(x) + 0.5) * cell    # engine anchors the disk
+        ay = st.y0 + (st._cj(y) + 0.5) * cell    # to the cell centre
+        d2 = ((xs - ax)[None, :] ** 2 + (ys - ay)[:, None] ** 2)
+        new = wall & (d2 <= tr * tr) & ~gone
+        gone |= new
+        return float(new.sum()) * cell * cell
+    cut(-20.0, 0.0)                              # the entry plunge
+    areas = [cut(-19.4, 0.0), cut(-18.8, 0.0), cut(-18.8, -0.99)]
+    mv = [dict(idx=k, line=10 + k, x=p[0], y=p[1], z=round(z, 3),
+               dx=d[0], dy=d[1], length_mm=L, area_mm2=a, depth_mm=0.15,
+               width_mm=0.865, feed=1000.0)
+          for k, (p, d, L, a) in enumerate(zip(
+              path[1:], [(1.0, 0.0), (1.0, 0.0), (0.0, -1.0)],
+              [0.6, 0.6, 0.99], areas))]
+    mv[2]["idx"] = 3             # rapid+plunge gap: the tail is its own chain
+    zw = zm._ae2_windows(mv)
+    assert len(zw) == 1, "ZG2 zmap must keep 1 merged window: %r" % (zw,)
+    z_w = zw[0]["ae_eff"]
+    pre_merge = (areas[0] + areas[1]) / 1.2      # what dropping the tail left
+    print("BS1a4d7 merged window: engine %.3f mm (area %.3f / len %.3f), "
+          "ZG2 zmap ae_eff %.3f mm (area %.3f / len %.3f); dropped-tail "
+          "value %.3f mm" % (eng_w, wins[0], lens[0], z_w, zw[0]["area_mm2"],
+                             zw[0]["length_mm"], pre_merge))
+    assert eng_w > 2.25, \
+        "engine merged window %.3f mm not judged over the 2.25 spike bar" \
+        % eng_w
+    assert z_w > 2.25, "ZG2 zmap merged ae_eff %.3f mm not over 2.25" % z_w
+    assert pre_merge < 2.25, \
+        "the dropped-tail value %.3f mm must sit UNDER the bar (the merge " \
+        "is what pushes the window over)" % pre_merge
+    assert abs(wins[0] - sum(areas)) < 1e-9, \
+        "engine merged area %.3f != per-move cell areas %.3f" % (
+            wins[0], sum(areas))
+    print("PASS bs1a4d7 sub-1 mm tail merges: engine %.3f mm > 2.25 > "
+          "%.3f mm dropped" % (eng_w, pre_merge))
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -1253,7 +1347,8 @@ def _main():
                test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load,
                test_bs1a4d6b_q4_entry_bore_in_live_stock,
                test_bs1a4d6c_side_entry_no_under_read,
-               test_bs1a4d6d_approach_simulated_in_window0):
+               test_bs1a4d6d_approach_simulated_in_window0,
+               test_bs1a4d7_sub1mm_tail_merges_not_dropped):
         try:
             fn()
         except AssertionError as e:

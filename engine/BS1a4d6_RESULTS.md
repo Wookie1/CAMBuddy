@@ -572,3 +572,137 @@ import engine.test_engine (with the new test wired into _main) EXIT=0.
   engine/test_engine.py; scratch only under scratch/ (diag_bs1a4d6d.py,
   run_d.sh, run_mut_d.sh, mut_d/ created-then-removed).
 - BS1a4d6d DONE.
+
+---
+
+## BS1a4d7: engine _simulate windowing mirrors ZG2 - sub-1 mm tails merge, never dropped
+
+Started 13:14 MST (date: Sun Oct 25 13:13:58 MST 2026). Base 36319bf (+ brief 6ae52e3).
+
+### Progress log
+- 13:2x engine/band.py _simulate: tails list; chord-break and path-end sub-1 mm
+  runs merge into the chain's last kept window, else the next kept window
+  (zg2 rule `windows[n-1] if n else windows[0]`); no kept window anywhere
+  stays out of the returned windows; ends untouched (len(ends)==len(wins),
+  boundaries stay where zmap's close). git diff --numstat vs 36319bf:
+  engine/band.py 12/3 = 15 changed non-test engine lines (budget <= 15).
+- NEW test_bs1a4d7_sub1mm_tail_merges_not_dropped added to engine/test_engine.py
+  and wired into _main; existing tests untouched.
+- ITEM 2 new test GREEN (slot_m4.sh, printed): engine merged width 5.833 mm
+  (area 7.000 / len 1.200), ZG2 zmap ae_eff 3.196 mm (area 7.000 / len
+  2.190), dropped-tail value 0.417 mm; both > 2.25; NEWT-EXIT 0.
+- ITEM 2 MUTATION (scratch/mut_d7 = worktree engine with band.py reverted to
+  36319bf, tails dropped again): test FAILS BY MEASURE -
+  "engine merged window 0.417 mm not judged over the 2.25 spike bar"
+  (engine 0.417 vs zmap 3.196, same geometry). Real engine files untouched.
+- AT-RISK BATTERY + NEW TEST (fixed engine/, all through slot_m4.sh via
+  scratch/run_d7.sh, one slot call; exit codes captured INSIDE the slot):
+  test_bs1a4d7_sub1mm_tail_merges_not_dropped EXIT=0
+  test_bs1a4d_credit0_lightest_option EXIT=0
+  test_bs1a_lshaped_channel EXIT=0
+  test_bs1a4d_credit_real_bore EXIT=0
+  test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load EXIT=0
+  test_bs1a4d2b_centred_entry_bore EXIT=0
+  test_bs1a4d4_credit_entry_matches_prediction EXIT=0
+  test_bs1a4d4_entry_pinned_to_stored_start EXIT=0
+  test_bs1a4c_backed_credit EXIT=0
+  test_bs1a4b_failed_region_lightest EXIT=0
+  test_bs1a4b_windows_align_zmap EXIT=0 (this branch's zmap: boundaries
+  identical; max diff engine-zmap +14.070 mm / zmap-engine 1.488 mm -
+  unchanged from the brief's BEFORE numbers)
+  test_bs1a4c2_band_chord_cl_checked EXIT=0
+  test_bs1a4c_fix_no_post_entry_helix EXIT=0
+  test_bs1a4d3_links_measured_as_cuts EXIT=0
+  test_bs1a_straight_channel EXIT=0
+  test_bs1a3_no_band_after_a2d EXIT=0
+  test_rough_synth_pocket_repro EXIT=0
+  test_dt1_synthetic_rough_twice_identical EXIT=0
+  test_bs1a4d6b_q4_entry_bore_in_live_stock EXIT=0
+  test_bs1a4d6c_side_entry_no_under_read EXIT=0
+  test_bs1a4d6d_approach_simulated_in_window0 EXIT=0
+  21/21 GREEN.
+
+### The change (file:line, engine/band.py only)
+- band.py:154 _simulate docstring:164 - "...its own window; ZG2 tails merge)."
+- band.py:195 `tails = []` - sub-1 mm runs kept as (area, len(wins) at break).
+- band.py:206-212 chord break (>45 deg, DIR_COS): instead of zeroing
+  acc_area/acc_len (dropping the fragment), a non-empty run is pushed to
+  tails with the kept-window count at its break point (zg2 close():
+  tails.append((w, len(windows)))).
+- band.py:232-237 after the loop: a path-end run with acc_len > 0 is a tail
+  too; each tail merges its AREA into windows[n-1] (last kept of its chain)
+  if n else windows[0] (first kept after) - exactly zg2 verify/zmap.py:1031
+  `tgt = windows[n - 1] if n else (windows[0] if windows else None)`; a run
+  with no kept window anywhere (whole path < 1 mm) stays out of the returned
+  windows (zmap: ungated .iso). Window VALUE unit unchanged (summed area per
+  window); ends untouched: len(ends) == len(wins) and boundaries stay where
+  the window closed - the same zmap does (merge updates area/length/ae_eff,
+  never end_line), so window boundaries stay comparable.
+- Line count vs 36319bf: git diff --numstat engine/band.py = 12/3 = 15
+  changed non-test engine lines (budget <= 15, STOP-at-~22 not approached).
+
+### Item 2 - numbers and mutation
+Same synthetic as ZG2's test_zg2_merged_tail_pushes_window_over_spike (wall
+face 0.865 mm inside the tool radius, 2 x 0.6 mm side cut, then a 0.99 mm
+sub-1 mm tail; the engine's chain break is the >45 deg chord turn where
+ZG2's case has rapid+plunge - _simulate replays feed moves only):
+  engine merged width    5.833 mm (area 7.000 / window travel 1.200) > 2.25
+  ZG2 zmap merged ae_eff 3.196 mm (area 7.000 / length 2.190)      > 2.25
+    (zg2 _ae2_windows driven with the SAME per-move cell areas; ZG2's own
+     test prints merged ae_eff 5.857 mm, area 12.300 / length 2.100)
+  dropped-tail value     0.417 mm (area 0.500 / 1.200)              < 2.25
+MUTATION (scratch/mut_d7, engine/band.py reverted to 36319bf - tails
+dropped again): test FAILS BY MEASURE -
+  "BS1a4d7 merged window: engine 0.417 mm (area 0.500 / len 1.200), ZG2 zmap
+   ae_eff 3.196 mm ...  MUT-RESULT FAILS-BY-MEASURE: engine merged window
+   0.417 mm not judged over the 2.25 spike bar"
+Real engine files untouched by the mutation (scratch copy only;
+scratch/stevecam-zg2 symlink lets the scratch copy find the read-only zg2
+worktree).
+
+### Item 3 - test_bs1a4b_windows_align_zmap, before/after
+BEFORE = this branch as-is (engine WITHOUT the change, this branch's zmap;
+supervisor-recorded today at +14.070 / 1.488 - and the battery run of the
+SAME test with the CHANGED engine against this branch's own zmap reproduced
+those numbers bit-for-bit, see NOTE); AFTER = engine change + ZG2
+zmap (scratch/zg2align = worktree copy with verify/zmap.py replaced by
+/Users/James/ai-sandbox/stevecam-zg2/verify/zmap.py, read-only source):
+  | run                          | engine-zmap | zmap-engine | boundaries |
+  |------------------------------|-------------|-------------|------------|
+  | BEFORE (this branch, today)  | +14.070 mm  | 1.488 mm    | identical  |
+  | AFTER (engine + ZG2 zmap)    | +14.070 mm  | 1.488 mm    | identical  |
+AFTER run: ALIGN-ZG2 EXIT=0, "PASS bs1a4b alignment: 1 region(s), window
+boundaries identical; max engine-zmap +14.070 mm, max zmap-engine 1.488 mm".
+The emitted test-block region carries no sub-1 mm tail (every chain reaches
+1 mm), so the merge changes nothing there - diffs bit-identical to BEFORE.
+NOTE: the battery's align run (changed engine + this branch's zmap) also
+printed +14.070/1.488 EXIT=0 - same reason; boundaries identical in all
+three configurations.
+
+### Exit codes (all through slot_m4.sh, captured inside the slot)
+- new test_bs1a4d7_sub1mm_tail_merges_not_dropped EXIT=0 (twice, incl. in
+  the battery); mutation run failed BY MEASURE as intended (AssertionError,
+  engine 0.417 mm).
+- 20/20 at-risk tests EXIT=0 + new test EXIT=0 = 21/21 GREEN (list above).
+- item 3 scratch align test ALIGN-ZG2 EXIT=0.
+
+### Close-out (BS1a4d7)
+- Started 13:14 MST, finished 14:0x MST (date at finish: Sun Oct 25 14:02
+  MST 2026) - well within the 2 h cap.
+- git diff --numstat vs 36319bf: engine/band.py 12/3 = 15 changed non-test
+  engine lines (budget <= 15); engine/test_engine.py 96/1 (tests only: the
+  new test + its _main wiring; no existing test or assertion touched);
+  BS1a4d6_RESULTS.md append-only; TASK_BS1a4d7.md 49/0 = the committed
+  brief itself; opencode.json 22/1 pre-existing at session start (NOT
+  edited here).
+- No locks touched; no Core Front job; no commit; no git
+  stash/reset/clean/restore/checkout/rebase/cherry-pick; no bypass flags;
+  no gate relaxed; no limit/floor raised (ZE2B 2.286 / ZE2 2.44 / ZA 0.2 /
+  ZB 0.5 / AE_SPIKE / AE_SS untouched); no margin/leave/feed change;
+  verify/ and opencode.json NOT edited; zg2 worktree READ-ONLY (file
+  copied out, never edited); engine code imports nothing from zmap/verify
+  (only the new TEST loads zg2 zmap by path); edits confined to
+  engine/band.py and engine/test_engine.py; scratch only under scratch/
+  (mut_d7/, zg2align/, run_d7.sh, run_align_zg2.sh, stevecam-zg2 symlink
+  left in place; earlier sessions' scratch files untouched).
+- BS1a4d7 DONE.

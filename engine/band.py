@@ -161,7 +161,7 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None,
     pre-cleared when entry="bore"; "side"/"link" not (BS1a4d6c). Returns the
     list of per-window ae_eff estimates (mm); ends collects each window's
     cumulative end-of-window travel (zmap _ae2_windows: moves merge until the
-    window reaches 1 mm, a move >= 1 mm is its own window).
+    window reaches 1 mm, a move >= 1 mm is its own window; ZG2 tails merge).
     approach (BS1a4d6d): the emitted entry move's start point; for
     "side"/"link" it is replayed as the first move into path[0]."""
     if approach is not None and entry in ("side", "link"):
@@ -191,6 +191,7 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None,
         if 0 <= a < stand.shape[1] and 0 <= b < stand.shape[0]:
             stand[b, a] = False
     wins = []
+    tails = []           # ZG2: (sub-1 mm area, len(wins) when its chain broke)
     acc_area = 0.0
     acc_len = 0.0
     tot = 0.0
@@ -204,8 +205,10 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None,
         if step_len > 1e-9:
             d = ((x - prev[0]) / step_len, (y - prev[1]) / step_len)
             if pdir is not None and d[0] * pdir[0] + d[1] * pdir[1] < DIR_COS:
-                acc_area = 0.0       # >45 deg chord break (zmap link rule):
-                acc_len = 0.0        # the sub-1 mm fragment is dropped there
+                if acc_len > 0.0:    # >45 deg chord break (zmap ZG2): the
+                    tails.append((acc_area, len(wins)))  # sub-1 mm fragment
+                    acc_area = 0.0   # keeps its place, merges into a
+                    acc_len = 0.0    # kept neighbour after the loop
             pdir = d
         ci, cj = stock._ci(x) - i0, stock._cj(y) - j0
         removed = 0
@@ -225,6 +228,12 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None,
             acc_area = 0.0
             acc_len = 0.0
         prev = (x, y)
+    if acc_len > 0.0:
+        tails.append((acc_area, len(wins)))  # ZG2: path-end tail
+    for area, n in tails:                    # ZG2 merge: last kept window
+        k = n - 1 if n else (0 if wins else -1)   # of its chain, else first
+        if k >= 0:                           # kept; none: stays ungated
+            wins[k] += area
     return wins
 
 
