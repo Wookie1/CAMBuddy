@@ -42,9 +42,9 @@ CODES = {
                    "(~/.stevecam or --home)."),
     "library_error": ("error", "Check ~/.stevecam/tools.json is valid JSON; "
                       "delete it to re-seed from the repo table."),
-    "tool_not_in_table": ("error", "Pick a tool_number that tools.list "
-                          "shows with a T, or add the tool to the library "
-                          "(tools.update)."),
+    "tool_not_in_table": ("error", "add this tool to tools/x7_tools.json "
+                          "(the table the engine and judges read), or pick a "
+                          "tool that is in it"),
     "tool_table_unreadable": ("error", "Fix or re-seed the tool library "
                               "file named in the message."),
     "tool_entry_incomplete": ("error", "Fill the missing field of that tool "

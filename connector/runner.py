@@ -342,9 +342,16 @@ class EngineRun:
         repo = {t.get("tool_id"): t for t in toollib._read(
             toollib.repo_table_path(self.cfg["repo_root"]))["tools"]}
         for e in self.tools.get("tools", []):
+            if e.get("number") not in numbers:
+                continue   # unused library-only tools stay allowed
             r = repo.get(e.get("tool_id"))
-            if r is None or e.get("number") not in numbers:
-                continue
+            if r is None:
+                raise EngineError(
+                    "tool %s (T%s) is not in tools/x7_tools.json, the table "
+                    "the engine and judges read" % (e.get("tool_id"),
+                                                    e.get("number")),
+                    code="tool_not_in_table", field="tool_id",
+                    got=e.get("tool_id"), allowed=sorted(repo))
             for key in _GEOMETRY_KEYS:
                 a, b = e.get(key), r.get(key)
                 if not (abs(a - b) <= toollib.TOL if isinstance(

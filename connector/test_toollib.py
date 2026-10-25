@@ -448,6 +448,40 @@ def _tl2_check_run(home, tmp_path, monkeypatch):
     return calls, runner_mod.EngineRun(cfg, str(work)), work / "program.nc"
 
 
+def test_tl2_library_only_tool_refused(home, tmp_path, monkeypatch):
+    """Coordinator (TL2 review a): a run that USES a library tool with no
+    repo-table row is refused (tool_not_in_table, the repo tool_ids as
+    `allowed`) before any engine work; an unused library-only tool does not
+    block a run."""
+    step = os.path.join(HERE, "testdata", "synth_pocket.step")
+    calls, eng, prog = _tl2_check_run(home, tmp_path, monkeypatch)
+    lib = toollib.load_library(home, REPO)
+    t13 = next(t for t in lib["tools"] if t["tool_id"] == ROUGH)
+    t13["tool_id"] = "lib-only-flat"          # same T13, no repo row
+    toollib.write_json(os.path.join(home, "tools.json"), lib)
+    eng2 = runner_mod.EngineRun(eng.cfg, eng.work)
+    err = None
+    try:
+        eng2.run_check_program(str(prog), step, dict(CP_VALS))
+    except runner_mod.EngineError as ex:
+        err = ex.as_error()
+    assert err is not None and len(calls) == 0, \
+        "library-only tool used: run proceeded with %d engine call(s) " \
+        "(must be refused before any)" % len(calls)
+    assert err["code"] == "tool_not_in_table", err
+    assert err["got"] == "lib-only-flat" and ROUGH in err["allowed"]
+    assert err["next_step"].startswith("add this tool to tools/x7_tools.json")
+    assert len(calls) == 0, "engine calls: %d (refused before any)" % len(calls)
+    # the same library-only tool, renumbered so this run does not use it
+    t13["number"] = 40
+    lib["tools"].append(dict(next(t for t in toollib._read(
+        toollib.repo_table_path(REPO))["tools"] if t["tool_id"] == ROUGH)))
+    toollib.write_json(os.path.join(home, "tools.json"), lib)
+    eng3 = runner_mod.EngineRun(eng.cfg, eng.work)
+    eng3.run_check_program(str(prog), step, dict(CP_VALS))
+    assert calls, "a run not using the library-only tool must proceed"
+
+
 def test_tl2_geometry_mismatch_refuses_the_run(home, tmp_path, monkeypatch):
     """Item 4: library geometry differing from the repo table for a tool
     the run judges refuses the run before any engine work, naming the

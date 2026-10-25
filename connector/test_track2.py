@@ -593,12 +593,13 @@ def test_tl2_check_program_origin_required():
 
 def test_tl2_check_origin_injected_fault_is_measured(monkeypatch):
     """Fault: the required-origin rule off (pre-TL2). The same inputs then
-    validate ok with the silent default - measured: ok True and
-    origin=model_origin, the exact slip item 1 refuses."""
+    validate ok with NO origin at all (the schema has no default since
+    the TL2 review) - measured: ok True and origin None, the exact slip
+    item 1 refuses."""
     monkeypatch.setattr(catalog_mod, "CHECK_ACTION", "other")
     ok, code, v = catalog_mod.validate_inputs(
         {"program": {"url": "u"}, "model": {"url": "u"}}, "check_program")
-    assert ok and v["origin"] == "model_origin"
+    assert ok and v["origin"] is None
 
 
 def _tl2_rough_argv(values, tmp_path, monkeypatch):
