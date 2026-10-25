@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import catalog as catalog_mod  # noqa: E402
 import config as config_mod    # noqa: E402
 import crypto                  # noqa: E402
+import toollib                 # noqa: E402
 from client import SteveClient, SteveError  # noqa: E402
 from runner import EngineRun, EngineError, Cancelled  # noqa: E402
 
@@ -202,12 +203,61 @@ class Connector:
             return  # never act twice
         self._remember_nonce(env.get("nonce"))
         action = env.get("action")
-        if action not in catalog_mod.ACTIONS:
+        if action not in catalog_mod.ACTIONS + catalog_mod.TOOL_ACTIONS:
             self._remember_run(run_id)
             self._safe_reject(run_id, "action_unknown")
             return
         self._remember_run(run_id)
+        if action in catalog_mod.TOOL_ACTIONS:
+            self._run_tool_action(run_id, env, action)
+            return
         self._run_job(run_id, env, action)
+
+    def tool_action(self, action, values):
+        """Track 2: tools.list / tools.update / job.get / job.renumber on
+        the library (<home>/tools.json) and the per-document jobs
+        (<home>/jobs/). Returns the result; ToolLibError -> {code,
+        message}."""
+        home, repo = self.home, self.cfg["repo_root"]
+        if action == catalog_mod.TOOLS_LIST:
+            return toollib.tools_list(home, repo)
+        if action == catalog_mod.TOOLS_UPDATE:
+            return toollib.update_tool(home, repo, values.get("tool_id"),
+                                       values.get("changes"),
+                                       values.get("pockets"))
+        if action == catalog_mod.JOB_GET:
+            return toollib.job_get(home, values["document_id"])
+        return toollib.renumber(home, repo, values["document_id"],
+                                values["tool_id"], values["t"])
+
+    def _run_tool_action(self, run_id, env, action):
+        try:
+            self.client.report_run(run_id, "received")
+        except SteveError:
+            pass
+        ok, code, values = catalog_mod.validate_inputs(
+            env.get("inputs", {}), action)
+        try:
+            if not ok:
+                self.client.report_run(run_id, "rejected",
+                                       error={"code": code, "message": values})
+                return
+            self.client.report_run(run_id, "running", progress=0.5,
+                                   message=action)
+            try:
+                result = self.tool_action(action, values)
+            except toollib.ToolLibError as e:
+                self.client.report_run(run_id, "failed", error=e.as_dict())
+                return
+            except (OSError, ValueError) as e:
+                self.client.report_run(
+                    run_id, "failed",
+                    error={"code": "library_error", "message": str(e)[:400]})
+                return
+            self.client.report_run(run_id, "succeeded", result=result,
+                                   message="done")
+        except SteveError:
+            pass
 
     def _safe_reject(self, run_id, code):
         try:
@@ -286,6 +336,13 @@ class Connector:
             # ranges are mm-valued, so validating raw inch numbers would
             # reject or misjudge sensible inch inputs
             values_in = catalog_mod.to_mm(values_in)
+            # track 2: job renumbering follows the STEVE document - an
+            # explicit document_id, else the model's own document
+            if not values_in.get("document_id"):
+                doc = (values_in.get("model") or {}).get("document") \
+                    if isinstance(values_in.get("model"), dict) else None
+                if isinstance(doc, dict) and doc.get("id"):
+                    values_in = dict(values_in, document_id=str(doc["id"]))
             ok, code, values = catalog_mod.validate_inputs(values_in, action)
             if not ok:
                 self.client.report_run(run_id, "rejected",

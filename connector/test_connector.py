@@ -8,6 +8,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -2709,3 +2710,114 @@ class TestAxialPlungeGate:
                                   dict(CHECK_INPUTS))
         msg = str(ei.value)
         assert "axial plunges" in msg, msg
+
+
+# ================================== track 2: tool library + job renumber ==
+
+def _final_body(mock, run_id, timeout=60):
+    final = mock.wait_terminal(run_id, timeout=timeout)
+    body = [r["body"] for r in mock.reports
+            if str(r["run_id"]) == str(run_id)][-1]
+    return final, body
+
+
+class TestToolLibE2E:
+    """STEVE -> tools.list / job.renumber / job.get, then a renumbered
+    rough -> finish -> rest chain and check_program on a renumbered
+    program. State lives in the live fixture's temp home only."""
+    DOC = "doc-renum-e2e"
+    ROUGH = "flat-12.686"
+
+    def _sha(self, path):
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    def test_tool_actions(self, live):
+        mock, home, _ = live
+        mock.enqueue_run(1301, action=catalog_mod.TOOLS_LIST, inputs={})
+        final, body = _final_body(mock, 1301)
+        assert final == "succeeded", body
+        res = body["result"]
+        assert res["pockets"] == 12
+        t13 = next(t for t in res["tools"] if t["tool_id"] == self.ROUGH)
+        assert (t13["t"], t13["h"], t13["d"]) == (13, 13, 13)
+
+        mock.enqueue_run(1302, action=catalog_mod.JOB_RENUMBER,
+                         inputs={"document_id": self.DOC,
+                                 "tool_id": self.ROUGH, "t": 5})
+        final, body = _final_body(mock, 1302)
+        assert final == "succeeded", body
+        assert body["result"] == {"document_id": self.DOC,
+                                  "renumber": {self.ROUGH: 5},
+                                  "tools_used": []}
+        # refusals come back as {code, message}
+        for rid, t, code in ((1303, 3, "duplicate_t"),
+                             (1304, 0, "out_of_range"),
+                             (1305, 13 + 100, "out_of_range")):
+            mock.enqueue_run(rid, action=catalog_mod.JOB_RENUMBER,
+                             inputs={"document_id": self.DOC,
+                                     "tool_id": "ball-19.050", "t": t})
+            final, body = _final_body(mock, rid)
+            assert final == "failed" and body["error"]["code"] == code, body
+            assert body["error"]["message"]
+        mock.enqueue_run(1306, action=catalog_mod.JOB_GET,
+                         inputs={"document_id": self.DOC})
+        final, body = _final_body(mock, 1306)
+        assert final == "succeeded"
+        assert body["result"]["renumber"] == {self.ROUGH: 5}
+
+    def test_renumbered_chain_posts_t5(self, live):
+        """rough -> finish -> rest with T13 -> T5 for this document: every
+        posted T/H of the rough switches to 5, the finish (T20) and rest
+        (T31) are unchanged, and neither the library nor the repo table
+        changes."""
+        mock, home, _ = live
+        lib = str(home / "tools.json")
+        assert os.path.exists(lib), "test_tool_actions seeds the library"
+        lib_before = self._sha(lib)
+        repo_before = self._sha(os.path.join(REPO, "tools", "x7_tools.json"))
+        mock.enqueue_run(1310, action=catalog_mod.SLOPE_ACTION,
+                         inputs=dict(SLOPE_GOOD_INPUTS,
+                                     model=model_input(mock),
+                                     rest_tool_number=31,
+                                     document_id=self.DOC))
+        final = mock.wait_terminal(1310, timeout=900)
+        assert final == "succeeded", mock.states_for(1310)
+        run = home / "runs" / "1310"
+
+        def words(name):
+            text = open(run / name).read()
+            body = re.sub(r"\([^)]*\)", "", text)
+            return (set(re.findall(r"\bT\d+", body)),
+                    set(re.findall(r"\bH\d+", body)))
+        assert words("rough.nc") == ({"T5"}, {"H05"})
+        assert words("finish.nc") == ({"T20"}, {"H20"})
+        assert words("rest.nc") == ({"T31"}, {"H31"})
+        assert self._sha(lib) == lib_before
+        assert self._sha(os.path.join(REPO, "tools", "x7_tools.json")) == \
+            repo_before
+        with open(home / "jobs" / "used" / (self.DOC + ".json")) as fh:
+            assert json.load(fh) == [self.ROUGH, "ball-9.525", "ball-5.958"]
+
+    def test_check_program_resolves_renumbered_t(self, live):
+        mock, _, _ = live
+        mock.enqueue_run(1320, action=catalog_mod.CHECK_ACTION,
+                         inputs=dict(CHECK_INPUTS, model=model_input(mock),
+                                     program=program_input(
+                                         mock, "check_ok_t5.nc"),
+                                     document_id=self.DOC))
+        final, body = _final_body(mock, 1320, timeout=600)
+        assert final == "succeeded", body
+        r = body["result"]
+        assert r["tool"]["number"] == 5
+        assert r["tool"]["diameter_mm"] == 12.686
+        assert r["tool"]["holder"] == "BT30-ER32-70"
+        assert r["zmap_gouges"]["count"] == 0
+        assert r["holder_hits"]["count"] == 0
+        # without the job (model document doc-1) T5 is unknown: refused
+        mock.enqueue_run(1321, action=catalog_mod.CHECK_ACTION,
+                         inputs=dict(CHECK_INPUTS, model=model_input(mock),
+                                     program=program_input(
+                                         mock, "check_ok_t5.nc")))
+        final, body = _final_body(mock, 1321, timeout=600)
+        assert final == "failed" and "T5" in body["error"]["message"], body

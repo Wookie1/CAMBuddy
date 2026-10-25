@@ -8,6 +8,12 @@ ACTION = "adaptive_rough"
 SLOPE_ACTION = "slope_split_finish"
 CHECK_ACTION = "check_program"
 ACTIONS = (ACTION, SLOPE_ACTION, CHECK_ACTION)
+# track 2 (toollib): library + per-document job renumbering, no engine work
+TOOLS_LIST = "tools.list"
+TOOLS_UPDATE = "tools.update"
+JOB_GET = "job.get"
+JOB_RENUMBER = "job.renumber"
+TOOL_ACTIONS = (TOOLS_LIST, TOOLS_UPDATE, JOB_GET, JOB_RENUMBER)
 EVENT = "engine_state"
 
 # inputs whose numeric value is a length/feeds in mm (or mm/min):
@@ -26,6 +32,15 @@ _ORIENTATION = {"type": "string",
                          "flip_z_180"],
                 "default": "as_modeled",
                 "title": "Orientation"}
+
+_DOCUMENT_ID = {"type": "string", "maxLength": 128,
+                "title": "STEVE document id",
+                "description": "applies this document's job tool "
+                               "renumbering (job.renumber); defaults to the "
+                               "model's STEVE document"}
+
+_DOC_ID_INPUT = {"type": "string", "maxLength": 128,
+                 "title": "STEVE document id"}
 
 _STOCK_INPUTS = {
     "stock_xy": {"type": "number", "minimum": 0.0, "maximum": 25.4,
@@ -115,6 +130,7 @@ ROUGHING_ACTION = {
                             "maximum": 999,
                             "description": "machine tool number; if blank, "
                                          "the X7 tool table picks the tool"},
+            "document_id": _DOCUMENT_ID,
         },
         "required": ["model"],
     },
@@ -192,6 +208,7 @@ SLOPE_ACTION_SPEC = {
                                         "triggers the rest pass; minimum 0.1"},
             # roughing tool + cutting data (defaults as in adaptive_rough)
             **{"rough_" + k: v for k, v in _ROUGHING_INPUTS.items()},
+            "document_id": _DOCUMENT_ID,
         },
         "required": ["model"],
     },
@@ -237,6 +254,7 @@ CHECK_ACTION_SPEC = {
                             "description": "optional override of the "
                                          "program's T word; the tool comes "
                                          "from tools/x7_tools.json"},
+            "document_id": _DOCUMENT_ID,
         },
         "required": ["program", "model"],
     },
@@ -246,8 +264,53 @@ CHECK_ACTION_SPEC = {
                "with their lines; files: check.json, preview.png."),
 }
 
+TOOL_ACTION_SPECS = [
+    {"name": TOOLS_LIST, "title": "List the tool library",
+     "description": "The X7 tool library (~/.stevecam/tools.json): every "
+                    "tool with its stable tool_id and library T/H/D, plus "
+                    "the pocket count. Unknown fields are null.",
+     "confirm": False,
+     "inputs": {"type": "object", "properties": {}},
+     "result": "{tools: [{tool_id, t, h, d, name, type, dia_mm, "
+               "corner_r_mm, flute_len_mm, reach_mm, holder, rpm, "
+               "feed_mm_min, plunge_mm_min}], pockets}"},
+    {"name": TOOLS_UPDATE, "title": "Edit a library tool",
+     "description": "Changes one tool in the library (never the repo "
+                    "table): changes is {field: value} over t, name, type, "
+                    "dia_mm, corner_r_mm, flute_len_mm, reach_mm, holder, "
+                    "rpm, feed_mm_min, plunge_mm_min (h and d follow t). "
+                    "pockets sets the pocket count.",
+     "confirm": False,
+     "inputs": {"type": "object", "properties": {
+         "tool_id": {"type": "string", "maxLength": 64},
+         "changes": {"type": "object"},
+         "pockets": {"type": "integer"}}},
+     "result": "{tool: <tools.list entry>, pockets} or {code, message}"},
+    {"name": JOB_GET, "title": "Job tool numbers",
+     "description": "This document's job renumbering and the tools its "
+                    "runs used.",
+     "confirm": False,
+     "inputs": {"type": "object",
+                "properties": {"document_id": _DOC_ID_INPUT},
+                "required": ["document_id"]},
+     "result": "{document_id, renumber: {tool_id: t}, tools_used: "
+               "[tool_id]}"},
+    {"name": JOB_RENUMBER, "title": "Renumber a tool for this job",
+     "description": "Posts tool_id as T t (and H/D) for this document "
+                    "only; the library is unchanged. Refused when another "
+                    "tool already has T t in the job (duplicate_t) or t is "
+                    "outside 1..pockets (out_of_range).",
+     "confirm": False,
+     "inputs": {"type": "object", "properties": {
+         "document_id": _DOC_ID_INPUT,
+         "tool_id": {"type": "string", "maxLength": 64},
+         "t": {"type": "integer"}},
+         "required": ["document_id", "tool_id", "t"]},
+     "result": "the job (as job.get) or {code, message}"},
+]
+
 CATALOG = {"actions": [ROUGHING_ACTION, SLOPE_ACTION_SPEC,
-                       CHECK_ACTION_SPEC],
+                       CHECK_ACTION_SPEC] + TOOL_ACTION_SPECS,
            "events": [{
                "name": EVENT,
                "description": "Engine state: idle or busy, the current "
