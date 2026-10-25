@@ -1551,6 +1551,94 @@ def test_ze2_parallel_merge_matches_serial():
 
 
 # ---------------------------------------------------------------------------
+# Task ZG2: sub-1 mm tails are MERGED into their kept window, never dropped
+# ---------------------------------------------------------------------------
+
+def _zg2_wall_stock(width):
+    """stock 18.6 under a wall whose face sits `width` mm inside the tool
+    radius from the y=0 path (and solid for x >= 10, fresh material for the
+    neighbour-free tail), 13.6 (tip level) elsewhere."""
+    ys = _centers_f()[:, None]
+    xs = _centers_f()[None, :]
+    face = D_ZE2 / 2.0 - width
+    return np.broadcast_to(
+        np.where((ys <= -face + 1e-9) | (xs >= 10.0 - 1e-9), 18.6, 13.6),
+        (NF, NF)).copy()
+
+
+def test_zg2_merged_tail_pushes_window_over_spike():
+    """ZG2 (a): a ~0.865 mm-wide side-cut window (2 x 0.6 = 1.2 mm, pre-merge
+    ae_eff ~0.865) plus a sub-1 mm tail from a neighbour-free chain (one
+    0.9 mm feed into fresh solid, area ~11 mm2) merge into ONE window whose
+    ae_eff is judged over the AE_SPIKE 2.25 limit (and over the SE2 merge
+    bar 2.4384). Dropping the tail again leaves 0.865 -> test fails by the
+    measured ae_eff."""
+    part = np.zeros((NF, NF))
+    gcode = _ae2_gcode([(-19.4, 0.0), (-18.8, 0.0)], (-20.0, 0.0), 13.6)
+    gcode += "G0 X20. Y20. Z20.\nG1 X20. Y20. Z13.6 F100.\n"
+    gcode += "G1 X20.9 Y20. F500.\n"
+    res = _run_ae2(gcode, part, stock_init=_zg2_wall_stock(0.865))
+    wins = res["_ae2_raw"]
+    assert len(wins) == 1, "expected 1 merged window: %r" % wins
+    w = wins[0]
+    print("ZG2(a) measured merged ae_eff %.3f mm (area %.3f / length %.3f, "
+          "line %s)" % (w["ae_eff"], w["area_mm2"], w["length_mm"],
+                        w["line"]))
+    assert w["ae_eff"] > 2.25, \
+        "merged ae_eff %.3f mm not judged over 2.25" % w["ae_eff"]
+    assert abs(w["length_mm"] - 2.1) <= 0.05, \
+        "merged window length %.3f not 1.2 + 0.9" % w["length_mm"]
+    eng = res["engagement"]
+    assert eng["ae2"]["n"] == 1
+    assert eng["ae2"]["max"] == w["ae_eff"]
+    assert eng["overload_feeds_ae2"]["count"] == 1
+    assert "ae2_isolated_sub1mm" not in eng  # the tail had a neighbour
+
+
+def test_zg2_merged_tail_under_limit_changes_nothing():
+    """ZG2 (b): uniform ~0.865 mm side cut: with a 0.6 mm tail the window
+    grows 1.2 -> 1.8 mm but ae_eff stays ~0.865 (< 2.25, unchanged vs the
+    no-tail run) and the window count stays 1; nothing is flagged."""
+    part = np.zeros((NF, NF))
+    base = _run_ae2(_ae2_gcode([(-19.4, 0.0), (-18.8, 0.0)],
+                               (-20.0, 0.0), 13.6), part,
+                    stock_init=_zg2_wall_stock(0.865))
+    tail = _run_ae2(_ae2_gcode([(-19.4, 0.0), (-18.8, 0.0), (-18.2, 0.0)],
+                               (-20.0, 0.0), 13.6), part,
+                    stock_init=_zg2_wall_stock(0.865))
+    wb, wt = base["_ae2_raw"], tail["_ae2_raw"]
+    print("ZG2(b) ae_eff before %.3f / after %.3f mm (len %.3f -> %.3f)"
+          % (wb[0]["ae_eff"], wt[0]["ae_eff"], wb[0]["length_mm"],
+             wt[0]["length_mm"]))
+    assert len(wb) == len(wt) == 1, "window count changed"
+    assert abs(wt[0]["length_mm"] - 1.8) <= 0.05
+    assert abs(wt[0]["ae_eff"] - wb[0]["ae_eff"]) <= 0.05, \
+        "ae_eff changed %.3f -> %.3f" % (wb[0]["ae_eff"], wt[0]["ae_eff"])
+    assert wt[0]["ae_eff"] < 2.25
+    eng = tail["engagement"]
+    assert eng["ae2"]["n"] == 1
+    assert eng["full_width_slots_ae2"]["count"] == 0
+    assert eng["overload_feeds_ae2"]["count"] == 0
+
+
+def test_zg2_isolated_sub1mm_cut_reported_not_gated():
+    """ZG2 item 2: a lone 0.6 mm cut with no kept window anywhere is NOT
+    judged (no ae2 window, nothing flagged) but reported in
+    engagement.ae2_isolated_sub1mm (count 1, worst area/length capped D)."""
+    part = np.zeros((NF, NF))
+    res = _run_ae2(_ae2_gcode([(-19.4, 0.0)], (-20.0, 0.0), 13.6), part)
+    assert res["_ae2_raw"] == [], "isolated cut must not become a window"
+    eng = res["engagement"]
+    assert eng["ae2"]["n"] == 0
+    assert eng["overload_feeds_ae2"]["count"] == 0
+    iso = eng["ae2_isolated_sub1mm"]
+    print("ZG2(c) isolated sub-1 mm: %r" % (iso,))
+    assert iso["count"] == 1
+    assert 0.0 < iso["worst_ae_eff_mm"] <= D_ZE2, \
+        "worst %.3f not capped at D %.3f" % (iso["worst_ae_eff_mm"], D_ZE2)
+
+
+# ---------------------------------------------------------------------------
 # S5: independent holder clearance check (holder frustum stack from
 # tools/x7_tools.json vs max(stock, part), 1.0 mm clearance)
 # ---------------------------------------------------------------------------
