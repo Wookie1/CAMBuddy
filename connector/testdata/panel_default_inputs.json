@@ -1,0 +1,235 @@
+{
+  "note": "Exact inputs the panel sends with untouched defaults. Run each through validate_inputs(action, inputs). 'catalog_681f551' = schema as of 681f551 (no origin/document_id); 'extended' = with the parallel origin/document_id inputs.",
+  "catalog_681f551": {
+    "inch": {
+      "adaptive_rough": {
+        "model": {
+          "document_id": "doc-42",
+          "revision": 7
+        },
+        "orientation": "as_modeled",
+        "units": "inch",
+        "stock_xy": 0.04,
+        "stock_top": 0.04,
+        "stock_bottom": 0.04,
+        "floor_z": 0,
+        "tool_type": "bull",
+        "tool_diameter": 0.5,
+        "corner_radius": 0.005,
+        "flute_length": 1.18,
+        "stepdown": 0.75,
+        "optimal_load": 0.08,
+        "stock_to_leave": 0.015,
+        "rest_stepup": 0.075,
+        "rpm": 7500,
+        "feed": 135,
+        "ramp_feed": 50,
+        "program_number": 1001
+      },
+      "slope_split_finish": {
+        "model": {
+          "document_id": "doc-42",
+          "revision": 7
+        },
+        "orientation": "as_modeled",
+        "units": "inch",
+        "stock_xy": 0.04,
+        "stock_top": 0.04,
+        "stock_bottom": 0.04,
+        "floor_z": 0,
+        "tool_diameter": 0.2362204724409449,
+        "stepover": 0.012,
+        "stepdown": 0.012,
+        "slope_threshold": 40,
+        "rpm": 7500,
+        "feed": 135,
+        "ramp_feed": 50,
+        "program_number": 1001,
+        "min_rest": 0.02,
+        "rough_tool_type": "bull",
+        "rough_tool_diameter": 0.5,
+        "rough_corner_radius": 0.005,
+        "rough_flute_length": 1.18,
+        "rough_stepdown": 0.75,
+        "rough_optimal_load": 0.08,
+        "rough_stock_to_leave": 0.015,
+        "rough_rest_stepup": 0.075
+      }
+    },
+    "mm": {
+      "adaptive_rough": {
+        "model": {
+          "document_id": "doc-42",
+          "revision": 7
+        },
+        "orientation": "as_modeled",
+        "units": "mm",
+        "stock_xy": 1,
+        "stock_top": 1,
+        "stock_bottom": 1,
+        "floor_z": 0,
+        "tool_type": "bull",
+        "tool_diameter": 12.7,
+        "corner_radius": 0.127,
+        "flute_length": 30,
+        "stepdown": 19.05,
+        "optimal_load": 2.03,
+        "stock_to_leave": 0.381,
+        "rest_stepup": 1.905,
+        "rpm": 7500,
+        "feed": 3429,
+        "ramp_feed": 1270,
+        "program_number": 1001
+      },
+      "slope_split_finish": {
+        "model": {
+          "document_id": "doc-42",
+          "revision": 7
+        },
+        "orientation": "as_modeled",
+        "units": "mm",
+        "stock_xy": 1,
+        "stock_top": 1,
+        "stock_bottom": 1,
+        "floor_z": 0,
+        "tool_diameter": 6,
+        "stepover": 0.3,
+        "stepdown": 0.3,
+        "slope_threshold": 40,
+        "rpm": 7500,
+        "feed": 3429,
+        "ramp_feed": 1270,
+        "program_number": 1001,
+        "min_rest": 0.5,
+        "rough_tool_type": "bull",
+        "rough_tool_diameter": 12.7,
+        "rough_corner_radius": 0.127,
+        "rough_flute_length": 30,
+        "rough_stepdown": 19.05,
+        "rough_optimal_load": 2.03,
+        "rough_stock_to_leave": 0.381,
+        "rough_rest_stepup": 1.905
+      }
+    }
+  },
+  "extended": {
+    "inch": {
+      "adaptive_rough": {
+        "model": {
+          "document_id": "doc-42",
+          "revision": 7
+        },
+        "document_id": "doc-42",
+        "orientation": "as_modeled",
+        "origin": "stock_bottom_centre",
+        "units": "inch",
+        "stock_xy": 0.04,
+        "stock_top": 0.04,
+        "stock_bottom": 0.04,
+        "floor_z": 0,
+        "tool_type": "bull",
+        "tool_diameter": 0.5,
+        "corner_radius": 0.005,
+        "flute_length": 1.18,
+        "stepdown": 0.75,
+        "optimal_load": 0.08,
+        "stock_to_leave": 0.015,
+        "rest_stepup": 0.075,
+        "rpm": 7500,
+        "feed": 135,
+        "ramp_feed": 50,
+        "program_number": 1001
+      },
+      "slope_split_finish": {
+        "model": {
+          "document_id": "doc-42",
+          "revision": 7
+        },
+        "document_id": "doc-42",
+        "orientation": "as_modeled",
+        "origin": "stock_bottom_centre",
+        "units": "inch",
+        "stock_xy": 0.04,
+        "stock_top": 0.04,
+        "stock_bottom": 0.04,
+        "floor_z": 0,
+        "tool_diameter": 0.2362204724409449,
+        "stepover": 0.012,
+        "stepdown": 0.012,
+        "slope_threshold": 40,
+        "rpm": 7500,
+        "feed": 135,
+        "ramp_feed": 50,
+        "program_number": 1001,
+        "min_rest": 0.02,
+        "rough_tool_type": "bull",
+        "rough_tool_diameter": 0.5,
+        "rough_corner_radius": 0.005,
+        "rough_flute_length": 1.18,
+        "rough_stepdown": 0.75,
+        "rough_optimal_load": 0.08,
+        "rough_stock_to_leave": 0.015,
+        "rough_rest_stepup": 0.075
+      }
+    },
+    "mm": {
+      "adaptive_rough": {
+        "model": {
+          "document_id": "doc-42",
+          "revision": 7
+        },
+        "document_id": "doc-42",
+        "orientation": "as_modeled",
+        "origin": "stock_bottom_centre",
+        "units": "mm",
+        "stock_xy": 1,
+        "stock_top": 1,
+        "stock_bottom": 1,
+        "floor_z": 0,
+        "tool_type": "bull",
+        "tool_diameter": 12.7,
+        "corner_radius": 0.127,
+        "flute_length": 30,
+        "stepdown": 19.05,
+        "optimal_load": 2.03,
+        "stock_to_leave": 0.381,
+        "rest_stepup": 1.905,
+        "rpm": 7500,
+        "feed": 3429,
+        "ramp_feed": 1270,
+        "program_number": 1001
+      },
+      "slope_split_finish": {
+        "model": {
+          "document_id": "doc-42",
+          "revision": 7
+        },
+        "document_id": "doc-42",
+        "orientation": "as_modeled",
+        "origin": "stock_bottom_centre",
+        "units": "mm",
+        "stock_xy": 1,
+        "stock_top": 1,
+        "stock_bottom": 1,
+        "floor_z": 0,
+        "tool_diameter": 6,
+        "stepover": 0.3,
+        "stepdown": 0.3,
+        "slope_threshold": 40,
+        "rpm": 7500,
+        "feed": 3429,
+        "ramp_feed": 1270,
+        "program_number": 1001,
+        "min_rest": 0.5,
+        "rough_tool_type": "bull",
+        "rough_tool_diameter": 12.7,
+        "rough_corner_radius": 0.127,
+        "rough_flute_length": 30,
+        "rough_stepdown": 19.05,
+        "rough_optimal_load": 2.03,
+        "rough_stock_to_leave": 0.381,
+        "rough_rest_stepup": 1.905
+      }
+    }
+  }
+}
