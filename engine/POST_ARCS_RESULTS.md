@@ -84,3 +84,18 @@ with the posted centre) passed for every arc written. The vertex-deviation requi
 - VERIFY on the X7: parameter 50048 value (A6). The 0.0005 mm limit is the post's own choice.
 - The real chain4 programs were re-posted and measured for deviation only (no part judge on them).
 - Finish TB program has 178 rapid collisions in both line and arc form (engine finish issue, not post).
+
+## Follow-up: parse-back test (coordinator review of f5d0c29)
+The coordinator's mutation (b) (G02/G03 flipped in the emitted mode word) was caught only by a string check.
+New test `test_posted_arcs_replay_onto_original_path` (no existing test changed) reads the posted program
+back with **verify/zmap's own interpreter**: `zmap.parse_gcode` -> `zmap.resolve_moves` (which resolves
+each G2/G3 through `zmap._arc_geom`: centre = start + I/J, G03 CCW / G02 CW sweep) -> `zmap._move_samples`
+(the sampler zmap's simulator sweeps, 0.1 mm steps here). Nothing from post_lnc/arcfit is used for the replay.
+Each sampled arc point's distance to the ORIGINAL neutral feed polyline is measured; it must be <= ARC_TOL
+(0.002 mm; inch output +0.0013 mm for 0.0001 in coordinate rounding), with the value in the failure message.
+Fixtures: full r=10 circle (two 180 deg arcs), r=10 90 deg CCW quarter, mirrored CW quarter; metric and inch.
+- This tree: passes. Measured max replay deviation 0.00037-0.00038 mm metric, 0.00084 mm inch.
+- Flip mutation (scratch copy only, scratchpad/pa/mut, never committed;
+  `newmode = _MOTION.get({2: 3, 3: 2}.get(g, g), "G01")`): FAILS with
+  "quarter_ccw metric=True: posted arcs replay 18.4776 mm from the original path (limit 0.0020)".
+- `POST_ZMAP_JOBS=4 slot_m4.sh python3 -m pytest engine/test_post.py -q`: 29 passed, exit 0.

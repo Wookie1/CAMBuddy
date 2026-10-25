@@ -759,3 +759,50 @@ def test_cli_post_arcs_flag(tmp_path):
     assert cli.main(base + ["--out", str(off)]) == 0
     assert cli.main(base + ["--out", str(on), "--arcs"]) == 0
     assert not _arc_lines(off.read_text()) and len(_arc_lines(on.read_text())) == 2
+
+
+def _seg_dist(p, a, b):
+    d = [b[k] - a[k] for k in range(3)]
+    L2 = sum(v * v for v in d)
+    t = 0.0 if L2 == 0 else max(0.0, min(1.0, sum((p[k] - a[k]) * d[k] for k in range(3)) / L2))
+    return _math.sqrt(sum((p[k] - a[k] - t * d[k]) ** 2 for k in range(3)))
+
+
+def test_posted_arcs_replay_onto_original_path():
+    """Replay the POSTED program with verify/zmap's own G2/G3 interpreter
+    (parse_gcode -> resolve_moves/_arc_geom -> _move_samples, the sampler its
+    simulator sweeps; nothing from post_lnc/arcfit), sample every arc along its
+    stated direction and measure the max distance to the ORIGINAL neutral feed path.
+    Catches a flipped G02/G03 (the wrong-way sweep is ~radius off)."""
+    sys.path.insert(0, os.path.join(ROOT, "verify"))
+    import zmap
+    quarter = [{"g": 0, "x": 10.0, "y": 0.0, "z": 5.0},
+               {"g": 1, "x": 10.0, "y": 0.0, "z": -1.0, "f": 1000.0}]
+    quarter += [{"g": 1, "x": x, "y": y, "z": -1.0, "f": 1000.0}
+                for x, y in _circle_pts(10.0, 0, 90, 1.0)[1:]]
+    quarter.append({"g": 0, "x": 0.0, "y": 10.0, "z": 5.0})
+    cw = [dict(m, y=-m["y"]) for m in quarter]          # mirrored: clockwise quarter
+    for name, mv in (("circle", _circle_moves()), ("quarter_ccw", quarter),
+                     ("quarter_cw", cw)):
+        feed = [m for m in mv if m["g"] == 1]
+        orig = [(m["x"], m["y"], m["z"]) for m in feed]
+        segs = list(zip(orig, orig[1:]))
+        for metric in (True, False):
+            txt = post_lnc.post(mv, metric=metric, tool_number=2, tool_kind="flat",
+                                dia_mm=6.0, crlf=False, arcs=True)
+            n_arcs, max_dev, pos = 0, 0.0, None
+            for m in zmap.resolve_moves(zmap.parse_gcode(txt)):
+                if m["motion"] in ("G2", "G3") and pos is not None:
+                    assert m.get("arc"), "zmap could not resolve the arc: %r" % m
+                    n_arcs += 1
+                    # zmap's own interpolator (the one its simulator sweeps)
+                    pts, _ = zmap._move_samples(m, pos, 0.4)
+                    for p in pts:
+                        max_dev = max(max_dev, min(_seg_dist(p, s0, s1) for s0, s1 in segs))
+                pos = (m["x"], m["y"], m["z"])
+            assert n_arcs >= 1, (name, metric)
+            # inch output carries up to 0.00254/2 mm of coordinate rounding on top
+            lim = _arcfit.ARC_TOL + (0.0 if metric else 0.0013)
+            assert max_dev <= lim, \
+                "%s metric=%s: posted arcs replay %.4f mm from the original path (limit %.4f)" \
+                % (name, metric, max_dev, lim)
