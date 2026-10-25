@@ -318,3 +318,15 @@ Mismatches / notes:
 3. report.js LISTS looks for `areas_left` / `left_for_next_op` / ... keys;
    the connector reports that as an info attention item
    (`area_left_for_next_op`), which the panel shows under "Good to know".
+
+## Final test results (after the merge of main 04eea8d)
+- `slot_m4.sh pytest connector/test_connector.py connector/test_toollib.py
+  connector/test_track2.py connector/test_panel_inputs.py -q -rs` at
+  3d6230b (detached worktree): **171 passed, 0 skipped, exit 0** (33 min).
+- `pytest engine/test_post.py -q` in this worktree: **29 passed, exit 0**.
+  (In a detached worktree 5 fail only because the untracked out/ fixtures
+  are absent there - not a code failure.)
+- TestWorkOriginE2E at 95bec85 (`-s`, slot_m4): 1 passed, exit 0. Printed:
+  `origin_program_worst_mm: {"stock_bottom_centre": 0.006,
+  "stock_top_centre": 0.006}` - no WARNING (both under 0.02 mm); the
+  stock-box asserts stay at 1e-3 mm, the program-frame assert at 0.05 mm.
