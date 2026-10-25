@@ -278,3 +278,51 @@ def test_real_post_and_zmap_read_the_effective_table(home, tmp_path):
     assert r4.returncode == 0, r4.stderr[-800:]
     rep2 = json.load(open(str(zj)))
     assert rep2["holder"]["status"] != "checked"
+
+
+def test_t_number_collision_library_tool_wins(home, tmp_path):
+    """Coordinator (TLG1 review 2): a library tool whose T equals a repo
+    tool's T (T31, repo ball-5.958) with a different tool_id. The effective
+    table holds exactly ONE T31 entry - the library's - and the engine post
+    (post_lnc lookup by kind + dia) and zmap both read the LIBRARY geometry
+    (dia 7.777, stick-out 33 vs the repo row's 5.958 / 18)."""
+    lib = toollib.load_library(home, REPO)
+    next(t for t in lib["tools"] if t["tool_id"] == "ball-5.958")["number"] = None
+    lib["tools"].append({
+        "tool_id": "ball-7.777-t31", "number": 31, "type": "ball",
+        "diameter_mm": 7.777, "corner_radius_mm": 3.8885,
+        "length_offset": "H31", "diameter_offset": "D31", "flute_mm": 15.0,
+        "shank_diameter_mm": 7.777, "stickout_mm": 33.0,
+        "holder": "BT30-ER20-60", "description": "TLG1 T collision"})
+    toollib.write_json(os.path.join(home, "tools.json"), lib)
+    eff = tmp_path / "tools_effective.json"
+    toollib.write_json(str(eff), toollib.effective_table(home, REPO, None))
+    t31 = [t for t in json.load(open(str(eff)))["tools"] if t.get("number") == 31]
+    assert [t["tool_id"] for t in t31] == ["ball-7.777-t31"], t31
+    neu = tmp_path / "n.ngc"
+    neu.write_text(NEUTRAL)
+    nc = tmp_path / "p.nc"
+    r = subprocess.run(
+        [PY, "-m", "engine.cli", "post", "--in", str(neu), "--out", str(nc),
+         "--metric", "--tool-kind", "ball", "--dia", "7.777",
+         "--corner", "3.8885", "--tools-json", str(eff)],
+        cwd=REPO, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-800:]
+    posted = nc.read_text()
+    assert "T31 M06" in posted and "D=7.777" in posted, posted[:400]
+    part = np.full((40, 40), 10.0)
+    hf = tmp_path / "part_hf.npy"
+    np.save(str(hf), part)
+    with open(str(hf)[:-4] + ".json", "w") as fh:
+        json.dump({"x0": -10.0, "y0": -10.0, "cell": 0.5,
+                   "tess_tol": 0.01, "step_sha256": "0" * 64}, fh)
+    zj = tmp_path / "check.json"
+    r3 = subprocess.run(
+        [PY, "-m", "verify.zmap", str(nc), "--part", str(hf), "--tool",
+         "ball", "--dia", "7.777", "--corner", "3.8885", "--stock", "-9",
+         "9", "-9", "9", "0", "10", "--tool-number", "31", "--out-json",
+         str(zj), "--tools-json", str(eff)],
+        cwd=REPO, capture_output=True, text=True)
+    assert r3.returncode == 0, r3.stderr[-800:]
+    hd = json.load(open(str(zj)))["holder"]
+    assert hd["status"] == "checked" and hd["stickout_mm"] == pytest.approx(33.0), hd
