@@ -1101,7 +1101,8 @@ def _main():
                test_bs1a4d_credit0_lightest_option,
                test_bs1a4d_credit_real_bore,
                test_bs1a4d2b_centred_entry_bore,
-               test_bs1a4d4_credit_entry_matches_prediction):
+               test_bs1a4d4_credit_entry_matches_prediction,
+               test_bs1a4d4_entry_pinned_to_stored_start):
         try:
             fn()
         except AssertionError as e:
@@ -2769,6 +2770,97 @@ def test_bs1a4d4_credit_entry_matches_prediction():
           "on the normal ladder; clcheck/axial 0" % (
               sum(1 for c in caps if c["credit"] > 1e-9), len(bored),
               n_bore_helix, n_nobore_helix))
+
+
+def test_bs1a4d4_entry_pinned_to_stored_start():
+    """Task BS1a4d4 (coordinator): the emitted band entry is the predicted
+    start even when the emitter's own pick would differ. Core Front's
+    fail-closed entry was chosen from [res["start"], first cutting point]
+    nearest the previous position - not the point the predictor evaluated.
+    Scene: the L channel + island of test_bs1a4d4_credit_entry_matches_
+    prediction. A channel_regions spy moves every bored region's
+    res["start"] to a DECOY - the far end of its own (legal) cutting path -
+    so the emitter's nearest-to-prev pick is the decoy wherever that is
+    closer; the stored bore (planned at the true start) is untouched.
+    Assert: no emitted helix is a centred bore through a decoy (circle
+    through the decoy, not through the stored start), and at least one
+    region bored with exactly its stored centre (1e-6) and radius. FAILS
+    with an emitter that ignores res["bore"] (no pin, no stored-bore
+    branch): it enters at the decoy with a centred bore there."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    from opencamlib import ocl
+    import engine.band as B
+    import engine.rough as R
+    from engine.rough import rough
+    tool_r = 6.343
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0)
+            + _box_tris(5.5, 9.5, 12.0, 16.0, 0.0, 18.0))
+    decoys = []                    # (z, decoy xy, stored bore)
+    _orig_cr, _orig_hm = B.channel_regions, R._helix_moves
+
+    def cr_spy(rings, stock, isl_ok3, z, tr_, leave, cell, stats=None, **kw):
+        res = _orig_cr(rings, stock, isl_ok3, z, tr_, leave, cell, stats, **kw)
+        for r in res:
+            b = r.get("bore")
+            pts = r["paths"][0][1]
+            if b and math.dist(pts[-1][:2], b[:2]) > 1.0:
+                r["start"] = [pts[-1][0], pts[-1][1]]
+                decoys.append((round(z, 4), tuple(pts[-1][:2]), b))
+        return res
+
+    helixes = []
+
+    def hm_spy(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg=2.0):
+        helixes.append((cx, cy, r, z_bot))
+        return _orig_hm(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg)
+
+    B.channel_regions = cr_spy
+    R._helix_moves = hm_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d4_pin.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            try:
+                moves, stats = rough(
+                    surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0), tool_r, 0.0,
+                    leave=0.381, axial_leave=0.381, stepdown=19.05,
+                    stepup=1.905, tolerance=0.05, threads=4, stock_cell=0.5,
+                    min_rest=0.5, corner_r=0.0, stl_path=stl)
+            except RuntimeError as e:
+                raise AssertionError("rough refused: %s" % str(e)[:160])
+    finally:
+        B.channel_regions = _orig_cr
+        R._helix_moves = _orig_hm
+    assert decoys, "no bored band region to decoy: vacuous"
+    n_exact = 0
+    for (z, dxy, b) in decoys:
+        at_z = [h for h in helixes if abs(h[3] - z) < 1e-6]
+        for (cx, cy, r, _zb) in at_z:
+            thru_decoy = abs(math.dist((cx, cy), dxy) - r) < 0.06
+            thru_start = abs(math.dist((cx, cy), b[:2]) - r) < 0.06
+            assert not (thru_decoy and not thru_start), \
+                "band entry (%.3f,%.3f)@Z%.3f bored through the emitter's own " \
+                "pick (%.3f,%.3f) with centre (%.4f,%.4f), not the stored start " \
+                "and bore centre (%.4f,%.4f): entry re-chosen at emit" % (
+                    b[0], b[1], z, dxy[0], dxy[1], cx, cy, b[2], b[3])
+        if any(math.dist((cx, cy), b[2:4]) < 1e-6 and abs(r - b[4]) < 1e-9
+               for (cx, cy, r, _zb) in at_z):
+            n_exact += 1
+    assert n_exact >= 1, "no decoyed region bored with its stored bore: vacuous"
+    assert stats.get("clcheck_violations", 0) == 0
+    assert stats.get("n_axial_plunge", 0) == 0
+    print("PASS bs1a4d4 pin: %d decoyed region(s), %d bored with exactly "
+          "their stored bore at the stored start; no entry re-chosen" % (
+              len(decoys), n_exact))
 
 
 def test_bs1a4d3_links_measured_as_cuts():
