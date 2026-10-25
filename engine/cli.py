@@ -262,6 +262,71 @@ def finish_main(a):
     return 0
 
 
+def rest_rough_main(a):
+    """`engine.cli rest-rough`: z-level ball rest-rough from a live-stock
+    map (engine/rest_rough.py). Fails closed: any emitted feed point below
+    the exact ball CL (probe_clcheck rule, 0.005 mm) aborts with exit 1."""
+    from engine import model, rest_rough as rrmod
+    kind, dia, _corner = parse_tool(a.tool)
+    if kind != "ball":
+        raise SystemExit("rest-rough: tool kind %r refused (%s): the rest "
+                         "generator cuts a ball only" % (kind, a.tool))
+    stock = rrmod.fin.load_heightfield(a.stock_from)
+    t0 = time.time()
+    stl = model.step_to_stl(a.step)
+    surf = model.load_surf(stl)
+    print("STL %s: %d triangles" % (stl, surf.size()), flush=True)
+    workers = a.workers if a.workers is not None else \
+        int(os.environ.get("ENGINE_WORKERS", 4))
+
+    def prog(stats):
+        print("rest-rough: zones entered=%d no-entry=%d cut=%.0fmm "
+              "ramp=%.0fmm rapid=%.0fmm" % (len(stats["zones"]),
+                                            len(stats["no_entry"]),
+                                            stats["cut_len"],
+                                            stats["ramp_len"],
+                                            stats["rapid_len"]), flush=True)
+
+    moves, stats = rrmod.rest_rough(
+        surf, stock, (kind, dia), floor_z=a.floor, stepdown=a.stepdown,
+        ae=a.ae, rest_leave=a.rest_leave, min_excess=a.min_excess,
+        min_helix_r=a.min_helix_r, ramp_angle_deg=a.ramp_angle_deg,
+        cut_feed=a.cut_feed, ramp_feed=a.ramp_feed, clearance=a.clearance,
+        zb_floor=a.zb_floor, workers=workers, shallow=a.shallow,
+        progress=prog)
+
+    below_cl, worst = rrmod.validate_exact(surf, dia, moves, a.rest_leave,
+                                           workers=workers)
+    stats["exact_cl_below"] = below_cl
+    stats["exact_cl_worst_mm"] = round(worst, 4)
+    if below_cl:
+        raise SystemExit("rest-rough: %d emitted CL point(s) below the exact "
+                         "ball CL by >0.005 mm (worst %.3f) - refusing to "
+                         "post" % (below_cl, worst))
+    if a.post == "lnc":
+        from engine import post_lnc
+        text = post_lnc.post(moves, metric=a.metric, program=a.program,
+                             op_name=a.op_name, tool_number=a.tool_number,
+                             rpm=a.spindle, dia_mm=dia, corner_mm=dia / 2.0,
+                             tool_kind="ball")
+    else:
+        text = moves_to_gcode(
+            moves, spindle_rpm=a.spindle,
+            tool_comment="T %s D=%.3f CR=%.3f (rest-rough)"
+                       % (kind, dia, dia / 2.0))
+    with open(a.out, "w", newline="") as fh:
+        fh.write(text)
+    stats["out"] = a.out
+    stats["n_moves"] = len(moves)
+    stats["t_total_s"] = round(time.time() - t0, 1)
+    print("wrote %s (%d moves) in %.1f s" % (a.out, len(moves),
+                                             stats["t_total_s"]), flush=True)
+    if a.stats_json:
+        with open(a.stats_json, "w") as fh:
+            json.dump(stats, fh, indent=2)
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="engine.cli")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -510,10 +575,62 @@ def main(argv=None):
                         "(0.001 for a metric post, 0.00254 for inch output; "
                         "the caller passes the grid matching its post units)")
 
+    rr = sub.add_parser("rest-rough",
+                       help="z-level ball rest-rough restricted to zones where "
+                            "live stock (--stock-from) exceeds the tool CL by "
+                            "--min-excess mm")
+    rr.add_argument("--step", required=True, help="part STEP")
+    rr.add_argument("--stock-from", dest="stock_from", required=True,
+                   help="live stock heightfield .npy (+ x0/y0/cell .json): "
+                        "the previous op's stock (engine.cli rough --stock-out "
+                        "or zmap --stock-out); the rest-rough starts from it")
+    rr.add_argument("--out", required=True, help="output .ngc file")
+    rr.add_argument("--tool", required=True,
+                   help="ball:DIA (only a ball is accepted)")
+    rr.add_argument("--floor", type=float, required=True,
+                   help="setup floor Z; levels = floor + leave + k*stepdown")
+    rr.add_argument("--stepdown", type=float, required=True,
+                   help="max level stepdown mm")
+    rr.add_argument("--ae", type=float, required=True,
+                   help="max radial engagement / stepover mm")
+    rr.add_argument("--rest-leave", dest="rest_leave", type=float, required=True,
+                   help="stock to leave on the part mm")
+    rr.add_argument("--min-excess", dest="min_excess", type=float, required=True,
+                   help="zone threshold mm: stock above the tool CL surface")
+    rr.add_argument("--min-helix-r", dest="min_helix_r", type=float, required=True,
+                   help="smallest largest-CL-circle radius that earns a helix "
+                        "entry; pockets below it are reported, not entered")
+    rr.add_argument("--ramp-angle-deg", dest="ramp_angle_deg", type=float,
+                   default=2.0, help="helix ramp angle deg (default 2.0)")
+    rr.add_argument("--cut-feed", dest="cut_feed", type=float, required=True)
+    rr.add_argument("--ramp-feed", dest="ramp_feed", type=float, required=True)
+    rr.add_argument("--spindle", type=int, required=True)
+    rr.add_argument("--clearance", type=float, default=None,
+                   help="retract plane Z (default: stock/part top + 2)")
+    rr.add_argument("--zb-floor", dest="zb_floor", type=float, default=0.5,
+                   help="entry-depth floor mm (FE5/ZB): no descent after a G0 "
+                        "may exceed it against live stock (default 0.5)")
+    rr.add_argument("--shallow", type=float, default=0.25,
+                   help="RR1c step-1 live-depth limit mm: a pass start whose "
+                        "FE5 disk depth against live stock is at or below this "
+                        "is entered by a straight feed descent (no helix); it "
+                        "also sizes the in-pass-ramp top-clear rule and the "
+                        "SE2 descent column (default 0.25)")
+    rr.add_argument("--workers", type=int, default=None)
+    rr.add_argument("--stats-json", dest="stats_json", default=None)
+    rr.add_argument("--post", choices=("neutral", "lnc"), default="neutral")
+    rr.add_argument("--program", type=int, default=1003)
+    rr.add_argument("--op-name", dest="op_name", default="REST ROUGH")
+    rr.add_argument("--metric", action="store_true")
+    rr.add_argument("--tool-number", dest="tool_number", type=int, default=None)
+
     a = p.parse_args(argv)
 
     if a.cmd == "finish":
         return finish_main(a)
+
+    if a.cmd == "rest-rough":
+        return rest_rough_main(a)
 
 
     if a.cmd == "post":
