@@ -150,3 +150,119 @@ ze2b worktree for ZE2B). Finish half not run (main lacks fe5 --ramp-angle-deg).
   margin 0.257; 0.2404 mm line 5361 (-21.763, -10.683) Z 43.014, margin 0.260.
 - Engine side: no entry accepted above 0.25 at any step on CF (max: step1 0.225, step2 0.247, step4 0.249,
   bore 0.028), so DEEP_TOP changed no CF decision.
+
+---
+
+## RRA3 (fresh session, started `date` = Sun Oct 25 02:53:27 MST 2026)
+
+Task: pin DEEP_TOP's scope at step-1 straight descents (TEST ONLY - no engine
+change). Plan:
+- Scene: uniform 29.87 mm stock top over a wide rectangular pocket (floor
+  29.4, frame/part top 29.8); level t = floor_z + rest_leave = 29.6, so EVERY
+  live disk_depth probe at the level reads exactly stock_top - t = 0.27 mm,
+  inside the (0.25, 0.3] window, independent of where the engine's entry
+  column lands. Clean tree: step1 refuses (0.27 > 0.25), step-2 ramp accepts
+  at L ~ 0.6 mm where the top reads 0.249 <= 0.25.
+- New test test_rra3_straight_descent_scope asserts every recorded step-1
+  entry <= 0.25 mm (printing measured depth) and non-vacuity via a
+  LiveStock.disk_depth spy: the first probe IS the step-1 attempt at the
+  ladder entry column and must read in (0.25, 0.3] with NO step-1 entry
+  recorded (refused on the clean tree).
+- Mutation B (step1 `d <= shallow` -> `d <= DEEP_TOP`) in a scratch copy must
+  make the test FAIL by the accepted straight-descent depth (~0.27 mm).
+Test scene validated (scratch/rra3_probe.py, EXIT=0, ~queued slot wait):
+uniform stock 29.87 over pocket floor 29.4 -> level 29.6; first live
+disk_depth probe (the step-1 attempt at the ladder entry column
+(18.558, 12.9, t=29.6)) reads 0.2697 mm (in (0.25, 0.3]) and is REFUSED
+(no step-1 entries); zone entered via step-2 ramp L=0.6 at 0.249 mm;
+1 level, 444 moves, validate_exact 0 gouges, 0 passes skipped.
+Writing the new test now.
+
+### Clean-tree run of the new test (slot_m4, ~03:35 MST)
+
+  slot_m4.sh python scratch/rra3_run.py test_rra3_straight_descent_scope
+  PASS rra3 straight-descent scope: step-1 column 0.270 mm (in (0.25, 0.30])
+  refused; 2 step-2 ramp entries, none deeper than 0.25
+  0 failure(s)
+  EXIT=0
+
+`git diff --numstat` at this point: 79 1 engine/test_engine.py (one new test
++ one _main tuple line), 30 0 engine/RRA_RESULTS.md, 23 2 opencode.json
+(pre-existing dirty, untouched). Next: the 4 at-risk tests, then mutation B.
+
+### Mutation B (scratch/rest_rough_mutB.py: step1 `d <= shallow` -> `d <= DEEP_TOP`)
+
+Run (slot_m4, ~03:55 MST): the mutant is loaded as engine.rest_rough by
+scratch/rra3_mut.py; the engine on disk is untouched.
+
+  slot_m4.sh python scratch/rra3_mut.py
+  FAIL test_rra3_straight_descent_scope: straight descent 0.270 mm accepted
+  where 0.25 must hold (DEEP_TOP applies only at step-2 descent re-entries,
+  never to step1): [{'zone': 0, 't': 29.6, 'step': 1, 'kind':
+  'direct-descent', 'depth_mm': 0.27}, {'zone': 0, ... 'depth_mm': 0.27}]
+  1 failure(s)
+  EXIT=1
+
+MEASURED VALUE: 0.270 mm - both ladder entries become straight descents in
+(0.25, 0.3] under mutation B, refused on the clean tree at the identical
+columns (spy: first probe 0.2697 mm). (An intermediate test revision failed
+mutation B one assertion earlier - "scene must still be cut via the step-2
+ramp", same 0.27 mm entries printed; the pin assertion was moved first so
+the failure message leads with the measured straight-descent depth.)
+
+### Clean-tree PASS of the final test + all 4 at-risk tests (slot_m4, ~04:05 MST)
+
+  slot_m4.sh python scratch/rra3_run.py test_rra3_straight_descent_scope \
+      test_rra2_deep_top_scope test_rr1c_thin_band_inpass_ramp \
+      test_rr1c3_bay_deep_groove_top_down \
+      test_rr1c5d_live_grid_fine_for_coarse_stock
+  PASS rra3 straight-descent scope: step-1 column 0.270 mm (in (0.25, 0.30])
+  refused; 2 step-2 ramp entries, none deeper than 0.25
+  PASS rra2 DEEP_TOP scope: max level-entry top 0.245 mm <= 0.25
+  PASS rr1c5d live grid: 0.100 mm for a 0.5 mm input stock
+  0 failure(s)
+  EXIT=0
+
+(test_rr1c_thin_band_inpass_ramp and test_rr1c3_bay_deep_groove_top_down
+print nothing on success; the runner mirrors _main - an AssertionError would
+have printed FAIL and forced exit 1. All five passed: EXIT=0.)
+
+### The scene (test_rra3_straight_descent_scope, engine/test_engine.py)
+
+Closed pocket 12 x 24 mm, floor 29.4, frame part top 29.8 (five boxes, the
+rr1c box-union style); stock = UNIFORM top 29.87 on the usual 0.5 mm grid.
+Single level t = floor_z + rest_leave = 29.6, so every live disk_depth probe
+at the level reads 29.87 - 29.6 = 0.27 mm (uniform top: position-independent,
+the disk never sees a taller neighbour column), inside the (0.25, 0.3]
+window. min_excess 0.2 keeps the frame (excess 0.07) out of the zone.
+Clean tree: step1 refuses the ladder's entry column (0.2697 > 0.25), the
+step-2 in-pass ramp accepts at L = 0.6 mm with top 0.249 <= 0.25; zone
+entered, 1 level, validate_exact clean. The test asserts (1) every recorded
+step-1 entry <= 0.25 mm (message prints the measured depth), (2) non-vacuity
+via a LiveStock.disk_depth spy (observation only): the FIRST probe - step1
+is the first ladder call and nothing probes disk_depth before it - reads in
+(0.25, DEEP_TOP] at the level, and no step-1 entry exists, i.e. that column
+was REFUSED as a straight descent; (3) the scene is still cut via step 2.
+
+### RRA3 summary
+
+- New test: test_rra3_straight_descent_scope + one _main() tuple line.
+  No existing test, tolerance, gate or engine file touched; no engine code
+  change (test-only task); no Core Front job; slot waits observed but no
+  stuck lock.
+- Clean tree: EXIT=0 (new test, twice incl. final combined run; at-risk x4
+  in the same combined run EXIT=0).
+- Mutation B (scratch copy only): EXIT=1, FAILS BY THE MEASURED accepted
+  straight-descent depth 0.270 mm.
+- Scratch artifacts (untracked scratch/): rra3_probe.py, rra3_run.py,
+  rra3_mut.py, rest_rough_mutB.py.
+
+### Final diff (`git diff --numstat`, 04:09 MST)
+
+  116 0  engine/RRA_RESULTS.md   (this file; RRA3 section appended)
+  85  1  engine/test_engine.py   (new test + one _main tuple line)
+  23  2  opencode.json           (pre-existing dirty at session start -
+                                  harness model config; NOT touched)
+
+No commits made. Session start 02:53 MST, finish 04:09 MST (~1 h 16 m,
+inside the 2 h cap).

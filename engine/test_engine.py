@@ -2335,6 +2335,89 @@ def test_rra2_deep_top_scope():
                 if e["depth_mm"] is not None))
 
 
+def test_rra3_straight_descent_scope():
+    """RRA3: DEEP_TOP (0.3) must NOT reach the step-1 STRAIGHT DESCENT -
+    its gate stays `d <= shallow` (0.25). Scene: a closed pocket (floor
+    29.4, frame top 29.8) under a UNIFORM 29.87 mm stock top, so every
+    live-column probe at the single level t = floor_z + rest_leave = 29.6
+    reads stock_top - t = 0.27 mm, inside the (0.25, 0.3] window, wherever
+    the engine's ladder lands. On the clean tree step1 refuses that column
+    (0.27 > 0.25) and the zone is entered by the step-2 in-pass ramp, whose
+    top clears at 0.249 <= 0.25. Mutation B (step1 `d <= shallow` ->
+    `d <= DEEP_TOP`) accepts the straight descent and this test fails BY
+    THE MEASURED depth (~0.27 mm). A LiveStock.disk_depth spy proves the
+    scene is not vacuous: the FIRST probe is the step-1 attempt at the
+    ladder's entry column and reads in (0.25, 0.3] with no step-1 entry."""
+    from engine import rest_rough as rr
+    from engine import entry_depth as ed
+    assert rr.DEEP_TOP > 0.25 + 1e-12, \
+        "DEEP_TOP %r: scene can only pin the split if DEEP_TOP > shallow" \
+        % rr.DEEP_TOP
+    box = _rr1c_boxes()
+    tris = []
+    tris += box(0, 14, 0, 40, 20, 29.8)          # frame W
+    tris += box(26, 40, 0, 40, 20, 29.8)         # frame E
+    tris += box(14, 26, 0, 8, 20, 29.8)          # frame S
+    tris += box(14, 26, 32, 40, 20, 29.8)        # frame N
+    tris += box(14, 26, 8, 32, 20, 29.4)         # pocket floor 29.4
+    surf = _rr1c_surf(tris)
+    cell = 0.5
+    n = int(40 / cell)
+    A = np.full((n, n), 29.87)          # uniform stock top: level columns
+    #                                       read 29.87 - 29.6 = 0.27 mm
+    probes = []
+    _orig_dd = ed.LiveStock.disk_depth
+
+    def spy(self, x, y, z):
+        d = _orig_dd(self, x, y, z)
+        probes.append((round(z, 4), float(d) if math.isfinite(d) else None))
+        return d
+
+    t0 = 29.4 + 0.2                       # floor_z + rest_leave
+    ed.LiveStock.disk_depth = spy         # observation only, behaviour kept
+    try:
+        moves, stats = rr.rest_rough(
+            surf, (A, 0.0, 0.0, cell), ("ball", 9.525), floor_z=29.4,
+            stepdown=2.0, ae=1.905, rest_leave=0.2, min_excess=0.2,
+            min_helix_r=1.903, ramp_angle_deg=2.0, cut_feed=2280.0,
+            ramp_feed=850.0)
+    finally:
+        ed.LiveStock.disk_depth = _orig_dd
+    assert moves and len(stats["zones"]) == 1 and not stats["no_entry"], \
+        "pocket must be entered: %r" % (stats["no_entry"],)
+    z = stats["zones"][0]
+    assert z["levels"] == 1, \
+        "scene must stay single-level (no descent re-entry here): %r" % z
+    # THE PIN: every recorded straight descent (step 1) stays <= shallow
+    over = [e for e in stats["entries"]
+            if e["step"] == 1 and (e["depth_mm"] is None
+                                   or e["depth_mm"] > 0.25)]
+    assert not over, \
+        ("straight descent %.3f mm accepted where 0.25 must hold (DEEP_TOP "
+         "applies only at step-2 descent re-entries, never to step1): %s"
+         % (max([e["depth_mm"] for e in over if e["depth_mm"] is not None]
+                or [0.0]), over[:3]))
+    assert any(e["step"] == 2 for e in stats["entries"]), \
+        "scene must still be cut via the step-2 ramp: %r" % stats["entries"]
+    # NON-VACUITY: the ladder's first step-1 probe (enter() runs step1
+    # first, and nothing probes disk_depth before it) must read IN the
+    # (0.25, DEEP_TOP] window at the level - and no step-1 entry exists,
+    # so that column was REFUSED as a straight descent on the clean tree.
+    assert probes, "no live disk_depth probe recorded"
+    t_first, d_first = probes[0]
+    assert abs(t_first - t0) < 1e-6 and d_first is not None and \
+        0.25 < d_first <= rr.DEEP_TOP, \
+        "first step-1 probe must read in (0.25, %.2f] at the level: %r" \
+        % (rr.DEEP_TOP, probes[0])
+    assert not [e for e in stats["entries"] if e["step"] == 1], \
+        "in-window column (%.3f mm) must be refused as a straight descent" \
+        % d_first
+    print("PASS rra3 straight-descent scope: step-1 column %.3f mm "
+          "(in (0.25, %.2f]) refused; %d step-2 ramp entries, none deeper "
+          "than 0.25" % (d_first, rr.DEEP_TOP,
+                         sum(1 for e in stats["entries"] if e["step"] == 2)))
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -2376,7 +2459,8 @@ def _main():
                test_rr1c5c_closed_pocket_bore_entry_no_deep_axial,
                test_rr1c5d_front1_chord_offset_slabs,
                test_rr1c5d_live_grid_fine_for_coarse_stock,
-               test_rra2_deep_top_scope):
+               test_rra2_deep_top_scope,
+               test_rra3_straight_descent_scope):
         try:
             fn()
         except AssertionError as e:
