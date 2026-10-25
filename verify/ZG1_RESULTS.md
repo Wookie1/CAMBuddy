@@ -154,3 +154,113 @@ Control (unmutated copy): 6 passed, PYTEST_EXIT=0.
 
 
 
+
+---
+
+# ZG1b — true stock bottom through --stock-in chains
+
+- Session start: Sun Oct 25 04:10:43 MST 2026 (`date`), branch zg1 @ cbb60bd.
+- Lane note: first two `slot_m4.sh` invocations (04:10, 04:12) timed out at
+  120 s / 600 s because the small-test lane is held by another live session's
+  job (`m4small.lock/pid` = 86492, alive since 04:11:33). Locks untouched.
+  Waiting; meanwhile making the edits.
+
+## Plan
+1. `main()`: read `<stock-in stem>.json` sidecar key `stock_box`; explicit
+   `--stock` wins, >1e-6 mm disagreement -> exit 1 naming both boxes.
+2. Derived `stock_box` zmin (no `--stock`) = sidecar `stock_box[4]` if present,
+   else -inf (gate can never fire); never `nanmin(stock_init)`.
+3. No box at all -> report `below_stock_bottom` says the check was not done,
+   why, and next_step "pass --stock or regenerate the stock file with this
+   version"; exit code unaffected.
+4. `--stock-out` merges `stock_box` (the ORIGINAL box: --stock, else the box
+   read from the --stock-in sidecar; never the remaining stock) into
+   `<stock-out stem>.json`, keeping existing keys.
+5. New tests (test_zmap.py): chain-below-true-bottom fails with measured
+   depth; old stock file w/o sidecar box -> unknown, exit 0; --stock vs
+   sidecar disagreement error; --stock-out merges into existing sidecar.
+6. Mutation in scratch/: restore nanmin(stock_init) bottom; test 4 must fail
+   by a measured value.
+
+## Test log
+- Run 1 (lane, VibeCAD python): PYTEST_EXIT=1 — `No module named pytest`
+  in /Applications/VibeCAD.app/Contents/Resources/bin/python (no tests ran).
+- Probe (lane): /opt/homebrew/bin/python3 has pytest 9.1.1, numpy 2.4.3.
+- Run 2 (lane, homebrew python):
+  `pytest verify/test_zmap.py -q -k 'stock or chain or gouge or axial or
+  strict or zg1 or ze2b_flat_and_bull_json_byte_identical'`
+  -> **PYTEST_EXIT=1**, 3 failed, 59 passed, 63 deselected in 160.35s.
+  ALL at-risk tests PASSED (incl. test_stock_chain_cli, every test_zg1_*,
+  test_ze2b_flat_and_bull_json_byte_identical). The 3 failures are my NEW
+  zg1b tests: test-side TypeError `PosixPath + ".json"` in the shared
+  helper (fixed; zmap.py untouched by the fix).
+- git diff --numstat at this point: 28 2 verify/zmap.py (30 changed lines,
+  budget <=30), 114 0 verify/test_zmap.py.
+- Run 3 (lane): `pytest verify/test_zmap.py -q -k zg1b` (my 4 new tests)
+  -> **PYTEST_EXIT=0**, 4 passed.
+
+## Change (verify/zmap.py, 28 added + 2 removed = 30 changed non-test lines)
+- `main()` ~2477-2482: read the `--stock-in` sidecar `<stem>.json` key
+  `stock_box` into `side_box` (never `nanmin(stock_init)`).
+- ~2484-2487: explicit `--stock` wins; if it disagrees with the sidecar box
+  by > 1e-6 mm in any coordinate, exit 1 with an error naming BOTH boxes.
+- ~2497: derived `stock_box` zmin (no `--stock`) = `side_box[4]` if present,
+  else `-inf` — the below_stock_bottom gate (zmap.py:1506) can never fire on
+  a guess. XY derivation for the grid check unchanged; zmax unchanged.
+- ~2500: `orig_box` = `--stock` box, else the sidecar box (the ORIGINAL
+  starting stock, never the remaining stock).
+- ~2553-2557: with no box at all the report's `below_stock_bottom` is
+  `{"status": "unknown", ..., "reason": "stock bottom check NOT done: ...",
+  "next_step": "pass --stock or regenerate the stock file with this
+  version"}`; exit code unaffected (gate sees count 0).
+- ~2602-2610: `--stock-out` merges `stock_box` (= `orig_box`) into
+  `<stock-out stem>.json`, keeping any existing sidecar keys; no box known ->
+  no `stock_box` key written.
+- Report top-level keys unchanged (item 7): proven by
+  `test_ze2b_flat_and_bull_json_byte_identical` passing.
+
+## New tests (verify/test_zmap.py, +114 lines, appended only)
+- `test_zg1b_chain_below_true_bottom_fails_by_value` — chain prog1
+  `--stock-out` / prog2 `--stock-in` no `--stock`, tip to Z -0.25 (true
+  bottom 0.0): exit 1 with measured `max_depth` 0.25 mm ±1e-6; prog2's own
+  sidecar re-records the ORIGINAL box (bottom travels on).
+- `test_zg1b_stock_without_sidecar_box_is_unknown` — sidecar removed (old
+  stock file), cut to Z 4.5 (below remaining 6.0): `status == "unknown"`,
+  count 0, reason + exact next_step, rc == 0.
+- `test_zg1b_stock_vs_sidecar_box_disagreement_fails` — sidecar zmin 0.5 vs
+  `--stock` zmin 0.0: exit 1, stderr names both values.
+- `test_zg1b_stock_out_merges_existing_sidecar` — pre-existing
+  x0/y0/cell keys survive; `stock_box` added.
+
+## Exit codes (all via the small-test lane slot_m4.sh)
+- Run 2 above: PYTEST_EXIT=1 (3 new tests, test-side Path+str bug; fixed).
+- Run 3, new tests: `pytest verify/test_zmap.py -q -k zg1b`
+  -> **PYTEST_EXIT=0**, 4 passed, 121 deselected in 0.23s.
+- Final at-risk + new: `pytest verify/test_zmap.py -q -k 'stock or chain or
+  gouge or axial or strict or zg1 or ze2b_flat_and_bull_json_byte_identical'`
+  -> **FINAL_EXIT=0**, 62 passed, 63 deselected in 157.79s. Includes
+  `test_stock_chain_cli` PASSING UNCHANGED, every `test_zg1_*`,
+  `test_ze2b_flat_and_bull_json_byte_identical`, and
+  `test_axial_real_core_front_rough_fails`.
+
+## Mutation (scratch/mut/, never committed; scratch/zg1b_mutation.out)
+Mutant = copy of zmap.py with zmin put back to `float(np.nanmin(stock_init))`
+(scratch/mut/zmap.py:2497); tests = copy of test_zmap.py.
+`pytest test_zmap.py -q -k 'test_zg1b_chain_below_true_bottom or
+test_stock_chain_cli'` -> **MUTATION_EXIT=1**, 2 failed:
+- `test_zg1b_chain_below_true_bottom_fails_by_value` fails BY MEASURED VALUE:
+  "measured depth below the TRUE bottom must be 0.25 mm: {'count': 2,
+  'max_depth': 6.26043481422465, ...}" — the nanmin bottom measures
+  **6.26043481422465 mm** instead of 0.25 mm.
+- `test_stock_chain_cli` also fails (`AssertionError: assert 1 == 0` at
+  test_zmap.py:284 — the original "below the stock bottom Z 6.000" bug).
+
+## Notes
+- Lane was held 04:10-04:35 by another live session (m4small.lock/pid 86492,
+  alive); locks untouched per LOCKS; queued waits eventually ran.
+- `/Applications/VibeCAD.app/Contents/Resources/bin/python` has no pytest;
+  lane test runs used `/opt/homebrew/bin/python3` (pytest 9.1.1), the same
+  interpreter the other lane user runs.
+- Not committed (per brief). `opencode.json` was already modified in this
+  worktree before this session; untouched. `scratch/` left untracked.
+- Session end: Sun Oct 25 05:02 MST 2026 (start 04:10, ~52 min < 2 h cap).

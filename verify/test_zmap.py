@@ -2970,3 +2970,117 @@ def test_zg1_heightfield_writes_hit_mask(tmp_path):
         assert bool(hit[j0, i0]), "geometry column must be hit (top=%s)" % top
         assert not bool(hit[0, 0]), "grown ring is part-free (top=%s)" % top
         assert hf[0, 0] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Task ZG1b: below_stock_bottom must use the TRUE stock bottom through
+# --stock-in chains. --stock-out records the ORIGINAL stock box in the stock
+# sidecar <stem>.json under "stock_box"; --stock-in reads it back. Without a
+# box (old stock files) the check is "unknown" and never gates.
+# ---------------------------------------------------------------------------
+
+_ZG1B_BOX = [-25.0, 25.0, -25.0, 25.0, 0.0, 10.0]  # == list(STOCK)
+
+
+def _zg1b_prog1_out(tmp_path, stem="st1"):
+    """Stage 1: cut to Z 6.0 with --stock, --stock-out -> grid + sidecar."""
+    npy = _zg1_plate(tmp_path, stem="zg1b")
+    g1 = tmp_path / "p1.ngc"
+    g1.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
+                  "G1 Z6. F100.\nG1 X20. F500.\n")
+    st = tmp_path / (stem + ".npy")
+    rc = zmap.main([str(g1), "--part", str(npy), "--tool", "ball", "--stock"]
+                   + [str(v) for v in STOCK]
+                   + ["--stock-out", str(st),
+                      "--out-json", str(tmp_path / (stem + ".json"))])
+    assert rc == 0, "stage 1 (legal cut to Z 6.0) must pass"
+    return npy, st
+
+
+def test_zg1b_chain_below_true_bottom_fails_by_value(tmp_path):
+    """Chained run, program 2 with --stock-in and NO --stock: a tip 0.25 mm
+    below the TRUE bottom Z 0.0 must exit 1 with measured depth 0.25 mm
+    (the remaining stock bottoms out at Z 6.0 - gating on that would
+    measure 6.25 mm and reject the legal part too)."""
+    npy, st1 = _zg1b_prog1_out(tmp_path)
+    box = json.loads((tmp_path / "st1.json").read_text())["stock_box"]
+    assert box == _ZG1B_BOX, "sidecar must carry the ORIGINAL box: %r" % box
+    g2 = tmp_path / "p2.ngc"
+    g2.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
+                  "G1 Z-0.25 F100.\nG1 X20. F500.\n")
+    j2 = tmp_path / "j2.json"
+    st2 = tmp_path / "st2.npy"
+    rc = zmap.main([str(g2), "--part", str(npy), "--tool", "ball",
+                    "--stock-in", str(st1), "--stock-out", str(st2),
+                    "--out-json", str(j2)])
+    bs = json.loads(j2.read_text())["below_stock_bottom"]
+    assert bs["count"] > 0, bs
+    assert abs(bs["max_depth"] - 0.25) < 1e-6, \
+        "measured depth below the TRUE bottom must be 0.25 mm: %r" % bs
+    assert rc == 1, "below the true stock bottom must exit non-zero"
+    # the true bottom travels on: stage 2's sidecar keeps the ORIGINAL box
+    assert json.loads((tmp_path / "st2.json").read_text())["stock_box"] \
+        == _ZG1B_BOX
+
+
+def test_zg1b_stock_without_sidecar_box_is_unknown(tmp_path):
+    """Old stock file (no sidecar stock_box): below_stock_bottom is
+    'unknown', the report says the check was NOT done and why, and a cut
+    below the lowest REMAINING stock (Z 6.0) does NOT exit 1 for that
+    reason (the old nanmin derivation would have failed it with 1.5 mm)."""
+    npy, st1 = _zg1b_prog1_out(tmp_path)
+    (tmp_path / "st1.json").unlink()  # simulate a pre-ZG1b stock file
+    g2 = tmp_path / "p2.ngc"
+    g2.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
+                  "G1 Z4.5 F100.\nG1 X20. F500.\n")
+    j2 = tmp_path / "j2.json"
+    rc = zmap.main([str(g2), "--part", str(npy), "--tool", "ball",
+                    "--stock-in", str(st1), "--out-json", str(j2)])
+    rep = json.loads(j2.read_text())
+    bs = rep["below_stock_bottom"]
+    assert bs["status"] == "unknown", bs
+    assert bs["count"] == 0, bs
+    assert "NOT done" in bs["reason"], bs
+    assert bs["next_step"] == \
+        "pass --stock or regenerate the stock file with this version", bs
+    assert rc == 0, "an unknown bottom must never gate: rc=%d %r" % (rc, bs)
+
+
+def test_zg1b_stock_vs_sidecar_box_disagreement_fails(tmp_path, capsys):
+    """--stock plus a --stock-in sidecar box differing by > 1e-6 mm must
+    fail with an error naming BOTH boxes (an exact match stays OK)."""
+    npy, st1 = _zg1b_prog1_out(tmp_path)
+    sc = tmp_path / "st1.json"
+    meta = json.loads(sc.read_text())
+    meta["stock_box"][4] = 0.5
+    sc.write_text(json.dumps(meta))
+    g2 = tmp_path / "p2.ngc"
+    g2.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
+                  "G1 Z4.5 F100.\nG1 X20. F500.\n")
+    rc = zmap.main([str(g2), "--part", str(npy), "--tool", "ball", "--stock"]
+                   + [str(v) for v in STOCK]
+                   + ["--stock-in", str(st1),
+                      "--out-json", str(tmp_path / "j2.json")])
+    err = capsys.readouterr().err
+    assert rc == 1, "a >1e-6 mm box disagreement must exit 1"
+    assert "disagree" in err and "0.5" in err and "0.0" in err, err
+
+
+def test_zg1b_stock_out_merges_existing_sidecar(tmp_path):
+    """--stock-out adds stock_box to an existing chain sidecar instead of
+    dropping its keys (chain scripts write x0/y0/cell there)."""
+    npy = _zg1_plate(tmp_path, stem="zg1bm")
+    g1 = tmp_path / "p1.ngc"
+    g1.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
+                  "G1 Z6. F100.\nG1 X20. F500.\n")
+    st = tmp_path / "stm.npy"
+    (tmp_path / "stm.json").write_text(json.dumps(
+        {"x0": X0, "y0": Y0, "cell": CELL}))
+    rc = zmap.main([str(g1), "--part", str(npy), "--tool", "ball", "--stock"]
+                   + [str(v) for v in STOCK]
+                   + ["--stock-out", str(st),
+                      "--out-json", str(tmp_path / "jm.json")])
+    assert rc == 0
+    meta = json.loads((tmp_path / "stm.json").read_text())
+    assert meta["x0"] == X0 and meta["y0"] == Y0 and meta["cell"] == CELL, meta
+    assert meta["stock_box"] == _ZG1B_BOX, meta

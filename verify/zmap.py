@@ -2474,7 +2474,17 @@ def main(argv=None):
     stock_init = None
     if args.stock_in:
         stock_init = np.load(args.stock_in)
+    # task ZG1b: the true stock bottom travels through chains via the stock
+    # sidecar's "stock_box" key (never nanmin of the remaining grid)
+    side_box = None
+    if args.stock_in and os.path.exists(si := os.path.splitext(args.stock_in)[0] + ".json"):
+        side_box = json.load(open(si)).get("stock_box")
+        side_box = tuple(map(float, side_box)) if side_box else None
     if args.stock is not None:
+        if side_box and any(abs(a - b) > 1e-6 for a, b in zip(args.stock, side_box)):
+            print("error: --stock box %s and --stock-in sidecar stock_box %s disagree"
+                  " by more than 1e-6 mm" % (list(args.stock), list(side_box)), file=sys.stderr)
+            return 1
         stock_box = tuple(args.stock)
     else:
         # Derive the box from the saved state's finite cells.
@@ -2483,8 +2493,11 @@ def main(argv=None):
             p.error("--stock-in file has no finite cells")
         stock_box = (x0 + ii.min() * cell, x0 + (ii.max() + 1) * cell,
                     y0 + jj.min() * cell, y0 + (jj.max() + 1) * cell,
-                    float(np.nanmin(stock_init)),
+                    # unknown bottom = -inf: the gate can never fire on a guess
+                    float(side_box[4]) if side_box else float("-inf"),
                     float(np.nanmax(stock_init)))
+    # --stock-out records this ORIGINAL box; --stock wins over the sidecar
+    orig_box = tuple(args.stock) if args.stock is not None else side_box
     # a judge must never silently judge less than the whole stock: the part
     # grid has to cover the stock box (within half a cell per side), or the
     # moves out there are unjudged. No option to skip this.
@@ -2537,7 +2550,11 @@ def main(argv=None):
         "window": ("steep walls |dZ|>1mm dilated 2mm" if args.window else None),
         "gouges": res["gouges"],
         "part_mask": res["part_mask"],
-        "below_stock_bottom": res["below_stock_bottom"],
+        "below_stock_bottom": res["below_stock_bottom"] if orig_box else {
+            "status": "unknown", "count": 0, "max_depth": 0.0, "worst_xy": None,
+            "first_line": None, "reason": "stock bottom check NOT done: no "
+            "--stock and no stock_box in the --stock-in sidecar", "next_step":
+            "pass --stock or regenerate the stock file with this version"},
         "outside_grid": res["outside_grid"],
         "leftover": res["leftover"],
         "within_0p5mm_fraction": res["within_0p5mm_fraction"],
@@ -2582,6 +2599,15 @@ def main(argv=None):
             json.dump(_sanitize(res.get("_zb_raw", [])), f, indent=1)
     if args.stock_out:
         np.save(args.stock_out, res["stock"])
+        if orig_box is not None:  # the ORIGINAL box; merge existing sidecar keys
+            sc = os.path.splitext(args.stock_out)[0] + ".json"
+            meta = {}
+            if os.path.exists(sc):
+                with open(sc) as f:
+                    meta = json.load(f)
+            meta["stock_box"] = [float(v) for v in orig_box]
+            with open(sc, "w") as f:
+                json.dump(meta, f)
     if args.png:
         ok = write_png(res["stock"], part, cell, x0, y0, args.png)
         if not ok:
