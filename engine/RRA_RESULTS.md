@@ -138,3 +138,15 @@ whose accepted descent ramp top reads 0.263 mm.)
                                  config written by the harness; NOT touched)
 
 No commits made. No limits/floors/gates changed; no existing test altered.
+
+## chain7 record (supervisor, 2026-10-25, CF lane)
+rr1b fa54f9b rest-rough on the current Core Front part (chain4 recipe, pinned chain4 judges: fe5 zmap for ZB, the
+ze2b worktree for ZE2B). Finish half not run (main lacks fe5 --ramp-angle-deg).
+- Rest-rough gen rc 0: 10278 moves, 837.7 s, 22 levels, 2 passes skipped. Exact CL: 0 below / 10010 pts.
+- ZB judge rc 0: gouges 0, rapid collisions 0, over-flute 0, holder 0; axial ZB 19 entries over the 0.2 floor,
+  max 0.247 mm. ZE2B rr rc 0.
+- Judge-measured ZB, worst three of all 128 recorded entries (covers every descent re-entry):
+  0.247 mm line 989 XY (71.045, -2.003) Z 38.979, margin 0.253; 0.2432 mm line 2899 (-18.611, -8.977) Z 45.014,
+  margin 0.257; 0.2404 mm line 5361 (-21.763, -10.683) Z 43.014, margin 0.260.
+- Engine side: no entry accepted above 0.25 at any step on CF (max: step1 0.225, step2 0.247, step4 0.249,
+  bore 0.028), so DEEP_TOP changed no CF decision.
