@@ -540,3 +540,222 @@ def test_stock_box_negative_is_error():
         stock_box(_CORE_FRONT_BBOX, -0.1, 12.7, 1.0, 0.0)
     with pytest.raises(ValueError):
         stock_box(_CORE_FRONT_BBOX, 2.286, -0.1, 1.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# post_arcs: engine/arcfit.py units, arcs=False byte identity, arc posting,
+# G02/G03-without-centre refusal (docs/lnc5800_post_spec.md A1-A8)
+# ---------------------------------------------------------------------------
+
+import math as _math  # noqa: E402
+
+from engine import arcfit as _arcfit  # noqa: E402
+
+
+def _circle_pts(r, deg_from, deg_to, step_deg, cx=0.0, cy=0.0):
+    n = int(round(abs(deg_to - deg_from) / step_deg))
+    return [(cx + r * _math.cos(_math.radians(deg_from + (deg_to - deg_from) * k / n)),
+             cy + r * _math.sin(_math.radians(deg_from + (deg_to - deg_from) * k / n)))
+            for k in range(n + 1)]
+
+
+def test_arcfit_circle_one_arc_per_half():
+    """Full circle -> two <=180 deg arcs; 270 deg -> two; all CCW, on the circle."""
+    for sweep, want in ((360, 2), (270, 2), (180, 1), (90, 1)):
+        pts = _circle_pts(10.0, 0, sweep, 1.0)
+        arcs = _arcfit.fit_polyline(pts)
+        assert len(arcs) == want, (sweep, [(a[0], a[1]) for a in arcs])
+        assert arcs[0][0] == 0 and arcs[-1][1] == len(pts) - 1, "arcs cover the run"
+        for i0, i1, cx, cy, r, ccw, dev in arcs:
+            assert ccw and abs(r - 10.0) < 1e-6 and abs(cx) < 1e-6 and abs(cy) < 1e-6
+            chk = _arcfit.arc_check(pts[i0:i1 + 1], cx, cy, r)
+            assert chk[1] <= _math.pi + 1e-9 and dev <= _arcfit.ARC_TOL
+    # clockwise
+    arcs = _arcfit.fit_polyline(_circle_pts(10.0, 90, -90, 1.0))
+    assert len(arcs) == 1 and not arcs[0][5]
+
+
+def test_arcfit_noise_gives_lines():
+    import random
+    rnd = random.Random(7)
+    noisy = [(0.1 * k, rnd.uniform(-0.05, 0.05)) for k in range(200)]
+    assert _arcfit.fit_polyline(noisy) == []
+    jitter = [(x + rnd.uniform(-0.05, 0.05), y + rnd.uniform(-0.05, 0.05))
+              for x, y in _circle_pts(10.0, 0, 180, 1.0)]
+    assert _arcfit.fit_polyline(jitter) == []
+    straight = [(0.1 * k, 0.0) for k in range(50)]
+    assert _arcfit.fit_polyline(straight) == []
+    # radius limits: 0.05 mm and 600 mm circles stay lines
+    assert _arcfit.fit_polyline(_circle_pts(0.05, 0, 180, 10.0)) == []
+    assert _arcfit.fit_polyline(_circle_pts(600.0, 0, 1, 0.05)) == []
+    # fewer than 4 moves stays lines
+    assert _arcfit.fit_polyline(_circle_pts(10.0, 0, 3, 1.0)) == []
+
+
+def test_arcfit_s_curve_split():
+    """S-curve (CCW half then CW half) -> one arc each way, split at the join."""
+    a = _circle_pts(5.0, 180, 360, 2.0, cx=-5.0)         # CCW about (-5,0) to (0,0)
+    b = _circle_pts(5.0, 180, 0, 2.0, cx=5.0)            # CW about (5,0) from (0,0)
+    pts = a + b[1:]
+    arcs = _arcfit.fit_polyline(pts)
+    assert [x[5] for x in arcs] == [True, False], [(x[0], x[1], x[5]) for x in arcs]
+    assert arcs[0][1] == len(a) - 1 == arcs[1][0], "split at the inflection"
+
+
+def _circle_moves(r=10.0, step=1.0, z=-1.0, cx=0.0, cy=0.0):
+    pts = _circle_pts(r, 0, 360, step, cx, cy)
+    mv = [{"g": 0, "x": pts[0][0], "y": pts[0][1], "z": 5.0},
+          {"g": 1, "x": pts[0][0], "y": pts[0][1], "z": z, "f": 1000.0}]
+    mv += [{"g": 1, "x": x, "y": y, "z": z, "f": 1000.0} for x, y in pts[1:]]
+    mv.append({"g": 0, "x": pts[-1][0], "y": pts[-1][1], "z": 5.0})
+    return mv
+
+
+# sha256 of main 681f551's post_lnc output on the test_post fixtures
+_MAIN_SHA = {
+    "syn_mm": "2c0dc6b104c4dc36ce3366b6563b387af29d50a9b6b6dc850772da7c4017369b",
+    "syn_in": "4aefb21242d900bfdb6c3878f449ceeea2e982eb092e7a735197a3f013a9695a",
+    "syn_dwell_x": "a6de7b890174ab7d8ffa11eaf879389f684996183c8337b69ae9a6118d48c987",
+    "syn_crlf": "056ebfd4a754c1d53c7ca3bb12ea5a0c804668da09e72077bd8453698ef43098",
+    "syn_slash": "4ea92f2483738a167d91674abcd9533501457f9e938ba0a605ac34b8c2de60bc",
+    "cf_inch": "1f8b89ae6a8d2cb3654e9ad9adc50ee42eb4ad17bec3bfdf6f97f934f33f2b29",
+    "cf_mm_t5": "bfbbf7ead9c11b44873d5304f747b0e6a3d44aa1e1c2348ee0bc254521e5b015",
+    "cr_ball": "dcd5501b4b51e3f1d0cd4aaed8ed01a6b8ec1734bf515427f5f4a3eef6455800",
+}
+
+
+def test_arcs_off_byte_identical_to_main():
+    """arcs=False (explicit and default) reproduces main's bytes on every fixture."""
+    import hashlib
+    _need(NEUTRAL)
+    neu = _read(NEUTRAL)
+    mv = [{"g": 0, "x": 0.0, "y": 0.0, "z": 5.0},
+          {"g": 1, "x": 5.0, "y": 0.0, "z": 5.0, "f": 1000.0}]
+    for extra in ({}, {"arcs": False}):
+        syn = lambda **kw: post_lnc.post(SYN_MOVES, tool_number=2, rpm=7500,  # noqa: E731
+                                         dia_mm=6.0, corner_mm=0.0, tool_kind="flat",
+                                         op_name="SPEC TEST", crlf=False, **dict(extra, **kw))
+        got = {
+            "syn_mm": syn(metric=True), "syn_in": syn(metric=False),
+            "syn_dwell_x": syn(metric=True, dwell_p_ms=False),
+            "syn_crlf": post_lnc.post(SYN_MOVES, metric=True, tool_number=2,
+                                      tool_kind="flat", dia_mm=6.0, **extra),
+            "syn_slash": post_lnc.post(SYN_MOVES, tool_number=3,
+                                       comment_style="slashstar", **extra),
+            "cf_inch": post_lnc.post_text(neu, program=1001,
+                                          op_name="OVERALL ROUGHING", **extra),
+            "cf_mm_t5": post_lnc.post_text(neu, program=1001, op_name="OVERALL ROUGHING",
+                                           tool_number=5, metric=True, crlf=False, **extra),
+            "cr_ball": post_lnc.post(mv, tool_kind="ball", dia_mm=9.525, corner_mm=0.0,
+                                     tool_number=20, crlf=False, **extra),
+        }
+        for k, txt in got.items():
+            assert hashlib.sha256(txt.encode()).hexdigest() == _MAIN_SHA[k], \
+                "arcs off changed %s (%r)" % (k, extra)
+
+
+def _arc_lines(txt):
+    return [l for l in _lines(txt) if re.search(r"\bI-?[0-9.]+ J-?[0-9.]+", l)]
+
+
+def test_arcs_on_circle_posts_ij_arcs():
+    """arcs=True: circle -> G03 arcs with incremental I/J, decimals on I/J,
+    start/end radius within 0.0005 mm after rounding, strict-judge clean."""
+    sys.path.insert(0, os.path.join(ROOT, "verify"))
+    import zmap
+    for metric, dec in ((True, 3), (False, 4)):
+        for cx, cy in ((0.0, 0.0), (3.21234, -7.65432)):
+            mv = _circle_moves(cx=cx, cy=cy)
+            txt = post_lnc.post(mv, metric=metric, tool_number=2, tool_kind="flat",
+                                dia_mm=6.0, crlf=False, arcs=True)
+            arcs = _arc_lines(txt)
+            assert len(arcs) == 2, arcs
+            assert arcs[0].startswith("G03 "), arcs[0]
+            assert "G02" not in txt
+            assert zmap.strict_check(txt) == [], zmap.strict_check(txt)
+            for l in arcs:
+                for letter, num in re.findall(r"\b([IJ])(-?[0-9.]+)", l):
+                    assert "." in num and len(num.split(".")[1]) <= dec, l
+            # replay: centre = start + (I, J); radii agree within the A6 limit
+            u = 1.0 if metric else 25.4
+            pos = None
+            for m in zmap.resolve_moves(zmap.parse_gcode(txt)):
+                if m["motion"] in ("G2", "G3"):
+                    c = (pos[0] + m["i"], pos[1] + m["j"])
+                    r1 = _math.hypot(pos[0] - c[0], pos[1] - c[1])
+                    r2 = _math.hypot(m["x"] - c[0], m["y"] - c[1])
+                    assert abs(r1 - r2) <= _arcfit.ARC_END_MISMATCH + 1e-12
+                    assert abs(r1 - 10.0) <= 0.003, r1
+                    assert abs(c[0] - cx) <= 0.002 * u and abs(c[1] - cy) <= 0.002 * u
+                pos = (m["x"], m["y"], m["z"])
+    # fewer lines than the linear post
+    lin = post_lnc.post(_circle_moves(), metric=True, tool_number=2, tool_kind="flat",
+                        dia_mm=6.0, crlf=False)
+    arc = post_lnc.post(_circle_moves(), metric=True, tool_number=2, tool_kind="flat",
+                        dia_mm=6.0, crlf=False, arcs=True)
+    assert len(_lines(arc)) < len(_lines(lin)) - 300
+
+
+def test_arcs_on_keeps_non_planar_and_short_runs_as_lines():
+    """A ramp (Z changes) and SYN_MOVES (3 feed moves) post unchanged with arcs."""
+    ramp = [{"g": 0, "x": 10.0, "y": 0.0, "z": 5.0}]
+    for k, (x, y) in enumerate(_circle_pts(10.0, 0, 180, 1.0)):
+        ramp.append({"g": 1, "x": x, "y": y, "z": -0.01 * k, "f": 1000.0})
+    kw = dict(metric=True, tool_number=2, tool_kind="flat", dia_mm=6.0, crlf=False)
+    assert post_lnc.post(ramp, arcs=True, **kw) == post_lnc.post(ramp, **kw)
+    assert post_lnc.post(SYN_MOVES, arcs=True, **kw) == post_lnc.post(SYN_MOVES, **kw)
+    # a feed change mid-circle splits the run but still fits both parts
+    mv = _circle_moves()
+    for m in mv[100:]:
+        if m["g"] == 1:
+            m["f"] = 500.0
+    txt = post_lnc.post(mv, arcs=True, **kw)
+    assert "F500." in txt and len(_arc_lines(txt)) >= 3
+
+
+def test_g2_g3_without_centre_refused():
+    """The latent bug: g 2/3 moves used to post as G02/G03 with no I/J."""
+    import pytest
+    base = [{"g": 0, "x": 0.0, "y": 0.0, "z": 5.0},
+            {"g": 1, "x": 0.0, "y": 0.0, "z": 0.0, "f": 500.0}]
+    kw = dict(metric=True, tool_number=2, tool_kind="flat", dia_mm=6.0)
+    for g in (2, 3):
+        with pytest.raises(ValueError, match="no centre data"):
+            post_lnc.post(base + [{"g": g, "x": 10.0, "y": 0.0, "z": 0.0, "f": 500.0}], **kw)
+        with pytest.raises(ValueError, match="no centre data"):
+            post_lnc.post_text("G21\nG90\nG0 X0 Y0 Z5\nG1 Z0 F500\nG%d X10 Y0 I5 J0\n" % g, **kw)
+    # an explicit arc with a centre posts; a helical one is refused
+    txt = post_lnc.post(base + [{"g": 3, "x": 10.0, "y": 0.0, "z": 0.0, "f": 500.0,
+                                 "cx": 5.0, "cy": 0.0}], crlf=False, **kw)
+    assert "G03 X10. I5. J0." in txt
+    with pytest.raises(ValueError, match="helical"):
+        post_lnc.post(base + [{"g": 3, "x": 10.0, "y": 0.0, "z": -1.0, "f": 500.0,
+                               "cx": 5.0, "cy": 0.0}], **kw)
+    with pytest.raises(ValueError, match="not on the arc"):
+        post_lnc.post(base + [{"g": 3, "x": 10.0, "y": 0.0, "z": 0.0, "f": 500.0,
+                               "cx": 4.0, "cy": 0.0}], **kw)
+
+
+def test_arc_rounding_failure_falls_back_to_lines():
+    """An arc whose rounded centre misses A6 / ARC_TOL is posted as its source lines."""
+    kw = dict(metric=True, tool_number=2, tool_kind="flat", dia_mm=6.0, crlf=False)
+    mv = _circle_moves()
+    lin = post_lnc.post(mv, **kw)
+    bad = mv[:2] + [{"g": 3, "x": mv[-2]["x"], "y": mv[-2]["y"], "z": -1.0,
+                     "f": 1000.0, "cx": 0.5, "cy": 0.0, "src": mv[2:-1]}] + mv[-1:]
+    assert post_lnc.post(bad, **kw) == lin
+
+
+def test_cli_post_arcs_flag(tmp_path):
+    from engine import cli
+    src = tmp_path / "c.ngc"
+    lines = ["G21", "G90", "(T1 flat D=6.000 CR=0.000)", "S7500 M3"]
+    for m in _circle_moves():
+        lines.append("G%d X%.4f Y%.4f Z%.4f%s" % (m["g"], m["x"], m["y"], m["z"],
+                                               " F1000" if m["g"] == 1 else ""))
+    src.write_text("\n".join(lines) + "\n")
+    off, on = tmp_path / "off.nc", tmp_path / "on.nc"
+    base = ["post", "--in", str(src), "--metric", "--tool-number", "2"]
+    assert cli.main(base + ["--out", str(off)]) == 0
+    assert cli.main(base + ["--out", str(on), "--arcs"]) == 0
+    assert not _arc_lines(off.read_text()) and len(_arc_lines(on.read_text())) == 2

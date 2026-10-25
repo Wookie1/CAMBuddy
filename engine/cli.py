@@ -45,7 +45,7 @@ def _run_post(a):
     kw = dict(metric=a.metric, program=a.program, op_name=a.op_name,
               wcs=a.wcs, dwell_ms=a.dwell_ms, dwell_p_ms=not getattr(a, "dwell_x_s", False),
               comment_style=getattr(a, "comment_style", "paren"),
-              tool_desc=a.tool_desc, crlf=not a.lf)
+              tool_desc=a.tool_desc, crlf=not a.lf, arcs=a.arcs)
     if a.tool_number is not None:
         kw["tool_number"] = a.tool_number
     if a.rpm is not None:
@@ -362,6 +362,9 @@ def main(argv=None):
                         "the default G04 P<milliseconds> (James's X7)")
     pp.add_argument("--tool-desc", dest="tool_desc", default=None)
     pp.add_argument("--lf", action="store_true", help="use LF instead of CRLF")
+    pp.add_argument("--arcs", action="store_true",
+                   help="fit G17 G02/G03 arcs (I/J) to G01 runs within 0.002 mm "
+                        "(spec A1-A8); default off: lines only")
 
     f = sub.add_parser("finish",
                        help="slope-split finishing (action: slope_split_finish) "
