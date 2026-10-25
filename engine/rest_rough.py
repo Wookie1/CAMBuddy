@@ -53,13 +53,7 @@ from . import entry_depth as fin
 from .finish import batch_drop, make_cutter, march_level
 
 CELL = 0.2          # mm, zone/contour grid (stock is max-resampled to this)
-# RR-A: top-clear limit for the step-2 ramp of a DESCENT re-entry (a lower
-# level entered from the level just cleared). The live grid is now
-# fine=min(stock cell, 0.1) (RR1c-5d (A)), at least as fine as the ZB
-# judge's 0.1 grid, so this read is no longer an under-read: the bay groove
-# ramp top measured 0.2571 mm on the 0.1 grid (0.2435 on the old 0.5 grid)
-# against the scored ZB limit 0.5. 0.3 keeps a >= 0.2 mm margin to ZB; the
-# shallow (0.25) gate stands for level entries, straight descents and SE2.
+# descent re-entry top-clear; calibrated at live grid 0.1, judge ZB 0.5
 DEEP_TOP = 0.3
 
 

@@ -66,3 +66,75 @@ reads 0.2571 > 0.25 and is refused, so the new behaviour fails by a measured val
   22 10. (opencode.json 24/3 was already dirty at session start, NOT touched by this task.)
 
 
+
+## RRA2 (fresh session, started `date` = Sun Oct 25 01:32:22 MST 2026)
+
+Plan: (1) replace DEEP_TOP's comment with the one-line text; (2) new test
+test_rra2_deep_top_scope pinning DEEP_TOP to the descent re-entry sites;
+(3) mutation on a scratch copy only (apply 0.3 at a level entry / straight
+descent) must fail the new test by a measured top depth in (0.25, 0.3].
+
+### Comment change (engine/rest_rough.py)
+
+Replaced the 7-line RR-A comment above `DEEP_TOP = 0.3` with exactly one line:
+`# descent re-entry top-clear; calibrated at live grid 0.1, judge ZB 0.5`.
+Comment-only: the constant line and all code are untouched (git diff of
+rest_rough.py is 1 insertion / 7 deletions, all comment lines).
+
+### New test (engine/test_engine.py)
+
+`test_rra2_deep_top_scope` (added to the file and to the `_main()` runner
+tuple). Uses the thin-band scene of test_rr1c_thin_band_inpass_ramp, which is
+SINGLE-level (stats zones[0]["levels"] == 1, asserted): every ladder entry is
+then a level entry / same-level link / straight descent (deep=False), so the
+shallow 0.25 top-clear gate must hold for EVERY recorded entry and DEEP_TOP
+(0.3) must never apply. The test asserts no entry in stats["entries"] reads
+deeper than 0.25 mm and fails printing the measured depth. Measured on this
+tree: max entry top 0.245 mm (zone-entry ramp L=8.8), plus a direct-descent
+at 0.047 mm -> passes. (The complementary half - DEEP_TOP DOES apply at
+descent re-entries - is already pinned by test_rr1c3_bay_deep_groove_top_down,
+whose accepted descent ramp top reads 0.263 mm.)
+
+### Test runs (all via slot_m4.sh + VibeCAD python, targeted only)
+
+- New test on this tree: "PASS rra2 DEEP_TOP scope: max level-entry top
+  0.245 mm <= 0.25 / PASS test_rra2_deep_top_scope" -> EXIT=0.
+- At-risk + new test, per-test exit codes (~01:38 MST):
+  test_rr1b_rest_rough_synth_pocket        EXIT=0
+  test_rr1c_thin_band_inpass_ramp          EXIT=0
+  test_rr1c_narrow_pocket_side_entry       EXIT=0
+  test_rr1c3_bay_deep_groove_top_down      EXIT=0
+  test_rr1c4b_plateau_topdown_axial_load   EXIT=0
+  test_rr1c5d_live_grid_fine_for_coarse_stock EXIT=0
+  test_rra2_deep_top_scope                 EXIT=0
+
+### Mutation (scratch copies under the session temp dir, NEVER committed)
+
+- Mutation A - leak at the LEVEL ENTRY (step-2 ramp): `top_lim = DEEP_TOP if
+  deep else shallow` -> `top_lim = DEEP_TOP` in the scratch copy. New test
+  output: "FAIL test_rra2_deep_top_scope: level-entry top 0.294 mm accepted
+  where 0.25 must hold (DEEP_TOP applies only at descent re-entries):
+  [{'zone': 0, 't': 29.847, 'step': 2, 'kind': 'in-pass-ramp 2.0 deg
+  L=7.4', 'depth_mm': 0.294}]" -> EXIT=1. MEASURED VALUE: 0.294 mm, a top in
+  (0.25, 0.3] accepted at L=7.4 where the clean tree refuses it and accepts
+  L=8.8 at 0.245 mm. This is the required measured-value failure.
+- Mutation B - leak at the STRAIGHT DESCENT (step1): `d <= shallow` ->
+  `d <= DEEP_TOP` in step1 only, scratch copy. The test still passes (EXIT=0)
+  on this scene: the step1 candidate column in the thin band reads ~0.55 mm
+  (rest 30.4 - level 29.847), above 0.3, so step1 fails under BOTH gates and
+  the leak is invisible here. No existing at-risk scene was found to route a
+  straight descent through a column depth in (0.25, 0.3] without inventing
+  geometry; the test's assertion already covers step-1 entries too (it checks
+  ALL recorded entries against 0.25), so a (0.25, 0.3] straight descent, if
+  a scene produced one, would fail it by the same measured-depth message.
+  Mutation A is the demonstrated pin.
+
+### Diff size at finish (`git diff --numstat`, 01:38 MST)
+
+  7  0  engine/RRA_RESULTS.md   (this file; RRA2 section appended)
+  1  7  engine/rest_rough.py    (comment-only)
+  60 1  engine/test_engine.py   (new test + one tuple line)
+  23 2  opencode.json           (pre-existing dirty at session start - model
+                                 config written by the harness; NOT touched)
+
+No commits made. No limits/floors/gates changed; no existing test altered.

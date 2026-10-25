@@ -2277,6 +2277,64 @@ def test_rr1c5d_live_grid_fine_for_coarse_stock():
           % (seen[0], cell))
 
 
+def test_rra2_deep_top_scope():
+    """RRA2: DEEP_TOP (0.3) is scoped to the DESCENT re-entry sites ONLY.
+    This is the thin-band scene of test_rr1c_thin_band_inpass_ramp, which is
+    SINGLE-level: every ladder entry here is a level entry or a same-level
+    link (deep=False), so the step-2 top-clear gate at every accepted ramp
+    top is `shallow` (0.25) and no accepted entry may read deeper than that.
+    DEEP_TOP belongs to the descent re-entries of test_rr1c3_bay_deep_groove_
+    top_down (accepted top 0.263 mm). If DEEP_TOP leaked into a level entry
+    or a straight descent, this scene's zone-entry ramp would accept a top
+    in (0.25, 0.3] and the assertion below fails BY THE MEASURED DEPTH."""
+    try:
+        from engine import rest_rough as rr
+    except ImportError as e:
+        raise AssertionError("rest-rough engine missing (%s)" % e)
+    assert rr.DEEP_TOP > 0.25 + 1e-12, \
+        "DEEP_TOP %r: scene can only pin the split if DEEP_TOP > shallow" \
+        % rr.DEEP_TOP
+    box = _rr1c_boxes()
+    tris = []
+    tris += box(0, 18.1, 0, 40, 20, 30)
+    tris += box(21.9, 40, 0, 40, 20, 30)
+    tris += box(18.1, 21.9, 0, 8, 20, 30)
+    tris += box(18.1, 21.9, 32, 40, 20, 30)
+    tris += box(18.1, 21.9, 8, 32, 20, 29.4)   # band floor 29.4
+    surf = _rr1c_surf(tris)
+    cell = 0.5
+    n = int(40 / cell)
+    cxv = (np.arange(n) + 0.5) * cell
+    X, Y = np.meshgrid(cxv, cxv)
+    A = np.full((n, n), 30.1)                   # 0.1 skin over the frame
+    band = ((X >= 18.1) & (X <= 21.9) & (Y >= 8) & (Y <= 32))
+    A[band] = 30.4                              # rest left in the band
+    moves, stats = rr.rest_rough(
+        surf, (A, 0.0, 0.0, cell), ("ball", 9.525), floor_z=29.4,
+        stepdown=2.0, ae=1.905, rest_leave=0.2, min_excess=0.4,
+        min_helix_r=1.903, ramp_angle_deg=2.0, cut_feed=2280.0,
+        ramp_feed=850.0)
+    assert moves and len(stats["zones"]) == 1 and not stats["no_entry"], \
+        "thin band must be entered: %r" % (stats["no_entry"],)
+    z = stats["zones"][0]
+    assert z["levels"] == 1, \
+        "scene must stay single-level (no descent re-entry here): %r" % z
+    step2 = [e for e in stats["entries"] if e["step"] == 2]
+    assert step2, "scene must keep a step-2 level-entry ramp: %r" \
+        % stats["entries"]
+    # every entry in this scene is a level entry / same-level link / straight
+    # descent: the shallow (0.25) top-clear gate must hold for ALL of them
+    over = [e for e in stats["entries"]
+            if e["depth_mm"] is not None and e["depth_mm"] > 0.25]
+    assert not over, \
+        ("level-entry top %.3f mm accepted where 0.25 must hold (DEEP_TOP "
+         "applies only at descent re-entries): %s"
+         % (max(e["depth_mm"] for e in over), over[:3]))
+    print("PASS rra2 DEEP_TOP scope: max level-entry top %.3f mm <= 0.25"
+          % max(e["depth_mm"] for e in stats["entries"]
+                if e["depth_mm"] is not None))
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -2317,7 +2375,8 @@ def _main():
                test_rr1c5b_mixed_band_core_front,
                test_rr1c5c_closed_pocket_bore_entry_no_deep_axial,
                test_rr1c5d_front1_chord_offset_slabs,
-               test_rr1c5d_live_grid_fine_for_coarse_stock):
+               test_rr1c5d_live_grid_fine_for_coarse_stock,
+               test_rra2_deep_top_scope):
         try:
             fn()
         except AssertionError as e:
