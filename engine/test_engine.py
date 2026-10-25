@@ -1069,6 +1069,96 @@ def test_rough_rapids_clear_stock():
           "lifted to verified heights" % (len(moves), stats["n_rapid_bumps"]))
 
 
+def test_bs1a4d6c_side_entry_no_under_read():
+    """BS1a4d6c item 2: a credit-0 piece entered from the SIDE into standing
+    stock. The predictor's max for that arrival (band._simulate at credit 0,
+    entry="side" - no start-disk pre-clear) must be >= the verify/zmap-judged
+    engagement of the SAME arrival as emitted (no under-read). Both numbers
+    printed."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import subprocess
+    import tempfile
+    import json as _json
+    import numpy as np
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.stock import StockField
+    from engine.gcode import moves_to_gcode
+    from engine.rough import build_part_hf
+    tr, cell, z = 6.343, 0.5, 6.0
+    box = (-25.0, 25.0, -20.0, 20.0, 0.0, 6.15)   # skin stands 0.15 over Z
+    # live stock AT PREDICT time: bore + channel cleared to Z at y=0, the
+    # rest of the blank still standing (a credit-0 arrival has no bore).
+    st = StockField(box, cell=cell)
+    st.mill_segment(-20.0, 0.0, -20.0, 0.0, z, tr, 0.0)
+    st.mill_path([(-20.0, 0.0), (-17.0, 0.0)], z, tr, 0.0)
+    # the piece: start P0 lies inside standing stock (its disk covers
+    # standing cells - the arrival load), then feeds along the cleared
+    # channel; credit 0, entry side (no helix, no bore).
+    p0 = (-17.0, 3.0)
+    path = [(p0[0], round(p0[1] - 0.4 * i, 4)) for i in range(16)]
+    wins = B._simulate(path, st, z, tr, cell, 0.0, entry="side")
+    pred = max(wins) if wins else 0.0
+    # the SAME arrival as emitted: feed-down in the cleared bore column
+    # (0.15 mm <= AXIAL_FLOOR), channel slot, ONE sideways feed-in move at
+    # cutting feed onto P0 (the offset_down shape), then the piece.
+    moves = [{"g": 0, "x": -20.0, "y": 0.0, "z": 7.0},
+             {"g": 1, "x": -20.0, "y": 0.0, "z": z, "f": 250.0},
+             {"g": 1, "x": -17.0, "y": 0.0, "z": z, "f": 1000.0},
+             {"g": 1, "x": p0[0], "y": p0[1], "z": z, "f": 1000.0}]
+    for q in path[1:]:
+        moves.append({"g": 1, "x": q[0], "y": q[1], "z": z, "f": 1000.0})
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a4d6c_floor.stl")
+        _write_stl(stl, _box_tris(-45.0, 45.0, -35.0, 35.0, -1.0, 0.0))
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        ngc = os.path.join(td, "bs1a4d6c.ngc")
+        with open(ngc, "w") as fh:
+            fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+        hf = build_part_hf(surf, -45.0, -35.0, 0.5, 180, 140, threads=4,
+                           drop_z=-1.0)
+        hf_p = os.path.join(td, "part_hf.npy")
+        pad = int(math.ceil((tr + 5.0) / 0.5))
+        padded = np.full((hf.shape[0] + 2 * pad, hf.shape[1] + 2 * pad),
+                         np.nan, dtype=hf.dtype)
+        padded[pad:pad + hf.shape[0], pad:pad + hf.shape[1]] = hf
+        np.save(hf_p, padded)
+        with open(hf_p[:-4] + ".json", "w") as fh:
+            _json.dump({"x0": -45.0 - pad * 0.5, "y0": -35.0 - pad * 0.5,
+                        "cell": 0.5, "tess_tol": 0.01}, fh)
+        dj = os.path.join(td, "ae2.json")
+        rr = subprocess.run(
+            [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+             "--part", hf_p, "--tool", "flat", "--dia", "%.3f" % (2 * tr),
+             "--stock", *[str(v) for v in box], "--engage-max", "2.438",
+             "--ae2-dump", dj],
+            capture_output=True, text=True, cwd=repo)
+        assert rr.returncode == 0, "zmap failed: %s | %s" % (
+            rr.stdout[-500:], rr.stderr[-500:])
+        wj = _json.load(open(dj))
+    # arrival windows = windows ending at the feed-in end (P0) or a piece
+    # path point, at Z, that actually cut (a > 0): the feed-in and the
+    # piece as emitted (the channel slot window ends at (-17, 0) - not the
+    # arrival - and is excluded).
+    key = {(round(q[0], 3), round(q[1], 3)) for q in path}
+    own = [w for w in wj if abs(w["z"] - z) < 1e-3 and w["a"] > 0.0
+           and (round(w["x"], 3), round(w["y"], 3)) in key]
+    assert own, "no judged arrival window at the side entry: vacuous test"
+    judged = max(w["ae_eff"] for w in own)
+    print("BS1a4d6c side entry into standing stock: predictor max %.2f "
+          "mm^2/window vs zmap-judged max %.2f mm (arrival windows %d)"
+          % (pred, judged, len(own)))
+    assert pred >= judged, \
+        "UNDER-READ: credit-0 side arrival predictor %.2f < zmap-judged " \
+        "%.2f mm (the entry's own engagement is missing from the " \
+        "prediction)" % (pred, judged)
+    print("PASS bs1a4d6c side-entry no-under-read: predictor %.2f >= judged "
+          "%.2f mm" % (pred, judged))
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -1104,7 +1194,8 @@ def _main():
                test_bs1a4d4_credit_entry_matches_prediction,
                test_bs1a4d4_entry_pinned_to_stored_start,
                test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load,
-               test_bs1a4d6b_q4_entry_bore_in_live_stock):
+               test_bs1a4d6b_q4_entry_bore_in_live_stock,
+               test_bs1a4d6c_side_entry_no_under_read):
         try:
             fn()
         except AssertionError as e:

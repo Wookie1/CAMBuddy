@@ -151,13 +151,14 @@ def _advance(r, tool_r):
     return max(LOOP_R_MIN * 0.3, min(p, P_CAP))
 
 
-def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None):
+def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None,
+              entry="bore"):
     """Replay ZE2 windowing on the engine stock grid: move-aligned windows of
     path travel; a window's area = distinct cells whose live top stands above
     z + 0.05 and that first fall under the cutter disk (applied at every
     emitted point) inside it. The entry bore (disk bore_r about the start or
     bore_xy - BS1a4d (c) helix centre) is
-    pre-cleared - the helix + floor circle cut it at entry feed. Returns the
+    pre-cleared when entry="bore"; "side"/"link" not (BS1a4d6c). Returns the
     list of per-window ae_eff estimates (mm); ends collects each window's
     cumulative end-of-window travel (zmap _ae2_windows: moves merge until the
     window reaches 1 mm, a move >= 1 mm is its own window)."""
@@ -177,16 +178,8 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None):
     stand = stock.top[j0:j1, i0:i1] > z + 0.05
     bx, by = (bore_xy[:2] if bore_xy else path[0][:2])
     ci, cj = stock._ci(bx) - i0, stock._cj(by) - j0
-    # BS1a4d6b: the entry ladder brings the tool to path[0] at Z BEFORE the
-    # first lateral cut - the start disk is entry-feed, never a cutting-feed
-    # window's engagement - so pre-clear it even at credit 0 (that counted
-    # the whole standing start disk, up to pi x tool_r^2, as window 0).
-    c0, s0 = stock._ci(path[0][0]) - i0, stock._cj(path[0][1]) - j0
-    for dj, di in offs:   # BS1a4d (c): start via the entry at Z
-        a, b = c0 + di, s0 + dj
-        if 0 <= a < stand.shape[1] and 0 <= b < stand.shape[0]:
-            stand[b, a] = False
-    for dj, di in offs_b:
+    # BS1a4d6c: pre-clear only the emitted entry's footprint (see entry).
+    for dj, di in (offs_b if entry == "bore" else ()):
         a, b = ci + di, cj + dj
         if 0 <= a < stand.shape[1] and 0 <= b < stand.shape[0]:
             stand[b, a] = False
@@ -276,7 +269,8 @@ def shrink_ladder(seg, stock, z, tool_r, cell, credit=None, dropopt=None,
         if borefn and not bxy:
             cr = 0.0   # BS1a4d4 (c): no predicted bore = unbacked credit
         wins = _simulate(path, stock, z, tool_r, cell,
-                        cr + (bxy[2] if bxy else 0.0), we, bore_xy=bxy)
+                        cr + (bxy[2] if bxy else 0.0), we, bore_xy=bxy,
+                        entry="bore" if cr > 1e-9 else "side")
         if not wins:
             break
         best_area = max(best_area, sum(wins))
@@ -377,7 +371,8 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                 continue
             dense = _resample(pts, step=0.4)
             wb = []
-            wins = _simulate(pts, stock, z, tool_r, cell, 1.3 * tool_r, wb)
+            wins = _simulate(pts, stock, z, tool_r, cell, 1.3 * tool_r, wb,
+                             entry="bore")
             if not wins:
                 continue
             drop_opt = (_opt_key(wins, wb, fw_min), "drop_ring", None, wins)

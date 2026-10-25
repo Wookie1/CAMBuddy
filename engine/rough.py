@@ -1458,7 +1458,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             return True
         from engine.band import _simulate, SPIKE_MM
         stats[key + "_chk"] = stats.get(key + "_chk", 0) + 1
-        w = _simulate(path, st, z, tool_r, st.cell, 0.0)
+        w = _simulate(path, st, z, tool_r, st.cell, 0.0, entry="link")
         ok = not w or max(w) <= SPIKE_MM
         if not ok:
             stats[key + "_cvt"] = stats.get(key + "_cvt", 0) + 1
@@ -2155,7 +2155,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     rb = res.get("replan0") == 2 and helix_n[0] > h0
                     ew0 = _simulate(pts_c, stock, z, tool_r, stock.cell,
                                     res["bore"][4] + tool_r if rb else 0.0,
-                                    bore_xy=res["bore"][2:] if rb else None)
+                                    bore_xy=res["bore"][2:] if rb else None,
+                                    entry="bore" if rb else "link")
                     if ew0 and max(ew0) <= AE_SPIKE and sorted(
                             ew0)[max(0, int(0.95 * len(ew0)) - 1)] <= AE_SS:
                         act = "replan0_ok"

@@ -247,3 +247,204 @@ the first entry there).
   already dirty at session start). Engine edits confined to engine/band.py,
   engine/rough.py (+ the approved test refinements in test_engine.py).
 - BS1a4d6b DONE.
+
+---
+
+# BS1a4d6c (fresh session, start `date`: Sun Oct 25 09:19:59 MST 2026)
+
+## Item 0 (before any code change): WHAT the _simulate window value IS
+
+engine/band.py _simulate (band.py:154) appends `acc_area` per window
+(band.py:222): the SUM of newly-removed plan-view cell areas inside that
+window, `area = removed * cell * cell` (band.py:218), cell = 0.5 mm ->
+0.25 mm2/cell. A window closes when accumulated travel reaches 1.0 mm
+(band.py:221, zmap AE2_WINDOW_MM = 1.0, zmap.py:59). So the value is
+AREA PER WINDOW, unit mm^2 - not area per step, not a width.
+
+The judge's comparable number is ae_eff = area_mm2 / length_mm
+(verify/zmap.py:991) - mm^2 per mm of travel = average radial engagement
+WIDTH in mm. The engine value equals ae_eff NUMERICALLY ONLY when the
+window's length is ~1.0 mm (runs of short merged moves). Two systematic
+ways it exceeds a width:
+- a single feed move >= 1 mm is its OWN window (zmap.py:980 "a move >= 1 mm
+  is its own window"; band.py:221 same): a 2 mm chord/link window carries
+  the whole stadium area ~ D x 2 mm, so 24.5 mm^2 (~2 x D x 1 mm) is one
+  window's area, not a 24.5 mm width;
+- the standing START DISK: the cutter disk is applied at every emitted
+  point EXCEPT path[0] (band.py:201 loop), so at credit 0 the whole disk
+  under path[0] (up to pi x 6.343^2 = 126.8 mm^2) is swept into window 0 -
+  the 36.25 "mm" was exactly 145 cells x 0.25 mm^2 of standing start disk.
+  12-24.5 on the BS1a4d6b table are likewise mm^2 window areas (long first
+  moves + disk), which is why they exceed the 12.686 mm diameter.
+
+Direct gate comparisons of these window values:
+- 2.44: engine SPIKE_MM = 2.44 (band.py:45) compared to _simulate window
+  AREAS at band.py:251 (_opt_key travel-over) and rough.py:1462
+  (lnk_cut_ok `max(w) <= SPIKE_MM`). Judge: OVERLOAD_WIDTH_MM = 1.2 x 2.032
+  = 2.4384 (zmap.py:52) compared to ae_eff at zmap.py:1102
+  (overload_feeds_ae2) and to the old chord width_mm at zmap.py:937;
+  the channel tests pass --engage-max 2.438 (test_engine.py:1671).
+- AE_SPIKE = 2.25 (band.py:44) vs window areas at band.py:284 (ladder gate)
+  and rough.py:2159 (emit re-check); AE_SS = 1.85 (band.py:43) at
+  band.py:285 and rough.py:2160.
+- 2.286 (ZE2B): NO gate compares any window value to 2.286 - it is the Core
+  Front blank margin per side in X (TASK_RP2_0.md:8, engine/test_post.py:517),
+  a stock-margin LIMIT, not an engagement threshold; it appears nowhere in
+  verify/zmap.py or the engine's comparisons.
+So the engine compares mm^2-per-~1mm-window against mm widths (2.25/2.44);
+that is sound only while windows are ~1 mm long and no entry disk leaks in.
+
+## Cause of the NOT-accepted state (46db9be band.py:180-188)
+_simulate pre-clears the tool_r disk at path[0] UNCONDITIONALLY. Correct for
+a helix arrival (the bore is cut at entry feed) - but for a credit-0 arrival
+that is a side entry or a link INTO standing stock the arrival cut happens
+AT CUTTING FEED in the emitted program, and the judge counts it; the
+pre-clear deletes that engagement from the prediction (under-read).
+
+## Plan
+1. band.py _simulate: new keyword entry={"bore","plunge","side","link"};
+   pre-clear ONLY the bore footprint disk (bore_r about bore_xy/path[0])
+   when entry="bore" (helix r_b: caller passes r_b + tool_r); "plunge"
+   (axial, already-bored spot) and "side"/"link" pre-clear NOTHING extra.
+   Callers pass the emitted entry type explicitly:
+   - band.py:278 shrink_ladder: "bore" iff credit cr > 0 (entry_credit says
+     standing stock forces a helix, or borefn predicted a bore), else "side";
+   - band.py:380 channel_regions scan: "bore" (bore_r 1.3 x tool_r as today);
+   - rough.py:1461 lnk_cut_ok: "link" (the link path IS the approach);
+   - rough.py:2156 emit re-check: "bore" iff rb (helix emitted, stored bore),
+     else "link" (tool-down link / side feed-in / clear-column plunge).
+2. NEW test test_bs1a4d6c_side_entry_no_under_read: L scene; spy wraps
+   band._simulate to log credit-0 arrival predictions (path[0], z, max win,
+   snapshot of live stock.top) + which entry the emitted program used;
+   judge = zmap --ae2-dump on the SAME emitted program; for the credit-0
+   pieces whose arrival cuts standing stock (side/link into stock), assert
+   predictor max >= judge max over the arrival windows, PRINT both numbers.
+3. Table: own-region (more_pcs) pieces on the L scene - engine max_ae next
+   to zmap-judged max ae_eff AS EMITTED.
+4. Mutation scratch/mut_bc/: restore the unconditional pre-clear; the new
+   test must FAIL by the under-read in mm; record the number.
+
+## Status log (BS1a4d6c)
+- 09:19 start; 09:20 lane sanity OK. 09:30 item 0 written (CAUSE FIRST).
+- 09:47 diag #1 (scratch/diag_bs1a4d6c.py, exit 0): 22 credit-0 re-check
+  arrivals on the L scene logged with live-stock snapshots + zmap windows.
+  Finding: with the 46db9be unconditional pre-clear, pred_max reads 0.0-0.5
+  at arrivals where the same-arrival judge windows read up to 8.57; two
+  arrivals (-5.0370,-2.5122 / -3.0946,7.3126) had REAL standing cells under
+  the start disk (no-pre-clear recomputes 0.25 > 0.0) - the pre-clear erases
+  arrival engagement from the prediction. Spatial-proximity matching is
+  contaminated by neighbouring passes; diag #2 matches judge window
+  ENDPOINTS to the piece's own path points (<=1e-3 mm) for exact attribution.
+- 10:25 engine fix applied (entry kwarg, 4 call sites). numstat vs 46db9be:
+  band 10/14 + rough 3/2 = 29 changed non-test engine lines (<= ~35; over
+  the 25 soft budget by 4 - reported, not hidden; no gate/limit touched).
+
+## The change (BS1a4d6c), file:line (vs 46db9be)
+- engine/band.py:154-155 _simulate gains keyword entry="bore" (default = the
+  bore-credited callers); :182 the pre-clear loop is
+  `for dj, di in (offs_b if entry == "bore" else ())` - the 46db9be
+  unconditional tool_r start-disk block is GONE. entry="bore" pre-clears
+  exactly the emitted entry's footprint (helix: caller passes bore_r =
+  r_b + tool_r about bore_xy; axial plunge at an already-bored spot: bore_r
+  0, nothing stands, nothing cleared); entry="side"/"link" pre-clears
+  NOTHING - the arrival cuts at cutting feed, its load is measured.
+- Callers pass the emitted entry type (never guessed inside _simulate):
+  band.py:273 shrink_ladder entry="bore" iff cr > 1e-9 (entry_credit forces
+  a helix / borefn predicted a bore) else "side"; band.py:375
+  channel_regions scan entry="bore" (its 1.3 x tool_r bore credit);
+  rough.py:1461 lnk_cut_ok entry="link" (the link path IS the approach);
+  rough.py:2159 emit re-check entry="bore" iff rb (stored-bore helix
+  emitted) else "link" (tool-down link / side feed-in / clear-column
+  plunge - all already cut whatever stood under the start disk).
+- engine/test_engine.py:1072 NEW test_bs1a4d6c_side_entry_no_under_read
+  (+ registration in _main).
+- git diff --numstat vs 46db9be: band 9/14 + rough 3/2 = 28 changed non-test
+  engine lines (soft budget 25 exceeded by 3 - reported, not hidden; the
+  ~35 STOP line not reached; no limit/floor/gate/margin/leave/feed change).
+  Correction to the earlier status log entry ("10/14 + 3/2 = 29"): final is
+  9/14 + 3/2 = 28.
+
+## Item 3 - L scene, credit-0 re-check pieces, engine vs zmap AS EMITTED
+(diag scratch/diag_bs1a4d6c2.py, exit 0; judge windows attributed EXACTLY:
+window endpoint == a point of the predicted piece path, |dz| < 1e-3; fixed
+engine pred vs MUTANT pred vs judged max, Z 0.381; engine numbers are mm^2
+per ~1 mm window, judged is ae_eff mm):
+p0x      p0y      npts pred_fixed mut_preclear judged_own
+-5.9780   3.5643   43   0.00       0.00        0.00
+-6.0769   3.6316   44   0.00       0.00        0.00
+-6.0419   3.6891   31   0.50       0.50        0.33
+-5.6924   3.7757   30   0.00       0.00        0.00
+-2.1882   3.5063   40   0.25       0.25        0.00
+-1.7313   3.7617   41   0.00       0.00        0.00
+-1.5835   4.0568   43   0.25       0.25        0.00
+-3.0946   7.3126   30   0.25       0.00        0.00   <- pre-clear erased
+-2.9690   7.6795   57   0.25       0.25        0.00       real engagement
+-2.7302   9.8552   42   0.00       0.00        0.73
+-2.6436   9.9092   45   0.00       0.00        1.20
+-4.7826  -1.5955   42   0.00       0.00        0.00
+-4.7648  -2.2530   38   0.00       0.00        0.67
+-5.0370  -2.5122   26   0.25       0.00        0.00   <- pre-clear erased
+-4.8710  -2.5694   39   0.25       0.25        0.00       real engagement
+(-11 more arrivals all 0.00/0.00/0.00; n_recs 22, clcheck_violations 0)
+The BS1a4d6b "12-24.5 pre-cut" figures were mm^2 window AREAS (item 0), and
+their judged counterparts on the emitted program are these 0-1.2 mm
+readings - the pre-cuts plus entry approach moves take the judge under the
+2.44 bar; where the arrival itself cut standing stock the fixed predictor
+keeps the engagement (0.25) that the pre-clear variant zeroed.
+
+## Item 2 + 4 - NEW test and mutation (pasted)
+Fixed engine (real engine/, scratch/run_bc.sh via slot_m4.sh):
+  BS1a4d6c side entry into standing stock: predictor max 28.75 mm^2/window
+  vs zmap-judged max 11.46 mm (arrival windows 4)
+  PASS bs1a4d6c side-entry no-under-read: predictor 28.75 >= judged 11.46 mm
+  RESULT test_bs1a4d6c_side_entry_no_under_read EXIT=0
+Mutation scratch/mut_bc/ (engine+verify copies; 46db9be unconditional
+start-disk pre-clear restored; real engine untouched by it):
+  AssertionError: UNDER-READ: credit-0 side arrival predictor 11.25 <
+  zmap-judged 11.46 mm (the entry's own engagement is missing from the
+  prediction)
+  MUT_EXIT=1
+  -> fails BY MEASURED UNDER-READ 11.46 - 11.25 = 0.21 mm; the pre-clear
+  also erases the arrival-window burst itself: 28.75 - 11.25 = 17.50 mm^2
+  of start-disk engagement removed from window 0.
+
+## At-risk battery (all 18 + new test, final engine, one lane call)
+test_bs1a4d_credit0_lightest_option EXIT=0; test_bs1a_lshaped_channel
+EXIT=0 (0 full-width windows); test_bs1a4d_credit_real_bore EXIT=0;
+test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load EXIT=0 (14 forced
+re-checks); test_bs1a4d2b_centred_entry_bore EXIT=0;
+test_bs1a4d4_credit_entry_matches_prediction EXIT=0 (15/15);
+test_bs1a4d4_entry_pinned_to_stored_start EXIT=0 (3 pinned);
+test_bs1a4c_backed_credit EXIT=0; test_bs1a4b_failed_region_lightest
+EXIT=0; test_bs1a4b_windows_align_zmap EXIT=0 (boundaries identical,
+max engine-zmap +14.070 mm); test_bs1a4c2_band_chord_cl_checked EXIT=0;
+test_bs1a4c_fix_no_post_entry_helix EXIT=0; test_bs1a4d3_links_measured_
+as_cuts EXIT=0 (brdg 2/1, fdin 10/6); test_bs1a_straight_channel EXIT=0;
+test_bs1a3_no_band_after_a2d EXIT=0; test_rough_synth_pocket_repro EXIT=0;
+test_dt1_synthetic_rough_twice_identical EXIT=0;
+test_bs1a4d6b_q4_entry_bore_in_live_stock EXIT=0 (18 bore-backed re-checks);
+NEW test_bs1a4d6c_side_entry_no_under_read EXIT=0.
+TOTAL_FAILURES 0, BATTERY_EXIT=0. 19/19 GREEN.
+NOTE: credit0_lightest_option now lists (-2.7176, 3.0018, shrink1, max_ae
+36.25) again - with the pre-clear gone the standing start disk reappears in
+the ladder window 0; per item 0 that is the arrival load of the q4->path
+chord (cutting feed), not a unit error, and the emitted piece is unchanged
+(test asserts the lightest option IS emitted: holds).
+
+## Close-out (BS1a4d6c)
+- Started 09:19:59 MST; finished within the 2 h cap (final numstat run at
+  10:25 MST; the battery lane call completed 19/19 before the cap).
+- No locks touched; no Core Front job; no commit; no git
+  stash/reset/clean/restore/checkout/rebase/cherry-pick; no bypass flags;
+  no gate relaxed; no limit/floor raised (ZE2B 2.286 / ZE2 2.44 / ZA 0.2 /
+  ZB 0.5 / AE_SPIKE / AE_SS untouched); no margin/leave/feed change;
+  verify/ and opencode.json NOT edited by this session (opencode.json was
+  already dirty at session start); engine code imports nothing from
+  zmap/verify; edits confined to engine/band.py, engine/rough.py,
+  engine/test_engine.py (new test only - no existing test or assertion
+  altered); scratch only under scratch/ (diag_bs1a4d6c.py, diag_bs1a4d6c2.py,
+  run_bc.sh, mut_bc/).
+- Final git diff --numstat (vs 46db9be): band.py 9/14, rough.py 3/2
+  (= 28 engine lines), test_engine.py 92/1 (tests only),
+  BS1a4d6_RESULTS.md append-only.
+- BS1a4d6c DONE.
