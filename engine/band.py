@@ -478,6 +478,13 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                         if _b:
                             regions[-1]["bore"] = (round(pc[0][0], 4),
                                                    round(pc[0][1], 4)) + _b
+                            b0 = borefn(path[0], z) or (0.0, 0.0, -9.0)
+                            if max(abs(u - v) for u, v in zip(_b, b0)) > 1e-6:
+                                regions[-1]["replan0"] = 2
+                                if stats is not None:
+                                    stats.setdefault("credit_fallback",
+                                        []).append((pc[0][0], pc[0][1],
+                                        round(z, 3), "plan0_splitbore"))
                         else:   # BS1a4d4 (c): unbacked -> credit 0, listed
                             regions[-1]["credit"] = 0.0
                             # planned with a bore at path[0] the piece won't

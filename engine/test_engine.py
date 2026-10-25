@@ -2326,8 +2326,15 @@ def test_bs1a4d_credit_real_bore():
             + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
             + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
             + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
-    caps, sims = [], []
+    caps, sims, helixes = [], [], []
     _orig_cr, _orig_sim = B.channel_regions, B._simulate
+    import engine.rough as R
+    _orig_hm = R._helix_moves
+
+    def hm_spy(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg=2.0):
+        mv = _orig_hm(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg)
+        helixes.append((cx, cy, r, z_bot))   # the EXACT emitted bore
+        return mv
 
     def sim_spy(path, stock, z, tool_r, cell, bore_r, ends=None, **kw):
         # forward in the CALLER's form: on 22cdff7 the engine never passes
@@ -2351,6 +2358,7 @@ def test_bs1a4d_credit_real_bore():
 
     B._simulate = sim_spy
     B.channel_regions = cr_spy
+    R._helix_moves = hm_spy
     try:
         with tempfile.TemporaryDirectory() as td:
             stl = os.path.join(td, "bs1a4d_c.stl")
@@ -2366,6 +2374,7 @@ def test_bs1a4d_credit_real_bore():
     finally:
         B.channel_regions = _orig_cr
         B._simulate = _orig_sim
+        R._helix_moves = _orig_hm
 
     def entry_pts(q, z):
         # the bore that matters for pre-crediting: cutter-disk sweep AT Z -
@@ -2410,10 +2419,35 @@ def test_bs1a4d_credit_real_bore():
         pts = entry_pts(cap["q"], cap["z"])
         if pts is None:
             continue                      # entry without an emitted helix
-        sim = next((s for s in sims if s[0] == cap["z"]
-                    and math.dist(s[1], cap["q"]) < 0.5), None)
+        # BS1a4d5 matcher: pair the cap with the planning or re-check sim
+        # whose bore_xy IS its emitted helix (centre 1e-6, r 1e-6) - the
+        # emitted helix captured exactly at _helix_moves, identified by its
+        # own floor-circle run. No proximity matching.
+        own = [h for h in helixes if abs(h[3] - cap["z"]) < 1e-6
+               and all(abs(math.dist(p, (h[0], h[1])) - h[2]) < 1.5e-4
+                       for p in pts[1:])]
+        assert len(own) == 1, \
+            "entry bore run at (%.4f,%.4f)@Z%.3f matches %d emitted helices" \
+            % (cap["q"][0], cap["q"][1], cap["z"], len(own))
+        hb = own[0]
+        sim = next((s for s in sims if s[0] == cap["z"] and s[3] is not None
+                    and math.dist(s[3][:2], hb[:2]) <= 1e-6
+                    and abs(s[3][2] - hb[2]) <= 1e-6), None)
         if sim is None:
-            continue                      # start != ladder path start
+            near = min((s for s in sims if s[0] == cap["z"]
+                        and s[3] is not None),
+                       key=lambda s: math.dist(s[3][:2], hb[:2]),
+                       default=None)
+            raise AssertionError(
+                "credited split cap (%.4f,%.4f)@Z%.3f emitted helix centre "
+                "(%.4f,%.4f) r %.4f has NO planning or re-check sim with "
+                "that bore: nearest planned bore centre (%.4f,%.4f) r %.4f, "
+                "planning-vs-emitted bore offset %.4f mm" % (
+                    cap["q"][0], cap["q"][1], cap["z"], hb[0], hb[1], hb[2],
+                    near[3][0] if near else -1.0,
+                    near[3][1] if near else -1.0,
+                    near[3][2] if near else -1.0,
+                    math.dist(near[3][:2], hb[:2]) if near else -1.0))
         assert sim[3] is not None, \
             "credited plan sim pre-cleared a disk about the path START " \
             "(%r), not the real helix-centred bore" % (sim,)

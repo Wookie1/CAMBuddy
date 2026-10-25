@@ -2147,10 +2147,17 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     or res.get("replan0"):   # BS1a4d4: plan0_split piece
                 pts_c, q4 = res["paths"][0][1], tuple(res["start"])
                 if res.get("replan0") or not stock.link_clear([q4, q4], z):
-                    ew0 = _simulate(pts_c, stock, z, tool_r, stock.cell, 0.0)
+                    rb = res.get("replan0") == 2 and helix_n[0] > h0
+                    ew0 = _simulate(pts_c, stock, z, tool_r, stock.cell,
+                                    res["bore"][4] + tool_r if rb else 0.0,
+                                    bore_xy=res["bore"][2:] if rb else None)
                     if ew0 and max(ew0) <= AE_SPIKE and sorted(
                             ew0)[max(0, int(0.95 * len(ew0)) - 1)] <= AE_SS:
                         act = "replan0_ok"
+                    elif rb:   # BS1a4d5: a mid-segment split piece's lightest
+                        act = "plan0_splitbore_keep"   # option cannot rejoin
+                        # q4: keep it, never silent (act recorded in
+                        # credit_fallback below).
                     else:
                         # BS1a4d (a0): Fix 1's lightest option - shrink ladder
                         # at credit 0 on the LIVE stock vs drop-ring, same
