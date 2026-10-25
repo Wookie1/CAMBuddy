@@ -1097,8 +1097,11 @@ def test_bs1a4d6c_side_entry_no_under_read():
     # channel; credit 0, entry side (no helix, no bore).
     p0 = (-17.0, 3.0)
     path = [(p0[0], round(p0[1] - 0.4 * i, 4)) for i in range(16)]
-    wins = B._simulate(path, st, z, tr, cell, 0.0, entry="side")
-    pred = max(wins) if wins else 0.0
+    ends = []
+    wins = B._simulate(path, st, z, tr, cell, 0.0, ends=ends, entry="side")
+    # window value is AREA (mm^2); as a width: area / that window's travel
+    lens = [e - (ends[i - 1] if i else 0.0) for i, e in enumerate(ends)]
+    pred = max((a / ln for a, ln in zip(wins, lens)), default=0.0)
     # the SAME arrival as emitted: feed-down in the cleared bore column
     # (0.15 mm <= AXIAL_FLOOR), channel slot, ONE sideways feed-in move at
     # cutting feed onto P0 (the offset_down shape), then the piece.
@@ -1148,15 +1151,15 @@ def test_bs1a4d6c_side_entry_no_under_read():
            and (round(w["x"], 3), round(w["y"], 3)) in key]
     assert own, "no judged arrival window at the side entry: vacuous test"
     judged = max(w["ae_eff"] for w in own)
-    print("BS1a4d6c side entry into standing stock: predictor max %.2f "
-          "mm^2/window vs zmap-judged max %.2f mm (arrival windows %d)"
+    print("BS1a4d6c side entry into standing stock: predictor max width "
+          "%.3f mm vs zmap-judged max ae_eff %.3f mm (arrival windows %d)"
           % (pred, judged, len(own)))
     assert pred >= judged, \
-        "UNDER-READ: credit-0 side arrival predictor %.2f < zmap-judged " \
-        "%.2f mm (the entry's own engagement is missing from the " \
+        "UNDER-READ: credit-0 side arrival predictor width %.3f mm < " \
+        "zmap-judged %.3f mm (the entry's own engagement is missing from the " \
         "prediction)" % (pred, judged)
-    print("PASS bs1a4d6c side-entry no-under-read: predictor %.2f >= judged "
-          "%.2f mm" % (pred, judged))
+    print("PASS bs1a4d6c side-entry no-under-read: predictor %.3f mm >= "
+          "judged %.3f mm" % (pred, judged))
 
 
 def _main():
