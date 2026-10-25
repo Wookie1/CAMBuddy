@@ -44,6 +44,24 @@ _ORIENTATION = {"type": "string",
                 "default": "as_modeled",
                 "title": "Orientation"}
 
+# task (e): the work origin. The runner moves the oriented model so the
+# chosen point of the STOCK box (allowances applied) is X0 Y0 Z0;
+# model_origin keeps the STEP's own frame (no move).
+ORIGINS = ["stock_bottom_centre", "stock_top_centre", "model_origin"]
+_ORIGIN_TEXT = ("where X0 Y0 Z0 of the program sits: stock_bottom_centre = "
+                "centre of the stock box's bottom face, stock_top_centre = "
+                "centre of its top face (both after orientation and stock "
+                "allowances), model_origin = the STEP model's own origin")
+_ORIGIN = {"type": "string", "enum": ORIGINS,
+           "default": "stock_bottom_centre", "title": "Work origin",
+           "description": _ORIGIN_TEXT}
+# check_program judges a program that was posted elsewhere: by default in
+# the model's own frame (today's behaviour); pass the origin it was
+# posted with to judge it in that frame
+_ORIGIN_CHECK = dict(_ORIGIN, default="model_origin",
+                     description=_ORIGIN_TEXT + "; give the origin the "
+                     "program was posted with (default model_origin)")
+
 _DOCUMENT_ID = {"type": "string", "maxLength": 128,
                 "title": "STEVE document id",
                 "description": "applies this document's job tool "
@@ -134,6 +152,7 @@ ROUGHING_ACTION = {
             "model": {"x-steve": "file", "format": "step",
                       "title": "STEP model"},
             "orientation": _ORIENTATION,
+            "origin": _ORIGIN,
             **_STOCK_INPUTS,
             **{k: v for k, v in _ROUGHING_INPUTS.items()},
             **_CUTTING_INPUTS,
@@ -174,6 +193,7 @@ SLOPE_ACTION_SPEC = {
             "model": {"x-steve": "file", "format": "step",
                       "title": "STEP model"},
             "orientation": _ORIENTATION,
+            "origin": _ORIGIN,
             **_STOCK_INPUTS,
             # finishing tool (ball) + cutting data
             "tool_diameter": {"type": "number", "minimum": 1.0,
@@ -259,6 +279,7 @@ CHECK_ACTION_SPEC = {
             "model": {"x-steve": "file", "format": "step",
                       "title": "STEP model"},
             "orientation": _ORIENTATION,
+            "origin": _ORIGIN_CHECK,
             **{k: v for k, v in _STOCK_INPUTS.items() if k != "floor_z"},
             "tool_number": {"type": "integer", "minimum": 1,
                             "maximum": 999,

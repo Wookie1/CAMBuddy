@@ -170,3 +170,48 @@ T word through the effective table.
   levels region 0 mm2) - same on as_modeled, not an orientation bug. The
   fixture is now box_turn.step (block with a pocket that faces up after
   rot_x_90). E2E re-run is queued behind the merge gate (slot_m4).
+
+## (e) Work origin
+- Input `origin` (enum stock_bottom_centre | stock_top_centre |
+  model_origin) on adaptive_rough + slope_split_finish (default
+  stock_bottom_centre), check_program (default **model_origin**, see
+  deviation below) and in job.setup (`setup.origin`).
+- Engine (outside connector/, exactly): engine/cli.py - new pure
+  `origin_offset(stock, origin)` + `ORIGINS`/`ORIGIN_EPS`, `prepare
+  --origin` (CLI default model_origin = unchanged for every other caller);
+  after the stock box is built, a non-zero offset (> 1e-4 mm) re-runs
+  engine/_orient.py with new env TRANSLATE to move the oriented STEP, and
+  the stock box is rebuilt from the moved bbox; prepare.json gains
+  `origin` + `origin_offset`. engine/_orient.py - optional TRANSLATE.
+  Below 1e-4 mm nothing is moved, so a model already in the chosen frame
+  keeps today's exact STEP.
+- Runner passes `--origin` to every prepare (rough, slope, check;
+  model.measure stays in the model frame); results gain `origin` and
+  `origin_offset_mm`.
+- Deviation 1 (check_program default model_origin): the existing
+  check_program E2E fixtures (check_ok.nc etc.) were posted in the
+  synth_pocket model frame (part z 0..12, stock bottom -1). Judged at
+  stock_bottom_centre the model moves +1 mm in Z and the top skim at
+  Z12.05 would sit 0.95 mm inside the part (13.0 top). Existing tests
+  cannot change, and a STEVE-posted program is in the frame it was
+  posted with, so check_program defaults to model_origin and takes
+  `origin` to judge in another frame.
+- Deviation 2 (header line HELD): the only existing post comment
+  parameter is `--op-name` (posted as `(<OP NAME>)`); using it changes the
+  posted bytes, which contradicts byte identity at the default. Held, no
+  edit to engine/post_lnc.py.
+- Byte identity note: synth_pocket (z 0..12) and samples/test_block.step
+  (bbox x -50..50, y -40..40, z 0..35) are XY-centred with Z0 at the PART
+  bottom; at the default origin they only stay byte-identical when
+  stock_bottom = 0 (else everything moves up by stock_bottom). TB pair
+  (stock_bottom 0 and 1) vs main 681f551 is queued; CF needs your setup
+  STEP path and runner inputs (not searched, nothing committed).
+- Fast tests: `test_e_*` (offset math for all 3 origins, catalog, runner
+  argv). Injected fault (`test_e_injected_fault_is_measured`): a Z offset
+  0.5 mm off -> frame check misses by 0.5 mm. E2E `TestWorkOriginE2E`
+  (box_origin.step: off-centre, Z0 at its top, pocket on top): stock box
+  in result and in zmap's check.json within 1e-3 mm for each origin,
+  the posted program moves by exactly the offset, the same check on real
+  data with a 0.5 mm wrong expectation measures 0.5 mm, and check_program
+  passes the bottom-centre program at stock_bottom_centre and fails it at
+  model_origin.

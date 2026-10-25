@@ -37,6 +37,25 @@ def stock_box(bbox, sx, sy, top, bottom):
             pzmin - bottom, pzmax + top]
 
 
+ORIGINS = ("stock_bottom_centre", "stock_top_centre", "model_origin")
+# below this (mm, under every post's output resolution) no translation is
+# applied: a model already in the chosen frame keeps today's exact STEP
+ORIGIN_EPS = 1e-4
+
+
+def origin_offset(stock, origin):
+    """Task (e): the translation (dx, dy, dz) mm that puts the chosen point
+    of the stock box at (0, 0, 0): its XY centre at the bottom or the top
+    face; model_origin keeps the model's own frame (0, 0, 0). Pure."""
+    if origin == "model_origin":
+        return (0.0, 0.0, 0.0)
+    if origin not in ORIGINS:
+        raise ValueError("unknown origin %r" % (origin,))
+    x0, x1, y0, y1, z0, z1 = stock
+    z = z0 if origin == "stock_bottom_centre" else z1
+    return (-(x0 + x1) / 2.0, -(y0 + y1) / 2.0, -z)
+
+
 def _run_post(a):
     """python -m engine.cli post --in <neutral/engine> --out F [options]"""
     from engine import post_lnc
@@ -104,6 +123,28 @@ def _run_prepare(a):
     except ValueError as e:
         raise SystemExit(str(e))
 
+    # task (e): work origin - move the oriented model so the chosen stock
+    # point is (0, 0, 0), then rebuild the stock box from the moved bbox
+    offset = origin_offset(stock, a.origin)
+    if max(abs(v) for v in offset) > ORIGIN_EPS:
+        moved = os.path.join(a.out_dir, "model_moved.step")
+        env = dict(os.environ, STEP_IN=step_out, STEP_OUT=moved,
+                   ORIENT="as_modeled", META_OUT=meta_out,
+                   TRANSLATE="%.9f %.9f %.9f" % offset)
+        os.remove(meta_out)
+        r = subprocess.run([model.freecadcmd(),
+                            os.path.join(here, "_orient.py")],
+                           env=env, capture_output=True, text=True)
+        if not os.path.exists(meta_out):
+            raise SystemExit("origin move failed: %s\n%s"
+                             % (r.stdout[-1500:], r.stderr[-1500:]))
+        os.replace(moved, step_out)
+        with open(meta_out) as fh:
+            bbox = json.load(fh)["bbox"]
+        stock = stock_box(bbox, sx, sy, a.stock_top, a.stock_bottom)
+    else:
+        offset = (0.0, 0.0, 0.0)
+
     prog(0.4, "rasterising part heightfield")
     # task HC: never accept a stale part_hf.npy from a reused out dir -
     # remove it (and its sidecar) first, then require both to exist and
@@ -125,7 +166,8 @@ def _run_prepare(a):
                                           r.stderr[-1500:]))
 
     out = {"step": step_out, "hf": hf_out, "bbox": bbox, "stock": stock,
-           "orient": a.orient}
+           "orient": a.orient, "origin": a.origin,
+           "origin_offset": list(offset)}
     with open(os.path.join(a.out_dir, "prepare.json"), "w") as fh:
         json.dump(out, fh, indent=2)
     prog(1.0, "prepared")
@@ -231,6 +273,9 @@ def main(argv=None):
                     choices=("as_modeled", "flip_x_180", "flip_y_180",
                            "flip_z_180", "rot_x_90", "rot_x_270",
                            "rot_y_90", "rot_y_270"))
+    pr.add_argument("--origin", default="model_origin", choices=ORIGINS,
+                    help="work origin: the stock point moved to (0,0,0) "
+                         "(default model_origin: the model's own frame)")
     pr.add_argument("--stock-xy", dest="stock_xy", type=float, default=1.0,
                    help="XY stock offset per side mm")
     pr.add_argument("--stock-x", dest="stock_x", type=float, default=None,

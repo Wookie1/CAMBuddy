@@ -249,8 +249,8 @@ def job_get(home, doc_id):
 
 # job.setup (track 2 c): the setup fields, validated against the cutting
 # actions' own catalog specs (mm values). blank = raw blank size or null.
-SETUP_FIELDS = ("orientation", "units", "stock_xy", "stock_x", "stock_y",
-                "stock_top", "stock_bottom", "floor_z")
+SETUP_FIELDS = ("orientation", "origin", "units", "stock_xy", "stock_x",
+                "stock_y", "stock_top", "stock_bottom", "floor_z")
 
 
 def _validate_setup(setup):

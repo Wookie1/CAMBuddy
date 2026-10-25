@@ -2953,7 +2953,7 @@ class TestOrientationE2E:
         mock, home, _ = live
         mock.enqueue_run(1630, inputs=dict(
             GOOD_INPUTS, model=box_input(mock, BOX_TURN_STEP),
-            orientation="rot_x_90", floor_z=1.0, program_number=1630))
+            orientation="rot_x_90", program_number=1630))
         final, body = _final_body(mock, 1630, timeout=900)
         assert final == "succeeded", body
         r = body["result"]
@@ -2965,3 +2965,113 @@ class TestOrientationE2E:
         assert [sb[1] - sb[0], sb[3] - sb[2], sb[5] - sb[4]] == \
             pytest.approx([62.0, 26.0, 31.4], abs=1e-3)
         assert r["cut_length_mm"] > 100
+
+
+ORIGIN_STEP = os.path.join(HERE, "testdata", "box_origin.step")
+# box_origin.step: 60 x 30 x 24 mm block off-centre (x 5..65, y -3..27)
+# drawn with Z0 at its top (z -24..0), a 30 x 16 x 6 mm pocket on top.
+# With GOOD_INPUTS allowances (xy 1, top 0.4, bottom 1) the stock box is:
+ORIGIN_EXPECT = {
+    "stock_bottom_centre": [-31.0, 31.0, -16.0, 16.0, 0.0, 25.4],
+    "stock_top_centre": [-31.0, 31.0, -16.0, 16.0, -25.4, 0.0],
+    "model_origin": [4.0, 66.0, -4.0, 28.0, -25.0, 0.4]}
+
+
+def _program_frame(path):
+    """(header ZMIN, centre X, centre Y of the G1 moves) of a posted
+    program (mm programs)."""
+    text = open(path).read()
+    zmin = float(re.search(r"ZMIN=(-?[0-9.]+)", text).group(1))
+    xs, ys, x, y, mode = [], [], None, None, None
+    for line in text.splitlines():
+        body = re.sub(r"\([^)]*\)", "", line)
+        g = re.findall(r"\bG0?([0-3])\b", body)
+        if g:
+            mode = g[-1]
+        mx = re.search(r"X(-?[0-9.]+)", body)
+        my = re.search(r"Y(-?[0-9.]+)", body)
+        x = float(mx.group(1)) if mx else x
+        y = float(my.group(1)) if my else y
+        if mode in ("1", "2", "3") and (mx or my):
+            xs.append(x)
+            ys.append(y)
+    return zmin, (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+
+
+class TestWorkOriginE2E:
+    """Track 2 (e): for each origin the stock box zmap judged sits where
+    expected within 0.001 mm, the posted program moves by exactly the same
+    offset, and check_program judges a program in the frame it was posted
+    with."""
+
+    def test_origins(self, live, tmp_path):
+        mock, home, _ = live
+        frames, worst = {}, 0.0
+        for i, origin in enumerate(sorted(ORIGIN_EXPECT)):
+            rid = 1700 + i
+            mock.enqueue_run(rid, inputs=dict(
+                GOOD_INPUTS, model=box_input(mock, ORIGIN_STEP),
+                origin=origin, program_number=1700 + i))
+            final, body = _final_body(mock, rid, timeout=900)
+            assert final == "succeeded", (origin, body)
+            r = body["result"]
+            assert r["origin"] == origin
+            with open(home / "runs" / str(rid) / "check.json") as fh:
+                judged = json.load(fh)["stock_box"]
+            for box in (r["stock_box_mm"], judged):
+                err = max(abs(a - b) for a, b in
+                          zip(box, ORIGIN_EXPECT[origin]))
+                worst = max(worst, err)
+                assert err < 1e-3, (origin, box)
+            frames[origin] = _program_frame(home / "runs" / str(rid) /
+                                            "rough.nc")
+        E2E["origin_worst_mm"] = worst
+        # the program itself moved by the stock-frame offset
+        m = frames["model_origin"]
+        for origin in ("stock_bottom_centre", "stock_top_centre"):
+            d = [a - b for a, b in zip(ORIGIN_EXPECT[origin],
+                                       ORIGIN_EXPECT["model_origin"])]
+            want = (m[0] + d[4], m[1] + d[0], m[2] + d[2])
+            assert frames[origin] == pytest.approx(want, abs=1e-3), origin
+        # injected fault on the real data: a 0.5 mm wrong Z expectation is
+        # measured as exactly 0.5 mm
+        wrong = list(ORIGIN_EXPECT["stock_bottom_centre"])
+        wrong[4] += 0.5
+        wrong[5] += 0.5
+        with open(home / "runs" / "1701" / "check.json") as fh:
+            judged = json.load(fh)["stock_box"]
+        assert max(abs(a - b) for a, b in zip(judged, wrong)) == \
+            pytest.approx(0.5, abs=1e-3)
+
+        # check_program on the stock_bottom_centre program: judged in its
+        # own frame it passes; judged in the model frame it does not
+        serve = tmp_path / "serve"
+        serve.mkdir()
+        import shutil
+        shutil.copy(home / "runs" / "1701" / "rough.nc",
+                    serve / "origin_rough.nc")
+        shutil.copy(ORIGIN_STEP, serve / "box_origin.step")
+        old = mock.serve_dir
+        mock.serve_dir = str(serve)
+        try:
+            for rid, origin in ((1710, "stock_bottom_centre"),
+                                (1711, "model_origin")):
+                prog = program_input(mock, "check_ok.nc")
+                data = (serve / "origin_rough.nc").read_bytes()
+                prog.update({"name": "origin_rough.nc",
+                             "sha256": hashlib.sha256(data).hexdigest(),
+                             "bytes": len(data),
+                             "url": mock.base_url + "/files/origin_rough.nc"})
+                mock.enqueue_run(rid, action=catalog_mod.CHECK_ACTION,
+                                 inputs=dict(CHECK_INPUTS,
+                                             model=box_input(mock,
+                                                             ORIGIN_STEP),
+                                             program=prog, origin=origin))
+                final, body = _final_body(mock, rid, timeout=900)
+                if origin == "stock_bottom_centre":
+                    assert final == "succeeded", body
+                    assert body["result"]["zmap_gouges"]["count"] == 0
+                else:
+                    assert final == "failed", body
+        finally:
+            mock.serve_dir = old

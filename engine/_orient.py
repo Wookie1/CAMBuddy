@@ -5,7 +5,8 @@ the part bbox centre) and export it.
 Run under freecadcmd. Env: STEP_IN, STEP_OUT, ORIENT
 (as_modeled|flip_x_180|flip_y_180|flip_z_180|rot_x_90|rot_x_270|rot_y_90|
 rot_y_270), META_OUT (json with bbox). Angles follow the right-hand rule
-(rot_x_90 carries +Y to +Z, rot_y_90 carries +Z to +X).
+(rot_x_90 carries +Y to +Z, rot_y_90 carries +Z to +X). Optional TRANSLATE
+"dx dy dz" (mm) moves the oriented shape afterwards (work origin, task e).
 """
 import json
 import math
@@ -42,6 +43,10 @@ if orient != "as_modeled":
     centre, axis, angle = axes[orient]
     shape = shape.rotate(FreeCAD.Vector(*centre), FreeCAD.Vector(*axis),
                          angle)
+
+if os.environ.get("TRANSLATE"):
+    dx, dy, dz = (float(v) for v in os.environ["TRANSLATE"].split())
+    shape.translate(FreeCAD.Vector(dx, dy, dz))
 
 os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
 shape.exportStep(out)

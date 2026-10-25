@@ -157,7 +157,8 @@ def test_b_runner_measure_uses_prepare(tmp_path, monkeypatch):
 import json  # noqa: E402
 import toollib  # noqa: E402
 
-SETUP = {"orientation": "flip_x_180", "units": "inch", "stock_xy": 1.0,
+SETUP = {"orientation": "flip_x_180", "origin": "stock_top_centre",
+         "units": "inch", "stock_xy": 1.0,
          "stock_x": 2.286, "stock_y": None, "stock_top": 0.5,
          "stock_bottom": 1.5, "floor_z": 4.0,
          "blank": {"x": 60.0, "y": 40.0, "z": 25.0}}
@@ -188,7 +189,8 @@ def test_c_setup_round_trip_and_coexists_with_renumber(home):
 
 def test_c_setup_defaults_fill_omitted_fields(home):
     job = toollib.set_setup(home, "doc-d", {"orientation": "as_modeled"})
-    assert job["setup"] == {"orientation": "as_modeled", "units": "inch",
+    assert job["setup"] == {"orientation": "as_modeled",
+                            "origin": "stock_bottom_centre", "units": "inch",
                             "stock_xy": 1.0, "stock_x": None,
                             "stock_y": None, "stock_top": 1.0,
                             "stock_bottom": 1.0, "floor_z": 0.0,
@@ -244,3 +246,74 @@ def test_b_measure_inputs_get_no_document_fallback():
         {"model": {"document": {"id": "doc-x"}}}, catalog_mod.MEASURE_ACTION)
     assert ok, (code, v)
     assert "document_id" not in v
+
+
+# ------------------------------------------------------ (e) work origin --
+
+from engine.cli import origin_offset, ORIGINS  # noqa: E402
+
+# box_origin.step with GOOD-style allowances (xy 1, top 0.4, bottom 1):
+# model frame stock box (part x 5..65, y -3..27, z -24..0, Z0 at its top)
+STOCK_MODEL = [4.0, 66.0, -4.0, 28.0, -25.0, 0.4]
+EXPECT = {"stock_bottom_centre": [-31.0, 31.0, -16.0, 16.0, 0.0, 25.4],
+          "stock_top_centre": [-31.0, 31.0, -16.0, 16.0, -25.4, 0.0],
+          "model_origin": STOCK_MODEL}
+
+
+def frame_error(stock_box, origin):
+    """max |stock box - where `origin` must put it| (mm)."""
+    return max(abs(a - b) for a, b in zip(stock_box, EXPECT[origin]))
+
+
+def _shift(box, d):
+    return [box[0] + d[0], box[1] + d[0], box[2] + d[1], box[3] + d[1],
+            box[4] + d[2], box[5] + d[2]]
+
+
+def test_e_origin_offset_places_stock():
+    assert tuple(ORIGINS) == tuple(catalog_mod.ORIGINS)
+    for o in ORIGINS:
+        moved = _shift(STOCK_MODEL, origin_offset(STOCK_MODEL, o))
+        assert frame_error(moved, o) < 1e-9, o
+
+
+def test_e_injected_fault_is_measured():
+    """Fault: a Z offset 0.5 mm off. The frame check misses by 0.5 mm."""
+    d = origin_offset(STOCK_MODEL, "stock_bottom_centre")
+    moved = _shift(STOCK_MODEL, (d[0], d[1], d[2] + 0.5))
+    assert frame_error(moved, "stock_bottom_centre") == pytest.approx(0.5)
+
+
+def test_e_catalog_origin_inputs():
+    for name, default in ((catalog_mod.ACTION, "stock_bottom_centre"),
+                          (catalog_mod.SLOPE_ACTION, "stock_bottom_centre"),
+                          (catalog_mod.CHECK_ACTION, "model_origin")):
+        p = catalog_mod.get_action(name)["inputs"]["properties"]
+        assert p["origin"]["enum"] == ["stock_bottom_centre",
+                                       "stock_top_centre", "model_origin"]
+        assert p["origin"]["default"] == default, name
+        assert len(p) <= 30
+    ok, code, v = catalog_mod.validate_inputs({"model": "m"},
+                                              catalog_mod.ACTION)
+    assert ok and v["origin"] == "stock_bottom_centre"
+    ok, code, _ = catalog_mod.validate_inputs(
+        {"model": "m", "origin": "corner"}, catalog_mod.ACTION)
+    assert not ok and code == "input_out_of_range"
+
+
+def test_e_runner_passes_origin_to_prepare(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner_mod.EngineRun, "_spawn", _fake_spawn(calls))
+    monkeypatch.setattr(runner_mod, "posted_units", lambda path, req: req)
+    cfg = {"engine_python": PY, "repo_root": REPO}
+    ok, code, v = connector_mod.prepare_values(
+        dict(INCH_NO_UNITS, origin="stock_top_centre"), catalog_mod.ACTION)
+    assert ok, v
+    runner_mod.EngineRun(cfg, str(tmp_path / "r")).run(STEP, v)
+    prep = [a for a in calls if "prepare" in a][0]
+    assert prep[prep.index("--origin") + 1] == "stock_top_centre"
+    calls.clear()
+    with pytest.raises(KeyError):  # the fake prepare writes no bbox
+        runner_mod.EngineRun(cfg, str(tmp_path / "m")).run_measure(
+            STEP, {"orientation": "as_modeled"})
+    assert "--origin" not in calls[0]  # measure: the model's own frame
