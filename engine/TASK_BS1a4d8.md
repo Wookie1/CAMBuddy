@@ -49,19 +49,22 @@ but these cutting-feed (F3429) windows are judged far over 2.44:
 0. CAUSE FIRST, per arrival (64232/64233, 233705/233706, 82422, 258545, 104980, and the 7 starts not found): how the
    piece is entered (own-region more_pcs entry, rotated pc[1], inter-piece link, entry ladder), WHICH code emits the
    straight cutting-feed move into it (file:line), which _simulate call (if any) predicted it, with which entry= and
-   approach, and why window 0 missed it. Measure on the real CF inputs (the CLI recipe below), not by reading.
+   approach, and why window 0 missed it. Add entry=/approach logging at EVERY _simulate call site (band.py and rough.py)
+   for this - it also settles the off-by-one window counts below. Measure on the real CF inputs (the CLI recipe below), not by reading.
    CF rough recipe (same as the supervisor's): engine.cli rough --step samples/core_front_setup.step --stock -128.651
    128.651 -82.55 82.55 0.0 60.96 --tool flat:12.686:0.0 --floor 24.765 --leave 0.381 --stepdown 19.05
    --optimal-load-mm 2.032 --stepup 1.905 --hf /Users/James/ai-sandbox/stevecam/out/core_front_setup_hf.npy --min-rest
    0.5 (a FULL CF rough takes ~15 min: at most ONE full run, through slot_m4.sh; prefer a crop, item 2).
-1. Rule: no emitted piece may arrive sideways at cutting feed into standing stock unless that arrival move is
-   simulated (approach included) and predicted <= the limits. Otherwise the piece gets a proper entry: enter_at with a
-   helix or ramp at entry feed, as for any region (or a lift + re-entry instead of a straight link). The predictor
-   mirrors whatever is emitted.
+1. Rule: a move at cutting feed between pieces or regions (and a piece's arrival feed-in) is allowed ONLY if it is
+   simulated through the LIVE stock (approach included) and predicted within the limits. Otherwise it becomes: lift ->
+   rapid at clearance -> a proper entry at the next piece (enter_at with a helix or ramp at entry feed, as for any
+   region). The predictor mirrors whatever is emitted.
 2. NEW test: L does not reproduce this, so build a small CF CROP scene around the failing arrivals - stock window and Z
    range around (1.67, 10.78) and (26.76, 13.43) at Z 42.354, from the CF inputs (out/ fixtures, never committed) -
    deterministic and fast (< ~2 min). Assert the judged (verify/zmap) first-window ae_eff <= 2.44 for every own-region
-   or rotated piece there, and that no cutting-feed move links two pieces through standing stock. Print the values.
-   Mutation (scratch copy, revert): today's arrival path; the test must fail by the measured ae_eff (~9.3). Record it.
+   or rotated piece there. The crop MUST contain the 64232 -> 64233 link case. Assert: no cutting-feed move on the crop
+   has a judged window over 2.44, and the inter-piece transition there is a lift plus an entry (measured from the
+   emitted moves). Print the values. Mutation (scratch copy, revert): restore the straight link; the test must fail by
+   the measured ae_eff (~9.3) and a (~18.6). Record both.
 ## engine/BS1a4d6_RESULTS.md "BS1a4d8": item 0 per arrival, the change with file:line, line count vs f81eaa7, PASTED exit
 codes of all at-risk tests + the new test, the mutation output, git diff --numstat. Then stop.
