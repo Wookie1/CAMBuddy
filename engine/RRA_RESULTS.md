@@ -407,3 +407,137 @@ git diff --numstat (working tree): engine/test_engine.py 6 added / 3 removed
 (9 changed lines, budget <= 20); engine/RRA_RESULTS.md (this record).
 opencode.json was already modified before this session and was NOT touched.
 Nothing committed.
+
+## RR1c5g
+
+Session start: Sun Oct 25 09:10 MST 2026. HEAD = 779990f (RR1c5g brief) on ec73844 (RR1c5f). Branch rr1b.
+
+### Cause-first: facts table (from brief, supervisor @ ec73844, scratch mutant engine/rest_rough.py:760 `c = ae - hch`)
+
+The test runs TWO zmap sims: the gate (_rr1c5b_zmap_gate, grid origin pad-corrected = -2.0) and the vacuity
+guard (inline zmap.simulate with origin 0.0, 0.0). "deep" = windows at >= 0.9 x 2280 feed with a > 0.5.
+
+| chord line | gate sim: deep / max a(feed) / over 2.286 / full-width | guard sim: deep / max ae_eff / over / full-width / max a | test |
+|---|---|---|---|
+| c = ae - hch (clean) | 0 / 0.145 / 0.0 mm / 0 | 2 / 17.250 / 2.0 mm / 1 / 1.095 | PASS |
+| c = ae | 0 / 0.019 / 0.0 / 0 | 0 / - / 0.0 / 0 / 0.082 | FAIL at vacuity guard only |
+| c = ae + hch (worse) | 0 / 0.179 / 0.0 / 0 | 1 / 14.435 / 6.2 mm / 1 / 1.445 | PASS (gate never sees it) |
+
+Cause: the guard's grid is shifted 2 mm against the padded part/stock, so the tool appears to cut stock that is
+not there (14-17 mm "full-width" windows even on the clean tree). On the correctly registered grid the ec73844
+scene has NO deep cutting-feed window: the test is still vacuous, and a worse slab cannot fail it.
+
+### Plan
+1. Shared origin helper for the pad-corrected grid origin; call it from _rr1c5b_zmap_gate and the inline guard.
+   Table both sims' numbers (deep, max a feed, max ae_eff) before/after.
+2. Re-scope the scene (replace ec73844's pocket A top 27.0) so the GATE sim has >= 1 deep window and
+   stats["rr_clmn_ladder"] >= 1, gate still passes clean. Scene table.
+3. Mutation c = ae + hch in a scratch copy of engine/rest_rough.py -> test must FAIL at the slab threshold
+   (over 2.286 or full-width) with deep >= 1. Real engine untouched.
+
+### Log
+(append after every test run)
+- 09:15 baseline probe (scratch/rr1c5g_probe.py, slot lane) exit 0: reproduces facts table exactly.
+  gate SIM#1 deep=0 maxa_feed=0.145 over=0 fw=0; guard SIM#2 deep=2 maxa=1.095 over=2.0 fw=1; test PASS.
+- Mechanism understood: a window is "deep" (a>0.5) only if a 2280-FEED horizontal move removes a >0.5 mm column.
+  ALL engine entries (helix bore, in-pass ramp, SE2 side-entry, direct descent, links) run at ramp_feed 850 and are
+  excluded from the cutting-feed windows; the 2280 rings only trim what the 850 entries pre-cut (max 0.145).
+  Chord-offset front-1 at c0=ae-hch keeps engagement ~ae wide AND ~0.1 deep BY DESIGN.
+  => a deep CLEAN window needs a1 ~0.55-1.2 (front-1 column a1-dz(|c0|) > 0.5) with the cleared channel wide
+  enough for CL at |c0| inside cleared ground (>= R from full-height walls), and NO second raw-engaging front
+  (successive fronts at ae spacing re-widen the band to ae/2+hch > 2.286 -> clean gate would fail).
+- scan TOP_A only (25.4..28.2): deep=0 everywhere (bore sweep / ramps pre-cut everything); ladder=0 for single-level A.
+
+### Item 1 DONE - before/after origin table (both sims, ec73844 scene, slot lane)
+
+| sim | origin before | origin after | deep | max a (feed) | max ae_eff (a>0.5) | over | fw |
+|---|---|---|---|---|---|---|---|
+| gate (_rr1c5b_zmap_gate) BEFORE | (-2.0, -2.0) | - | 0 | 0.145 | 0.000 | 0.0 | 0 |
+| guard (inline vacuity assert) BEFORE | (0.0, 0.0) | - | 2 | 1.095 | 17.250 | 2.0 mm | 1 |
+| gate AFTER fix | (-2.0, -2.0) | (-2.0, -2.0) | 0 | 0.145 | 0.000 | 0.0 | 0 |
+| guard AFTER fix | - | (-2.0, -2.0) | 0 | 0.145 | 0.000 | 0.0 | 0 |
+
+After the fix the guard's numbers EQUAL the gate's (scratch/rr1c5g_probe_after.out: SIM#1 and SIM#2 lines are
+identical: windows=67 feed=48 deep=0 maxa_feed=0.145 maxa_all=0.154 over=0.0mm fw=0). The 14-17 mm phantom
+"full-width" windows are gone - they were the 2 mm grid misregistration cutting stock that is not there.
+
+### Item 2 NOT ACHIEVABLE - scenes tried (gate sim on the ALIGNED grid; every run through slot_m4.sh)
+
+| scene knob (pocket A unless noted) | zones | ladder | gouge | deep | over | fw | max a (feed) |
+|---|---|---|---|---|---|---|---|
+| ec73844 baseline top 27.0 | 2 | 3 | 0 | 0 | 0.0 | 0 | 0.145 |
+| top 25.4 / 25.8 / 26.0 / 26.2 / 26.4 / 26.6 | 2 | 0 | 0 | 0 | 0.0 | 0 | 0.052-0.119 |
+| top 26.8 (single level) | 2 | 0 | 0 | 0 | 0.0 | 0 | 0.133 |
+| top 27.2 / 27.35 / 27.4 | 2 | 4 | 0 | 0 | 0.0 | 0 | 0.158-0.168 |
+| top 27.55 (old docstring value) | 2 | 2 | 0 | 0 | 0.0 | 0 | 0.190 |
+| top 27.8 / 28.2 / 28.5 | 2 | 2-4 | 0 | 0 | 0.0 | 0 | 0.247-0.303 |
+| top 29.5 | 2 | 0 | 0 | 0 | 0.0 | 0 | 0.058 |
+| west wall 4.0 / 2.0 x top 25.5-27.0 (wide cleared channel, 15 scenes) | 2 | 0-4 | - | 0 | 0.0 | 0 | 0.000 |
+
+Why NO scene of this family can work (mechanism, verified by replay scratch/rr1c5g_replay.py + ML trace):
+1. A window is deep (a > 0.5) only when a 2280-feed horizontal move removes a > 0.5 mm column. EVERY engine
+   entry (helix bore, in-pass ramp, SE2 side-entry, direct descent, ring links) runs at ramp_feed 850 and is
+   excluded from the cutting-feed windows; each such entry pre-shaves the wall it passes through, so the 2280
+   rings that follow trim at most ~0.15-0.3 mm.
+2. The chord-offset front-1 (c0 = ae - hch) is DESIGNED so its engagement is ~ae wide and its removed column
+   a1 - dz(|c0|) stays small; a deep front-1 (a1 >= ~0.55) additionally needs CL |c0| up to ~2 mm INSIDE the
+   cleared channel, which needs >= R + |c0| of legal CL between the cleared edge and the full-height frame wall
+   (pocket A's 6 mm channel admits |c0| < 0.24).
+3. If a deep front-1 IS placed, the NEXT front (spacing ae) bites the raw face with the SAME column > 0.5 over
+   a band ae/2 + hch >= 3.2 mm > 2.286 -> the CLEAN gate fails at the slab threshold too. Deep-clean-without-over
+   requires exactly one raw-engaging front whose entry ladder succeeds while all later fronts see only pre-cut
+   stock - unreachable from scene values alone.
+=> Brief item 4 invoked: STOP; nothing changed beyond item 1. (No scene was stacked: engine/test_engine.py
+scene values are byte-identical to ec73844.)
+
+### Item 3 - mutation on the aligned grid (scratch/rr1c5g_rr_mut.py ONLY, c = ae + hch at the :760 line; real engine untouched - git diff engine/rest_rough.py empty)
+
+    MUTATION RESULT: FAIL at VACUITY GUARD: no deep cutting-feed windows: gate would be vacuous
+    MUT_EXIT=4
+
+The worsening still fails ONLY at the vacuity guard (deep count = 0, gate over = 0.0 mm, fw = 0 - the supervisor
+facts' gate column reproduced), i.e. NOT at the slab threshold, exactly as the brief predicted for a vacuous
+scene. Failing at the vacuity guard does not count; no scene tried changes that (item 2 table).
+
+### Item 1 change (test-only; engine/verify/opencode.json untouched)
+
+- engine/test_engine.py:1946-1953  NEW helper _rr1c5b_zmap_origin(part, cell, box) - the ONE pad-corrected
+  ZE2B grid origin (moved out of _rr1c5b_zmap_gate verbatim).
+- engine/test_engine.py:1966      _rr1c5b_zmap_gate now calls the helper (its old 2-line formula deleted).
+- engine/test_engine.py:1828-1832 the inline vacuity-guard zmap.simulate calls the SAME helper instead of
+  hardcoded 0.0, 0.0. Thresholds (2.286, a > 0.5, 0.9 x feed) and the vacuity assert untouched.
+- Changed lines vs ec73844: 14 insertions / 3 deletions in engine/test_engine.py (<= 25 budget).
+
+### At-risk test runs AFTER the fix (every command foreground through slot_m4.sh; scratch/rr1c5g_atrisk.py)
+
+    ATRISK_EXIT=1
+    RESULT test_rr1c5d_front1_chord_offset_slabs         FAIL: AssertionError('no deep cutting-feed windows: gate would be vacuous')
+    RESULT test_rr1c5b_varying_width_band_fronts         PASS
+    RESULT test_rr1c5b_open_edge_proud_block             PASS
+    RESULT test_rr1c5b_mixed_band_core_front             PASS
+    RESULT test_rra2_deep_top_scope                      PASS
+    RESULT test_rra3_straight_descent_scope              PASS
+    RESULT test_rr1c3_bay_deep_groove_top_down           PASS
+    RESULT test_rr1c_thin_band_inpass_ramp               PASS
+    RESULT test_rr1c_narrow_pocket_side_entry            PASS
+    RESULT test_rr1c5d_live_grid_fine_for_coarse_stock   PASS
+    TOTAL 9/10 passed
+
+(The other _rr1c5b_zmap_gate callers are exactly the three test_rr1c5b_* tests above - grep -n
+_rr1c5b_zmap_gate: def at :1954, callers at :1826, :2115, :2160, :2252.)
+
+test_rr1c5d_front1_chord_offset_slabs now FAILS at the vacuity assert. That failure IS the finding: on the
+correctly registered grid the ec73844 scene has no deep cutting-feed window, so the gate is vacuous and no
+worsening chord line can fail it at the slab threshold (item 3 above). Per brief item 4 nothing beyond the
+origin fix was changed; the scene and all thresholds are ec73844's.
+
+### Final size (git diff --numstat, before this heredoc)
+
+    40	0	engine/RRA_RESULTS.md   (this RR1c5g section appended; earlier sections untouched)
+    14	3	engine/test_engine.py
+    23	2	opencode.json           (pre-existing user change, NOT touched this session)
+
+Scratch (all under scratch/): rr1c5g_probe.py, rr1c5g_scene.py, rr1c5g_scan.py, rr1c5g_scan2.py,
+rr1c5g_replay.py, rr1c5g_atrisk.py, rr1c5g_mut_run.py, rr1c5g_rr_mut.py + .out files. Nothing committed.
+Lane note: one scan invocation exceeded the 15-min shell timeout (validate_exact on pathological wide-channel
+scenes); the slot cleared the dead owner itself; no lock was touched. Subsequent scans dropped validate_exact.

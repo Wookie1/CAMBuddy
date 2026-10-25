@@ -1825,8 +1825,10 @@ def test_rr1c5d_front1_chord_offset_slabs():
                       (0.0, 52.0, 0.0, 40.0, 20.0, 28.9))
     # non-vacuous: deep cutting-feed engagement windows DO exist here
     from verify import zmap
+    _ox, _oy = _rr1c5b_zmap_origin(part, cell,
+                                   (0.0, 52.0, 0.0, 40.0, 20.0, 28.9))
     _rep = zmap.simulate(zmap.parse_gcode(moves_to_gcode(
-        moves, spindle_rpm=8000)), part, cell, 0.0, 0.0,
+        moves, spindle_rpm=8000)), part, cell, _ox, _oy,
         (0.0, 52.0, 0.0, 40.0, 20.0, 28.9), tool="ball", dia=9.525,
         stock_init=stock_init, engage_max=2.286)
     deep = [w for w in _rep["_ae2_raw"]
@@ -1941,6 +1943,16 @@ def _rr1c5b_surf(tris):
     return surf
 
 
+def _rr1c5b_zmap_origin(part, cell, box):
+    """RR1c5g: the ONE ZE2B grid origin both zmap sims use: the box corner
+    minus the symmetric pad the caller added to part/stock (the callers pad
+    part/stock by 4 cells; passing box[0]/box[2] shifted the judge's grid by
+    that pad, so the tool cut stock that is not there)."""
+    ox = box[0] - (part.shape[1] * cell - (box[1] - box[0])) / 2.0
+    oy = box[2] - (part.shape[0] * cell - (box[3] - box[2])) / 2.0
+    return ox, oy
+
+
 def _rr1c5b_zmap_gate(moves, part, stock_init, cell, box):
     """ZE2B load bar (verify/zmap.py read-only, padded part grid): 0 mm of
     wide slots over engage-max 2.286 and 0 full-width windows at cutting
@@ -1951,8 +1963,7 @@ def _rr1c5b_zmap_gate(moves, part, stock_init, cell, box):
     # grid origin = box corner minus the symmetric pad the caller added (the
     # callers pad part/stock by 4 cells; passing box[0]/box[2] shifted the
     # judge's grid by that pad)
-    ox = box[0] - (part.shape[1] * cell - (box[1] - box[0])) / 2.0
-    oy = box[2] - (part.shape[0] * cell - (box[3] - box[2])) / 2.0
+    ox, oy = _rr1c5b_zmap_origin(part, cell, box)
     rep = zmap.simulate(pg, part, cell, ox, oy, box, tool="ball",
                         dia=9.525, stock_init=stock_init, engage_max=2.286)
     raw = rep["_ae2_raw"]
