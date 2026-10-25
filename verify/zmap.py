@@ -2347,9 +2347,10 @@ def main(argv=None):
     p.add_argument("--out-json", default=None, help="write report JSON here")
     p.add_argument("--png", default=None, help="optional leftover heatmap PNG")
     p.add_argument("--window", action="store_true",
-                   help="only simulate/evaluate cells within 2 mm of steep "
-                        "walls (|dZ| > 1 mm between part heightfield "
-                        "neighbours); faster at fine cell sizes")
+                   help="speed option: only cells within 2 mm of steep walls "
+                        "are simulated and judged; gouges and every other "
+                        "check outside the window are NOT judged; never use "
+                        "for a gate or a verdict")
     p.add_argument("--rapid-feed", dest="rapid_feed", type=float,
                    default=RAPID_FEED,
                    help="assumed G0 feed mm/min for the cycle-time estimate")
@@ -2478,7 +2479,8 @@ def main(argv=None):
     # sidecar's "stock_box" key (never nanmin of the remaining grid)
     side_box = None
     if args.stock_in and os.path.exists(si := os.path.splitext(args.stock_in)[0] + ".json"):
-        side_box = json.load(open(si)).get("stock_box")
+        with open(si) as fh:
+            side_box = json.load(fh).get("stock_box")
         side_box = tuple(map(float, side_box)) if side_box else None
     if args.stock is not None:
         if side_box and any(abs(a - b) > 1e-6 for a, b in zip(args.stock, side_box)):
@@ -2547,7 +2549,10 @@ def main(argv=None):
         "stock_in": os.path.abspath(args.stock_in) if args.stock_in else None,
         "holder": _holder_report(args, holder_name, holder_stick),
         "cell": cell,
-        "window": ("steep walls |dZ|>1mm dilated 2mm" if args.window else None),
+        "window": ("speed option: only cells within 2 mm of steep walls are "
+                   "simulated and judged; gouges and every other check outside "
+                   "the window are NOT judged; never use for a gate or a "
+                   "verdict" if args.window else None),
         "gouges": res["gouges"],
         "part_mask": res["part_mask"],
         "below_stock_bottom": res["below_stock_bottom"] if orig_box else {

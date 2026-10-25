@@ -3084,3 +3084,24 @@ def test_zg1b_stock_out_merges_existing_sidecar(tmp_path):
     meta = json.loads((tmp_path / "stm.json").read_text())
     assert meta["x0"] == X0 and meta["y0"] == Y0 and meta["cell"] == CELL, meta
     assert meta["stock_box"] == _ZG1B_BOX, meta
+
+
+def test_zg1_window_is_speed_only_off_window_gouge_not_judged(tmp_path):
+    """ZG1 (coordinator): --window is a SPEED option that simulates and
+    judges only cells within 2 mm of steep walls. A 0.1 mm gouge on the flat
+    block top, more than 2 mm from any wall, is reported without --window
+    and NOT judged with it; the --window report says so plainly."""
+    npy = tmp_path / "blk.npy"
+    np.save(npy, block_part(hi=10.0, half=15.0))
+    (tmp_path / "blk.json").write_text(json.dumps(
+        {"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}))
+    body = "G0 X-5. Y0. Z20.\nG1 Z9.9 F100.\nG1 X5. F500.\n"
+    _rc0, plain = _zg1_cli(tmp_path, npy, body)
+    _rc1, win = _zg1_cli(tmp_path, npy, body, tool=["--window"])
+    assert plain["gouges"]["count"] >= 1, plain["gouges"]
+    assert abs(plain["gouges"]["max_depth"] - 0.1) < 1e-6, plain["gouges"]
+    assert win["gouges"]["count"] == 0, \
+        "--window restricts what is simulated: off-window gouge measured " \
+        "count %r, expected 0 (not judged)" % win["gouges"]["count"]
+    assert "NOT judged" in (win["window"] or ""), win["window"]
+    assert plain["window"] is None
