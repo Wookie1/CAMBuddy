@@ -1126,9 +1126,17 @@ class EngineRun:
             # judge heightfield this stock was computed on
             with open(os.path.splitext(hf01)[0] + ".json") as fh:
                 hf_meta = json.load(fh)
-            with open(os.path.splitext(stock_finish)[0] + ".json", "w") as fh:
-                json.dump({"x0": hf_meta["x0"], "y0": hf_meta["y0"],
-                          "cell": hf_meta["cell"]}, fh)
+            # merge, never overwrite: zmap's own sidecar carries the true
+            # stock_box the rest judge needs for its below_stock_bottom gate
+            sc = os.path.splitext(stock_finish)[0] + ".json"
+            meta = {}
+            if os.path.exists(sc):
+                with open(sc) as fh:
+                    meta = json.load(fh)
+            meta.update(x0=hf_meta["x0"], y0=hf_meta["y0"],
+                        cell=hf_meta["cell"])
+            with open(sc, "w") as fh:
+                json.dump(meta, fh)
 
             # 9a) rest finish (neutral G-code): --tool is the previous (finish)
             #     ball, --rest-tool the smaller ball that does the cutting

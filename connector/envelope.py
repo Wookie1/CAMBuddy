@@ -61,6 +61,13 @@ def program_items(program, check):
             "%.1f deg)" % (program, pl["count"],
                            pl.get("ramp_angle_deg") or 3.0),
             where={"program": program, "line": _first_line(pl)}))
+    bsb = check.get("below_stock_bottom") or {}
+    if bsb.get("status") == "unknown":
+        out.append(item(
+            "stock_bottom_unchecked", "%s: the cut below the stock bottom "
+            "was not checked (%s)" % (program, bsb.get("reason") or
+                                      "no stock box"),
+            where={"program": program}))
     for k in _REVIEW_KEYS:
         if _count(check.get(k)) > 0:
             out.append(item(k, "%s: %s = %s" % (program, k,

@@ -108,6 +108,9 @@ CODES = {
                         "its fallback strategy."),
     "failed_region_emitted": ("review", "Inspect the region the engine "
                               "could not plan cleanly before running."),
+    "stock_bottom_unchecked": ("review", "Run again; if it repeats, "
+                               "report it with the run id (the judge got "
+                               "no stock box for this program)."),
     # --- info items ---
     "area_left_for_next_op": ("info", "Plan the next operation (finish or "
                               "rest) for the stock left."),

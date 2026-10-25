@@ -102,6 +102,7 @@ rewrites this table; a test fails when it drifts).
 | `reduced_feed_windows` | review | Check the slowed sections; they cost cycle time. |
 | `credit_fallback` | review | Check the regions the engine cut with its fallback strategy. |
 | `failed_region_emitted` | review | Inspect the region the engine could not plan cleanly before running. |
+| `stock_bottom_unchecked` | review | Run again; if it repeats, report it with the run id (the judge got no stock box for this program). |
 | `area_left_for_next_op` | info | Plan the next operation (finish or rest) for the stock left. |
 | `leftover` | info | No action: leftover summary for the program. |
 | `tool_without_holder` | info | Add holder + stick-out if you will cut with it (tools.update). |
