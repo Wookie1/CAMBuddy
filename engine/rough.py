@@ -2154,10 +2154,6 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     if ew0 and max(ew0) <= AE_SPIKE and sorted(
                             ew0)[max(0, int(0.95 * len(ew0)) - 1)] <= AE_SS:
                         act = "replan0_ok"
-                    elif rb:   # BS1a4d5: a mid-segment split piece's lightest
-                        act = "plan0_splitbore_keep"   # option cannot rejoin
-                        # q4: keep it, never silent (act recorded in
-                        # credit_fallback below).
                     else:
                         # BS1a4d (a0): Fix 1's lightest option - shrink ladder
                         # at credit 0 on the LIVE stock vs drop-ring, same

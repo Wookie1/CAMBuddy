@@ -1102,7 +1102,8 @@ def _main():
                test_bs1a4d_credit_real_bore,
                test_bs1a4d2b_centred_entry_bore,
                test_bs1a4d4_credit_entry_matches_prediction,
-               test_bs1a4d4_entry_pinned_to_stored_start):
+               test_bs1a4d4_entry_pinned_to_stored_start,
+               test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load):
         try:
             fn()
         except AssertionError as e:
@@ -2303,6 +2304,87 @@ def test_bs1a4d_credit0_lightest_option():
     print("PASS bs1a4d(a0): credit-0 failures %s, listed %s" % (
         [a for a in acts if a.startswith("replan0_")],
         [(e["x"], e["y"], e["z"], e["option"], e["max_ae"]) for e in fre]))
+
+
+def test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load():
+    """BS1a4d5 (supervisor): a credited split piece whose real-bore emit
+    re-check FAILS its gate is never emitted at the failing load: it goes
+    through the re-check's own shrink ladder (like plan0_split) and is listed
+    in failed_region_emitted at its lightest option (or dropped to the ring).
+    The L scene of test_bs1a4d_credit_real_bore has plan0_splitbore pieces;
+    the test forces each one's real-bore re-check (the band._simulate call at
+    emit with the piece start and its stored bore) to read 0.75 mm over
+    AE_SPIKE. FAILS when the engine keeps the piece instead
+    (plan0_splitbore_keep): the message gives the measured overload in mm."""
+    import tempfile
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.rough import rough
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+    split, forced = {}, {}
+    _orig_cr, _orig_sim = B.channel_regions, B._simulate
+    over = B.AE_SPIKE + 0.75
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None,
+               **kw):
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats,
+                       **kw)
+        for r in res:
+            if r.get("replan0") == 2:
+                split[(round(z, 3), round(r["start"][0], 4),
+                       round(r["start"][1], 4))] = tuple(r["bore"][2:])
+        return res
+
+    def sim_spy(path, stock, z, tool_r, cell, bore_r, ends=None, **kw):
+        w = _orig_sim(path, stock, z, tool_r, cell, bore_r, ends, **kw)
+        key = (round(z, 3), round(path[0][0], 4), round(path[0][1], 4))
+        bxy = kw.get("bore_xy")
+        if bxy and key in split and max(abs(a - b) for a, b in
+                                        zip(bxy, split[key])) < 1e-9:
+            forced[key] = over          # the emit-time real-bore re-check
+            return list(w) + [over]
+        return w
+
+    B._simulate = sim_spy
+    B.channel_regions = cr_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d5.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            moves, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0,
+                                        18.0), 6.343, 0.0, leave=0.381,
+                                axial_leave=0.381, stepdown=19.05,
+                                stepup=1.905, tolerance=0.05, threads=4,
+                                stock_cell=0.5, min_rest=0.5, corner_r=0.0,
+                                stl_path=stl)
+    finally:
+        B.channel_regions = _orig_cr
+        B._simulate = _orig_sim
+    assert split, "no plan0_splitbore piece on the L scene: vacuous"
+    assert forced, "no real-bore re-check reached at emit: vacuous"
+    acts = {(z, round(x, 4), round(y, 4)): a
+            for (x, y, z, a) in stats["credit_fallback"]}
+    fre = {(f["z"], round(f["x"], 4), round(f["y"], 4))
+           for f in stats["failed_region_emitted"]}
+    for key, ae in forced.items():
+        act = acts.get(key)
+        assert act is not None and act.startswith("replan0_") \
+            and act != "replan0_ok", \
+            "split piece %r emitted at the failing load (act %r): re-check " \
+            "measured %.3f mm > AE_SPIKE %.2f, overload %.3f mm" % (
+                key, act, ae, B.AE_SPIKE, ae - B.AE_SPIKE)
+        assert key in fre, "failed split piece %r not in " \
+            "failed_region_emitted (act %r)" % (key, act)
+    print("PASS bs1a4d5 splitbore fail path: %d forced re-check(s), acts %s"
+          % (len(forced), sorted({acts[k] for k in forced})))
 
 
 def test_bs1a4d_credit_real_bore():
