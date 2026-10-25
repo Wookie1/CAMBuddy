@@ -180,7 +180,8 @@ def test_update_saves_library_never_repo(home):
 
 @pytest.mark.parametrize("changes,code", [
     ({"t": 3}, "duplicate_t"),
-    ({"t": 40}, "out_of_range"),
+    ({"t": 1000}, "out_of_range"),
+    ({"t": 0}, "out_of_range"),
     ({"h": 4}, "invalid_field"),
     ({"tool_id": "x"}, "invalid_field"),
     ({"type": "drill"}, "invalid_field"),

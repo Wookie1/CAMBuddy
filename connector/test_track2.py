@@ -287,11 +287,17 @@ def test_e_injected_fault_is_measured():
 def test_e_catalog_origin_inputs():
     for name, default in ((catalog_mod.ACTION, "stock_bottom_centre"),
                           (catalog_mod.SLOPE_ACTION, "stock_bottom_centre"),
-                          (catalog_mod.CHECK_ACTION, "model_origin")):
+                          (catalog_mod.CHECK_ACTION, None)):
         p = catalog_mod.get_action(name)["inputs"]["properties"]
         assert p["origin"]["enum"] == ["stock_bottom_centre",
                                        "stock_top_centre", "model_origin"]
-        assert p["origin"]["default"] == default, name
+        if default is None:   # check_program: required, no default (TL2)
+            assert "default" not in p["origin"], name
+            ok, code, _ = catalog_mod.validate_inputs(
+                {"model": "m", "program": "p"}, name)
+            assert not ok and code == "input_missing", (name, code)
+        else:
+            assert p["origin"]["default"] == default, name
         assert len(p) <= 30
     ok, code, v = catalog_mod.validate_inputs({"model": "m"},
                                               catalog_mod.ACTION)

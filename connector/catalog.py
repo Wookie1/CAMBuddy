@@ -60,8 +60,8 @@ _ORIGIN = {"type": "string", "enum": ORIGINS,
            "description": _ORIGIN_TEXT}
 # check_program judges a program that was posted elsewhere: TL2 item 1 makes
 # origin REQUIRED there - validate() refuses a check_program that omits it
-# (the property keeps model_origin as its catalog default value only).
-_ORIGIN_CHECK = dict(_ORIGIN, default="model_origin",
+# (no default: the schema never advertises a guess).
+_ORIGIN_CHECK = dict({k: v for k, v in _ORIGIN.items() if k != "default"},
                      description=_ORIGIN_TEXT + "; REQUIRED: give the "
                      "origin the program was posted with")
 
