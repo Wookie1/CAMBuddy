@@ -1465,6 +1465,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     # footprint-outside-grid tracking (cells outside the grid are unjudged)
     outside_grid = 0
     first_outside_line = None
+    bsb_raw = []  # task ZG1: {line, x, y, depth} below the stock bottom
 
     for mi, mv in enumerate(resolved):
         if mv.get("comp"):
@@ -1497,6 +1498,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             if first_outside_line is None:
                 first_outside_line = mv["line"]
         cutting = mv["motion"] in ("G1", "G2", "G3")
+        if cutting and min(z1, cur[2]) < szmin - 1e-9:  # task ZG1
+            bz, bxy = ((z1, [x1, y1]) if z1 <= cur[2] else (cur[2], cur[:2]))
+            bsb_raw.append({"line": mv["line"], "x": bxy[0], "y": bxy[1],
+                            "depth": szmin - bz})
         move_collided = False
         move_over_flute = False
         move_shank = False
@@ -1917,6 +1922,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                             "first_line": first_rapid_line},
         "outside_grid": {"count": outside_grid,
                          "first_line": first_outside_line},
+        "below_stock_bottom": _bsb_report(bsb_raw),
+        "_bsb_raw": bsb_raw,
         "plunge_over_flute": ({"count": over_flute, "flute_mm": flute,
                                "first_line": first_over_flute_line}
                               if flute is not None else None),
@@ -2142,6 +2149,8 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
         "axial_plunges": _axial_report(
             [e for r in results for e in r["_axial_raw"]]),
         "_axial_raw": [e for r in results for e in r["_axial_raw"]],
+        "below_stock_bottom": _bsb_report(
+            [e for r in results for e in r["_bsb_raw"]]),
     }
     zbands = {}
     for r in results:
@@ -2195,16 +2204,25 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
 # Analysis / report
 # --------------------------------------------------------------------------
 
+def _bsb_report(raw):  # task ZG1: below_stock_bottom block from raw records
+    w = max(raw, key=lambda e: e["depth"], default=None)
+    return {"count": len(raw), "max_depth": w["depth"] if w else 0.0,
+            "worst_xy": [w["x"], w["y"]] if w else None,
+            "first_line": min((e["line"] for e in raw), default=None)}
+
+
 def analyze(stock, part, cell, x0, y0, restrict=None):
     ny, nx = part.shape
     valid = np.isfinite(stock)
+    hit = getattr(part, "hit", None)
     bottom = float(np.min(part))
     footprint = part > bottom + 1e-9
     mask = valid & footprint
     if restrict is not None:
         mask &= restrict
     depth = part - stock
-    gouge_mask = mask & (stock < part - GOUGE_TOL)
+    gouge_mask = (valid & hit if hit is not None else valid) \
+        & (stock < part - GOUGE_TOL)
     if gouge_mask.any():
         flat = np.argmax(np.where(gouge_mask, depth, -np.inf))
         gj, gi = np.unravel_index(flat, part.shape)
@@ -2227,6 +2245,7 @@ def analyze(stock, part, cell, x0, y0, restrict=None):
     return {
         "gouges": {"count": int(gouge_mask.sum()), "max_depth": max_depth,
                    "worst_xy": worst},
+        "part_mask": "present" if hit is not None else "missing",
         "leftover": lv,
         "within_0p5mm_fraction": within,
     }
@@ -2257,6 +2276,9 @@ def write_png(stock, part, cell, x0, y0, path):
 # CLI
 # --------------------------------------------------------------------------
 
+class PartField(np.ndarray): hit = None  # ndarray + .hit bool mask (task ZG1)
+
+
 def load_part(path):
     part = np.load(path)
     sidecar = re.sub(r"\.npy$", "", path) + ".json"
@@ -2269,6 +2291,9 @@ def load_part(path):
             "vertical walls carry unbounded chord error and the judgement "
             "would be silently optimistic. Regenerate the heightfield with "
             "TESS_TOL=0.01." % (sidecar, tess))
+    part = part.view(PartField)
+    if os.path.exists(hp := re.sub(r"\.npy$", "", path) + ".hit.npy"):
+        part.hit = np.load(hp)
     return part, float(meta["cell"]), float(meta["x0"]), float(meta["y0"])
 
 
@@ -2493,6 +2518,8 @@ def main(argv=None):
         "cell": cell,
         "window": ("steep walls |dZ|>1mm dilated 2mm" if args.window else None),
         "gouges": res["gouges"],
+        "part_mask": res["part_mask"],
+        "below_stock_bottom": res["below_stock_bottom"],
         "outside_grid": res["outside_grid"],
         "leftover": res["leftover"],
         "within_0p5mm_fraction": res["within_0p5mm_fraction"],
@@ -2550,6 +2577,12 @@ def main(argv=None):
                   res["outside_grid"]["count"], args.dia / 2.0,
                   gxmin, gxmax, gymin, gymax,
                   res["outside_grid"]["first_line"]), file=sys.stderr)
+        return 1
+    if (bs := res["below_stock_bottom"])["count"] > 0:
+        print("error: %d cutting move(s) drive the tip below the stock "
+              "bottom Z %.3f (max %.3f mm below at XY %s, first line %s)"
+              % (bs["count"], stock_box[4], bs["max_depth"],
+                 bs["worst_xy"], bs["first_line"]), file=sys.stderr)
         return 1
     ap = res["axial_plunges"]
     if args.tool != "ball" and ap["count"] > 0:

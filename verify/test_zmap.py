@@ -2815,3 +2815,141 @@ def test_ze2b_mutation_broken_chord_breaks_assertions(monkeypatch):
         _check_side_pass(_run_zb(_zb_pass_gcode(-1.0, 8.0, x0=-5.0, x1=20.0),
                                  part, stock_init=res_a["stock"],
                                  x0=X0_L, y0=Y0_L, stock=STOCK_L))
+
+
+# ---------------------------------------------------------------------------
+# Task ZG1: the gouge rule's blind spot at the global part minimum.
+# A plate whose top face IS the part's global minimum must have cuts into
+# it reported as gouges (via <stem>.hit.npy, or fail-closed strict when the
+# mask is missing); below_stock_bottom is a hard gate.
+# ---------------------------------------------------------------------------
+
+def _zg1_plate(tmp_path, hit=None, top=10.0, stem="plate"):
+    """Uniform plate: top face == the part's global minimum (the blind
+    spot), flush with the stock top. Optional bool hit mask as .hit.npy."""
+    npy = tmp_path / (stem + ".npy")
+    np.save(npy, np.full((N, N), top))
+    (tmp_path / (stem + ".json")).write_text(json.dumps(
+        {"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}))
+    if hit is not None:
+        np.save(str(npy)[:-4] + ".hit.npy", hit)
+    return npy
+
+
+def _zg1_cli(tmp_path, npy, body, tool=None):
+    gc = tmp_path / "zg1.ngc"
+    gc.write_text("G21 G90 F500\n" + body)
+    out = tmp_path / "zg1.json"
+    argv = [str(gc), "--part", str(npy), "--stock"]
+    argv += [str(v) for v in STOCK] + ["--out-json", str(out)]
+    if tool:
+        argv += tool
+    rc = zmap.main(argv)
+    return rc, json.loads(out.read_text())
+
+
+def test_zg1_plate_minimum_face_gouge_with_hit_mask(tmp_path):
+    """Cut 0.1 mm into a plate face sitting at the part's global minimum:
+    with a .hit.npy mask it is a gouge (fails under the old footprint rule)."""
+    npy = _zg1_plate(tmp_path, hit=np.ones((N, N), dtype=bool))
+    rc, rep = _zg1_cli(tmp_path, npy, "G0 X-20. Y0. Z20.\n"
+                                      "G1 Z9.9 F100.\nG1 X20. F500.\n")
+    assert rep["part_mask"] == "present"
+    assert abs(rep["gouges"]["max_depth"] - 0.1) < 1e-6, \
+        "measured gouge depth must be 0.1 mm: %r" % rep["gouges"]
+    assert rep["gouges"]["worst_xy"] is not None
+    assert rc == 0  # gouges stay report-only
+
+
+def test_zg1_plate_minimum_face_gouge_without_mask(tmp_path):
+    """Same cut with NO .hit.npy: fail closed, judge every valid cell
+    strictly, and say so in the JSON."""
+    npy = _zg1_plate(tmp_path)
+    rc, rep = _zg1_cli(tmp_path, npy, "G0 X-20. Y0. Z20.\n"
+                                      "G1 Z9.9 F100.\nG1 X20. F500.\n")
+    assert rep["part_mask"] == "missing"
+    assert abs(rep["gouges"]["max_depth"] - 0.1) < 1e-6, \
+        "fail-closed fallback must report the 0.1 mm gouge: %r" % rep["gouges"]
+    assert rc == 0
+
+
+def test_zg1_hit_mask_excludes_part_free_cells(tmp_path):
+    """Mask present: cuts BELOW the zmin fill outside the part footprint
+    (depth 0.15) must NOT count as gouges; the 0.1 mm cut into real part
+    geometry must. Drop the mask use -> measured depth becomes 0.15."""
+    xs = centers()[None, :]
+    ys = centers()[:, None]
+    hit = (np.abs(xs) <= 5.0) & (np.abs(ys) <= 5.0)
+    npy = _zg1_plate(tmp_path, hit=hit)
+    rc, rep = _zg1_cli(tmp_path, npy,
+                       "G0 X-5. Y0. Z20.\nG1 Z9.9 F100.\nG1 X5. F500.\n"
+                       "G0 X-10. Y10. Z20.\nG1 Z9.85 F100.\nG1 X10. F500.\n")
+    assert rep["part_mask"] == "present"
+    assert abs(rep["gouges"]["max_depth"] - 0.1) < 1e-6, \
+        "only the 0.1 mm cut into part geometry may gouge: %r" % rep["gouges"]
+    assert rc == 0
+
+
+def test_zg1_below_stock_bottom_hard_gate(tmp_path):
+    """Tip 0.1 mm below the stock bottom Z0: non-zero exit, with count,
+    max depth, worst xy and first line."""
+    npy = _zg1_plate(tmp_path)
+    rc, rep = _zg1_cli(tmp_path, npy,
+                       "G0 X-20. Y0. Z20.\nG1 Z-0.1 F100.\nG1 X20. F500.\n",
+                       tool=["--tool", "ball"])  # ball: axial stays report-only
+    bs = rep["below_stock_bottom"]
+    assert bs["count"] > 0
+    assert abs(bs["max_depth"] - 0.1) < 1e-6, \
+        "measured depth below the stock bottom must be 0.1 mm: %r" % bs
+    assert bs["worst_xy"] == [-20.0, 0.0], bs
+    assert bs["first_line"] == 3, bs
+    assert rc == 1, "below_stock_bottom must exit non-zero"
+
+
+def test_zg1_at_stock_bottom_not_flagged(tmp_path):
+    """Cutting exactly TO the stock bottom is not below it: gate stays 0."""
+    npy = _zg1_plate(tmp_path)
+    rc, rep = _zg1_cli(tmp_path, npy,
+                       "G0 X-20. Y0. Z20.\nG1 Z0. F100.\nG1 X20. F500.\n",
+                       tool=["--tool", "ball"])
+    assert rep["below_stock_bottom"]["count"] == 0
+    assert rep["below_stock_bottom"]["max_depth"] == 0.0
+    assert rc == 0
+
+
+def test_zg1_heightfield_writes_hit_mask(tmp_path):
+    """rasterize(hit_out=...) writes the bool geometry-hit mask: True where
+    part geometry was hit (even a top face AT zmin), False in the grown,
+    part-free zmin-fill ring."""
+    import types
+    sys.modules.setdefault("FreeCAD", types.ModuleType("FreeCAD"))
+    sys.modules.setdefault("Part", types.ModuleType("Part"))
+    import heightfield
+
+    class _Square:
+        """Flat square top at z=top over [-10, 8] x [-6, 5]."""
+        def __init__(self, top):
+            self.top = top
+            self.BoundBox = types.SimpleNamespace(
+                XMin=-10.0, XMax=8.0, YMin=-6.0, YMax=5.0,
+                ZMin=0.0, ZMax=top)
+
+        def tessellate(self, tol):
+            v = [types.SimpleNamespace(x=x, y=y, z=self.top)
+                 for x, y in ((-10.0, -6.0), (8.0, -6.0),
+                              (8.0, 5.0), (-10.0, 5.0))]
+            return v, [(0, 1, 2), (0, 2, 3)]
+
+    for top in (10.0, 0.0):  # 0.0: top face IS the global minimum
+        hp = tmp_path / ("hf_%s.hit.npy" % top)
+        hf, meta = heightfield.rasterize(_Square(top), cell=0.5, tol=0.01,
+                                         stock_box=[-20.0, 20.0, -15.0, 15.0],
+                                         tool_r=6.35, margin=5.0,
+                                         hit_out=str(hp))
+        hit = np.load(str(hp))
+        assert hit.dtype == bool and hit.shape == hf.shape
+        i0 = int((0.0 - meta["x0"]) / 0.5)
+        j0 = int((0.0 - meta["y0"]) / 0.5)
+        assert bool(hit[j0, i0]), "geometry column must be hit (top=%s)" % top
+        assert not bool(hit[0, 0]), "grown ring is part-free (top=%s)" % top
+        assert hf[0, 0] == 0.0
