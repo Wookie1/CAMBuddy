@@ -270,6 +270,8 @@ def shrink_ladder(seg, stock, z, tool_r, cell, credit=None, dropopt=None,
         cr = (entry_credit(stock, path[0], z, tool_r) if credit is None
               else credit)
         bxy = borefn(path[0], z) if (cr > 1e-9 and borefn) else None
+        if borefn and not bxy:
+            cr = 0.0   # BS1a4d4 (c): no predicted bore = unbacked credit
         wins = _simulate(path, stock, z, tool_r, cell,
                         cr + (bxy[2] if bxy else 0.0), we, bore_xy=bxy)
         if not wins:
@@ -476,6 +478,12 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                         if _b:
                             regions[-1]["bore"] = (round(pc[0][0], 4),
                                                    round(pc[0][1], 4)) + _b
+                        else:   # BS1a4d4 (c): unbacked -> credit 0, listed
+                            regions[-1]["credit"] = 0.0
+                            if stats is not None:
+                                stats.setdefault("credit_fallback", []).append(
+                                    (round(pc[0][0], 4), round(pc[0][1], 4),
+                                     round(z, 3), "plan0_nobore"))
                     regions[-1]["seg"] = seg        # BS1a4d (a0): centre line
                     regions[-1]["dropkey"] = drop_opt[0]   # + ring rank key
     if stats is not None:
