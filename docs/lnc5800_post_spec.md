@@ -46,12 +46,36 @@ Before anything new runs on the machine, he does a graphics check or a dry run a
 | N2 | Integer-only addresses (O, N, T, H, D, M, S, G) never carry a decimal point; the control alarms otherwise. | [LNC] p.179 INT 3010 "NOT ALLOWABLE DECIMAL POINT" |
 | N3 | Coordinates: mm to 3 decimals (0.001 mm) and inch to 4 decimals (0.0001 in), the Fanuc least input increments. Trailing zeros are trimmed but the point is kept (`3.`, `2.6`, `-5.1141`). `-0.` is written `0.`. | [DPI] (least input increment 0.001 mm / 0.0001 in) |
 | N4 | Feed: mm/min as an integer with a point (`F1270.`); in/min to 1 decimal (`F50.`, `F135.5`). Below 0.1 in/min is irrelevant for milling. | [LNC] p.156 (G94 units); N1 |
-| N5 | Arc centre I/J/K (incremental from the start point) with a point, same precision as coordinates. Arcs only in G17 for now; there are no arcs yet (paths are lines). | [LCNC-G] G2/G3 centre format |
+| N5 | Arc centre I/J (incremental from the start point) with a point, same precision as coordinates. Arcs only in G17, only with the opt-in `--arcs` post option (default off: paths are lines). Rules A1-A8 below. | [LNC-PM] PDF p.11; [LCNC-G] G2/G3 centre format |
 | N6 | Modal: a motion G word is written only when the mode changes, an axis word only when its value changes at output precision, and F only when the feed changes. G00/G01/G02/G03, F and the axis positions are modal. | [LCNC-G] modal groups; [LNC-OP] (G00 stays in effect until G01 is commanded) |
 | N7 | Line endings: CRLF (accepted by DOS-based LNC controls over disk/RS232). | [LNC] p.1-2 (DOS update page, disk/RS232 transfer) |
+
+## Arcs: G02/G03 (`--arcs`, default off)
+Page refs are PDF pages of [LNC-PM] (printed page in brackets). Facts are paraphrased, not quoted.
+| # | Fact / rule | Source |
+|---|-------------|--------|
+| A1 | G02 is clockwise and G03 counter-clockwise, viewed in the active plane. The plane is G17 (XY), G18 (ZX) or G19 (YZ) and must be set before an arc; parameter 50042 sets the plane after power-on/RESET. The post emits arcs only in G17, which the P4 safety line already selects. | PDF p.11-12 [7-8]; PDF p.21 [17] |
+| A2 | Centre form: I, J, K are the X, Y, Z distances from the arc **start point** to the centre, described only as incremental values from the start (G90/G91 is stated to govern the end point, not I/J/K; the manual gives no absolute-centre mode). In G17 the words are X Y with I J. The post writes both I and J on every arc line (they are per-block, not modal) with the coordinate precision and a forced point (N1/N3). | PDF p.11 [7] |
+| A3 | R form: R (arc radius) may replace I/J; when R and I/J are all given, the control uses R. The manual does not say how an arc over 180 deg is selected with R (no negative-R rule). The post therefore never emits R; it always uses I/J. | PDF p.11 [7] |
+| A4 | Full circles: the manual is silent (no statement that a zero-length I/J arc is a 360 deg circle). The post never emits a full circle: every fitted sweep is split at 180 deg or less. | PDF p.11-12 [7-8] (silent) |
+| A5 | Helical: the manual is silent. The G17 format lists only X, Y and I, J (no Z) and nothing describes a linear third axis along an arc. The post emits **no helical arcs**: arcs are fitted only at constant Z, and a G02/G03 move whose Z differs from the start is refused. | PDF p.11 [7] (silent) |
+| A6 | End-point check: the control compares the start-to-centre and end-to-centre distances; if they differ by more than parameter 50048 it raises alarm 510204 (end point not on the arc). The manual does **not** give the default value of 50048. The post uses 0.0005 mm as its limit, checked after rounding the start, end and I/J to the posted precision (a fitted arc that misses it after trying the 3x3 nearest-grid centres is posted as its original lines). **VERIFY**: James can read 50048 on the X7. | PDF p.11 [7] |
+| A7 | Fit rules (post option, not a manual fact): only runs of 4 or more consecutive G01 moves at one Z and one feed; every original point and every original chord within ARC_TOL = 0.002 mm of the arc (chord check is the vertex residual plus the chord sagitta, conservative); radius 0.1 to 500 mm, otherwise lines; one direction per arc. | engine/arcfit.py |
+| A8 | A G02/G03 move with no centre data is a hard error in the post (previously it would have been written without I/J). | engine/post_lnc.py |
+
+## Cutter radius compensation: G40/G41/G42 (facts only; the post keeps G40)
+| # | Fact | Source |
+|---|------|--------|
+| C1 | G41 offsets to the left, G42 to the right, G40 cancels. The comp number is the **D** address, range 1 to 99; D0 cancels comp. The offset plane comes from G17/G18/G19 (XY uses X/Y moves). | [LNC-PM] PDF p.30-31 [26-27] |
+| C2 | Comp start: G41/G42 with 0 < D <= the maximum comp number; the start block must be a straight move (G00 or G01), never G02/G03. Start/cancel approach shape is type A or B by parameter 50060. | [LNC-PM] PDF p.31 [27] |
+| C3 | While comp is active, more than 8 consecutive blocks with no motion cause over- or under-cut, and changing the plane raises alarm 510393 and stops motion. | [LNC-PM] PDF p.31 [27] |
+| C4 | Comp is cancelled by power-on, G40, D0, M02/M30 and RESET. The cancel block must also be a straight move (G00/G01), not an arc. | [LNC-PM] PDF p.31 [27] |
+| C5 | Inside/outside corner definitions (above 180 deg = inner edge, 0 to 180 = outer) are given for the comp path shapes. | [LNC-PM] PDF p.32 [28] |
+| C6 | **Post decision:** no G41/G42 code. G40 stays in the P4 header and engine paths stay tool-centre (P12), because the independent judge (verify/zmap) simulates tool-centre paths and cannot check a controller-side comp offset. | - |
 
 ## Open points for James (VERIFY)
 1. ~~Parameter 42 / `( )` comments (P3)~~: confirmed 2026-10-18.
 2. ~~`G04` dwell unit (P8)~~: confirmed `P<ms>` 2026-10-18.
 3. That `M05` before `M30` is wanted. It's harmless, since M30 also stops the spindle (P13).
 4. The tool and H/D numbers come from tools/x7_tools.json, his own tool table.
+5. Parameter 50048 (arc end-point tolerance, A6): the manual gives no default; the post assumes 0.0005 mm.

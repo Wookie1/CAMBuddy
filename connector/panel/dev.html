@@ -1,123 +1,349 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Panel dev harness (fake STEVE bridge)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SteveCAM panel dev</title>
 <style>
-  body { margin:0; background:#2a2a30; font-family: -apple-system, sans-serif;
-         display:flex; gap:12px; padding:12px; color:#eee; }
-  iframe { width:420px; height:760px; border:1px solid #555; border-radius:8px;
-           background:#fff; }
-  #log { flex:1; font:11px/1.5 ui-monospace, monospace; white-space:pre-wrap;
-         background:#17171b; padding:10px; border-radius:8px; overflow:auto; }
+  :root { --bg: #eef0f3; --fg: #1b1c20; --line: #c9ccd3; --card: #fff; }
+  :root[data-theme="dark"] { --bg: #0f1013; --fg: #e9e9ee; --line: #34363e; --card: #1b1c21; }
+  body { margin: 0; font: 12px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  .bar { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); background: var(--card); }
+  .wrap { display: flex; gap: 10px; padding: 10px; align-items: flex-start; flex-wrap: wrap; }
+  iframe { border: 1px solid var(--line); background: #fff; height: 900px; }
+  #log { flex: 1 1 280px; min-width: 260px; max-height: 900px; overflow: auto; font: 11px/1.35 ui-monospace, monospace; white-space: pre-wrap; margin: 0; background: var(--card); border: 1px solid var(--line); padding: 6px; }
+  button, select { font: inherit; }
 </style>
 </head>
 <body>
-<iframe id="panel" src="index.html" title="panel"></iframe>
-<div id="log"></div>
+<div class="bar">
+  <button type="button" id="theme">Toggle theme</button>
+  <label>Width <select id="width"><option>300</option><option selected>420</option><option>600</option></select></label>
+  <label>Next rough/finish
+    <select id="outcome">
+      <option value="ready">Ready</option>
+      <option value="needs_review">Needs review (2 items)</option>
+      <option value="failed_blocker">Failed: blocker</option>
+      <option value="bad_input">Failed: bad input</option>
+      <option value="rate_limited">rate_limited</option>
+      <option value="caller_not_allowed">caller_not_allowed</option>
+    </select></label>
+  <label><input type="checkbox" id="confirm"> Needs confirm</label>
+  <button type="button" id="confirm-btn">Confirm pending runs</button>
+  <label><input type="checkbox" id="extras" checked> Tool, job, measure actions</label>
+  <label><input type="checkbox" id="newinputs" checked> origin / 90° tips / document_id</label>
+  <button type="button" id="check-btn">Push a check result</button>
+  <button type="button" id="doc-btn">New revision</button>
+</div>
+<div class="wrap">
+  <iframe id="panel" title="SteveCAM panel" width="420"></iframe>
+  <pre id="log"></pre>
+</div>
 <script>
 "use strict";
-// Dev harness: fakes the STEVE panel bridge so the panel can be opened and
-// screenshotted locally. No network.
-const frame = document.getElementById("panel");
-const logEl = document.getElementById("log");
-let theme = "dark";
-let runSeq = 0;
-
-function log(...a) { logEl.textContent += a.map(String).join(" ") + "\n";
-                     logEl.scrollTop = logEl.scrollHeight; }
-function post(msg) { frame.contentWindow.postMessage(msg, "*"); }
-
-// fake leftover preview PNG (gradient) built on a canvas
-function fakePreviewPng() {
-  return new Promise((resolve) => {
-    const c = document.createElement("canvas");
-    c.width = c.height = 160;
-    const g = c.getContext("2d");
-    const grad = g.createLinearGradient(0, 0, 160, 160);
-    grad.addColorStop(0, "#440154"); grad.addColorStop(0.5, "#20a584");
-    grad.addColorStop(1, "#fde725");
-    g.fillStyle = grad; g.fillRect(0, 0, 160, 160);
-    g.fillStyle = "#fff"; g.font = "14px sans-serif";
-    g.fillText("leftover (mm)", 20, 84);
-    c.toBlob((blob) => resolve(blob));
-  });
+// Fake STEVE bridge for the SteveCAM panel. No network: everything is answered here.
+const MM_FIELDS = ["stock_xy","stock_x","stock_y","stock_top","stock_bottom","floor_z","tool_diameter","corner_radius",
+  "flute_length","stepdown","optimal_load","stock_to_leave","rest_stepup","feed","ramp_feed","stepover",
+  "rough_tool_diameter","rough_corner_radius","rough_flute_length","rough_stepdown","rough_optimal_load",
+  "rough_stock_to_leave","rough_rest_stepup","min_rest"];
+const N = (min, max, dflt, type) => ({ type: type || "number", minimum: min, maximum: max, default: dflt });
+const ORIENT = ["as_modeled","flip_x_180","flip_y_180","flip_z_180"];
+const TIPS = ["rot_x_90","rot_x_270","rot_y_90","rot_y_270"];
+const ORIGINS = ["stock_bottom_centre","stock_top_centre","model_origin"];
+function roughingProps(p) {
+  return {
+    [p+"tool_type"]: { type: "string", enum: ["flat","bull"], default: "bull" },
+    [p+"tool_diameter"]: N(1,32,12.7), [p+"corner_radius"]: N(0,8,0.127), [p+"flute_length"]: N(1,150,30),
+    [p+"stepdown"]: N(0.1,25.4,19.05), [p+"optimal_load"]: N(0.05,10,2.03), [p+"stock_to_leave"]: N(0,5,0.381),
+    [p+"rest_stepup"]: N(0.1,10,1.905),
+  };
+}
+function schemas(newInputs) {
+  const stock = { stock_xy: N(0,25.4,1), stock_x: N(0,null,null), stock_y: N(0,null,null), stock_top: N(0,25.4,1),
+    stock_bottom: N(0,25.4,1), floor_z: N(0,200,0) };
+  const orient = { orientation: { type: "string", enum: newInputs ? ORIENT.concat(TIPS) : ORIENT, default: "as_modeled" } };
+  const cutting = { rpm: N(100,30000,7500,"integer"), feed: N(10,20000,3429), ramp_feed: N(10,20000,1270),
+    units: { type: "string", enum: ["inch","mm"], default: "inch" }, program_number: N(1,9999,1001,"integer") };
+  const extra = newInputs ? { origin: { type: "string", enum: ORIGINS, default: "stock_bottom_centre" }, document_id: { type: "string" } } : {};
+  const model = { model: { "x-steve": "file", format: "step" } };
+  return {
+    adaptive_rough: Object.assign({}, model, orient, stock, roughingProps(""), cutting, { tool_number: N(1,999,null,"integer") }, extra),
+    slope_split_finish: Object.assign({}, model, orient, stock, { tool_diameter: N(1,25,6), stepover: N(0.05,2,0.3),
+      stepdown: N(0.05,2,0.3), slope_threshold: N(10,80,40) }, cutting, { tool_number: N(1,999,null,"integer"),
+      rest_tool_number: N(1,999,null,"integer"), min_rest: N(0.1,null,0.5) }, roughingProps("rough_"), extra),
+    check_program: Object.assign({ program: { "x-steve": "program" }, program_2: { "x-steve": "program" } }, model, orient,
+      { stock_xy: stock.stock_xy, stock_top: stock.stock_top, stock_bottom: stock.stock_bottom }, { tool_number: N(1,999,null,"integer") }),
+    "model.measure": Object.assign({}, model, orient),
+  };
+}
+function validate(action, inputs, sch) {
+  const props = sch[action];
+  if (!props) return null;
+  const v = {};
+  for (const k in inputs) {
+    if (!props[k]) return { code: "input_unknown", field: k, message: "SteveCAM doesn't know the input \u201c" + k + "\u201d.", next_step: "Update the panel or SteveCAM." };
+    v[k] = inputs[k];
+  }
+  const inch = (inputs.units || "inch") === "inch";
+  for (const k in props) {
+    const p = props[k];
+    if (!(k in v)) { if (p.default !== undefined && p.default !== null) v[k] = p.default; continue; }
+    if (p.enum && !p.enum.includes(v[k])) return { code: "input_out_of_range", field: k, got: v[k], allowed: p.enum, message: k + " must be one of " + p.enum.join(", ") + "." };
+    if (p.type === "number" || p.type === "integer") {
+      let x = v[k];
+      if (typeof x !== "number") return { code: "input_out_of_range", field: k, got: x, message: k + " must be a number." };
+      if (inch && MM_FIELDS.includes(k)) x = x * 25.4;
+      if ((p.minimum != null && x < p.minimum) || (p.maximum != null && x > p.maximum)) {
+        return { code: "input_out_of_range", field: k, got: x, allowed: { min: p.minimum, max: p.maximum },
+          message: k + " is " + (+x.toFixed(3)) + (MM_FIELDS.includes(k) ? " mm" : "") + ", outside " + p.minimum + " to " + p.maximum + ".",
+          next_step: "Check the units: values are read in " + (inch ? "inches" : "mm") + "." };
+      }
+      v[k] = x;
+    }
+  }
+  for (const p of ["", "rough_"]) {
+    if (!(p + "tool_type" in v)) continue;
+    if (v[p+"tool_type"] === "bull" && !(v[p+"corner_radius"] > 0 && v[p+"corner_radius"] < v[p+"tool_diameter"] / 2)) {
+      return { code: "input_out_of_range", field: p + "corner_radius", message: "A bull tool needs a corner radius above 0 and below half its diameter." };
+    }
+  }
+  return null;
 }
 
-window.addEventListener("message", async (event) => {
+// ------------------------------------------------------------------ data --
+const TOOLS = [
+  { tool_id: "tl-flat-12", t: 13, h: 13, d: 13, name: "1/2\" flat endmill", type: "flat", dia_mm: 12.7, corner_r_mm: 0, flute_len_mm: 31.75, reach_mm: 50, holder: "BT30-ER32-70", rpm: 8000, feed_mm_min: 3429, plunge_mm_min: 1270 },
+  { tool_id: "tl-bull-12", t: 5, h: 5, d: 5, name: "1/2\" bull, 0.03\" radius", type: "bull", dia_mm: 12.7, corner_r_mm: 0.762, flute_len_mm: 31.75, reach_mm: 45, holder: "BT30-ER32-70", rpm: 7500, feed_mm_min: 3429, plunge_mm_min: 1270 },
+  { tool_id: "tl-ball-6", t: 20, h: 20, d: 20, name: "6 mm ball", type: "ball", dia_mm: 6, corner_r_mm: 3, flute_len_mm: 12, reach_mm: 30, holder: "BT30-ER16-60", rpm: 12000, feed_mm_min: 1800, plunge_mm_min: 600 },
+  { tool_id: "tl-ball-3", t: 33, h: 33, d: 33, name: "3 mm ball", type: "ball", dia_mm: 3, corner_r_mm: 1.5, flute_len_mm: 6, reach_mm: 20, holder: "BT30-ER16-60", rpm: 15000, feed_mm_min: 1000, plunge_mm_min: 300 },
+];
+const POCKETS = 12;
+const jobs = {};
+function job(docId) { return jobs[docId] || (jobs[docId] = { document_id: docId, renumber: {}, tools_used: [], setup: null }); }
+function jobT(j, tool) { return j.renumber[tool.tool_id] != null ? j.renumber[tool.tool_id] : tool.t; }
+const CHECK_SAMPLE = {"programs":[{"name":"program","tool":{"number":13,"type":"flat","diameter_mm":12.686,"corner_radius_mm":0.0,"flute_mm":50.8,"shank_diameter_mm":12.686,"holder":"BT30-ER32-70","stickout_mm":71.6},"check":{"gcode":"<run_dir>/program.nc","part":"<run_dir>/part_hf_zmap.npy","tool":{"type":"flat","dia":12.686,"corner":0.0},"stock_box":[-31.0,31.0,-31.0,31.0,-1.0,12.4],"part_grid":[-42.343,42.357,-42.343,42.357],"stock_in":null,"holder":{"status":"checked","name":"BT30-ER32-70","stickout_mm":71.6,"dimension_source":"estimated"},"cell":0.1,"window":null,"gouges":{"count":0,"max_depth":0.0,"worst_xy":null},"outside_grid":{"count":0,"first_line":null},"leftover":{"max":8.4,"mean":5.318611600609757,"p95":8.4},"within_0p5mm_fraction":0.36,"rapid_collisions":{"count":0,"first_line":null},"plunge_over_flute":{"count":0,"flute_mm":50.8,"first_line":null},"over_flute":{"count":0,"max_depth":0.0,"worst_xy":null,"first_line":null},"holder_hits":{"count":0,"max_intrusion":0.0,"worst_xy":null,"first_line":null},"cutter_comp":{"active_moves":0,"first_line":null,"last_line":null,"d_registers":[]},"comp_radius_mm":0.0,"air_fraction":0.2015708630023392,"cutting_length_mm":187.9,"cutting_length_by_zband_mm":{"10-15":150.1,"15-20":37.8,"25-30":0.0},"rapid_length_mm":150.7,"cycle_time_s":15.1,"cycle_time_note":"feed moves at their F words; rapids assumed at 15000 mm/min","engagement":{"threshold_mm":null,"count":0,"max_mm":12.686,"horizontal":{"n":3,"p50":12.4,"p95":12.6574,"p99":12.6803,"max":12.686},"entry":{"n":3,"p50":12.4,"p95":12.6574,"p99":12.6803,"max":12.686},"spikes":[],"wide_moves":null,"slot_horizontal":{"n":0,"p50":null,"p95":null,"p99":null,"max":null},"skim_by_z":{},"full_width_slots":{"count":0,"total_length_mm":0,"total_time_s":0,"top":[]},"overload_feeds":{"width_mm_above":2.4384,"count":0,"total_length_mm":0,"total_time_s":0,"worst":[]},"roughing_target_ae2":{"fw_cutting_feed":0,"fw_entry_not_allowed":0,"met":true},"ae2":{"n":3,"p50":12.376,"p95":12.646,"p99":12.67,"max":12.676},"full_width_slots_ae2":{"count":0,"total_length_mm":0,"worst":[]},"overload_feeds_ae2":{"ae_eff_above_mm":2.4384,"count":0,"total_length_mm":0,"worst":[]}},"plunge":{"ramp_angle_deg":3.0,"count":3,"flags":[{"line":9,"x":-25.0,"y":-25.0,"z":12.05,"angle_deg":9.93,"depth_mm":0.35},{"line":14,"x":-25.0,"y":0.0,"z":12.05,"angle_deg":9.93,"depth_mm":0.35},{"line":19,"x":-25.0,"y":25.0,"z":12.05,"angle_deg":9.93,"depth_mm":0.35}]},"axial_plunges":{"count":0,"max_depth_mm":0.0,"first_line":null,"worst_xy":null,"floor_mm":0.2},"strict":true,"unsupported":[]}}]};
+function programCheck(name, tool, patch) {
+  const p = JSON.parse(JSON.stringify(CHECK_SAMPLE.programs[0]));
+  p.name = name;
+  p.tool = Object.assign(p.tool, tool);
+  Object.assign(p.check, patch || {});
+  return p;
+}
+const ATTN_REVIEW = [
+  { code: "overload_feed", severity: "review", message: "Tool load goes over 1.2\u00d7 optimal in 2 places; the feed is slowed there.",
+    where: { program: "rough.nc", line: 1234, x: 12.3, y: 4.5, z: -3.2 }, next_step: "Check those moves in the preview, or lower the optimal load." },
+  { code: "steep_ramp", severity: "review", message: "3 ramps are steeper than 3\u00b0.",
+    where: { program: "rough.nc", line: 9, x: -25, y: -25, z: 12.05 }, next_step: "Check the entry moves before running." },
+];
+function roughResult(outcome) {
+  const base = { estimated_time_min: 0.82, cut_length_mm: 1253.9, zmap_gouges: { count: 0 }, rapid_collisions: { count: 0 },
+    over_flute: { count: 0 }, leftover: { mean_mm: 0.42, p95_mm: 0.5, within_0p5mm_fraction: 0.98 }, output_dir: "C:\\SteveCAM\\jobs\\doc-42" };
+  if (outcome === "needs_review") {
+    return Object.assign(base, { verdict: "needs_review", summary: "No gouges or collisions, but two things need a look before you run it.",
+      attention: ATTN_REVIEW, engagement: { overloads: 2, limit_mm: 2.438, reduced_feed_windows: [{ line: 1234, feed_pct: 70 }, { line: 1388, feed_pct: 80 }] } });
+  }
+  if (outcome === "failed_blocker") {
+    return Object.assign(base, { verdict: "failed", summary: "The roughing cuts into the part in 3 places.",
+      zmap_gouges: { count: 3, max_depth: 0.12, first_line: 880 },
+      attention: [{ code: "gouge", severity: "blocker", message: "The tool cuts 0.12 mm into the part.",
+        where: { program: "rough.nc", line: 880, x: 40.2, y: -12.5, z: 8.4 }, next_step: "Leave more stock or lower the stepdown, then run again." },
+        ATTN_REVIEW[1]] });
+  }
+  return Object.assign(base, { verdict: "ready", summary: "Ready to run: no gouges, collisions or holder hits.",
+    attention: [{ code: "holder_estimated", severity: "info", message: "The holder size was estimated (BT30-ER32-70).", next_step: "Measure the holder and add it to the tool table." }] });
+}
+function finishResult(outcome, rest) {
+  const r = { chain_time_min: 3.4, chain_cut_length_mm: 8120.5, probe_clcheck: { count: 0 },
+    chain: { zmap_gouges: { count: 0 }, rapid_collisions: { count: 0 }, over_flute: { count: 0 },
+      leftover: { mean_mm: 0.05, p95_mm: 0.11, within_0p5mm_fraction: 0.999 } },
+    areas_left: [{ where: "pocket floor corners", reason: "narrower than the 6 mm ball" }], output_dir: "C:\\SteveCAM\\jobs\\doc-42" };
+  if (outcome === "needs_review") return Object.assign(r, { verdict: "needs_review", summary: "The chain is clean, but check two places.", attention: ATTN_REVIEW });
+  if (outcome === "failed_blocker") return Object.assign(r, { verdict: "failed", summary: "The finish misses the model at 4 probe points.", probe_clcheck: { count: 4 },
+    attention: [{ code: "clcheck", severity: "blocker", message: "The finish is more than 0.005 mm off the model at 4 probe points.", where: { program: "finish.nc", line: 5120, x: 10.1, y: 22.4, z: 31.0 }, next_step: "Use a smaller stepover, then run again." }] });
+  return Object.assign(r, { verdict: "ready", summary: "Ready to run: rough and finish checked as one chain." });
+}
+
+// ---------------------------------------------------------------- bridge --
+const frame = document.getElementById("panel");
+const logEl = document.getElementById("log");
+let theme = "light";
+let doc = { id: "doc-42", kind: "part", revision: 7 };
+let nextRun = 0;
+const runs = {};
+const pending = [];
+function log(dir, obj) {
+  const line = dir + " " + JSON.stringify(obj, (k, v) => (v instanceof Blob ? "[Blob " + v.size + "]" : v));
+  logEl.textContent = line.slice(0, 600) + "\n" + logEl.textContent.slice(0, 40000);
+}
+function post(msg) { log("<-", msg); frame.contentWindow.postMessage(msg, "*"); }
+function plain(run) { const copy = Object.assign({}, run); delete copy.checkJson; return JSON.parse(JSON.stringify(copy)); }
+function push(run) { runs[run.id] = run; post({ steve: 1, event: "run", run: plain(run) }); }
+function actions() {
+  const extras = document.getElementById("extras").checked;
+  const sch = schemas(document.getElementById("newinputs").checked);
+  const list = [
+    { id: "act-1", name: "adaptive_rough", title: "Adaptive rough", allowed: true, needs_confirmation: false, sends_open_document_on_click: true, inputs: { type: "object", properties: sch.adaptive_rough } },
+    { id: "act-2", name: "slope_split_finish", title: "Slope-split finish", allowed: true, needs_confirmation: false, sends_open_document_on_click: true, inputs: { type: "object", properties: sch.slope_split_finish } },
+    { id: "act-3", name: "check_program", title: "Check program", allowed: true, needs_confirmation: false, sends_open_document_on_click: false, inputs: { type: "object", properties: sch.check_program } },
+  ];
+  if (extras) {
+    list.push(
+      { id: "act-4", name: "model.measure", title: "Measure model", allowed: true, needs_confirmation: false, sends_open_document_on_click: true, inputs: { type: "object", properties: sch["model.measure"] } },
+      { id: "act-5", name: "tools.list", title: "Tool table", allowed: true, needs_confirmation: false, inputs: { type: "object", properties: {} } },
+      { id: "act-6", name: "tools.update", title: "Update a tool", allowed: true, needs_confirmation: false, inputs: { type: "object", properties: { tool: { type: "object" } } } },
+      { id: "act-7", name: "job.get", title: "Job", allowed: true, needs_confirmation: false, inputs: { type: "object", properties: { document_id: { type: "string" } } } },
+      { id: "act-8", name: "job.renumber", title: "Renumber a tool", allowed: true, needs_confirmation: false, inputs: { type: "object", properties: { document_id: {}, tool_id: {}, t: { type: "integer" } } } },
+      { id: "act-9", name: "job.setup", title: "Save setup", allowed: true, needs_confirmation: false, inputs: { type: "object", properties: { document_id: {}, setup: { type: "object" } } } });
+  }
+  return list;
+}
+function finishUtility(run, result, error, delay) {
+  setTimeout(() => push(Object.assign(run, error ? { state: "failed", error, progress: 1 } : { state: "succeeded", result, progress: 1 })), delay || 150);
+}
+function startCam(run, inputs, outcome) {
+  const steps = [["received", 0, "Got it"], ["running", 0.1, "Making the STEP file\u2026"], ["running", 0.45, "Roughing level 2/5"], ["running", 0.8, "Checking"], ["running", 0.95, "Writing programs"]];
+  let i = 0;
+  const tick = () => {
+    if (runs[run.id].state === "cancelled") return;
+    if (i < steps.length) {
+      const [state, progress, message] = steps[i++];
+      push(Object.assign(run, { state, progress, message }));
+      setTimeout(tick, 600);
+      return;
+    }
+    const finish = run.action === "slope_split_finish";
+    const rest = finish && inputs.rest_tool_number != null;
+    const result = finish ? finishResult(outcome, rest) : roughResult(outcome);
+    const files = finish ? ["rough.nc", "finish.nc"].concat(rest ? ["rest.nc"] : [], ["check.json", "preview.png"]) : ["rough.nc", "check.json", "preview.png"];
+    const tool = TOOLS.find((t) => jobT(job(doc.id), t) === inputs.tool_number) || (finish ? TOOLS[2] : TOOLS[1]);
+    const j = job(doc.id);
+    for (const t of finish ? [TOOLS[1], tool] : [tool]) if (!j.tools_used.includes(t.tool_id)) j.tools_used.push(t.tool_id);
+    run.checkJson = { verdict: result.verdict, summary: result.summary, attention: result.attention || [], programs: finish
+      ? [programCheck("rough.nc", { number: jobT(j, TOOLS[1]), type: "bull", diameter_mm: 12.7 }),
+         programCheck("finish.nc", { number: jobT(j, tool), type: "ball", diameter_mm: tool.dia_mm }, { plunge: { ramp_angle_deg: 3, count: 0, flags: [] } })]
+      : [programCheck("rough.nc", { number: jobT(j, tool), type: tool.type, diameter_mm: tool.dia_mm },
+          outcome === "failed_blocker" ? { gouges: { count: 3, max_depth: 0.12, worst_xy: [40.2, -12.5] } } : {})] };
+    if (outcome === "failed_blocker") {
+      push(Object.assign(run, { state: "failed", progress: 1, message: "", result, files,
+        error: { code: "gate_failed", message: result.summary, next_step: result.attention[0].next_step } }));
+    } else {
+      push(Object.assign(run, { state: "succeeded", progress: 1, message: "Done", result, files }));
+    }
+  };
+  if (document.getElementById("confirm").checked) pending.push(tick); else setTimeout(tick, 400);
+}
+function answerRun(id, params) {
+  const action = params.action;
+  const inputs = params.inputs || {};
+  const run = { id: "dev-run-" + (++nextRun), action, state: "running", progress: null, message: "", result: null, error: null, files: [] };
+  runs[run.id] = run;
+  const sch = schemas(document.getElementById("newinputs").checked);
+  const docTaking = ["adaptive_rough", "slope_split_finish", "model.measure"].includes(action);
+  if (docTaking) {
+    const outcome = document.getElementById("outcome").value;
+    if (action !== "model.measure" && (outcome === "rate_limited" || outcome === "caller_not_allowed")) {
+      return post({ steve: 1, id, error: { code: outcome, message: outcome === "rate_limited" ? "at most 20 runs a minute" : "panel may not run " + action } });
+    }
+    const bad = validate(action, inputs, sch);
+    if (bad || (action !== "model.measure" && outcome === "bad_input")) {
+      run.state = "failed";
+      run.error = bad || { code: "input_out_of_range", field: "tool_diameter", got: 322.58, allowed: { min: 1, max: 32 },
+        message: "Tool diameter 322.58 mm is above 32 mm.", next_step: "Check the units: a 1/2\" tool is 0.5 in or 12.7 mm." };
+      return post({ steve: 1, id, result: run });
+    }
+    run.state = document.getElementById("confirm").checked ? "awaiting_confirmation" : "received";
+    run.message = run.state === "awaiting_confirmation" ? "Waiting for the person" : "";
+    post({ steve: 1, id, result: plain(run) });
+    if (action === "model.measure") {
+      const o = inputs.orientation || "as_modeled";
+      let [x, y, z] = [254, 165, 55];
+      if (o.startsWith("rot_x")) [y, z] = [z, y];
+      if (o.startsWith("rot_y")) [x, z] = [z, x];
+      const go = () => finishUtility(run, { size_mm: { x, y, z }, bbox_mm: { min: [-x / 2, -y / 2, 0], max: [x / 2, y / 2, z] } }, null, 500);
+      if (run.state === "awaiting_confirmation") pending.push(go); else go();
+      return;
+    }
+    startCam(run, inputs, outcome);
+    return;
+  }
+  post({ steve: 1, id, result: plain(run) });
+  const j = inputs.document_id ? job(inputs.document_id) : null;
+  if (action === "tools.list") return finishUtility(run, { tools: TOOLS, pockets: POCKETS });
+  if (action === "job.get") return finishUtility(run, j);
+  if (action === "job.setup") { j.setup = inputs.setup; return finishUtility(run, j); }
+  if (action === "job.renumber") {
+    const t = inputs.t;
+    if (!Number.isInteger(t) || t < 1 || t > POCKETS) return finishUtility(run, null, { code: "out_of_range", message: "t must be 1.." + POCKETS });
+    const other = TOOLS.find((x) => x.tool_id !== inputs.tool_id && jobT(j, x) === t);
+    if (other) return finishUtility(run, null, { code: "duplicate_t", message: "T" + t + " is already " + other.tool_id });
+    j.renumber[inputs.tool_id] = t;
+    return finishUtility(run, j);
+  }
+  if (action === "tools.update") return finishUtility(run, { tool: inputs.tool });
+  finishUtility(run, null, { code: "action_not_found", message: "no action " + action });
+}
+function pngBlob() {
+  return new Promise((resolve) => {
+    const c = document.createElement("canvas");
+    c.width = 320; c.height = 200;
+    const g = c.getContext("2d");
+    const grad = g.createLinearGradient(0, 0, 320, 200);
+    grad.addColorStop(0, "#2b5876"); grad.addColorStop(1, "#4e4376");
+    g.fillStyle = grad; g.fillRect(0, 0, 320, 200);
+    g.strokeStyle = "#ffd166"; g.lineWidth = 2;
+    for (let i = 0; i < 9; i++) { g.strokeRect(30 + i * 9, 25 + i * 6, 260 - i * 18, 150 - i * 12); }
+    c.toBlob(resolve, "image/png");
+  });
+}
+async function answerFile(id, params) {
+  const run = runs[params.id];
+  if (!run || !(run.files || []).includes(params.name)) return post({ steve: 1, id, error: { code: "action_not_found", message: "no such file" } });
+  let blob;
+  if (params.name === "preview.png") blob = await pngBlob();
+  else if (params.name === "check.json") blob = new Blob([JSON.stringify(run.checkJson || CHECK_SAMPLE)], { type: "application/json" });
+  else blob = new Blob(["%\nO1001 (" + params.name + ")\nG90 G17 G40 G80\nM30\n%\n"], { type: "text/plain" });
+  post({ steve: 1, id, result: { name: params.name, media_type: blob.type, bytes: blob.size, blob } });
+}
+window.addEventListener("message", (event) => {
   if (event.source !== frame.contentWindow) return;
   const m = event.data;
   if (!m || m.steve !== 1) return;
-
-  if (m.method === "context") {
-    log("-> context");
-    event.source.postMessage({ steve: 1, id: m.id, result: {
-      panel: "adaptive_rough", connector: "stevecam-rough",
-      document: { id: "doc-42", kind: "part", revision: 7 },
-      theme } }, "*");
-  } else if (m.method === "actions") {
-    log("-> actions");
-    event.source.postMessage({ steve: 1, id: m.id, result: [{
-      id: "act-1", name: "adaptive_rough", title: "Adaptive roughing",
-      allowed: true, needs_confirmation: false,
-      sends_open_document_on_click: true, inputs: {} }] }, "*");
-  } else if (m.method === "events") {
-    log("-> events");
-    event.source.postMessage({ steve: 1, id: m.id, result: [
-      { name: "engine_state", data: { state: "idle", action: null,
-        progress: null }, at: Date.now() }] }, "*");
-  } else if (m.method === "run") {
-    runSeq += 1;
-    const id = "dev-run-" + runSeq;
-    log("-> run " + JSON.stringify(m.params));
-    const run = (state, extra) => Object.assign(
-      { id, action: "adaptive_rough", state, progress: 0, message: "",
-        result: null, error: null, files: [] }, extra || {});
-    event.source.postMessage({ steve: 1, id: m.id,
-      result: run("awaiting_confirmation", { message: "confirm me" }) }, "*");
-    const steps = [
-      ["received", 0], ["running", 0.1], ["running", 0.45],
-      ["running", 0.8], ["running", 0.95]];
-    let d = 600;
-    for (const [state, p] of steps) {
-      setTimeout(() => post({ steve: 1, event: "run",
-        run: run(state, { progress: p, message: "level " + Math.round(p * 5) + "/5" }) }), d);
-      d += 700;
-    }
-    setTimeout(() => post({ steve: 1, event: "run", run: run("succeeded", {
-      progress: 1, message: "done",
-      result: { estimated_time_min: 0.82, cut_length_mm: 1253.9,
-                zmap_gouges: { count: 0 }, rapid_collisions: { count: 0 },
-                over_flute: { count: 0 },
-                leftover: { mean_mm: 0.42, p95_mm: 0.5,
-                          within_0p5mm_fraction: 0.98 } },
-      files: ["rough.nc", "check.json", "preview.png"] }) }), d);
-  } else if (m.method === "run.file") {
-    log("-> run.file " + m.params.name);
-    fakePreviewPng().then((blob) => {
-      event.source.postMessage({ steve: 1, id: m.id, result: {
-        name: m.params.name, media_type: "image/png",
-        bytes: blob.size, blob } }, "*");
-    });
-  } else if (m.method === "cancel") {
-    log("-> cancel " + m.params.id);
-    event.source.postMessage({ steve: 1, id: m.id, result: { ok: true } }, "*");
-    post({ steve: 1, event: "run", run: { id: m.params.id,
-      action: "adaptive_rough", state: "cancelled", progress: 0,
-      message: "cancelled", result: null, error: null, files: [] } });
-  } else if (m.method === "run.get") {
-    event.source.postMessage({ steve: 1, id: m.id, error:
-      { code: "action_not_found", message: "n/a in harness" } }, "*");
-  }
+  log("->", m);
+  const { id, method, params } = m;
+  if (method === "context") post({ steve: 1, id, result: { panel: "stevecam", connector: "stevecam", document: doc, theme } });
+  else if (method === "events") post({ steve: 1, id, result: [{ name: "engine_state", data: { state: "idle", action: null, progress: null }, at: Date.now() }] });
+  else if (method === "actions") post({ steve: 1, id, result: actions() });
+  else if (method === "run") answerRun(id, params || {});
+  else if (method === "run.get") post(runs[params.id] ? { steve: 1, id, result: plain(runs[params.id]) } : { steve: 1, id, error: { code: "action_not_found", message: "no run" } });
+  else if (method === "run.file") answerFile(id, params || {});
+  else if (method === "cancel") {
+    post({ steve: 1, id, result: { ok: true } });
+    const r = runs[params.id];
+    if (r && !["succeeded","failed","rejected","cancelled","expired"].includes(r.state)) push(Object.assign(r, { state: "cancelled", message: "Cancelled" }));
+  } else post({ steve: 1, id, error: { code: "action_not_found", message: "unknown method " + method } });
 });
-
-// theme toggle from the harness page: click anywhere on the log
-document.getElementById("log").addEventListener("click", () => {
-  theme = theme === "dark" ? "light" : "dark";
-  log("theme -> " + theme);
-  post({ steve: 1, event: "context", context: { theme } });
+function pushContext() { post({ steve: 1, event: "context", context: { panel: "stevecam", connector: "stevecam", document: doc, theme } }); }
+document.getElementById("theme").addEventListener("click", () => {
+  theme = theme === "light" ? "dark" : "light";
+  document.documentElement.setAttribute("data-theme", theme);
+  pushContext();
 });
-log("Harness ready. Click 'Rough the open document' in the panel.\nClick here to toggle theme.");
+logEl.addEventListener("click", () => document.getElementById("theme").click());
+document.getElementById("doc-btn").addEventListener("click", () => { doc = Object.assign({}, doc, { revision: doc.revision + 1 }); pushContext(); });
+document.getElementById("width").addEventListener("change", (e) => { frame.width = e.target.value; });
+document.getElementById("confirm-btn").addEventListener("click", () => { while (pending.length) pending.shift()(); });
+function reload() { frame.src = "index.html"; }
+document.getElementById("extras").addEventListener("change", reload);
+document.getElementById("newinputs").addEventListener("change", reload);
+document.getElementById("check-btn").addEventListener("click", () => {
+  const run = { id: "dev-run-" + (++nextRun), action: "check_program", state: "succeeded", progress: 1, message: "Done",
+    result: { verdict: "needs_review", summary: "No gouges or collisions. 3 ramps are steeper than 3\u00b0.",
+      attention: [{ code: "steep_ramp", severity: "review", message: "3 ramps are steeper than 3\u00b0.", where: { program: "program", line: 9, x: -25, y: -25, z: 12.05 }, next_step: "Check the entry moves before running." },
+        { code: "holder_estimated", severity: "info", message: "The holder size was estimated (BT30-ER32-70).", next_step: "Measure the holder and add it to the tool table." }] },
+    files: ["check.json"], checkJson: CHECK_SAMPLE };
+  push(run);
+});
+reload();
 </script>
 </body>
 </html>
