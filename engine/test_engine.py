@@ -1100,7 +1100,8 @@ def _main():
                test_bs1a4c2_band_chord_cl_checked,
                test_bs1a4d_credit0_lightest_option,
                test_bs1a4d_credit_real_bore,
-               test_bs1a4d2b_centred_entry_bore):
+               test_bs1a4d2b_centred_entry_bore,
+               test_bs1a4d4_credit_entry_matches_prediction):
         try:
             fn()
         except AssertionError as e:
@@ -2610,6 +2611,164 @@ def test_bs1a4d2b_centred_entry_bore():
               len(chk_tb), nl_tb, len(chk_ls), nl_ls,
               [f[3] for f in st_tb.get("credit_fallback", [])],
               [f[3] for f in st_ls.get("credit_fallback", [])]))
+
+
+def test_bs1a4d4_credit_entry_matches_prediction():
+    """Task BS1a4d4: band entry credit and the emitted entry are ONE
+    decision. Where the bore predictor (_bore_pred via band.bore_context)
+    accepts a centred bore for a credited band start, channel_regions stores
+    that exact bore in the region (res["bore"] = start x, start y, centre x,
+    centre y, radius) and rough.py enters at exactly that stored start with
+    exactly that stored bore - no re-search. A region whose start disk stands
+    (credit > 0) but where NO centred bore fits gets the normal full-tier
+    ladder (centred=False), never the centred-only ladder that failed closed
+    on Core Front. Scene: the L channel plus an island box beside the
+    vertical arm; the trochoid starts hugging the inner-corner block have
+    credit > 0 with no centred bore that fits, while other credited regions
+    get predicted bores. Assert: rough generates; every credited region with
+    a stored bore that bored entered at exactly that stored centre (within
+    1e-6, centres captured exactly at _helix_moves) and radius; no region
+    without a stored bore used the centred-only ladder (its own bore circle
+    never passes through the entry: centred bores have |centre dist - r| =
+    0.05, normal tiers >= 0.17); clcheck and axial counts are 0.
+    FAILS on 6793ad9: band.py:471 stores no bore at all (0 stored bores) and
+    rough.py:2129 passes centred="credit" in res - always True for band
+    regions - so every band entry takes the centred-only ladder (the two
+    corner entries there exhaust all 96 centred candidates)."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    from opencamlib import ocl
+    import engine.band as B
+    import engine.rough as R
+    from engine.rough import rough
+    tool_r = 6.343
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)      # floor
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)    # left wall
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)     # bottom wall
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)        # inner crn
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)        # right wall
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)       # upr-left
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0)        # top cap
+            + _box_tris(5.5, 9.5, 12.0, 16.0, 0.0, 18.0))        # island
+    caps = []
+    _orig_cr, _orig_hm = B.channel_regions, R._helix_moves
+
+    def cr_spy(rings, stock, isl_ok3, z, tr_, leave, cell, stats=None, **kw):
+        res = _orig_cr(rings, stock, isl_ok3, z, tr_, leave, cell, stats, **kw)
+        for r in res:
+            caps.append({"z": round(z, 3), "q": tuple(r["start"]),
+                         "credit": r.get("credit") or 0.0,
+                         "bore": r.get("bore")})
+        return res
+
+    helixes = []
+
+    def hm_spy(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg=2.0):
+        mv = _orig_hm(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg)
+        helixes.append((cx, cy, r, z_bot))   # the EXACT emitted bore
+        return mv
+
+    B.channel_regions = cr_spy
+    R._helix_moves = hm_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d4.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            try:
+                moves, stats = rough(
+                    surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0), tool_r, 0.0,
+                    leave=0.381, axial_leave=0.381, stepdown=19.05,
+                    stepup=1.905, tolerance=0.05, threads=4, stock_cell=0.5,
+                    min_rest=0.5, corner_r=0.0, stl_path=stl)
+            except RuntimeError as e:
+                raise AssertionError("rough refused: %s" % str(e)[:160])
+    finally:
+        B.channel_regions = _orig_cr
+        R._helix_moves = _orig_hm
+
+    def own_helix(q, z):
+        """the helix event whose floor-circle run ends in this region's
+        landing move (its own bore), or None if the entry did not bore."""
+        idx = next((i for i, m in enumerate(moves) if m["g"] == 1
+                    and m["x"] is not None and m["z"] is not None
+                    and abs(m["z"] - z) < 1e-6
+                    and math.dist((m["x"], m["y"]), q) < 1e-4), None)
+        if idx is None:
+            return None
+        fz, j = [], idx - 1
+        while j >= 0:
+            m = moves[j]
+            if m["g"] == 0:
+                j -= 1
+                continue
+            if m["g"] == 1 and m["x"] is not None:
+                if abs(m.get("f", 0.0) - 1270.0) < 1e-6:
+                    if abs(m["z"] - z) <= 1e-6:
+                        fz.append((m["x"], m["y"]))
+                    elif m["z"] > z + 0.05:
+                        pass               # helix descent above Z
+                    else:
+                        break
+                else:
+                    break                  # cutting feed / link: other's run
+            j -= 1
+        if len(fz) < 5:
+            return None
+        own = [h for h in helixes if abs(h[3] - z) < 1e-6
+               and all(abs(math.dist(p, (h[0], h[1])) - h[2]) < 1.5e-4
+                       for p in fz)]
+        assert len(own) == 1, \
+            "entry bore run at (%.3f,%.3f)@Z%.3f matches %d emitted helices" \
+            % (q[0], q[1], z, len(own))
+        return own[0]
+
+    bored = [c for c in caps if c["bore"] is not None]
+    assert bored, \
+        "no band region carries the bore its planner accepted: the credit " \
+        "and the emitted entry are still two separate decisions"
+    n_bore_helix = n_nobore_helix = 0
+    for c in caps:
+        q, z = c["q"], c["z"]
+        if c["bore"] is not None:
+            b = c["bore"]
+            assert math.dist(b[:2], q) < 1e-4, \
+                "stored bore start (%.3f,%.3f) != region start (%.3f,%.3f)" \
+                % (b[0], b[1], q[0], q[1])
+            own = own_helix(q, z)
+            if own is None:
+                continue                   # link-backed entry (disk cleared)
+            n_bore_helix += 1
+            assert math.dist((own[0], own[1]), (b[2], b[3])) < 1e-6 \
+                and abs(own[2] - b[4]) < 1e-9, \
+                "credited region (%.3f,%.3f)@Z%.3f bored at (%.4f,%.4f) " \
+                "r %.4f, not its stored bore centre (%.4f,%.4f) r %.4f: " \
+                "the emit re-searched its own ladder" % (
+                    q[0], q[1], z, own[0], own[1], own[2], b[2], b[3], b[4])
+        elif c["credit"] > 1e-9:
+            own = own_helix(q, z)
+            if own is None:
+                continue
+            n_nobore_helix += 1
+            d = math.dist(own[:2], q)
+            assert abs(d - own[2]) > 0.12, \
+                "region (%.3f,%.3f)@Z%.3f with no predicted bore entered " \
+                "through a centred-only bore (centre %.3f mm from entry, " \
+                "r %.3f: circle passes through the entry)" % (
+                    q[0], q[1], z, d, own[2])
+    assert n_bore_helix >= 1, \
+        "no credited region bored with its stored bore: vacuous"
+    assert n_nobore_helix >= 1, \
+        "no credit-0 region needed a descent (no bore to deny it): vacuous"
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    assert stats.get("n_axial_plunge", 0) == 0, stats.get("axial_pts")
+    print("PASS bs1a4d4: %d credited region(s), %d stored bore(s), %d "
+          "entered with exactly their stored bore, %d credit-0 descents all "
+          "on the normal ladder; clcheck/axial 0" % (
+              sum(1 for c in caps if c["credit"] > 1e-9), len(bored),
+              n_bore_helix, n_nobore_helix))
 
 
 def test_bs1a4d3_links_measured_as_cuts():

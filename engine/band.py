@@ -470,6 +470,12 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                                    "paths": [["cutting", pc]]})
                     regions[-1]["credit"] = entry_credit(stock, pc[0], z,
                                                         tool_r)  # back at emit
+                    if borefn and regions[-1]["credit"] > 1e-9:
+                        # BS1a4d4: the bore the predictor accepted IS the entry
+                        _b = borefn(pc[0], z)
+                        if _b:
+                            regions[-1]["bore"] = (round(pc[0][0], 4),
+                                                   round(pc[0][1], 4)) + _b
                     regions[-1]["seg"] = seg        # BS1a4d (a0): centre line
                     regions[-1]["dropkey"] = drop_opt[0]   # + ring rank key
     if stats is not None:

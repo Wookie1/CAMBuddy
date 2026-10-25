@@ -1248,7 +1248,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     mx = float(v)
         return mx
 
-    def helix_entry(x, y, z, hc, centred=False):
+    def helix_entry(x, y, z, hc, centred=False, bore=None):
         """RT: bore down to cutting depth on a helix instead of axially
         plunging. The region entry point often hugs a forbidden island with
         only marginal clearance, so the helix is placed at a nearby position
@@ -1387,6 +1387,12 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             mill_now(x, y, z)
             return True
 
+        if bore is not None:
+            # BS1a4d4: the emitted entry IS the planned bore - no re-search
+            if not try_cand(bore[2], bore[3], bore[4]):
+                raise RuntimeError("band credit bore rejected at emit: "
+                                   "(%.3f, %.3f)" % (x, y))
+            return True
         if hc is not None:
             r0 = math.dist((hc[0], hc[1]), (x, y))
             if r0 > 0.05 and try_cand(hc[0], hc[1], r0):
@@ -1545,7 +1551,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         mill_now(x, y, z)
         stats["n_offset_descends"] += 1
 
-    def feed_down(x, y, z, hc=None, side=False, centred=False):
+    def feed_down(x, y, z, hc=None, side=False, centred=False, bore=None):
         """RT item 1+3: reach (x, y, Z) from directly above. Straight feed is
         only allowed where the flat bottom cuts already-cleared ground: any
         stock under the footprint goes through a helix/ramp entry; the air
@@ -1571,7 +1577,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     stats["n_side_entries"] += 1
                     stats["side_entry_feed_mm"] += math.dist(off, (x, y))
                     return
-            if helix_entry(x, y, z, hc, centred=centred):
+            if helix_entry(x, y, z, hc, centred=centred or bore is not None,
+                           bore=bore):
                 helix_n[0] += 1   # BS1a4c: this helix backs an entry credit
                 return
             if ax_hard:
@@ -1681,7 +1688,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         emit({"g": 0, "x": px, "y": py, "z": round(h, 4)})
         emit({"g": 0, "x": x, "y": y, "z": round(h, 4)})
 
-    def enter_at(x, y, z, hc, side=False, centred=False):
+    def enter_at(x, y, z, hc, side=False, centred=False, bore=None):
         """Get the tool to (x, y, Z) cutting depth, keeping it down when the
         stock model says the way is clear. RP2_1 side=True: OPEN region -
         feed_down tries the verified side entry before any helix."""
@@ -1730,7 +1737,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # G0-shortened descent; never an axial plunge into stock (RT item 3).
         # feed_down itself diverts long air descents to a nearby clear column.
         retract_to(x, y)
-        feed_down(x, y, z, hc, centred=centred)
+        feed_down(x, y, z, hc, centred=centred, bore=bore)
 
     def mill_now(x, y, z_bot):
         """Vertical plunge: the tool physically clears its footprint down to
@@ -2120,13 +2127,15 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 # tie must not follow candidate list order.
                 entry = min(cand[k], key=lambda p: (math.dist(
                     (prev[0], prev[1]), p), p[0], p[1]))
+            if res.get("bore"):
+                entry = res["bore"][:2]   # BS1a4d4: enter at the stored start
             rp2_flag, rp2_cand = rp2_open(res)
             pxy0 = (prev[0], prev[1])
             pz0 = prev[2]
             i0m = len(moves)
             h0 = helix_n[0]
             enter_at(round(entry[0], 4), round(entry[1], 4), z, res["helix"],
-                     side=bool(rp2_flag), centred="credit" in res)
+                     side=bool(rp2_flag), bore=res.get("bore"))
             de = descend_feed(pxy0 + (pz0,), i0m)
             # BS1a4c (f3f2165): a credited BAND start is backed at emit only
             # by an emitted helix or live-clear disk; else credit-0 re-check,
