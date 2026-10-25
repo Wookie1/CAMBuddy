@@ -1781,7 +1781,7 @@ def test_rr1c5d_front1_chord_offset_slabs():
     A = np.full((ny, nx), 30.0)
     pocketA = (X >= 6.0) & (X <= 22.0) & (Y >= 12.0) & (Y <= 28.0)
     pocketB = (X >= 30.0) & (X <= 46.0) & (Y >= 12.0) & (Y <= 28.0)
-    A[pocketA] = 27.55   # a1 = 0.75 above the cutting Z 26.8
+    A[pocketA] = 27.0    # a1 = 2.2 above the cutting Z 24.8: chord c0 = -2.11
     A[pocketB] = 28.9    # a1 ~2.1 (live) above the cutting Z 26.8
     A[pocketA & (X < 12.0)] = 24.8   # cleared ground: the open edge
     A[pocketB & (X < 36.0)] = 24.8
@@ -1798,6 +1798,9 @@ def test_rr1c5d_front1_chord_offset_slabs():
     assert len(stats["zones"]) == 2, \
         "two open-edge slab zones required: %s" % [
             (z["bbox"], z["helix"]) for z in stats["zones"]]
+    assert stats.get("rr_clmn_ladder", 0) >= 1, \
+        "no chord-offset slab inspected: the RR1c5d front-1 slab guard "\
+        "(clmn bookkeeping, rr_clmn_ladder) never saw an emitted slab"
     assert any(m["g"] == 1 and m.get("f") == 2280.0 for m in moves), \
         "no cutting-feed moves: vacuous"
     below, worst = rr.validate_exact(surf, 9.525, moves, 0.2)
@@ -1812,7 +1815,7 @@ def test_rr1c5d_front1_chord_offset_slabs():
     part[(Xp >= 6.0) & (Xp <= 22.0) & (Yp >= 12.0) & (Yp <= 28.0)] = 24.6
     part[(Xp >= 30.0) & (Xp <= 46.0) & (Yp >= 12.0) & (Yp <= 28.0)] = 24.6
     stock_init[(Xp >= 6.0) & (Xp <= 22.0) & (Yp >= 12.0) &
-               (Yp <= 28.0)] = 27.55
+               (Yp <= 28.0)] = 27.0
     stock_init[(Xp >= 30.0) & (Xp <= 46.0) & (Yp >= 12.0) &
                (Yp <= 28.0)] = 28.9
     stock_init[(Xp >= 6.0) & (Xp < 12.0) & (Yp >= 12.0) & (Yp <= 28.0)] = 24.8
@@ -1830,7 +1833,7 @@ def test_rr1c5d_front1_chord_offset_slabs():
             if w.get("feed", 0.0) >= 0.9 * 2280.0 and w["a"] > 0.5]
     assert deep, "no deep cutting-feed windows: gate would be vacuous"
     rep = []
-    for tag, top in (("A", 27.55), ("B", 28.9)):
+    for tag, top in (("A", 27.0), ("B", 28.9)):
         a1 = top - 26.8
         hch = math.sqrt(a1 * (9.525 - a1))
         rep.append("%s: a1=%.2f c0=%.3f est_w=%.3f" % (tag, a1,

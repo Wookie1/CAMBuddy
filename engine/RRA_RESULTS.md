@@ -294,3 +294,116 @@ git show HEAD:engine/RRA_RESULTS.md with this RR1c5e section appended.
 ### Test runs / exit codes
 
 ### Mutation record
+
+
+---
+
+# RR1c5f — re-scope the SCENE of test_rr1c5d_front1_chord_offset_slabs
+
+Session start: Sun Oct 25 08:06:50 MST 2026 (HARD CAP 2 h -> end by 10:07 MST)
+Base commit: 9ffac88 (branch rr1b). Worktree: /Users/James/ai-sandbox/stevecam-rr1b.
+
+## RR1c5f — cause table (supervisor bisect, copied in before any change)
+
+Supervisor bisect 2026-10-25; that test only, on archives of each rr1b engine
+commit; "deep" = ae2 windows at >= 0.9 x 2280 feed with a > 0.5 mm, as the
+test's own guard counts them.
+
+| commit | windows | at cutting feed | deep | max a (feed) | max a (all) | result |
+|---|---|---|---|---|---|---|
+| 8d96cea (added the test) | 81 | 63 | 0 | 0.241 | 0.879 | FAIL vacuous |
+| 5f938de | 81 | 63 | 0 | 0.241 | 0.879 | FAIL vacuous |
+| eee3f66 | 81 | 63 | 0 | 0.241 | 0.879 (1st sim 0.199) | FAIL vacuous |
+| 447c434 | 81 | 63 | 0 | 0.241 | 0.879 | FAIL vacuous |
+| 07f0c7e | 81 | 63 | 0 | 0.241 | 0.879 | FAIL vacuous |
+| 9260c78 | 82 | 63 | 0 | 0.241 | 0.879 | FAIL vacuous |
+| fa54f9b | 82 | 63 | 0 | 0.241 | 0.879 | FAIL vacuous |
+
+Cause: vacuous SINCE the commit that added it - the scene never produced a
+deep cutting-feed window. Reproduced on this worktree (scratch/rr1c5f_probe.py):
+gate sim 82/63/0/0.190/0.199, guard sim 82/63/0/0.241/0.879 - exact match.
+
+Mechanism: pocket A's wall a1 = 27.55 - 26.8 = 0.75 mm. A clean single feed
+pass along that wall (front-1 at c0 = ae - c(a1)/2 = -0.66, micro-sim
+scratch/rr1c5f_shift.py) removes at most a = 0.317 mm - below the 0.5 deep
+threshold by construction. The vacuity guard additionally runs its sim with
+grid origin 0.0 while the gate helper uses the corrected -2.0 (eee3f66 fixed
+only the gate sim); the guard stays untouched, so the scene must reach a deep
+window IN THE GUARD SIM and stay gate-clean in the gate sim.
+
+## Scene sweep (scratch/rr1c5f_scene.py; gate via _rr1c5b_zmap_gate on its own
+grid; guard sim exactly as the test runs it; gouge = validate_exact)
+
+| topA | gouge | gate | deep (guard) | max a (feed) | rr_clmn_ladder |
+|---|---|---|---|---|---|
+| 25.8 | 0 | PASS | 6 | 1.353 | 0 |
+| 26.2 | 0 | PASS | 3 | 0.712 | 0 |
+| 26.6 | 0 | PASS | 4 | 0.703 | 0 |
+| **27.0 (chosen)** | 0 | PASS | 2 | 1.095 | 3 |
+| 27.2 | 0 | PASS | 2 | 0.762 | 4 |
+| 27.4 | 0 | PASS | 0 | 0.379 | 4 |
+| 28.3 | - | deep windows at Z 24.8 are full-width (lower level under the chord model) | | | |
+| 28.9 | - | lower levels never entered (all passes skipped) | | | |
+
+## Scene change (engine/test_engine.py, that test ONLY; stock only, tris and
+level params untouched; threshold 2.286 and the vacuity guard untouched)
+
+- pocket A stock top 27.55 -> 27.0 (the A[pocketA] line and the matching
+  stock_init line): wall a1 = 2.2 above the Z 24.8 cutting level, front-1
+  chord c0 = ae - c(a1)/2 = -2.109 mm (CL inside cleared ground; instrumented
+  scratch copy confirms a1 = 2.200, hch = 4.014, chord-offset front-1 rings
+  emitted n_f1 >= 1)
+- the PASS-report tuple ("A", 27.55) -> ("A", 27.0) (same line, cosmetic)
+- ONE added assert: `stats.get("rr_clmn_ladder", 0) >= 1` - the engine's own
+  RR1c5d front-1 slab bookkeeping. The f1 flags themselves are function-local
+  and rr_f1_mismatch only records a mismatch; rr_clmn_ladder is the only
+  positive counter the engine exports for the chord-offset slab path (links
+  inspected against the clmn near-groove mask of the EMITTED chord-offset
+  slabs and sent to the ladder). No engine change.
+
+New scene (topA = 27.0), guard sim, same table form:
+
+| scene | windows | at cutting feed | deep | max a (feed) | max a (all) | result |
+|---|---|---|---|---|---|---|
+| re-scoped 27.0 | 67 | 48 | 2 | 1.095 | 1.105 | PASS (gate clean, gouge 0) |
+
+## Test runs (pasted exit codes; every command foreground through slot_m4.sh)
+
+- re-scoped test: `PASS rr1c5d front-1 chord: ... | gen 0.47s`  EXIT=0
+- test_rra2_deep_top_scope: PASS  EXIT_rra2=0
+- test_rra3_straight_descent_scope: PASS  EXIT_rra3=0
+- test_rr1c3_bay_deep_groove_top_down: EXIT_bay=0
+- test_rr1c_thin_band_inpass_ramp: EXIT_thin=0
+- test_rr1c_narrow_pocket_side_entry: EXIT_narrow=0
+- test_rr1c5d_live_grid_fine_for_coarse_stock: PASS  EXIT_livegrid=0
+
+## Mutation record (scratch copy scratch/rr1c5f_rr_mut.py ONLY - real engine
+untouched; `c = ae - hch` -> `c = ae / 2.0`, dropping the front-1 chord
+offset; run via scratch/rr1c5f_mut_run.py / rr1c5f_mut_measure.py)
+
+    MUTATION RESULT: FAIL by measured value: no deep cutting-feed windows:
+    gate would be vacuous
+    EXIT_mut=1
+    SIM#1 windows=48 feed=32 deep=0 maxa_all=0.155 maxa_feed=0.155
+    SIM#2 windows=48 feed=32 deep=0 maxa_all=1.401 maxa_feed=0.155
+    EXIT_mut_measure=1
+
+With the chord offset dropped the front-1 rings move to ae/2 OUTSIDE the
+cleared ground; the measured deep cutting-feed windows disappear (0 deep,
+max a at cutting feed 0.155 mm) and the re-scoped test fails BY MEASURED
+VALUE (exit 1).
+
+## Lane note
+
+After all required runs were complete (~08:50), the small-test lane stopped
+returning even for `python -c "print('lane-ok')"` (4 min timeout hit twice;
+likely another owner holds the slot). Per LOCKS no lock file was touched. No
+required measurement was pending; the final optional probe re-run was
+skipped.
+
+## Final size
+
+git diff --numstat (working tree): engine/test_engine.py 6 added / 3 removed
+(9 changed lines, budget <= 20); engine/RRA_RESULTS.md (this record).
+opencode.json was already modified before this session and was NOT touched.
+Nothing committed.
