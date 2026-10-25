@@ -53,6 +53,14 @@ from . import entry_depth as fin
 from .finish import batch_drop, make_cutter, march_level
 
 CELL = 0.2          # mm, zone/contour grid (stock is max-resampled to this)
+# RR-A: top-clear limit for the step-2 ramp of a DESCENT re-entry (a lower
+# level entered from the level just cleared). The live grid is now
+# fine=min(stock cell, 0.1) (RR1c-5d (A)), at least as fine as the ZB
+# judge's 0.1 grid, so this read is no longer an under-read: the bay groove
+# ramp top measured 0.2571 mm on the 0.1 grid (0.2435 on the old 0.5 grid)
+# against the scored ZB limit 0.5. 0.3 keeps a >= 0.2 mm margin to ZB; the
+# shallow (0.25) gate stands for level entries, straight descents and SE2.
+DEEP_TOP = 0.3
 
 
 def _grid(stock):
@@ -404,17 +412,19 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
         _record(zi, t, 1, "direct-descent", d)
         return True
 
-    def step2(x, y, t, ux, uy, zi):
+    def step2(x, y, t, ux, uy, zi, deep=False):
         """In-pass ramp at ramp_angle: smallest L along +-u whose top
         satisfies the FE5e top-clear rule (descent column at the ramp top
         verified live depth <= shallow); the ramp is IN-PASS: its top and
-        path stay inside the level region and leave-legal."""
+        path stay inside the level region and leave-legal. deep: descent
+        re-entry, top-clear limit DEEP_TOP (see constant)."""
         for sgn in (1.0, -1.0):
-            if step2_dir(x, y, t, sgn * ux, sgn * uy, zi):
+            if step2_dir(x, y, t, sgn * ux, sgn * uy, zi, deep):
                 return True
         return False
 
-    def step2_dir(x, y, t, ux, uy, zi):
+    def step2_dir(x, y, t, ux, uy, zi, deep=False):
+        top_lim = DEEP_TOP if deep else shallow
         L = CELL
         while L <= 80.0:
             ax, ay = x - ux * L, y - uy * L
@@ -427,7 +437,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                      and 0 <= j0 < reg_cur.shape[1] and bool(reg_cur[i0, j0]))
             if inpass and cl_ok(ax, ay, az):
                 d = live.disk_depth(ax, ay, az)
-                if math.isfinite(d) and d <= shallow:
+                if math.isfinite(d) and d <= top_lim:
                     n = max(int(L / CELL), 1)
                     rp = [(x - ux * L * (1.0 - q / n),
                          y - uy * L * (1.0 - q / n),
@@ -511,13 +521,14 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
     Dz = None            # distance transform of the current level region
     reg_cur = None
 
-    def enter(x, y, t, ux, uy, zi):
+    def enter(x, y, t, ux, uy, zi, deep=False):
         """ONE ladder entry (steps 1, 2, 4) used by both the zone entry and
         the per-pass links (RR1c_DIAG 3): shallow descent, in-pass ramp along
-        (ux, uy) when a direction exists, SE2 side entry."""
+        (ux, uy) when a direction exists, SE2 side entry. deep: a descent
+        re-entry from the level just cleared (step-2 top-clear DEEP_TOP)."""
         if step1(x, y, t, zi):
             return True
-        if abs(ux) + abs(uy) > 0.5 and step2(x, y, t, ux, uy, zi):
+        if abs(ux) + abs(uy) > 0.5 and step2(x, y, t, ux, uy, zi, deep):
             return True
         return step4(x, y, t, zi)
 
@@ -886,7 +897,8 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                             # already cut), not the contour tangent
                             ldx, ldy = ((pts[0][0] - prev[0]) / d0,
                                        (pts[0][1] - prev[1]) / d0)
-                        ok = enter(pts[0][0], pts[0][1], t, ldx, ldy, zi)
+                        ok = enter(pts[0][0], pts[0][1], t, ldx, ldy, zi,
+                                   dzd > 1e-9)
                         if not ok and dzd > 1e-9:
                             # descent into a narrow strip: at the contour's
                             # start (its cap) the tangent runs ACROSS the
@@ -898,7 +910,7 @@ def rest_rough(surf, stock, tool, floor_z, stepdown, ae, rest_leave,
                                      xs[isr2].min() >= ys[jsr2].max() -
                                      ys[jsr2].min() else (0.0, 1.0))
                                 ok = enter(pts[0][0], pts[0][1], t, ax2[0],
-                                         ax2[1], zi)
+                                         ax2[1], zi, True)
                         if not ok:
                             skipped += 1
                             stats["passes_skipped"].append({
