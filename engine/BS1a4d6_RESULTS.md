@@ -448,3 +448,12 @@ chord (cutting feed), not a unit error, and the emitted piece is unchanged
   (= 28 engine lines), test_engine.py 92/1 (tests only),
   BS1a4d6_RESULTS.md append-only.
 - BS1a4d6c DONE.
+
+## Supervisor notes on BS1a4d6c (2026-10-25)
+- Correction to item 0: 2.286 IS used as an engagement limit - the ZE2B test gate (_rr1c5b_zmap_gate on rr1b,
+  engage_max 2.286 and its "over 2.286" assert). It is not used by the band engine's own comparisons.
+- Test units fixed (73e8d92): the side-entry test now compares predictor WIDTH (window area / that window's travel,
+  from _simulate ends=) to the judged ae_eff, both mm. Clean: 23.958 >= 11.458 mm PASS. Mutation (unconditional
+  pre-clear restored for side/link): 9.375 < 11.458 mm, FAIL by an under-read of 2.083 mm.
+- Open: the clean predictor width 23.958 mm exceeds D 12.686 - for entry="side" the approach move into path[0] is not
+  simulated, so the standing start disk lands in window 0 (an over-read).
