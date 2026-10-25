@@ -266,3 +266,31 @@ was REFUSED as a straight descent; (3) the scene is still cut via step 2.
 
 No commits made. Session start 02:53 MST, finish 04:09 MST (~1 h 16 m,
 inside the 2 h cap).
+
+---
+
+## RR1c5e (started Sun Oct 25 05:03:42 MST 2026, hard cap 2 h)
+
+Task: test_rr1c5d_front1_chord_offset_slabs is vacuous ("no deep cutting-feed
+windows"). Bisect engine commits, decide legit-vs-regression, re-scope scene
+only if legitimate. Test/scene edits only (engine/test_engine.py), <= 20
+changed lines, threshold and vacuity guard unchanged.
+
+NOTE: at session start this file was mistakenly rewritten before its tracked
+contents were checked; it has been restored byte-for-byte from
+git show HEAD:engine/RRA_RESULTS.md with this RR1c5e section appended.
+
+### Cause analysis (step 1) - IN PROGRESS
+
+### Bisect table
+
+| commit | deep-window count | max depth | verdict |
+|---|---|---|---|
+
+### Decision
+
+### Scene change (step 2)
+
+### Test runs / exit codes
+
+### Mutation record
