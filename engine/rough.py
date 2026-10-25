@@ -2143,9 +2143,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # tool is already at depth there (gouged); enter_at's own ladder
             # (link / side / helix, each CL-checked) is the only entry.
             drop_cut = False
-            if (res.get("credit") or 0.0) > 1e-9 and helix_n[0] == h0:
+            if ((res.get("credit") or 0.0) > 1e-9 and helix_n[0] == h0) \
+                    or res.get("replan0"):   # BS1a4d4: plan0_split piece
                 pts_c, q4 = res["paths"][0][1], tuple(res["start"])
-                if not stock.link_clear([q4, q4], z):
+                if res.get("replan0") or not stock.link_clear([q4, q4], z):
                     ew0 = _simulate(pts_c, stock, z, tool_r, stock.cell, 0.0)
                     if ew0 and max(ew0) <= AE_SPIKE and sorted(
                             ew0)[max(0, int(0.95 * len(ew0)) - 1)] <= AE_SS:
