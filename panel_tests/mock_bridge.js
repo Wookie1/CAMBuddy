@@ -85,6 +85,7 @@
     }
     if (action === "job.setup") {
       const r = newRun(action, "running"); send({ steve: 1, id, result: plainRun(r) });
+      if (CFG.setupError) return finishLater(r, { state: "failed", error: CFG.setupError });
       M.job.setup = inputs.setup;
       return finishLater(r, { state: "succeeded", result: Object.assign({ document_id: inputs.document_id }, JSON.parse(JSON.stringify(M.job))) });
     }

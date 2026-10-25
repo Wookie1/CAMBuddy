@@ -8,6 +8,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -2058,6 +2059,9 @@ def test_zz_print_e2e_result(live):
 CHECK_INPUTS = {
     "orientation": "as_modeled", "stock_xy": 1.0, "stock_top": 0.4,
     "stock_bottom": 1.0,
+    # TL2 item 1: origin is required for check_program (approved edit: the
+    # fixtures were posted in the model frame)
+    "origin": "model_origin",
 }
 
 
@@ -2092,7 +2096,8 @@ class TestCheckProgramCatalog:
 
     def test_validate_inputs(self):
         ok, code, v = catalog_mod.validate_inputs(
-            {"program": {"url": "u"}, "model": {"url": "u"}},
+            {"program": {"url": "u"}, "model": {"url": "u"},
+             "origin": "model_origin"},
             catalog_mod.CHECK_ACTION)
         assert ok, code
         ok, code, _ = catalog_mod.validate_inputs(
@@ -2100,11 +2105,13 @@ class TestCheckProgramCatalog:
         assert not ok and code == "input_missing"
         ok, code, _ = catalog_mod.validate_inputs(
             {"program": {"url": "u"}, "model": {"url": "u"},
-             "floor_z": 4.0}, catalog_mod.CHECK_ACTION)
+             "origin": "model_origin", "floor_z": 4.0},
+            catalog_mod.CHECK_ACTION)
         assert not ok and code == "input_unknown"
         ok, code, _ = catalog_mod.validate_inputs(
             {"program": {"url": "u"}, "model": {"url": "u"},
-             "tool_number": 5000}, catalog_mod.CHECK_ACTION)
+             "origin": "model_origin", "tool_number": 5000},
+            catalog_mod.CHECK_ACTION)
         assert not ok and code == "input_out_of_range"
 
 
@@ -2276,6 +2283,7 @@ class TestCheckProgramSequenceCatalog:
     def test_validate_accepts_program_2_and_3(self):
         ok, code, v = catalog_mod.validate_inputs(
             {"program": {"url": "u"}, "model": {"url": "u"},
+             "origin": "model_origin",
              "program_2": {"url": "u"}, "program_3": {"url": "u"}},
             catalog_mod.CHECK_ACTION)
         assert ok, code
@@ -2709,3 +2717,601 @@ class TestAxialPlungeGate:
                                   dict(CHECK_INPUTS))
         msg = str(ei.value)
         assert "axial plunges" in msg, msg
+
+
+# ================================== track 2: tool library + job renumber ==
+
+def _final_body(mock, run_id, timeout=60):
+    final = mock.wait_terminal(run_id, timeout=timeout)
+    body = [r["body"] for r in mock.reports
+            if str(r["run_id"]) == str(run_id)][-1]
+    return final, body
+
+
+class TestToolLibE2E:
+    """STEVE -> tools.list / job.renumber / job.get, then a renumbered
+    rough -> finish -> rest chain and check_program on a renumbered
+    program. State lives in the live fixture's temp home only."""
+    DOC = "doc-renum-e2e"
+    ROUGH = "flat-12.686"
+
+    def _sha(self, path):
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    def test_tool_actions(self, live):
+        mock, home, _ = live
+        mock.enqueue_run(1301, action=catalog_mod.TOOLS_LIST, inputs={})
+        final, body = _final_body(mock, 1301)
+        assert final == "succeeded", body
+        res = body["result"]
+        assert res["pockets"] == 12
+        t13 = next(t for t in res["tools"] if t["tool_id"] == self.ROUGH)
+        assert (t13["t"], t13["h"], t13["d"]) == (13, 13, 13)
+
+        mock.enqueue_run(1302, action=catalog_mod.JOB_RENUMBER,
+                         inputs={"document_id": self.DOC,
+                                 "tool_id": self.ROUGH, "t": 5})
+        final, body = _final_body(mock, 1302)
+        assert final == "succeeded", body
+        job = {k: body["result"][k] for k in ("document_id", "renumber",
+                                               "tools_used", "setup")}
+        assert job == {"document_id": self.DOC,
+                       "renumber": {self.ROUGH: 5},
+                       "tools_used": [], "setup": None}
+        assert body["result"]["verdict"] == "ready"  # task f envelope
+        # refusals come back as {code, message}
+        for rid, t, code in ((1303, 3, "duplicate_t"),
+                             (1304, 0, "out_of_range"),
+                             (1305, 13 + 100, "out_of_range")):
+            mock.enqueue_run(rid, action=catalog_mod.JOB_RENUMBER,
+                             inputs={"document_id": self.DOC,
+                                     "tool_id": "ball-19.050", "t": t})
+            final, body = _final_body(mock, rid)
+            assert final == "failed" and body["error"]["code"] == code, body
+            assert body["error"]["message"]
+        mock.enqueue_run(1306, action=catalog_mod.JOB_GET,
+                         inputs={"document_id": self.DOC})
+        final, body = _final_body(mock, 1306)
+        assert final == "succeeded"
+        assert body["result"]["renumber"] == {self.ROUGH: 5}
+
+    def test_renumbered_chain_posts_t5(self, live):
+        """rough -> finish -> rest with T13 -> T5 for this document: every
+        posted T/H of the rough switches to 5, the finish (T20) and rest
+        (T31) are unchanged, and neither the library nor the repo table
+        changes."""
+        mock, home, _ = live
+        lib = str(home / "tools.json")
+        assert os.path.exists(lib), "test_tool_actions seeds the library"
+        lib_before = self._sha(lib)
+        repo_before = self._sha(os.path.join(REPO, "tools", "x7_tools.json"))
+        mock.enqueue_run(1310, action=catalog_mod.SLOPE_ACTION,
+                         inputs=dict(SLOPE_GOOD_INPUTS,
+                                     model=model_input(mock),
+                                     rest_tool_number=31,
+                                     document_id=self.DOC))
+        final = mock.wait_terminal(1310, timeout=900)
+        assert final == "succeeded", mock.states_for(1310)
+        run = home / "runs" / "1310"
+
+        def words(name):
+            text = open(run / name).read()
+            body = re.sub(r"\([^)]*\)", "", text)
+            return (set(re.findall(r"\bT\d+", body)),
+                    set(re.findall(r"\bH\d+", body)))
+        assert words("rough.nc") == ({"T5"}, {"H05"})
+        assert words("finish.nc") == ({"T20"}, {"H20"})
+        assert words("rest.nc") == ({"T31"}, {"H31"})
+        assert self._sha(lib) == lib_before
+        assert self._sha(os.path.join(REPO, "tools", "x7_tools.json")) == \
+            repo_before
+        with open(home / "jobs" / "used" / (self.DOC + ".json")) as fh:
+            assert json.load(fh) == [self.ROUGH, "ball-9.525", "ball-5.958"]
+
+    def test_check_program_resolves_renumbered_t(self, live):
+        mock, _, _ = live
+        mock.enqueue_run(1320, action=catalog_mod.CHECK_ACTION,
+                         inputs=dict(CHECK_INPUTS, model=model_input(mock),
+                                     program=program_input(
+                                         mock, "check_ok_t5.nc"),
+                                     document_id=self.DOC))
+        final, body = _final_body(mock, 1320, timeout=600)
+        assert final == "succeeded", body
+        r = body["result"]
+        assert r["tool"]["number"] == 5
+        assert r["tool"]["diameter_mm"] == 12.686
+        assert r["tool"]["holder"] == "BT30-ER32-70"
+        assert r["zmap_gouges"]["count"] == 0
+        assert r["holder_hits"]["count"] == 0
+        # without the job (model document doc-1) T5 is unknown: refused
+        mock.enqueue_run(1321, action=catalog_mod.CHECK_ACTION,
+                         inputs=dict(CHECK_INPUTS, model=model_input(mock),
+                                     program=program_input(
+                                         mock, "check_ok_t5.nc")))
+        final, body = _final_body(mock, 1321, timeout=600)
+        assert final == "failed" and "T5" in body["error"]["message"], body
+
+
+class TestOmittedUnitsE2E:
+    """Track 2 (a): an adaptive_rough with NO units input reads every
+    length/feed as inch and posts G20: the posted header diameter and the
+    cutting feed match the inch interpretation."""
+
+    def test_omitted_units_post_inch(self, live):
+        mock, home, _ = live
+        inputs = dict(GOOD_INPUTS, model=model_input(mock))
+        del inputs["units"]
+        inputs.update({"stock_xy": 1.0 / 25.4, "stock_top": 0.4 / 25.4,
+                       "stock_bottom": 1.0 / 25.4,
+                       "floor_z": GOOD_INPUTS["floor_z"] / 25.4,
+                       "tool_diameter": 0.5, "flute_length": 2.0,
+                       "stepdown": GOOD_INPUTS["stepdown"] / 25.4,
+                       "optimal_load": GOOD_INPUTS["optimal_load"] / 25.4,
+                       "stock_to_leave": GOOD_INPUTS["stock_to_leave"] / 25.4,
+                       "rest_stepup": GOOD_INPUTS["rest_stepup"] / 25.4,
+                       "feed": 135.0, "ramp_feed": 50.0})
+        mock.enqueue_run(1401, inputs=inputs)
+        final = mock.wait_terminal(1401, timeout=600)
+        assert final == "succeeded", mock.states_for(1401)
+        text = open(home / "runs" / "1401" / "rough.nc").read()
+        assert "G20" in text and "G21" not in text
+        head = re.search(r"\(T13 D=([0-9.]+) ", text)
+        assert head and float(head.group(1)) == pytest.approx(0.5), head
+        feeds = {float(f) for f in re.findall(r"\bF([0-9.]+)", text)}
+        assert 135.0 in feeds, sorted(feeds)
+        assert max(feeds) == pytest.approx(135.0)
+
+
+class TestModelMeasureE2E:
+    """Track 2 (b): model.measure returns the oriented model's box from the
+    same prepare path a rough uses: measured box + the rough's allowances =
+    the rough's stock box (within 0.0001 mm rounding)."""
+
+    def test_measure_matches_rough_stock_box(self, live):
+        mock, home, _ = live
+        mock.enqueue_run(1501, action=catalog_mod.MEASURE_ACTION,
+                         inputs={"model": model_input(mock),
+                                 "orientation": "as_modeled"})
+        final, body = _final_body(mock, 1501, timeout=300)
+        assert final == "succeeded", body
+        m = body["result"]
+        assert set(m) >= {"size_mm", "bbox_mm"}
+        lo, hi = m["bbox_mm"]["min"], m["bbox_mm"]["max"]
+        for i, k in enumerate("xyz"):
+            assert m["size_mm"][k] == pytest.approx(hi[i] - lo[i], abs=1e-4)
+        assert mock.file_names(1501) == []
+
+        # same frame as the measurement: the model's own (task e's default
+        # origin would move the stock box to the stock bottom centre)
+        mock.enqueue_run(1502, inputs=dict(GOOD_INPUTS,
+                                           model=model_input(mock),
+                                           origin="model_origin"))
+        final, body = _final_body(mock, 1502, timeout=600)
+        assert final == "succeeded", body
+        sb = body["result"]["stock_box_mm"]
+        g = GOOD_INPUTS
+        want = [lo[0] - g["stock_xy"], hi[0] + g["stock_xy"],
+                lo[1] - g["stock_xy"], hi[1] + g["stock_xy"],
+                lo[2] - g["stock_bottom"], hi[2] + g["stock_top"]]
+        assert max(abs(a - b) for a, b in zip(sb, want)) < 2e-4, (sb, want)
+
+
+BOX_STEP = os.path.join(HERE, "testdata", "box_off_centre.step")
+# box_off_centre.step: 40 x 20 x 10 mm, x 5..45, y -3..17, z -10..0
+# (off-centre in XY, Z0 at its top), centre (25, 7, -5)
+BOX_SIZE = {"as_modeled": (40, 20, 10), "flip_x_180": (40, 20, 10),
+            "flip_y_180": (40, 20, 10), "flip_z_180": (40, 20, 10),
+            "rot_x_90": (40, 10, 20), "rot_x_270": (40, 10, 20),
+            "rot_y_90": (10, 20, 40), "rot_y_270": (10, 20, 40)}
+
+
+def box_input(mock, path=BOX_STEP):
+    m = model_input(mock)
+    with open(path, "rb") as fh:
+        data = fh.read()
+    name = os.path.basename(path)
+    m.update({"name": name,
+              "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
+              "url": mock.base_url + "/files/" + name,
+              "document": {"id": "doc-box"}})
+    return m
+
+
+# box_turn.step: 60 x 30 x 24 mm block (x -30..30, y -15..15, z 3..27)
+# with a 30 x 16 x 6 mm pocket in its +Y face. After rot_x_90 (about its
+# centre) it stands 60 x 24 x 30 on Z0 (z 0..30) with the pocket on top:
+# the roughing engine only clears enclosed regions, so a plain exterior box
+# posts an empty program, which the gates refuse (measured: G43 Z0. ->
+# 2 rapid collisions)
+BOX_TURN_STEP = os.path.join(HERE, "testdata", "box_turn.step")
+
+
+def _measure(mock, run_id, orientation):
+    mock.enqueue_run(run_id, action=catalog_mod.MEASURE_ACTION,
+                     inputs={"model": box_input(mock),
+                             "orientation": orientation})
+    final, body = _final_body(mock, run_id, timeout=300)
+    assert final == "succeeded", body
+    return body["result"]
+
+
+class TestOrientationE2E:
+    """Track 2 (d): rot_x_90/270 and rot_y_90/270 on a non-cube box swap
+    the measured axes as expected (about the box centre), and a rough on
+    the turned box passes every gate."""
+
+    def test_measured_sizes_swap(self, live):
+        mock, _, _ = live
+        worst = 0.0
+        for i, (o, size) in enumerate(sorted(BOX_SIZE.items())):
+            m = _measure(mock, 1600 + i, o)
+            got = [m["size_mm"][k] for k in "xyz"]
+            worst = max(worst, max(abs(a - b) for a, b in zip(got, size)))
+            centre = [(lo + hi) / 2 for lo, hi in
+                      zip(m["bbox_mm"]["min"], m["bbox_mm"]["max"])]
+            assert centre == pytest.approx([25, 7, -5], abs=1e-3), (o, m)
+        assert worst < 1e-3, worst
+
+    def test_injected_fault_is_measured(self, live):
+        """Fault: rot_x_90 mapped to the 180 deg flip. The real measurement
+        of that box misses rot_x_90's expected size by 10 mm in Y and Z."""
+        mock, _, _ = live
+        m = _measure(mock, 1620, "flip_x_180")
+        err = [abs(m["size_mm"][k] - e)
+               for k, e in zip("xyz", BOX_SIZE["rot_x_90"])]
+        assert err == pytest.approx([0.0, 10.0, 10.0], abs=1e-3)
+
+    def test_rough_on_turned_box_passes_gates(self, live):
+        mock, home, _ = live
+        mock.enqueue_run(1630, inputs=dict(
+            GOOD_INPUTS, model=box_input(mock, BOX_TURN_STEP),
+            orientation="rot_x_90", program_number=1630))
+        final, body = _final_body(mock, 1630, timeout=900)
+        assert final == "succeeded", body
+        r = body["result"]
+        assert r["zmap_gouges"]["count"] == 0
+        assert r["rapid_collisions"]["count"] == 0
+        assert r["over_flute"]["count"] == 0
+        assert r["holder_hits"]["count"] == 0
+        sb = r["stock_box_mm"]
+        assert [sb[1] - sb[0], sb[3] - sb[2], sb[5] - sb[4]] == \
+            pytest.approx([62.0, 26.0, 31.4], abs=1e-3)
+        assert r["cut_length_mm"] > 100
+
+
+ORIGIN_STEP = os.path.join(HERE, "testdata", "box_origin.step")
+# box_origin.step: 60 x 30 x 24 mm block off-centre (x 5..65, y -3..27)
+# drawn with Z0 at its top (z -24..0), a 30 x 16 x 6 mm pocket on top.
+# With GOOD_INPUTS allowances (xy 1, top 0.4, bottom 1) the stock box is:
+ORIGIN_EXPECT = {
+    "stock_bottom_centre": [-31.0, 31.0, -16.0, 16.0, 0.0, 25.4],
+    "stock_top_centre": [-31.0, 31.0, -16.0, 16.0, -25.4, 0.0],
+    "model_origin": [4.0, 66.0, -4.0, 28.0, -25.0, 0.4]}
+
+
+def _program_frame(path):
+    """(header ZMIN, centre X, centre Y of the G1 moves) of a posted
+    program (mm programs)."""
+    text = open(path).read()
+    zmin = float(re.search(r"ZMIN=(-?[0-9.]+)", text).group(1))
+    xs, ys, x, y, mode = [], [], None, None, None
+    for line in text.splitlines():
+        body = re.sub(r"\([^)]*\)", "", line)
+        g = re.findall(r"\bG0?([0-3])\b", body)
+        if g:
+            mode = g[-1]
+        mx = re.search(r"X(-?[0-9.]+)", body)
+        my = re.search(r"Y(-?[0-9.]+)", body)
+        x = float(mx.group(1)) if mx else x
+        y = float(my.group(1)) if my else y
+        if mode in ("1", "2", "3") and (mx or my):
+            xs.append(x)
+            ys.append(y)
+    return zmin, (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+
+
+class TestWorkOriginE2E:
+    """Track 2 (e): for each origin the stock box zmap judged sits where
+    expected within 0.001 mm, the posted program moves by exactly the same
+    offset, and check_program judges a program in the frame it was posted
+    with."""
+
+    def test_origins(self, live, tmp_path):
+        mock, home, _ = live
+        frames, worst = {}, 0.0
+        for i, origin in enumerate(sorted(ORIGIN_EXPECT)):
+            rid = 1700 + i
+            mock.enqueue_run(rid, inputs=dict(
+                GOOD_INPUTS, model=box_input(mock, ORIGIN_STEP),
+                origin=origin, program_number=1700 + i))
+            final, body = _final_body(mock, rid, timeout=900)
+            assert final == "succeeded", (origin, body)
+            r = body["result"]
+            assert r["origin"] == origin
+            with open(home / "runs" / str(rid) / "check.json") as fh:
+                judged = json.load(fh)["stock_box"]
+            for box in (r["stock_box_mm"], judged):
+                err = max(abs(a - b) for a, b in
+                          zip(box, ORIGIN_EXPECT[origin]))
+                worst = max(worst, err)
+                assert err < 1e-3, (origin, box)
+            frames[origin] = _program_frame(home / "runs" / str(rid) /
+                                            "rough.nc")
+        E2E["origin_worst_mm"] = worst
+        # the program itself moved by the stock-frame offset: ZMIN and the
+        # X/Y centre of its cutting moves. Tolerance 0.05 mm: the engine
+        # plans on a grid tied to the frame, so the toolpath is not
+        # translation-exact at sub-cell level (measured 0.006 mm in Y on
+        # the first run); the stock box itself is held to 0.001 mm above
+        m = frames["model_origin"]
+        prog_worst = {}
+        for origin in ("stock_bottom_centre", "stock_top_centre"):
+            d = [a - b for a, b in zip(ORIGIN_EXPECT[origin],
+                                       ORIGIN_EXPECT["model_origin"])]
+            want = (m[0] + d[4], m[1] + d[0], m[2] + d[2])
+            prog_worst[origin] = round(max(
+                abs(a - b) for a, b in zip(frames[origin], want)), 6)
+        E2E["origin_program_worst_mm"] = prog_worst
+        print("\norigin_program_worst_mm: %s" % json.dumps(prog_worst))
+        for origin, v in prog_worst.items():
+            if v > 0.02:
+                print("WARNING: origin %s program-frame error %.6f mm is "
+                      "over 0.02 mm" % (origin, v))
+        for origin in prog_worst:
+            d = [a - b for a, b in zip(ORIGIN_EXPECT[origin],
+                                       ORIGIN_EXPECT["model_origin"])]
+            want = (m[0] + d[4], m[1] + d[0], m[2] + d[2])
+            assert frames[origin] == pytest.approx(want, abs=0.05), origin
+        # injected fault on the real data: a 0.5 mm wrong Z expectation is
+        # measured as exactly 0.5 mm
+        wrong = list(ORIGIN_EXPECT["stock_bottom_centre"])
+        wrong[4] += 0.5
+        wrong[5] += 0.5
+        with open(home / "runs" / "1701" / "check.json") as fh:
+            judged = json.load(fh)["stock_box"]
+        assert max(abs(a - b) for a, b in zip(judged, wrong)) == \
+            pytest.approx(0.5, abs=1e-3)
+
+        # check_program on the stock_bottom_centre program: judged in its
+        # own frame it passes; judged in the model frame it does not
+        serve = tmp_path / "serve"
+        serve.mkdir()
+        import shutil
+        shutil.copy(home / "runs" / "1701" / "rough.nc",
+                    serve / "origin_rough.nc")
+        shutil.copy(ORIGIN_STEP, serve / "box_origin.step")
+        old = mock.serve_dir
+        mock.serve_dir = str(serve)
+        try:
+            for rid, origin in ((1710, "stock_bottom_centre"),
+                                (1711, "model_origin")):
+                prog = program_input(mock, "check_ok.nc")
+                data = (serve / "origin_rough.nc").read_bytes()
+                prog.update({"name": "origin_rough.nc",
+                             "sha256": hashlib.sha256(data).hexdigest(),
+                             "bytes": len(data),
+                             "url": mock.base_url + "/files/origin_rough.nc"})
+                mock.enqueue_run(rid, action=catalog_mod.CHECK_ACTION,
+                                 inputs=dict(CHECK_INPUTS,
+                                             model=box_input(mock,
+                                                             ORIGIN_STEP),
+                                             program=prog, origin=origin))
+                final, body = _final_body(mock, rid, timeout=900)
+                if origin == "stock_bottom_centre":
+                    assert final == "succeeded", body
+                    assert body["result"]["zmap_gouges"]["count"] == 0
+                else:
+                    assert final == "failed", body
+        finally:
+            mock.serve_dir = old
+
+
+TB_STEP = os.path.join(REPO, "samples", "test_block.step")
+
+
+class TestAgentEnvelopeE2E:
+    """Track 2 (f): a scripted agent walk-through on mock_steve, and the
+    envelope schema on real TB rough, finish and check runs."""
+
+    def test_agent_walk_through(self, live):
+        """The agent sends a mm diameter while units is inch (default):
+        the refusal names the field and the allowed range in inch; the
+        agent converts, retries, and gets ready or needs_review with every
+        item explained."""
+        from test_track2 import envelope_issues
+        mock, home, _ = live
+        inch = {k: v / 25.4 if k in catalog_mod.MM_FIELDS else v
+                for k, v in GOOD_INPUTS.items() if k != "units"}
+        first = dict(inch, tool_diameter=12.686, model=model_input(mock))
+        mock.enqueue_run(1801, inputs=first)
+        assert mock.wait_state(1801, "rejected", 60), mock.states_for(1801)
+        err = [r["body"] for r in mock.reports
+               if str(r["run_id"]) == "1801"][-1]["error"]
+        assert err["code"] == "input_out_of_range"
+        assert err["field"] == "tool_diameter" and err["got"] == 12.686
+        allowed = err["allowed"]
+        assert allowed["units"] == "inch" and err["next_step"]
+        # agent: 12.686 is above the inch maximum, so it was mm - convert
+        assert err["got"] > allowed["maximum"]
+        retry = dict(first, tool_diameter=err["got"] / 25.4,
+                     model=model_input(mock))
+        assert allowed["minimum"] <= retry["tool_diameter"] <= \
+            allowed["maximum"]
+        mock.enqueue_run(1802, inputs=retry)
+        final, body = _final_body(mock, 1802, timeout=900)
+        assert final == "succeeded", body
+        r = body["result"]
+        assert envelope_issues(r) == [], r
+        assert r["verdict"] in ("ready", "needs_review")
+        if r["verdict"] == "needs_review":
+            assert [a for a in r["attention"] if a["severity"] == "review"]
+        E2E["walk_through"] = {"verdict": r["verdict"],
+                               "summary": r["summary"],
+                               "codes": [a["code"] for a in r["attention"]]}
+        with open(home / "runs" / "1802" / "check.json") as fh:
+            cj = json.load(fh)
+        assert {k: cj[k] for k in ("verdict", "summary", "attention")} == \
+            {k: r[k] for k in ("verdict", "summary", "attention")}
+
+    def test_envelope_schema_on_tb_runs(self, live, tmp_path):
+        from test_track2 import envelope_issues
+        import shutil
+        mock, home, _ = live
+        serve = tmp_path / "serve"
+        serve.mkdir()
+        shutil.copy(TB_STEP, serve / "test_block.step")
+        old = mock.serve_dir
+        mock.serve_dir = str(serve)
+        try:
+            tb = box_input(mock, TB_STEP)
+            tb["document"] = {"id": "doc-tb"}
+            mock.enqueue_run(1810, inputs=dict(
+                GOOD_INPUTS, model=dict(tb), program_number=1810))
+            fin = dict(SLOPE_GOOD_INPUTS, model=dict(tb), stepover=1.0,
+                       stepdown=1.0, program_number=1820)
+            mock.enqueue_run(1811, action=catalog_mod.SLOPE_ACTION,
+                             inputs=fin)
+            results = {}
+            for rid in (1810, 1811):
+                final, body = _final_body(mock, rid, timeout=3600)
+                results[rid] = (final, body)
+            shutil.copy(home / "runs" / "1810" / "rough.nc",
+                        serve / "tb_rough.nc")
+            data = (serve / "tb_rough.nc").read_bytes()
+            prog = program_input(mock, "check_ok.nc")
+            prog.update({"name": "tb_rough.nc", "bytes": len(data),
+                         "sha256": hashlib.sha256(data).hexdigest(),
+                         "url": mock.base_url + "/files/tb_rough.nc"})
+            mock.enqueue_run(1812, action=catalog_mod.CHECK_ACTION,
+                             inputs=dict(CHECK_INPUTS, model=dict(tb),
+                                         program=prog,
+                                         origin="stock_bottom_centre"))
+            results[1812] = _final_body(mock, 1812, timeout=3600)
+        finally:
+            mock.serve_dir = old
+        summary = {}
+        for rid, (final, body) in results.items():
+            r = body.get("result") or {}
+            assert envelope_issues(r) == [], (rid, final, r)
+            if final == "failed":
+                assert r["verdict"] == "failed" and body["error"][
+                    "next_step"], body
+                assert not any(n.endswith(".nc")
+                               for n in mock.file_names(rid))
+            else:
+                with open(home / "runs" / str(rid) / "check.json") as fh:
+                    assert envelope_issues(json.load(fh)) == []
+            summary[rid] = (final, r.get("verdict"),
+                            sorted({a["code"] for a in r["attention"]}))
+        E2E["tb_envelopes"] = summary
+        assert results[1810][0] == "succeeded", results[1810]
+
+
+# ==================================== TL2: toollib follow-ups (E2E) =======
+
+class TestTl2CheckOriginE2E:
+    """Item 1 E2E: a check_program without origin is rejected before any
+    engine work; the error names field origin and the check.json hint."""
+
+    def test_missing_origin_rejected(self, live):
+        mock, _, _ = live
+        mock.enqueue_run(1900, action=catalog_mod.CHECK_ACTION,
+                         inputs={"orientation": "as_modeled",
+                                 "stock_xy": 1.0, "stock_top": 0.4,
+                                 "stock_bottom": 1.0,
+                                 "model": model_input(mock),
+                                 "program": program_input(mock)})
+        final, body = _final_body(mock, 1900, timeout=120)
+        assert final == "rejected", body
+        err = body["error"]
+        assert err["code"] == "input_missing" and err["field"] == "origin"
+        assert "check.json setup" in err["next_step"]
+        assert mock.file_names(1900) == []
+
+
+class TestNothingToCutE2E:
+    """Item 5 E2E: the plain exterior box (box_off_centre.step) roughs to
+    an empty program: the run fails with a nothing_to_cut blocker
+    (verdict failed), and no .nc is uploaded or copied anywhere."""
+
+    def test_exterior_box_fails_nothing_to_cut(self, live):
+        mock, home, programs = live
+        mock.enqueue_run(1901, inputs=dict(
+            GOOD_INPUTS, model=box_input(mock), program_number=1901))
+        final, body = _final_body(mock, 1901, timeout=900)
+        assert final == "failed", body
+        err = body["error"]
+        assert err["code"] == "nothing_to_cut"
+        assert err["message"].startswith("nothing to cut") and err["next_step"]
+        r = body["result"]
+        assert r["verdict"] == "failed"
+        assert [a["code"] for a in r["attention"]] == ["nothing_to_cut"]
+        assert r["attention"][0]["severity"] == "blocker"
+        assert r["attention"][0]["next_step"]
+        assert mock.file_names(1901) == []
+        assert not list(programs.glob("O1901*"))
+
+
+class TestTl2OriginHeaderE2E:
+    """Items 1+2 E2E on TB: the runner posts the origin line and records
+    the origin in check.json's setup; the identical engine rough WITHOUT
+    --header-comment (what main's byte-identical default post produces,
+    proven in engine/test_post.py) differs by EXACTLY that one added line
+    and nothing else."""
+
+    def test_tb_rough_one_origin_line_vs_no_flag(self, live, tmp_path):
+        import difflib
+        import shutil
+        mock, home, _ = live
+        serve = tmp_path / "serve_tl2"
+        serve.mkdir()
+        shutil.copy(TB_STEP, serve / "test_block.step")
+        old = mock.serve_dir
+        mock.serve_dir = str(serve)
+        try:
+            tb = box_input(mock, TB_STEP)
+            tb["document"] = {"id": "doc-tl2"}
+            mock.enqueue_run(1910, inputs=dict(
+                GOOD_INPUTS, model=dict(tb), origin="stock_bottom_centre",
+                program_number=1910))
+            final, body = _final_body(mock, 1910, timeout=3600)
+            assert final == "succeeded", body
+        finally:
+            mock.serve_dir = old
+        run = home / "runs" / "1910"
+        text = open(run / "rough.nc", newline="").read()
+        assert text.count("(ORIGIN: STOCK BOTTOM CENTRE)") == 1
+        with open(run / "check.json") as fh:
+            assert json.load(fh)["setup"] == {"origin": "stock_bottom_centre"}
+        # the same engine job without the flag: engine.cli rough with the
+        # run's own prepare.json artifacts and the runner's argv (minus
+        # --header-comment); the default post is byte-identical to main
+        prep = json.load(open(run / "prepare.json"))
+        g = GOOD_INPUTS
+        out2 = str(tmp_path / "rough_noflag.nc")
+        subprocess.run(
+            [VIBE_PY, "-m", "engine.cli", "rough", "--step", prep["step"],
+             "--stock", *[("%.4f" % v) for v in prep["stock"]],
+             "--tool", "flat:%.4f:%.4f" % (g["tool_diameter"],
+                                           g["corner_radius"]),
+             "--out", out2,
+             "--floor", "%.4f" % (prep["stock"][4] + g["floor_z"]),
+             "--leave", "%.4f" % g["stock_to_leave"],
+             "--stepdown", "%.4f" % g["stepdown"],
+             "--optimal-load-mm", "%.4f" % g["optimal_load"],
+             "--stepup", "%.4f" % g["rest_stepup"],
+             "--hf", prep["hf"], "--min-rest", "0.5",
+             "--cut-feed", "%.1f" % g["feed"],
+             "--ramp-feed", "%.1f" % g["ramp_feed"],
+             "--spindle", str(g["rpm"]), "--post", "lnc",
+             "--program", "1910", "--tool-number", "13", "--metric",
+             "--stats-json", str(tmp_path / "noflag_stats.json")],
+            cwd=REPO, check=True, env=dict(os.environ, ENGINE_WORKERS="4"),
+            stdout=subprocess.DEVNULL)
+        base = open(out2, newline="").read()
+        a = text.replace("\r\n", "\n").split("\n")
+        b = base.replace("\r\n", "\n").split("\n")
+        added = [l[2:] for l in difflib.ndiff(b, a) if l.startswith("+ ")]
+        removed = [l[2:] for l in difflib.ndiff(b, a) if l.startswith("- ")]
+        assert added == ["(ORIGIN: STOCK BOTTOM CENTRE)"] and removed == []
