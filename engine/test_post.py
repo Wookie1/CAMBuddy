@@ -870,3 +870,35 @@ def test_tl2_header_comments_injected_fault_is_measured():
     broken = base[:3] + [line] + base[3:8] + [line] + base[8:]
     assert len(_added_lines(base, good)) == 1
     assert len(_added_lines(base, broken)) == 2
+
+
+def test_cli_tools_json_redirects_table(tmp_path):
+    """TLG1: engine.cli --tools-json makes the post read THAT table (a
+    library-only tool posts with its number and diameter); with no flag the
+    repo table still refuses the same tool (default behaviour unchanged)."""
+    import json as _json
+    import subprocess
+    from engine import cli
+    table = {"tools": [{"tool_id": "ball-7.777", "number": 50,
+                        "type": "ball", "diameter_mm": 7.777,
+                        "corner_radius_mm": 3.8885}], "holders": {}}
+    tpath = tmp_path / "eff.json"
+    tpath.write_text(_json.dumps(table))
+    inp = tmp_path / "n.ngc"
+    inp.write_text("G21\nG90\nG0 Z12.\nG1 Z9. F1270\nG1 X5. Y0. F3429\n")
+    out = tmp_path / "p.nc"
+    r = subprocess.run(
+        [sys.executable, "-m", "engine.cli", "post", "--in", str(inp),
+         "--out", str(out), "--metric", "--tool-kind", "ball",
+         "--dia", "7.777", "--corner", "3.8885", "--tools-json", str(tpath)],
+        cwd=ROOT, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-600:]
+    assert "T50 M06" in out.read_text()
+    assert "D=7.777" in out.read_text()
+    # no --tools-json: the repo table does not know this ball -> refused
+    r2 = subprocess.run(
+        [sys.executable, "-m", "engine.cli", "post", "--in", str(inp),
+         "--out", str(tmp_path / "x.nc"), "--metric", "--tool-kind", "ball",
+         "--dia", "7.777", "--corner", "3.8885"],
+        cwd=ROOT, capture_output=True, text=True)
+    assert r2.returncode != 0 and "not in" in (r2.stderr + r2.stdout)
