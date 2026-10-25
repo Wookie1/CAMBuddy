@@ -38,9 +38,14 @@ test_bs1a4d6b_q4_entry_bore_in_live_stock, test_bs1a4d6c_side_entry_no_under_rea
   were entered at their own q4; they judge ~0 only because earlier pieces already cut that corridor.
 - BS1a4d8 (eps 0 in lnk_cut_ok, enter_at route 1, offset_down) did not touch this site.
 ## Items (coordinator spec)
-(a) Fix the named site: after a region's entry, the run must start where the tool is. Enter at the path's actual
-    first point, or treat the entry-end -> path[0] distance as a gap (lift -> rapid at clearance -> proper entry at
-    path[0]). The predictor mirrors the emitted choice (the region's re-check/ladder must see the same start).
+(a) Fix the named site, PREFERRED way (keeps entry and path consistent): after a lightest-option re-plan, the
+    region's entry target IS the emitted path's first point. Plan and credit the entry there - its own bore or ramp -
+    with the predictor and the re-check simulated from that point; the helix at the stale q4 is then NOT emitted for
+    that region. FALLBACK, only where entering at fc[0] fails its own checks: treat entry-end -> path[0] as a gap
+    (lift -> rapid at clearance -> proper entry at path[0]).
+    Plus an ASSERT-style guard in the run loop: it never emits path[0] at cutting feed farther than one step from the
+    current tool position unless that move is a simulated link (this is (b)'s backstop at this site, and the test
+    must measure it).
 (b) Emission backstop: ANY straight cutting-feed move between two emitted pieces or regions (entry end -> path, piece
     -> piece, region -> region) that is not part of a simulated path is simulated against the LIVE stock right before
     it is written (eps 0, as lnk_cut_ok). If it is over the limits, or its a exceeds the level step with ae_eff >
