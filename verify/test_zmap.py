@@ -1350,7 +1350,11 @@ def test_ze2_full_slot_short_segments_ae_eff_is_dia():
         # window closes at the first travel >= 1 mm; ten 0.1 mm floats sum to
         # just under/over 1.0, so accept 10 or 11 segments
         assert w["n_moves"] in (10, 11)
-        assert 1.0 <= w["length_mm"] <= 1.15
+        if w is not wins[-1]:
+            assert 1.0 <= w["length_mm"] <= 1.15
+    # ZG2: the program's last 0.7 mm tail merges into the last kept window
+    assert abs(wins[-1]["length_mm"] - 1.7) <= 1e-6, wins[-1]["length_mm"]
+    assert abs(wins[-1]["ae_eff"] - D_ZE2) <= 0.05 * D_ZE2, wins[-1]["ae_eff"]
     eng = res["engagement"]
     assert eng["ae2"]["n"] == len(wins)
     assert abs(eng["ae2"]["p50"] - D_ZE2) <= 0.05 * D_ZE2
