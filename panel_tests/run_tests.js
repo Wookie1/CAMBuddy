@@ -745,6 +745,7 @@ test("job setup with inch values reloads as clean inch numbers; skipped quietly 
   await env.open({ jobSetup: { orientation: "as_modeled", units: "inch", stock_xy: 1.016, stock_x: 3.175, stock_y: null, stock_top: 1.016, stock_bottom: 0, floor_z: 0, blank: { x: 260.35, y: null, z: null } } });
   assert.strictEqual(await env.panel.inputValue("#f-setup-stock_xy"), "0.04");
   assert.strictEqual(await env.panel.inputValue("#f-blank-blank_x"), "10.25");
+  assert.strictEqual(await env.panel.isVisible("#blank-partial"), true, "partial blank hint missing");
   assert.strictEqual(await env.panel.inputValue("#f-setup-stock_bottom"), "0");
   await env.ctx.close();
   const env2 = await newEnv();
@@ -759,10 +760,79 @@ test("job setup with inch values reloads as clean inch numbers; skipped quietly 
   } finally { await env2.ctx.close(); }
 }, { ownContext: true });
 
+test("partial blank: not used, hint shown, job.setup gets blank null; all three filled -> {x,y,z} in mm", async (env) => {
+  await env.open({});
+  await env.panel.click("#measure-btn");
+  await env.waitText("#model-size", /Model/);
+  assert.strictEqual(await env.panel.isVisible("#blank-partial"), false);
+  await env.panel.fill("#f-blank-blank_x", "10.25");
+  assert.strictEqual(await env.panel.isVisible("#blank-partial"), true);
+  assert.strictEqual((await env.text("#blank-partial")).trim(), "Fill all three to use the blank size.");
+  assert.strictEqual(await env.disabled("#f-setup-stock_x"), false, "a partial blank must not drive the extras");
+  await env.panel.fill("#f-blank-blank_y", "6.75");
+  assert.strictEqual(await env.panel.isVisible("#blank-partial"), true);
+  const inputs = await clickRun(env, "rough");
+  assert(!("stock_x" in inputs) && !("stock_y" in inputs), "partial blank sent extras: " + JSON.stringify(inputs));
+  assert.strictEqual(inputs.stock_top, 0.04);
+  await waitFinal(env, "rough");
+  const s1 = (await env.sent("run", "job.setup")).pop().params.inputs.setup;
+  assert.strictEqual(s1.blank, null, "partial blank sent to job.setup");
+  await env.panel.fill("#f-blank-blank_z", "2.25");
+  assert.strictEqual(await env.panel.isVisible("#blank-partial"), false);
+  assert.strictEqual(await env.disabled("#f-setup-stock_x"), true);
+  await env.panel.click("#save-setup");
+  await env.waitText("#save-state", /Setup saved/);
+  const s2 = (await env.sent("run", "job.setup")).pop().params.inputs.setup;
+  assert.deepStrictEqual(s2.blank, { x: 260.35, y: 171.45, z: 57.15 });
+  // a zero axis is not a usable blank either
+  await env.panel.fill("#f-blank-blank_z", "0");
+  await env.panel.click("#save-setup");
+  await env.settle();
+  assert.strictEqual((await env.sent("run", "job.setup")).pop().params.inputs.setup.blank, null);
+});
+
+test("server error fields: 'setup.' and 'inputs.' prefixes are stripped before highlighting", async (env) => {
+  await env.open({ setupError: { code: "input_out_of_range", field: "setup.stock_xy", message: "stock_xy is above 25.4 mm.", next_step: "Use less extra per side." },
+    results: { adaptive_rough: { state: "failed", error: { code: "input_out_of_range", field: "inputs.stepdown", message: "stepdown too big" }, files: [] } } });
+  await env.panel.click("#save-setup");
+  await env.waitText("#save-state", /Couldn't save the setup: stock_xy is above 25\.4 mm\./);
+  assert.match(await env.panel.getAttribute("#w-setup-stock_xy", "class"), /\bbad\b/);
+  assert.strictEqual(await env.text("#err-setup-stock_xy"), "Allowed: from 0 to 1 in.");
+  await env.mock(() => { window.__mock.cfg.setupError = { code: "input_out_of_range", field: "setup.blank", message: "The blank needs x, y and z above 0." }; });
+  await env.panel.click("#save-setup");
+  await env.waitText("#err-blank-blank_y", /The blank needs x, y and z above 0\./);
+  assert.match(await env.panel.getAttribute("#w-blank-blank_z", "class"), /\bbad\b/);
+  await env.mock(() => { window.__mock.cfg.setupError = { code: "input_out_of_range", field: "setup.blank.x", message: "Blank x must be above 0." }; });
+  await env.panel.click("#save-setup");
+  await env.waitText("#err-blank-blank_x", /Blank x must be above 0\./);
+  await clickRun(env, "rough"); await waitFinal(env, "rough");
+  assert.match(await env.panel.getAttribute("#w-rough-stepdown", "class"), /\bbad\b/);
+  assert.strictEqual(await env.text("#err-rough-stepdown"), "Allowed: from 0.004 to 1 in.");
+});
+
+test("attention items with code area_left_for_next_op go in 'Left for another operation', not 'Good to know'", async (env) => {
+  const result = { verdict: "needs_review", summary: "Check one thing.", zmap_gouges: { count: 0 },
+    attention: [
+      { code: "steep_ramp", severity: "review", message: "3 ramps are steeper than 3°.", where: { line: 9 }, next_step: "Check the entry moves." },
+      { code: "area_left_for_next_op", severity: "info", message: "Pocket corners are narrower than the ball.", where: { program: "finish.nc", line: 50, x: 25.4, y: 0, z: -2.54 } },
+      { code: "area_left_for_next_op", severity: "info", message: "Slot end left." },
+    ],
+    areas_left: ["old-style area"] };
+  await env.open({ results: { slope_split_finish: { state: "succeeded", result, files: [] } } });
+  await env.panel.click("#tab-finish");
+  await clickRun(env, "finish"); await waitFinal(env, "finish");
+  await env.waitText("#finish-results", /Left for another operation/);
+  const groups = await env.panel.$$eval("#finish-results .attn h4", (hs) => hs.map((h) => h.textContent));
+  assert.deepStrictEqual(groups, ["Please review (1)"], "left-for-next-op items shown as attention: " + groups);
+  const lists = await env.panel.$$eval("#finish-results h4", (hs) => hs.filter((h) => h.textContent === "Left for another operation")
+    .map((h) => [...h.nextElementSibling.querySelectorAll("li")].map((li) => li.textContent)));
+  assert.deepStrictEqual(lists, [["Pocket corners are narrower than the ball. · finish.nc · line 50 · X 1.000 Y 0.000 Z −0.100", "Slot end left.", "old-style area"]]);
+});
+
 test("check tab: one plain line, and check runs pushed to the panel render per program", async (env) => {
   await env.open({ checkJson: SAMPLE });
   await env.panel.click("#tab-check");
-  assert.match(await env.text("#pane-check .lead"), /run “Check program” from STEVE's connector menu and pick the program there/);
+  assert.match(await env.text("#pane-check .lead"), /run “Check program” from STEVE's connector menu and pick the program and its origin there\.$/);
   await env.mock(() => window.__mock.pushRun({ id: "chk-1", action: "check_program", state: "succeeded", progress: 1,
     result: { verdict: "ready", summary: "Clean.", attention: [] }, files: ["check.json"] }));
   await env.waitText("#check-runs", /Holder size was estimated/);

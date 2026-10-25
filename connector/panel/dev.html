@@ -72,6 +72,7 @@ function schemas(newInputs) {
       stepdown: N(0.05,2,0.3), slope_threshold: N(10,80,40) }, cutting, { tool_number: N(1,999,null,"integer"),
       rest_tool_number: N(1,999,null,"integer"), min_rest: N(0.1,null,0.5) }, roughingProps("rough_"), extra),
     check_program: Object.assign({ program: { "x-steve": "program" }, program_2: { "x-steve": "program" } }, model, orient,
+      { origin: { type: "string", enum: ORIGINS, required: true } },
       { stock_xy: stock.stock_xy, stock_top: stock.stock_top, stock_bottom: stock.stock_bottom }, { tool_number: N(1,999,null,"integer") }),
     "model.measure": Object.assign({}, model, orient),
   };
@@ -156,11 +157,13 @@ function finishResult(outcome, rest) {
   const r = { chain_time_min: 3.4, chain_cut_length_mm: 8120.5, probe_clcheck: { count: 0 },
     chain: { zmap_gouges: { count: 0 }, rapid_collisions: { count: 0 }, over_flute: { count: 0 },
       leftover: { mean_mm: 0.05, p95_mm: 0.11, within_0p5mm_fraction: 0.999 } },
-    areas_left: [{ where: "pocket floor corners", reason: "narrower than the 6 mm ball" }], output_dir: "C:\\SteveCAM\\jobs\\doc-42" };
-  if (outcome === "needs_review") return Object.assign(r, { verdict: "needs_review", summary: "The chain is clean, but check two places.", attention: ATTN_REVIEW });
+    output_dir: "C:\\SteveCAM\\jobs\\doc-42" };
+  const left = { code: "area_left_for_next_op", severity: "info", message: "Pocket floor corners are narrower than the 6 mm ball.",
+    where: { program: "finish.nc", line: 4410, x: 88.2, y: -31.5, z: 4.0 }, next_step: "Add a smaller ball or a pencil pass." };
+  if (outcome === "needs_review") return Object.assign(r, { verdict: "needs_review", summary: "The chain is clean, but check two places.", attention: ATTN_REVIEW.concat([left]) });
   if (outcome === "failed_blocker") return Object.assign(r, { verdict: "failed", summary: "The finish misses the model at 4 probe points.", probe_clcheck: { count: 4 },
     attention: [{ code: "clcheck", severity: "blocker", message: "The finish is more than 0.005 mm off the model at 4 probe points.", where: { program: "finish.nc", line: 5120, x: 10.1, y: 22.4, z: 31.0 }, next_step: "Use a smaller stepover, then run again." }] });
-  return Object.assign(r, { verdict: "ready", summary: "Ready to run: rough and finish checked as one chain." });
+  return Object.assign(r, { verdict: "ready", summary: "Ready to run: rough and finish checked as one chain.", attention: [left] });
 }
 
 // ---------------------------------------------------------------- bridge --

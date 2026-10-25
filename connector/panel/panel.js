@@ -261,10 +261,12 @@
     if (m.orientation !== S.vals["setup.orientation"].v) return null;
     return m;
   }
+  // The blank is used only when all three sizes are filled (job.setup takes {x,y,z} or null).
+  function blankFilled() { return ["x", "y", "z"].filter((a) => S.vals["blank.blank_" + a] && !S.vals["blank.blank_" + a].empty).length; }
   function hasBlank(axis) {
     if (!present(ACTION.measure)) return false;
     const st = S.vals["blank.blank_" + axis];
-    return !!st && !st.empty;
+    return !!st && !st.empty && blankFilled() === 3;
   }
   // The stock extra the run will use, for stock_x / stock_y / stock_top (from the blank when typed).
   function stockView(name, spec, lim) {
@@ -365,6 +367,8 @@
     return s + orient;
   }
   function paintSetupInfo() {
+    const n = blankFilled();
+    $("blank-partial").hidden = !present(ACTION.measure) || n === 0 || n === 3;
     const m = S.measured;
     const ms = $("model-size");
     if (m) {
@@ -599,7 +603,7 @@
     if (originShown()) o.origin = S.vals["setup.origin"].v;
     for (const n of SETUP_LEN) o[n] = mmOf("setup." + n);
     const blank = { x: mmOf("blank.blank_x"), y: mmOf("blank.blank_y"), z: mmOf("blank.blank_z") };
-    o.blank = blank.x === null && blank.y === null && blank.z === null ? null : blank;
+    o.blank = ["x", "y", "z"].every((a) => typeof blank[a] === "number" && blank[a] > 0) ? blank : null;
     return o;
   }
   function savedState(mm) {
@@ -643,12 +647,14 @@
       } else {
         S.savedSetup = prev === json ? null : prev;
         $("save-state").textContent = "Couldn't save the setup: " + errText(run.error);
+        if (run.error && run.error.field) markServerField(null, run.error);
       }
     }, (e) => {
       S.saving = false;
       $("save-setup").disabled = !S.doc;
       S.savedSetup = null;
       $("save-state").textContent = "Couldn't save the setup: " + errText(e);
+      if (e && e.field) markServerField(null, e);
     });
   }
 
@@ -819,12 +825,22 @@
     if (e.code) c.err.append(el("div", { class: "muted small", text: "Code: " + e.code }));
     if (e.field && form) markServerField(form, e);
   }
+  // Server error fields look like "tool_diameter", "inputs.tool_diameter" or "setup.stock_xy" / "setup.blank.x".
   function markServerField(form, e) {
-    const name = String(e.field).replace(/^inputs\./, "");
-    const key = [form + "." + name, "setup." + name].find((k) => F[k]);
+    const name = String(e.field).replace(/^(setup|inputs)\./, "");
+    const b = /^blank(?:\.([xyz]))?$/.exec(name);
+    if (b) {
+      for (const a of b[1] ? [b[1]] : ["x", "y", "z"]) {
+        const f = F["blank.blank_" + a];
+        f.err.textContent = e.message || "Check the blank size.";
+        f.wrap.classList.add("bad");
+      }
+      return;
+    }
+    const key = [form ? form + "." + name : null, "setup." + name].find((k) => k && F[k]);
     if (!key) return;
     const f = F[key];
-    const range = FX.rangeText(f.spec, limits(form, f.spec), S.units);
+    const range = FX.rangeText(f.spec, limits(form || "setup", f.spec), S.units);
     let text = range ? "Allowed: " + range + "." : "";
     if (!text && e.allowed != null) text = "Allowed: " + (Array.isArray(e.allowed) ? e.allowed.join(", ") : isObj(e.allowed) ? JSON.stringify(e.allowed) : e.allowed);
     f.err.textContent = text || (e.message || "Check this value.");

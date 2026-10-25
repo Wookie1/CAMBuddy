@@ -33,6 +33,7 @@
         cutting, { tool_number: N(1, 999, null, "integer"), rest_tool_number: N(1, 999, null, "integer"), min_rest: N(0.1, null, 0.5) },
         roughing("rough_"), extra),
       check_program: Object.assign({ program: { "x-steve": "program", required: true } }, model, orient,
+        extended ? { origin: { type: "string", enum: ORIGINS, required: true } } : {},
         { stock_xy: stock.stock_xy, stock_x: stock.stock_x, stock_y: stock.stock_y, stock_top: stock.stock_top, stock_bottom: stock.stock_bottom },
         { tool_number: N(1, 999, null, "integer") }),
       "model.measure": Object.assign({}, model, orient),
