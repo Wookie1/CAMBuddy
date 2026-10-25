@@ -3038,7 +3038,20 @@ class TestWorkOriginE2E:
         # translation-exact at sub-cell level (measured 0.006 mm in Y on
         # the first run); the stock box itself is held to 0.001 mm above
         m = frames["model_origin"]
+        prog_worst = {}
         for origin in ("stock_bottom_centre", "stock_top_centre"):
+            d = [a - b for a, b in zip(ORIGIN_EXPECT[origin],
+                                       ORIGIN_EXPECT["model_origin"])]
+            want = (m[0] + d[4], m[1] + d[0], m[2] + d[2])
+            prog_worst[origin] = round(max(
+                abs(a - b) for a, b in zip(frames[origin], want)), 6)
+        E2E["origin_program_worst_mm"] = prog_worst
+        print("\norigin_program_worst_mm: %s" % json.dumps(prog_worst))
+        for origin, v in prog_worst.items():
+            if v > 0.02:
+                print("WARNING: origin %s program-frame error %.6f mm is "
+                      "over 0.02 mm" % (origin, v))
+        for origin in prog_worst:
             d = [a - b for a, b in zip(ORIGIN_EXPECT[origin],
                                        ORIGIN_EXPECT["model_origin"])]
             want = (m[0] + d[4], m[1] + d[0], m[2] + d[2])

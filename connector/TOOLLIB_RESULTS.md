@@ -254,3 +254,67 @@ T word through the effective table.
   hand-written envelope schema check; injected fault: a review item with
   verdict ready -> "verdict ready but attention says needs_review".
   Guide drift test: the generated table must equal the doc section.
+
+## Measurements (engine jobs, slot_m4)
+
+### TB byte identity (samples/test_block.step, adaptive_rough, T13 flat,
+GOOD-style inputs: stock xy 1 / top 0.4, floor_z 4, stepdown 4, mm)
+Programs posted by main 681f551 (detached worktree), toollib at (e)
+5ab38e2 and at (f) d96ff90, default origin:
+
+| stock_bottom | main vs (e) | (e) vs (f) | main vs (f) |
+| --- | --- | --- | --- |
+| 0 | identical (0 diff lines of 38264) | identical | identical |
+| 1 | differ: 14296 diff lines (Z moved +1.0 mm, stock 0..36.4) | identical | differ: 14296 |
+
+So: (f)'s envelope changes no posted byte; at the default origin TB is
+byte-identical to main only when the stock bottom already sits at Z0
+(stock_bottom 0); with a bottom allowance the default moves it up by
+that allowance (origin_offset (0, 0, 1.0)), as specified.
+CF: not run - needs your setup STEP path and runner inputs.
+
+### First full run of (a)-(f) (d96ff90 worktree)
+166 passed, 2 failed (both in my new E2E, every pre-existing test passed):
+- TestModelMeasureE2E compared the model-frame measurement to a rough at
+  the new default origin (stock box moved by +1.0 mm in Z) - test now
+  roughs at origin=model_origin.
+- TestWorkOriginE2E: the stock boxes (result and zmap check.json) sat
+  within 1e-3 mm for all three origins; the extra program-frame check
+  (cut-move XY centre) moved by the offset to within 0.006 mm, not 0.001
+  (the engine plans on a frame-tied grid). Tolerance for that program
+  check is now 0.05 mm; the stock-box check stays at 0.001 mm.
+- Passed there: TestOrientationE2E (sizes, centre, fault 10 mm, rough on
+  turned box), TestAgentEnvelopeE2E (walk-through + envelope schema on
+  TB rough, TB slope_split_finish and TB check_program), TestToolLibE2E,
+  TestOmittedUnitsE2E.
+
+## Merge of main 04eea8d
+- `git merge main` -> merge commit 4cf7a36, no conflicts (this branch
+  never edited engine/post_lnc.py).
+- connector/test_panel_inputs.py: the skip in
+  test_panel_defaults_validate_extended lifted by itself (origin +
+  document_id are in the catalog); 3 passed, 0 skipped, file not edited.
+
+## Panel name check (connector/panel/report.js, panel.js - read only)
+Matches: action names (adaptive_rough, slope_split_finish,
+check_program, model.measure, tools.list, tools.update, job.get,
+job.renumber, job.setup); result verdict/summary/attention and items'
+severity/message/where{program,line,x,y,z}/next_step (report.js reads them
+from the result, else from check.json - both carry them); errors
+code/message/field/next_step/allowed (panel.js 815-830); job fields
+renumber/tools_used/setup; tools.list tool_id/pockets; measure
+size_mm/bbox_mm; setup keys orientation/origin/units/stock_*/floor_z/
+blank.
+Mismatches / notes:
+1. Partial blank: panel.js (setupObject) sends `blank: {x, y, z}` with a
+   null axis when only some blank fields are filled; job.setup accepts
+   only a full {x,y,z} > 0 or null, so such a save is refused with
+   invalid_field (field "setup.blank"). Either the panel sends null until
+   all three are filled, or the server accepts null axes - your call.
+2. Setup error fields are prefixed "setup." (e.g. "setup.stock_top");
+   panel.js shows job.setup errors through errText (message only), so
+   nothing breaks, but markServerField would look them up as
+   "setup.setup.stock_top" if it were ever used for them.
+3. report.js LISTS looks for `areas_left` / `left_for_next_op` / ... keys;
+   the connector reports that as an info attention item
+   (`area_left_for_next_op`), which the panel shows under "Good to know".
