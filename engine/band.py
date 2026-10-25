@@ -27,9 +27,14 @@ r >= 1.903 helix: they are REPORTED (stats["band_blocked"]) and left to the
 ring, never forced (no plunge).
 """
 import math
+import os
 from contextvars import ContextVar
 
 import numpy as np
+
+# BS1a4d8: entry=/approach provenance at every _simulate call site (opt-in:
+# set BS1D8_SIM=1 before importing the engine; one tuple per call).
+SIM_LOG = [] if os.environ.get("BS1D8_SIM") else None
 
 # ZE2 bars (verify/zmap.py): full width = ae_eff >= 0.9 x dia; the roughing
 # target is steady 2.032, spike 2.438. Engine-side targets sit under them
@@ -152,7 +157,7 @@ def _advance(r, tool_r):
 
 
 def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None,
-              entry="bore", approach=None):
+              entry="bore", approach=None, eps=0.05):
     """Replay ZE2 windowing on the engine stock grid: move-aligned windows of
     path travel; a window's area = distinct cells whose live top stands above
     z + 0.05 and that first fall under the cutter disk (applied at every
@@ -182,7 +187,7 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None,
     j1 = min(max(stock._cj(p[1]) for p in path) + k + 2, stock.ny)
     if i0 >= i1 or j0 >= j1:
         return []
-    stand = stock.top[j0:j1, i0:i1] > z + 0.05
+    stand = stock.top[j0:j1, i0:i1] > z + eps
     bx, by = (bore_xy[:2] if bore_xy else path[0][:2])
     ci, cj = stock._ci(bx) - i0, stock._cj(by) - j0
     # BS1a4d6c: pre-clear only the emitted entry's footprint (see entry).
@@ -288,6 +293,13 @@ def shrink_ladder(seg, stock, z, tool_r, cell, credit=None, dropopt=None,
                         cr + (bxy[2] if bxy else 0.0), we, bore_xy=bxy,
                         entry="bore" if cr > 1e-9 else "side",
                         approach=approach)
+        if SIM_LOG is not None:
+            SIM_LOG.append(["shrink_ladder", round(z, 3),
+                            "bore" if cr > 1e-9 else "side",
+                            None if approach is None else
+                            [round(approach[0], 3), round(approach[1], 3)],
+                            [round(path[0][0], 3), round(path[0][1], 3)],
+                            round(max(wins), 3) if wins else None])
         if not wins:
             break
         best_area = max(best_area, sum(wins))
@@ -390,6 +402,10 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
             wb = []
             wins = _simulate(pts, stock, z, tool_r, cell, 1.3 * tool_r, wb,
                              entry="bore")
+            if SIM_LOG is not None:
+                SIM_LOG.append(["channel_regions", round(z, 3), "bore", None,
+                                [round(pts[0][0], 3), round(pts[0][1], 3)],
+                                round(max(wins), 3) if wins else None])
             if not wins:
                 continue
             drop_opt = (_opt_key(wins, wb, fw_min), "drop_ring", None, wins)

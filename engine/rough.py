@@ -1027,6 +1027,13 @@ def insert_levels(order, extra):
     return order
 
 
+def _dense_line(a, b, step=0.4):
+    """BS1a4d8: a->b sampled every <= step mm (endpoints included)."""
+    n = max(1, int(math.dist(a, b) / step))
+    return [(a[0] + (b[0] - a[0]) * t / n, a[1] + (b[1] - a[1]) * t / n)
+            for t in range(n + 1)]
+
+
 def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           stepover=0.16, cut_feed=3429.0, ramp_feed=1270.0,
           clearance_z=None, lift=1.9, wl_sampling=None, threads=8,
@@ -1454,12 +1461,21 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         live stock at its Z is checked as a cut - the band planner's window
         measure on the live stock at Z, credit 0. Max window <= SPIKE_MM
         stays a link; over it the caller lifts and re-enters via enter_at."""
-        if st.link_clear(path, z):
+        if st.link_clear(path, z, eps=0.0):
             return True
-        from engine.band import _simulate, SPIKE_MM
+        from engine.band import _simulate, SPIKE_MM, SIM_LOG
         stats[key + "_chk"] = stats.get(key + "_chk", 0) + 1
-        w = _simulate(path, st, z, tool_r, st.cell, 0.0, entry="link")
+        w = _simulate(path, st, z, tool_r, st.cell, 0.0, entry="link",
+                      eps=0.0)   # BS1a4d8: the judge counts ANY cell above
+        # Z as cut (eps~0, full-area weight per cell): a corridor whose floor
+        # stands in (Z, Z+0.05] reads clear to the old eps=0.05 gate yet is
+        # judged full-disk (CF 64233: engine 0.000 vs judged 9.319).
         ok = not w or max(w) <= SPIKE_MM
+        if SIM_LOG is not None:   # BS1a4d8: entry/approach per call site
+            SIM_LOG.append(["lnk_cut_ok", key, round(z, 3), "link", None,
+                            [round(path[0][0], 3), round(path[0][1], 3)],
+                            [round(path[-1][0], 3), round(path[-1][1], 3)],
+                            round(max(w), 3) if w else None])
         if not ok:
             stats[key + "_cvt"] = stats.get(key + "_cvt", 0) + 1
         return ok
@@ -1531,6 +1547,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                        max(tool_r - corner_r - 0.5, 0.1)) \
                         > z + 0.05:
                     continue     # would drag the flat bottom over stock
+                elif not lnk_cut_ok(stock, path, z, "fdin"):
+                    continue     # BS1a4d8: the feed-in's own disk (the last
+                    # 0.5 mm ring link_top_max's eroded radius never sees)
+                    # must be simulated through the live stock and in limits
                 return (sx, sy)
         return None
 
@@ -1700,9 +1720,13 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         py = prev[1] if prev[1] is not None else y
         pz = prev[2]
         # 1) straight tool-down link at cutting Z (clear in BOTH the stock
-        # model and the exact forbidden islands - the hf can miss steep walls)
+        # model and the exact forbidden islands - the hf can miss steep walls).
+        # BS1a4d8: and simulated as a CUT through the live stock (credit 0,
+        # full disk at every ~0.4 mm sample, entry="link"): a link over
+        # standing stock is not a link, it is an un-simulated sideways entry.
         if corridor_ok((px, py), (x, y)) and stock.link_clear([(px, py), (x, y)], z) \
-                and stock.rise_clear(px, py, pz, z):
+                and stock.rise_clear(px, py, pz, z) \
+                and lnk_cut_ok(stock, _dense_line((px, py), (x, y)), z, "tolk"):
             feed_down(px, py, z)
             emit({"g": 1, "x": x, "y": y, "z": z, "f": cut_feed})
             stats["n_tooldown_links"] += 1
@@ -2092,7 +2116,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 # (NN) and rings (NN from the last band).
                 from engine.band import (channel_regions, _simulate, AE_SS,
                                        AE_SPIKE, shrink_ladder, bore_context,
-                                       _split_at_jumps)
+                                       _split_at_jumps, SIM_LOG)
                 with bore_context(lambda p, zz: _bore_pred(
                         isl_ok, centre_zone, stock, p[0], p[1], tool_r)):
                     bands = channel_regions(rings, stock, isl_ok3, z, tool_r,
@@ -2156,7 +2180,14 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     ew0 = _simulate(pts_c, stock, z, tool_r, stock.cell,
                                     res["bore"][4] + tool_r if rb else 0.0,
                                     bore_xy=res["bore"][2:] if rb else None,
-                                    entry="bore" if rb else "link")
+                                    entry="bore" if rb else "link",
+                                    eps=0.05 if rb else 0.0)
+                    if SIM_LOG is not None:
+                        SIM_LOG.append(["recheck_ew0", round(z, 3),
+                                        "bore" if rb else "link", None,
+                                        [round(pts_c[0][0], 3),
+                                         round(pts_c[0][1], 3)],
+                                        round(max(ew0), 3) if ew0 else None])
                     if ew0 and max(ew0) <= AE_SPIKE and sorted(
                             ew0)[max(0, int(0.95 * len(ew0)) - 1)] <= AE_SS:
                         act = "replan0_ok"

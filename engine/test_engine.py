@@ -1310,6 +1310,166 @@ def test_bs1a4d7_sub1mm_tail_merges_not_dropped():
           "%.3f mm dropped" % (eng_w, pre_merge))
 
 
+def test_bs1a4d8_arrival_gate_reads_judge_skin():
+    """BS1a4d8 item 1+2: a straight cutting-feed arrival across a floor that
+    stands inside the OLD link-clear eps band (Z, Z+0.05] - the CF 64232/
+    64233 signature (engine 0.000 vs judged 8.486/9.319: the corridor floor
+    left by the previous level's disk rim stands a hair above Z, which the
+    engine read as clear while zmap counts EVERY cell above Z at full area).
+    The arrival gate (lnk_cut_ok) now simulates the link through the LIVE
+    stock at the judge's own threshold (eps=0). Asserts, with values printed:
+    (a) stock.link_clear at the old eps=0.05 says the corridor is clear;
+    (b) band._simulate at the old eps reads ZERO load on that link;
+    (c) at eps=0 (what the gate uses now) the same link reads a full-disk
+    cut, and verify/zmap judging the link AS EMITTED reads the same load;
+    a dense eps=0 replay of the same corridor mirrors zmap's continuous
+    sweep with no under-read (the single-chord gate reading is a
+    point-sample floor pi*r^2/L, still far over 2.44);
+    (d) WIRED: during a real rough() every entry="link" _simulate call the
+    arrival gate makes carries eps=0.0 (mutation: revert the gate's eps to
+    0.05 and this assert fails by the measured eps)."""
+    import subprocess
+    import tempfile
+    import json as _json
+    import numpy as np
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.stock import StockField
+    from engine.gcode import moves_to_gcode
+    from engine.rough import rough, build_part_hf
+    tr, cell, z = 6.343, 0.5, 6.0
+    D = 2.0 * tr
+    box = (-25.0, 25.0, -20.0, 20.0, 0.0, 6.01)
+
+    def skin():
+        st = StockField(box, cell=cell)
+        st.top = np.where(st.inb, 6.01, -np.inf)   # floor stands 0.01 over Z
+        st.set_tool(tr, 0.0)
+        return st
+    line = [(-8.0, 0.0), (8.0, 0.0)]
+    # (a) the OLD gate waved this through
+    assert skin().link_clear(line, z), \
+        "scenario broken: old-eps link_clear must pass this corridor"
+    assert not skin().link_clear(line, z, eps=0.0), \
+        "scenario broken: the judge-threshold clear must fail"
+
+    def widths(eps):
+        ends = []
+        w = (B._simulate(line, skin(), z, tr, cell, 0.0, ends=ends,
+                         entry="link", eps=eps) if eps is not None else
+             B._simulate(line, skin(), z, tr, cell, 0.0, ends=ends,
+                         entry="link"))
+        ln = [e - (ends[i - 1] if i else 0.0) for i, e in enumerate(ends)]
+        return [a / l for a, l in zip(w, ln)] or [0.0]
+    w_old = widths(None)                       # default eps = 0.05 (blind)
+    w_new = widths(0.0)                        # what the gate reads now
+    dense = [(round(-8.0 + 0.5 * i, 3), 0.0) for i in range(33)]
+    ends_d = []
+    w_dense = [a / l for a, l in zip(
+        B._simulate(dense, skin(), z, tr, cell, 0.0, ends=ends_d,
+                    entry="link", eps=0.0),
+        [e - (ends_d[i - 1] if i else 0.0) for i, e in enumerate(ends_d)])]
+    print("BS1a4d8 skin link: old-eps engine widths %s, eps=0 widths %s, "
+          "dense-replay widths %s (D %.3f mm)"
+          % ([round(v, 3) for v in w_old], [round(v, 3) for v in w_new],
+             [round(v, 3) for v in w_dense[:4]], D))
+    # (b) old reading: zero
+    assert max(w_old) == 0.0, "old eps must still read 0 (bug preserved " \
+        "as documented): %r" % (w_old,)
+    # (c) new reading: a full-disk cut, over the bar
+    assert max(w_new) > 2.44, "eps=0 gate reads %.3f mm - not the judged " \
+        "load" % max(w_new)
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a4d8_floor.stl")
+        _write_stl(stl, _box_tris(-45.0, 45.0, -35.0, 35.0, -1.0, 0.0))
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        moves = [{"g": 0, "x": -8.0, "y": 0.0, "z": 7.0},
+                 {"g": 1, "x": -8.0, "y": 0.0, "z": z, "f": 250.0},
+                 {"g": 1, "x": 8.0, "y": 0.0, "z": z, "f": 3429.0}]
+        ngc = os.path.join(td, "bs1a4d8.ngc")
+        with open(ngc, "w") as fh:
+            fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+        hf = build_part_hf(surf, -45.0, -35.0, 0.5, 180, 140, threads=4,
+                           drop_z=-1.0)
+        hf_p = os.path.join(td, "part_hf.npy")
+        pad = int(math.ceil((tr + 5.0) / 0.5))
+        padded = np.full((hf.shape[0] + 2 * pad, hf.shape[1] + 2 * pad),
+                         np.nan, dtype=hf.dtype)
+        padded[pad:pad + hf.shape[0], pad:pad + hf.shape[1]] = hf
+        np.save(hf_p, padded)
+        with open(hf_p[:-4] + ".json", "w") as fh:
+            _json.dump({"x0": -45.0 - pad * 0.5, "y0": -35.0 - pad * 0.5,
+                        "cell": 0.5, "tess_tol": 0.01}, fh)
+        dj = os.path.join(td, "ae2.json")
+        rr = subprocess.run(
+            [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+             "--part", hf_p, "--tool", "flat", "--dia", "%.3f" % D,
+             "--stock", *[str(v) for v in box], "--engage-max", "2.438",
+             "--ae2-dump", dj],
+            capture_output=True, text=True, cwd=repo)
+        assert rr.returncode == 0, "zmap failed: %s | %s" % (
+            rr.stdout[-500:], rr.stderr[-500:])
+        wj = _json.load(open(dj))
+    cut = [w for w in wj if abs(w["z"] - z) < 1e-3 and w["feed"] > 3000.0
+           and w["area_mm2"] > 0.0]
+    assert cut, "no judged cutting-feed window on the link: vacuous"
+    judged = max(w["ae_eff"] for w in cut)
+    print("BS1a4d8 skin link judged by zmap: ae_eff %.3f mm vs gate "
+          "reading %.3f mm (old reading 0.000)" % (judged, max(w_new)))
+    assert judged > 2.44, "zmap judged the skin link %.3f mm - not over " \
+        "2.44 (scenario broken)" % judged
+    # the gate's single-chord reading is a point-sample floor (pi*r^2/L);
+    # the dense replay mirrors zmap's continuous sweep: no under-read.
+    assert max(w_dense) >= judged - 1e-6, \
+        "UNDER-READ: dense eps=0 replay %.3f mm < zmap-judged %.3f mm" % (
+            max(w_dense), judged)
+    # (d) wired: every entry="link" sim the engine makes for an arrival gate
+    # runs at the judge's threshold.
+    assert HAVE_AREA, "area module missing"
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+    link_calls = []
+    _orig_sim = B._simulate
+
+    def sim_spy(path, stock, z_, tool_r_, cell_, bore_r, ends=None, **kw):
+        if kw.get("entry") == "link":
+            link_calls.append(kw.get("eps", 0.05))
+        return _orig_sim(path, stock, z_, tool_r_, cell_, bore_r, ends, **kw)
+    B._simulate = sim_spy
+    try:
+        with tempfile.TemporaryDirectory() as td2:
+            stl2 = os.path.join(td2, "bs1a4d8_wire.stl")
+            _write_stl(stl2, tris)
+            surf2 = ocl.STLSurf()
+            ocl.STLReader(stl2, surf2)
+            _m, st2 = rough(surf2, (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0),
+                            6.343, 0.0, leave=0.381, axial_leave=0.381,
+                            stepdown=19.05, stepup=1.905, tolerance=0.05,
+                            threads=4, stock_cell=0.5, min_rest=0.5,
+                            corner_r=0.0, stl_path=stl2)
+    finally:
+        B._simulate = _orig_sim
+    print("BS1a4d8 wiring: %d entry='link' arrival sims, eps values %s"
+          % (len(link_calls), sorted(set(link_calls))))
+    assert link_calls, "no entry='link' arrival sim ran: wiring vacuous"
+    assert all(e == 0.0 for e in link_calls), \
+        "arrival gate simulated at eps %r - must be the judge's 0.0" % (
+            sorted(set(link_calls)),)
+    assert st2.get("clcheck_violations", 0) == 0, st2.get(
+        "clcheck_violations")
+    print("PASS bs1a4d8 arrival gate: skin link old 0.000 mm, gate %.3f mm, "
+          "zmap %.3f mm; %d wired link sims at eps=0"
+          % (max(w_new), judged, len(link_calls)))
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -1348,7 +1508,8 @@ def _main():
                test_bs1a4d6b_q4_entry_bore_in_live_stock,
                test_bs1a4d6c_side_entry_no_under_read,
                test_bs1a4d6d_approach_simulated_in_window0,
-               test_bs1a4d7_sub1mm_tail_merges_not_dropped):
+               test_bs1a4d7_sub1mm_tail_merges_not_dropped,
+               test_bs1a4d8_arrival_gate_reads_judge_skin):
         try:
             fn()
         except AssertionError as e:

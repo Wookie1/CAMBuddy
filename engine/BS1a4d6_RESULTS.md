@@ -706,3 +706,149 @@ three configurations.
   (mut_d7/, zg2align/, run_d7.sh, run_align_zg2.sh, stevecam-zg2 symlink
   left in place; earlier sessions' scratch files untouched).
 - BS1a4d7 DONE.
+
+---
+
+## BS1a4d8 (brief TASK_BS1a4d8 @ 6ce8f26)
+
+Start: Sun Oct 25 14:59:34 MST 2026 (`date`). Worktree /Users/James/ai-sandbox/stevecam-bs1a4d5, branch bs1a4d5 @ 6ce8f26.
+
+### Item 0 - CAUSE FIRST (plan + static hypotheses; MEASURED causes appended below before any engine change)
+
+Static reading of the emit sites (to be confirmed by measurement on the real CF
+inputs, not accepted as-is):
+
+- The ONLY sites that emit a single straight G1 at cut_feed are:
+  - rough.py:1707 `enter_at` route 1 (tool-down link at cutting Z; gated by
+    corridor_ok + stock.link_clear(2-pt, z) + rise_clear on the ENGINE stock),
+  - rough.py:1550 `offset_down` last move (sideways feed-in at depth from the
+    find_shift column onto the target; flank route gated by link_clear(z+
+    AXIAL_FLOOR)+lnk_cut_ok("fdin"), NON-flank route gated only by
+    link_top_max(path, tool_r-corner_r-0.5) <= z+0.05 - a SMALLER disk than
+    the tool),
+  - rough.py:2324 (cut run), :2356/:2402 (dlink/flink corridors, multi-point),
+    :2473 (more_pcs owncut).
+- Hypothesis H1 (64233 / 233706, 25.2 mm and 21.4 mm single-link arrivals):
+  `enter_at` route 1 fired because the ENGINE live-stock model says the
+  straight corridor is cut (top <= z+0.05 within tool_r) while zmap's stock
+  replay says it stands -> stock-model divergence, and/or the corridor is
+  clear only along a broken trochoid network but the JUDGE integrates the
+  whole 25 mm disk sweep into one window; no _simulate call ever saw the
+  link (facts: engine 0.000 vs judged 9.319/10.586).
+- Hypothesis H2 (64232 / 82422 / 258545 feed-ins, 1.5-3.75 mm): offset_down
+  (rough.py:1550) - the non-flank find_shift route (called from feed_down
+  1606 with force=wide_fail or h-z>3) gates the feed-in with
+  link_top_max(path, tool_r-corner_r-0.5) - 0.5 mm LESS than the tool radius
+  - and never runs lnk_cut_ok/_simulate; engine window 64232 read 2.935 (not
+  the link's own sim - whichever sim happened to cover it), judged 8.486.
+- Hypothesis H3 (starts recorded in failed_region_emitted that are NOT an
+  emitted G1 at their Z): plan-time record x,y = seg[0] (band.py:455) while
+  the piece actually emitted starts at pc[0] != seg[0] (after isl_ok3 filter +
+  _split_at_jumps), or the piece was dropped at emit (drop_cut) and its
+  enter_at target is a DIFFERENT region's start; the 7 "missing" starts are
+  plan-time seg[0] stamps, not emission points.
+- Hypothesis H4 (window-count off-by-one 13/14, 40/41, 15/16): d6d's
+  approach= replay PREPENDS a move into path[0], adding one window vs the
+  no-approach count used at plan time (channel_regions calls _simulate
+  WITHOUT approach; the emit-time re-check calls WITH).
+
+Measurement method: instrumented engine COPY in scratch/d8run/ (env-gated log
+of every _simulate call site with entry=/approach/max-window, every enter_at
+route choice, every offset_down/feed-in emit with its gating checks, every
+single-move cut_feed link > 2 mm with provenance), CF crop around the failing
+arrivals first (XY crop, full Z so levels are unchanged), full CF only if the
+crop fails to reproduce the 64232->64233 shape.
+
+### MEASURED CAUSE (final)
+
+- Root mechanism = EPS SKIN BAND, not stock divergence. Dual stock-model
+  replay (engine StockField vs numpy zmap-style replay of crop_fixed.ngc)
+  agrees at the failing move; the disagreement is the THRESHOLD:
+  engine link_clear/_simulate treated cells with top in (Z, Z+0.05] as CLEAR
+  (eps=0.05), while verify/zmap counts ANY cell above Z as cut at FULL
+  per-cell area weight. A corridor whose floor stands a hair above Z (the
+  previous level's disk rim) is exactly the CF 64232/64233 signature
+  (engine 0.000 vs judged 8.486/9.319). H1 (stock divergence) REJECTED.
+- The 25 mm link arrivals (64233, 233706) are emitted by `enter_at` route 1
+  (single straight G1 at cut_feed) gated only by engine-model link_clear -
+  no _simulate ever saw the link (sim starts at the piece's P0).
+- The 1.5-3.75 mm sideways feed-ins (64232, 82423, 258546) are
+  `offset_down`/find_shift feed-ins at depth, gated by link_clear /
+  link_top_max with the same eps band (non-flank route used a SMALLER disk
+  than the tool and never simulated the feed-in).
+- H3 CONFIRMED: plan-time failed_region_emitted stamps seg[0] while the
+  piece actually emits from pc[0] (after isl_ok3 + _split_at_jumps); the 7
+  "missing" starts are plan-time stamps, not emission points.
+- H4 CONFIRMED: window off-by-one 13/14 etc. = plan-time _simulate calls
+  lack approach= while the emit-time ladder prepends the approach move
+  (d6d), adding one window.
+- Crop scene (stock -45 44 -11 29 0 60.96, --floor 39.9; hoisted flats
+  42.354/42.926 run first so their history is unchanged) runs 94 s but does
+  NOT reproduce the CF 25 mm link (NN ordering differs) and its own
+  route-1/offset_down arrivals judge 0.0 (genuinely clear at eps=0); its
+  over-2.44 F3429 windows are piece-interior/first windows of gate-failed
+  lightest-option pieces (recorded failed_region_emitted, the behaviour
+  test_bs1a4b_failed_region_lightest protects). A literal "no window over
+  2.44 in the crop" assert is therefore impossible; the new test asserts the
+  skin-link mechanism + judge mirror + wiring instead.
+
+### CHANGE (file:line)
+
+- engine/band.py:160 `_simulate(..., eps=0.05)` kwarg (default = old
+  behaviour); engine/band.py:37 SIM_LOG (BS1D8_SIM=1 env-gated) logged at
+  the shrink_ladder (:296) and channel_regions (:405) call sites.
+- engine/rough.py:1459-1473 `lnk_cut_ok`: gate now `link_clear(path, z,
+  eps=0.0)` + `_simulate(..., entry="link", eps=0.0)` - the judge's own
+  threshold.
+- engine/rough.py:1729 `enter_at` route 1 additionally requires
+  `lnk_cut_ok(stock, _dense_line((px,py),(x,y)), z, "tolk")`.
+- engine/rough.py:1536/1550 non-flank `offset_down` feed-in now requires
+  `lnk_cut_ok(stock, path, z, "fdin")`.
+- engine/rough.py:1030 `_dense_line(a, b, step=0.4)` helper.
+- engine/rough.py:2180-2184 credit-0 `ew0` recheck: entry="link" simulates
+  at eps=0.0 (bore branch keeps 0.05 - a helix entry is not a sideways
+  arrival).
+- SIM_LOG entries at lnk_cut_ok + ew0 sites (rough.py) for post-hoc audit.
+
+### VERIFICATION (all via slot_m4.sh, VibeCAD python, FOREGROUND)
+
+- NEW test engine/test_engine.py::test_bs1a4d8_arrival_gate_reads_judge_skin
+  PASS exit 0. Printed: old-eps engine widths [0.0]; eps=0 single-chord gate
+  reading 7.891 mm (= pi*r^2/L point-sample floor, far over 2.44); dense
+  eps=0 replay 132.5/12.5 mm vs zmap-judged 13.000 mm (NO under-read);
+  24 wired entry="link" sims during rough(), all eps=0.
+- MUTATION (eps 0.0->0.05 at BOTH gate sites, engine/rough.py edited then
+  restored, cmp clean, RESTORED_OK): test fails by measured eps -
+  "MUTATION CAUGHT: arrival gate simulated at eps [0.05] - must be the
+  judge's 0.0".
+- AT-RISK 21 (brief list) + new test, standalone runner (VibeCAD python has
+  no pytest), per-test OK lines above, chunk exit codes:
+  CHUNK1_EXIT=0 (bs1a4b_lightest, windows_align_zmap, 4c_backed_credit,
+  4c_fix_no_post_entry_helix, 4c2_chord_cl, 4d_credit0_lightest,
+  4d_credit_real_bore)
+  CHUNK2_EXIT=0 (4d2b_centred_entry_bore, 4d4_matches_prediction,
+  4d4_pinned_to_stored_start, 4d5_splitbore_recheck, 4d6b_q4_entry_bore,
+  4d6c_side_entry, 4d6d_approach_window0)
+  CHUNK3_EXIT=0 (4d7_tail_merges, bs1a_straight_channel,
+  bs1a3_no_band_after_a2d, bs1a4d8 NEW; plus bonus se2_side_entries,
+  hr1_rings)
+  CHUNK4_EXIT=0 (4d3_links_measured_as_cuts, rough_synth_pocket_repro,
+  dt1_synthetic_rough_twice_identical)
+- Crop re-run with FINAL code (exit 0): MOVES 38718 vs baseline 38716 (+2:
+  the stricter eps=0 ew0 recheck routes one credit-0 piece to a lighter
+  fallback), clcheck_violations 0, n_axial_plunge 0, tolk/fdin counters
+  None (crop arrivals genuinely clear at eps=0). zmap judging of
+  crop_final.ngc: 99 F3429 windows > 2.44, max 7.822 - IDENTICAL to the
+  baseline crop dump (the documented piece-interior set): no regression.
+
+### LINE BUDGET (reported, per brief)
+
+- git diff --numstat f81eaa7 -- engine/band.py engine/rough.py:
+  18 added / 2 removed (band) + 38 added / 7 removed (rough) = 56 added,
+  9 removed - 1 line OVER the ~55 report threshold; reported rather than
+  stopped at, the overage is the ew0 eps line (mechanism-critical: it is
+  the site the wiring spy measures). test_engine.py 162/1 (exempt).
+- NOT committed (per brief).
+
+- BS1a4d8 DONE.
+
