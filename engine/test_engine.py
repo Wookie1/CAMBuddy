@@ -2536,6 +2536,21 @@ def test_bs1a4d_credit_real_bore():
         credited = cells(cap, [sim[3][:2]], sim[2])
         credited |= cells(cap, [cap["q"]], 6.343)   # return-feed landing disk
         cleared = cells(cap, pts, 6.343)
+        # BS1a4d6 (b): the "extra > 100" bound below was written for emitted
+        # bores at the smallest helix tier (0.3 x tool_r = 1.9029 ~ 1.903); a
+        # SMALLER emitted bore legitimately credits (about) the start disk, so
+        # there the bound is scoped away and replaced: the credited area must
+        # equal the emitted bore's OWN sim footprint - disk(helix centre,
+        # r + tool_r) plus the landing disk - within the grid tolerance.
+        if hb[2] < 0.3 * 6.343 - 1e-9:
+            foot = cells(cap, [hb[:2]], hb[2] + 6.343)
+            foot |= cells(cap, [cap["q"]], 6.343)
+            assert len(credited ^ foot) <= 4, \
+                "small-bore credit != the emitted bore's own footprint: " \
+                "credited %d cells, emitted-helix footprint %d cells, area " \
+                "difference %d > grid tolerance 4 at (%.3f,%.3f) r %.4f" % (
+                    len(credited), len(foot), len(credited ^ foot),
+                    cap["q"][0], cap["q"][1], hb[2])
         assert len(cleared - credited) <= 20, \
             "%d cell(s) cleared by the emitted entry are not credited at " \
             "(%.3f,%.3f) (bound 20 = return-feed stadium between helix end " \
@@ -2546,9 +2561,10 @@ def test_bs1a4d_credit_real_bore():
             "chord sliver bound 30) at (%.3f,%.3f)" % (
                 len(credited - cleared), cap["q"][0], cap["q"][1])
         start_disk = cells(cap, [cap["q"]], 6.343)
-        assert len(credited - start_disk) > 100, \
-            "credit is still (about) the tool_r start disk: extra %d" % \
-            len(credited - start_disk)
+        if hb[2] >= 0.3 * 6.343 - 1e-9:   # BS1a4d6 (b): kept for r >= min_helix_r
+            assert len(credited - start_disk) > 100, \
+                "credit is still (about) the tool_r start disk: extra %d" % \
+                len(credited - start_disk)
         checked += 1
     assert checked >= 1, "no helix-entered credited region was checked"
     print("PASS bs1a4d(c): %d helix-entered region(s) - credited cells cover "

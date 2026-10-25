@@ -2173,6 +2173,26 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                             if len(pcs[0]) >= 4:
                                 res["paths"][0][1] = pcs[0]
                                 act, drop_cut = "replan0_" + opt, False
+                            else:
+                                # BS1a4d6 (a): a piece that cannot rejoin q4
+                                # is NOT dropped - its lightest option goes
+                                # out as its OWN region, entered through its
+                                # own enter_at ladder (the only entry), never
+                                # at the failing load; its stock is cut here,
+                                # never left for the ring.
+                                own = next((pc for pc in pcs[1:]
+                                            if len(pc) >= 4), None)
+                                if own is not None:
+                                    i0o = len(moves)
+                                    p0o = (prev[0], prev[1], prev[2])
+                                    enter_at(own[0][0], own[0][1], z, None,
+                                             side=bool(rp2_flag))
+                                    stats["reentry_feed_mm"] += \
+                                        descend_feed(p0o, i0o)
+                                    level_pts.append((own[0][0], own[0][1],
+                                                      "own r%d" % nreg))
+                                    res["paths"][0][1] = own
+                                    act, drop_cut = "replan0_" + opt, False
                         stats["failed_region_emitted"].append(
                             {"x": q4[0], "y": q4[1], "z": round(z, 3),
                              "area": round(ba, 2),
