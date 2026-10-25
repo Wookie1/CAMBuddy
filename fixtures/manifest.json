@@ -18,8 +18,13 @@
   },
   {
    "path": "out/core_front_setup_hf.json",
-   "sha256": "1da575f52d8964c4e2ad934cd394e4a5a7a27b0b0d56580c19a64f77ac41adbf",
+   "sha256": "2437bcb8216380aa3e5a599d63979dbc8c318df0df4da1ce51dae243bd5cbd2a",
    "regenerate": "sidecar written with core_front_setup_hf.npy"
+  },
+  {
+   "path": "out/core_front_setup_hf.hit.npy",
+   "sha256": "f969b8a499ccb81554d282e3ff89d07e4f8aee98a420ab1f599c3357709e6ae0",
+   "regenerate": "part hit mask written with core_front_setup_hf.npy by verify/heightfield.py (ZG1)"
   },
   {
    "path": "out/cf_hf01_z5b.npy",
@@ -28,8 +33,13 @@
   },
   {
    "path": "out/cf_hf01_z5b.json",
-   "sha256": "47f8baaeb3b4403905257e3dc7dd99f30dffcfba9d688046464f07489b99de87",
+   "sha256": "d96e8a7e1627826a8c7420cd3f131a30427fba037215faf0248ffdee96fac7df",
    "regenerate": "sidecar written with cf_hf01_z5b.npy"
+  },
+  {
+   "path": "out/cf_hf01_z5b.hit.npy",
+   "sha256": "d1f8d24257b93d2d7f704901ab4131dddbd72a4876227839b3b0d30388abab67",
+   "regenerate": "part hit mask written with cf_hf01_z5b.npy by verify/heightfield.py (ZG1)"
   },
   {
    "path": "out/core_front_roughRT_before.ngc",
