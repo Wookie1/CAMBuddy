@@ -2761,8 +2761,25 @@ def test_ze2b_flat_and_bull_json_byte_identical(tmp_path):
                  "--stock"] + stock_args + ["--engage-max", "2.0"]
                 + ["--out-json", str(o)] + extra)
             assert rc == 0, "zmap run failed: %s %s" % (script, extra)
-            outs.append(o.read_bytes())
-        assert outs[0] == outs[1], "flat/bull JSON changed: %r" % extra
+            outs.append(json.loads(o.read_bytes()))
+        _assert_pinned_plus_zg1(outs[0], outs[1], "missing", extra)
+
+
+def _assert_pinned_plus_zg1(pinned, new, part_mask, label):
+    """ZG1 (supervisor, coordinator-approved): every key of the b1688b8 JSON is
+    present with a byte-identical value (json.dumps, sort_keys); the ONLY
+    extra keys are below_stock_bottom (count 0) and part_mask (this synthetic
+    part has no .hit.npy, so "missing")."""
+    for k, v in pinned.items():
+        assert k in new, "pinned key %r gone: %r" % (k, label)
+        assert json.dumps(new[k], sort_keys=True) == \
+            json.dumps(v, sort_keys=True), \
+            "flat/bull JSON changed at %r: %r" % (k, label)
+    extra = set(new) - set(pinned)
+    assert extra == {"below_stock_bottom", "part_mask"}, \
+        "extra keys %r: %r" % (sorted(extra), label)
+    assert new["below_stock_bottom"]["count"] == 0, new["below_stock_bottom"]
+    assert new["part_mask"] == part_mask, (new["part_mask"], label)
 
 
 def test_ze2b_cli_ball_block_and_dump(tmp_path):
