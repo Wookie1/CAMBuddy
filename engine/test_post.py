@@ -806,3 +806,67 @@ def test_posted_arcs_replay_onto_original_path():
             assert max_dev <= lim, \
                 "%s metric=%s: posted arcs replay %.4f mm from the original path (limit %.4f)" \
                 % (name, metric, max_dev, lim)
+
+
+# ---------------------------------------------------------------------------
+# TL2 item 2: extra header comment lines (the runner's origin line)
+# ---------------------------------------------------------------------------
+
+def _added_lines(base_lines, new_lines):
+    """Lines present only in new_lines (exact, ordered)."""
+    import difflib
+    return [l[2:] for l in difflib.ndiff(base_lines, new_lines)
+            if l.startswith("+ ")]
+
+
+def test_tl2_header_comments_default_byte_identical():
+    """header_comments=None (the default, and what every caller that does
+    not pass it gets) posts byte-identical to today."""
+    assert _synthetic(header_comments=None) == _synthetic()
+
+
+def test_tl2_header_comments_add_exactly_one_line():
+    base = _lines(_synthetic())
+    withc = _lines(_synthetic(header_comments=["ORIGIN: MODEL ORIGIN"]))
+    assert _added_lines(base, withc) == ["(ORIGIN: MODEL ORIGIN)"]
+    assert len(withc) == len(base) + 1
+    # the line sits in the header, right after the tool comment
+    assert withc[withc.index("(ORIGIN: MODEL ORIGIN)") - 1].startswith("(T2 ")
+    assert withc[withc.index("(ORIGIN: MODEL ORIGIN)") + 1] == \
+        "G90 G94 G17 G49 G40 G80"
+
+
+def test_tl2_header_comments_p3_form():
+    """P3: upper case output; slashstar style when selected; parentheses
+    inside a comment line are refused."""
+    txt = _synthetic(header_comments=["origin: stock bottom centre"])
+    assert "(ORIGIN: STOCK BOTTOM CENTRE)" in txt
+    ss = _synthetic(comment_style="slashstar",
+                    header_comments=["ORIGIN: STOCK TOP CENTRE"])
+    assert "/*ORIGIN: STOCK TOP CENTRE*/" in ss
+    import pytest
+    with pytest.raises(ValueError, match="parentheses"):
+        _synthetic(header_comments=["ROUGH (STEVE) PASS"])
+
+
+def test_tl2_post_text_real_rough_one_line_diff():
+    """The real roughing program (out/core_front_roughG.ngc) posted twice:
+    the origin line is the ONLY difference (main = no parameter)."""
+    _need(NEUTRAL)
+    base = _lines(_posted_inch_text())
+    hc = post_lnc.post_text(_read(NEUTRAL), program=1001,
+                            op_name="OVERALL ROUGHING",
+                            header_comments=["ORIGIN: STOCK BOTTOM CENTRE"])
+    assert _added_lines(base, _lines(hc)) == ["(ORIGIN: STOCK BOTTOM CENTRE)"]
+
+
+def test_tl2_header_comments_injected_fault_is_measured():
+    """Fault: the origin line emitted twice (header AND op block, e.g. a
+    wiring slip). The added-lines measurement then reads 2 added lines
+    where exactly 1 is required - the check fails on the measured value."""
+    base = _lines(_synthetic())
+    line = "(ORIGIN: MODEL ORIGIN)"
+    good = base[:3] + [line] + base[3:]
+    broken = base[:3] + [line] + base[3:8] + [line] + base[8:]
+    assert len(_added_lines(base, good)) == 1
+    assert len(_added_lines(base, broken)) == 2

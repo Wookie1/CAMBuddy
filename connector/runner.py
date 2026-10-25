@@ -13,6 +13,8 @@ import subprocess
 import sys
 import threading
 
+import toollib
+
 # Engagement warning factors (report-only warnings, never gates):
 # roughing warns above ROUGH_ENGAGE_FACTOR x optimal load, finishing above
 # FINISH_ENGAGE_FACTOR x stepover.
@@ -66,7 +68,62 @@ def _stock_args(values):
 
 
 class EngineError(Exception):
-    pass
+    """A refused or failed run. `code` (errors.CODES) + optional field /
+    got / allowed / where make the agent error (task f); str(e) stays the
+    plain message."""
+
+    def __init__(self, message, code="engine_failed", field=None, got=None,
+                 allowed=None, where=None):
+        super().__init__(message)
+        self.code = code
+        self.field = field
+        self.got = got
+        self.allowed = allowed
+        self.where = where
+
+    def as_error(self):
+        import errors
+        return errors.make_error(self.code, str(self), field=self.field,
+                                 got=self.got, allowed=self.allowed,
+                                 where=self.where)
+
+
+def _xy_where(d):
+    """{line, x, y} from a zmap gate dict (worst_xy / first_line)."""
+    w = {}
+    if isinstance(d, dict):
+        if d.get("first_line") is not None:
+            w["line"] = d["first_line"]
+        xy = d.get("worst_xy")
+        if isinstance(xy, (list, tuple)) and len(xy) >= 2:
+            w["x"], w["y"] = xy[0], xy[1]
+    return w or None
+
+
+_UNSUPPORTED_RE = re.compile(r"unsupported: (\S+) at line (\d+)")
+
+
+def _engine_error(rc, stderr):
+    """The caller-facing error for a failed engine subprocess: a known
+    gate line when there is one, else the last non-traceback line; the
+    raw stderr goes to the run dir log, never to the caller."""
+    lines = [l.rstrip() for l in stderr.splitlines() if l.strip()]
+    m = next((_UNSUPPORTED_RE.search(l) for l in lines
+              if _UNSUPPORTED_RE.search(l)), None)
+    if m:
+        line = next(l for l in lines if _UNSUPPORTED_RE.search(l))
+        return EngineError("engine failed (rc=%d): %s" % (rc, line.strip()),
+                           code="unsupported_code",
+                           where={"line": int(m.group(2))})
+    grid = next((l for l in lines if "outside the part grid" in l), None)
+    if grid:
+        lm = re.search(r"first line (\d+)", grid)
+        return EngineError("engine failed (rc=%d): %s" % (rc, grid.strip()),
+                           code="outside_grid",
+                           where={"line": int(lm.group(1))} if lm else None)
+    plain = [l for l in lines if not l.startswith((" ", "Traceback"))]
+    return EngineError("engine failed (rc=%d): %s"
+                       % (rc, (plain[-1] if plain else "no message")[:300]))
 
 
 def _check_zmap_gates(check):
@@ -79,29 +136,34 @@ def _check_zmap_gates(check):
     if isinstance(gouges, dict) and gouges.get("count", 0) > 0:
         raise EngineError(
             "zmap gate: %d gouges (max %.3f mm)"
-            % (gouges["count"], gouges.get("max_depth", 0.0)))
+            % (gouges["count"], gouges.get("max_depth", 0.0)),
+            code="gouges", where=_xy_where(gouges))
     rapids = check.get("rapid_collisions", {})
     if isinstance(rapids, dict) and rapids.get("count", 0) > 0:
         raise EngineError(
             "zmap gate: %d rapid collisions (first line %s)"
-            % (rapids["count"], rapids.get("first_line", "?")))
+            % (rapids["count"], rapids.get("first_line", "?")),
+            code="rapid_collisions", where=_xy_where(rapids))
     of = check.get("over_flute")
     if isinstance(of, dict) and of.get("count", 0) > 0:
         raise EngineError(
             "zmap gate: %d over-flute/shank hits (max %.3f mm)"
-            % (of["count"], of.get("max_depth", 0.0)))
+            % (of["count"], of.get("max_depth", 0.0)),
+            code="over_flute", where=_xy_where(of))
     hd = check.get("holder") or {}
     if hd.get("status") != "checked" or not isinstance(check.get("holder_hits"), dict):
         raise EngineError(
             "zmap gate: holder unknown (%s) - a run is never judged without "
-            "the holder clearance check" % hd.get("reason", hd.get("status", "no holder report")))
+            "the holder clearance check" % hd.get("reason", hd.get("status", "no holder report")),
+            code="holder_unknown")
     hh = check.get("holder_hits")
     if isinstance(hh, dict) and hh.get("count", 0) > 0:
         raise EngineError(
             "zmap gate: %d holder hits (max intrusion %.3f mm, first line "
             "%s) - the holder cannot keep 1.0 mm clearance"
             % (hh["count"], hh.get("max_intrusion", 0.0),
-               hh.get("first_line", "?")))
+               hh.get("first_line", "?")),
+            code="holder_hits", where=_xy_where(hh))
     # task ZA: axial plunges fail flat/bull roughing programs; for a ball
     # they stay report-only (count + depths in check.json)
     ap = check.get("axial_plunges")
@@ -112,10 +174,14 @@ def _check_zmap_gates(check):
             "zmap gate: %d axial plunges (max %.3f mm, first line %s) - a "
             "%s program must not drive its flat bottom straight into solid "
             "stock" % (ap["count"], ap.get("max_depth_mm", 0.0),
-                       ap.get("first_line", "?"), ttype))
+                       ap.get("first_line", "?"), ttype),
+            code="axial_plunges", where=_xy_where(ap))
 
 
-def _tool_number(cfg, values):
+def _tool_number(cfg, values, table=None):
+    """Explicit tool_number, else the T of the matching entry in `table`
+    (the run's effective table: library + job renumbering), else the repo
+    X7 table."""
     if values.get("tool_number"):
         return int(values["tool_number"])
     try:  # X7 table lookup via the engine's own module (under repo root)
@@ -125,6 +191,7 @@ def _tool_number(cfg, values):
         from engine import post_lnc
         e = post_lnc.lookup_tool(values["tool_type"], values["tool_diameter"],
                                  values["corner_radius"],
+                                 table if table is not None else
                                  post_lnc.load_tool_table(
                                      os.path.join(cfg["repo_root"], "tools",
                                                 "x7_tools.json")))
@@ -136,6 +203,18 @@ def _tool_number(cfg, values):
 
 
 T_WORD_RE = re.compile(r"\bT\s*(\d+)", re.IGNORECASE)
+
+
+def _origin_flags(values):
+    """TL2 item 2: posts name their work origin in a header comment (P3)."""
+    return ["--header-comment",
+            "ORIGIN: " + (values.get("origin") or "model_origin")
+            .replace("_", " ").upper()]
+
+
+# TL2 item 4: geometry fields compared between library and repo table.
+_GEOMETRY_KEYS = ("diameter_mm", "corner_radius_mm", "flute_mm",
+                  "shank_diameter_mm", "holder", "stickout_mm")
 
 # task CPc: check_program input fields judged in this order
 CHECK_PROGRAM_FIELDS = ("program", "program_2", "program_3")
@@ -176,7 +255,8 @@ def posted_units(path, requested):
         raise EngineError(
             "posted units mismatch in %s: units %r was requested but the "
             "program posts %s - the run failed"
-            % (os.path.basename(path), requested, other))
+            % (os.path.basename(path), requested, other),
+            code="posted_units_mismatch", field="units", got=requested)
     return requested
 
 
@@ -193,18 +273,23 @@ def check_tool_entry(number, path=None):
         with open(path) as fh:
             data = json.load(fh)
     except (IOError, OSError, ValueError) as e:
-        raise EngineError("cannot read tool table %s: %s" % (path, e))
+        raise EngineError("cannot read tool table %s: %s" % (path, e),
+                          code="tool_table_unreadable")
     e = next((t for t in data.get("tools", [])
               if t.get("number") == int(number)), None)
     if e is None:
         raise EngineError(
             "tool T%d is not in tools/x7_tools.json: unknown tool - add it "
             "to the X7 table (or pass a tool_number that is in the table)"
-            % int(number))
+            % int(number), code="tool_not_in_table", field="tool_number",
+            got=int(number),
+            allowed=sorted(t["number"] for t in data.get("tools", [])
+                           if t.get("number") is not None))
     for k in ("type", "diameter_mm"):
         if e.get(k) is None:
             raise EngineError("tool T%d entry in %s has no %s"
-                              % (int(number), path, k))
+                              % (int(number), path, k),
+                              code="tool_entry_incomplete", field=k)
     return {"number": int(number), "type": e["type"],
             "diameter_mm": float(e["diameter_mm"]),
             "corner_radius_mm": float(e.get("corner_radius_mm") or 0.0),
@@ -218,6 +303,16 @@ def check_tool_entry(number, path=None):
                             if e.get("stickout_mm") is not None else None)}
 
 
+def measure_result(bbox):
+    """prepare's bbox [xmin, xmax, ymin, ymax, zmin, zmax] -> the
+    model.measure result (mm, rounded to 0.0001)."""
+    lo = [round(bbox[i], 4) for i in (0, 2, 4)]
+    hi = [round(bbox[i], 4) for i in (1, 3, 5)]
+    return {"size_mm": {k: round(h - l, 4)
+                        for k, l, h in zip("xyz", lo, hi)},
+            "bbox_mm": {"min": lo, "max": hi}}
+
+
 class EngineRun:
     """Runs one roughing job; .cancel() stops the active subprocess."""
 
@@ -228,6 +323,76 @@ class EngineRun:
         self._proc = None
         self._lock = threading.Lock()
         self.cancelled = False
+        self.tools = None        # effective tool table (see _load_tools)
+        self.tools_path = None   # its copy in the run dir (zmap --tools-json)
+
+    def _load_tools(self, values):
+        """Track 2: the run's tool table = the library (<home>/tools.json)
+        with the STEVE document's job renumbering applied; every T/H the
+        run posts and every table lookup (zmap holder, flute, shank) uses
+        it. Written to the run dir for zmap --tools-json. Without a state
+        dir (unit callers) it is the repo table and argv is unchanged."""
+        try:
+            self.tools = toollib.effective_table(
+                self.cfg.get("home"), self.cfg["repo_root"],
+                values.get("document_id"))
+        except toollib.ToolLibError as e:
+            d = e.as_dict()
+            raise EngineError("tool library: %s" % e, code=e.code,
+                              field=d.get("field"), got=d.get("got"),
+                              allowed=d.get("allowed"))
+        except (OSError, ValueError) as e:
+            raise EngineError("tool library: %s" % e, code="library_error")
+        self.tools_path = None
+        if self.cfg.get("home"):
+            self.tools_path = os.path.join(self.work, "tools_effective.json")
+            toollib.write_json(self.tools_path, self.tools)
+
+    def _table_file(self):
+        return self.tools_path or toollib.repo_table_path(
+            self.cfg["repo_root"])
+
+    def _tools_json_args(self):
+        return ["--tools-json", self.tools_path] if self.tools_path else []
+
+    def _record_used(self, values, numbers):
+        try:
+            toollib.record_used(self.cfg.get("home"),
+                                values.get("document_id"), self.tools,
+                                numbers)
+        except (toollib.ToolLibError, OSError, ValueError):
+            pass  # bookkeeping only: never fails a finished run
+
+    def _check_library_geometry(self, numbers):
+        """TL2 item 4: the library geometry of every tool this run posts or
+        judges must equal the repo table the engine and judges read; a
+        difference refuses the run, naming the field and both values."""
+        if not self.cfg.get("home"):
+            return  # no library: the effective table IS the repo table
+        repo = {t.get("tool_id"): t for t in toollib._read(
+            toollib.repo_table_path(self.cfg["repo_root"]))["tools"]}
+        for e in self.tools.get("tools", []):
+            if e.get("number") not in numbers:
+                continue   # unused library-only tools stay allowed
+            r = repo.get(e.get("tool_id"))
+            if r is None:
+                raise EngineError(
+                    "tool %s (T%s) is not in tools/x7_tools.json, the table "
+                    "the engine and judges read" % (e.get("tool_id"),
+                                                    e.get("number")),
+                    code="tool_not_in_table", field="tool_id",
+                    got=e.get("tool_id"), allowed=sorted(repo))
+            for key in _GEOMETRY_KEYS:
+                a, b = e.get(key), r.get(key)
+                if not (abs(a - b) <= toollib.TOL if isinstance(
+                        a, (int, float)) and isinstance(b, (int, float))
+                        else a == b):
+                    raise EngineError(
+                        "tool %s: the library has %s %r but the engine and "
+                        "judges read %r from tools/x7_tools.json"
+                        % (e.get("tool_id"), key, a, b),
+                        code="tool_geometry_mismatch", field=key, got=a,
+                        allowed=b)
 
     def cancel(self):
         self.cancelled = True
@@ -294,18 +459,29 @@ class EngineRun:
         if self.cancelled:
             raise Cancelled("cancelled")
         if proc.returncode != 0:
-            raise EngineError("engine failed (rc=%d): %s"
-                             % (proc.returncode, "".join(err_lines[-25:])))
+            # full stderr stays server-side, in the run dir
+            try:
+                with open(os.path.join(self.work, "engine_stderr.log"),
+                          "a") as fh:
+                    fh.write("$ %s\n%s\n" % (" ".join(argv),
+                                              "".join(err_lines)))
+            except OSError:
+                pass
+            raise _engine_error(proc.returncode, "".join(err_lines[-25:]))
         return proc
 
     def run(self, step_path, values, on_progress=None):
         py = self.cfg["engine_python"]
         cell = 0.5
+        self._load_tools(values)
+        number = _tool_number(self.cfg, values, self.tools["tools"])
+        self._check_library_geometry([number])
         # 1) orient + stock box + part heightfield (grid covers the run's
         #    stock + tool radius + margin via STOCK_BOX/TOOL_R, task Z5b)
         self._spawn([py, "-m", "engine.cli", "prepare",
                     "--step", step_path, "--out-dir", self.work,
                     "--orient", values["orientation"],
+                    "--origin", values.get("origin") or "model_origin",
                     *_stock_args(values),
                     "--stock-top", "%.4f" % values["stock_top"],
                     "--stock-bottom", "%.4f" % values["stock_bottom"],
@@ -339,14 +515,21 @@ class EngineRun:
                  "--spindle", str(int(values["rpm"])),
                  "--post", "lnc", "--program",
                  str(int(values["program_number"])),
-                 "--tool-number", str(_tool_number(self.cfg, values)),
+                 "--tool-number", str(number),
                  "--json-progress", "--stats-json", stats_path]
+        argv_r += _origin_flags(values)
         if metric:
             argv_r += ["--metric"]
         self._spawn(argv_r, 0.2, 0.85, on_progress)
         posted = {"rough.nc": posted_units(nc, values["units"])}
         with open(stats_path) as fh:
             stats = json.load(fh)
+        if not stats.get("n_moves"):
+            # TL2 item 5: an exterior box leaves roughing an empty program.
+            raise EngineError(
+                "nothing to cut: the roughing program has no moves (every "
+                "level found 0 mm2 of stock region) - adaptive roughing "
+                "only clears enclosed stock", code="nothing_to_cut")
 
         # 3) independent zmap check + leftover preview. The zmap part grid
         #    must cover stock + tool radius (zmap exits non-zero if the
@@ -374,7 +557,7 @@ class EngineRun:
             fr.require_fresh(hf_zmap, step_sha256=step_sha, cell=cell,
                              tess_tol=0.01)
         except OSError as e:
-            raise EngineError(str(e))
+            raise EngineError(str(e), code="stale_artifact")
         check_path = os.path.join(self.work, "check.json")
         png_path = os.path.join(self.work, "preview.png")
         self._spawn([py, "-m", "verify.zmap", nc,
@@ -387,7 +570,8 @@ class EngineRun:
                     "--optimal-load", "%.4f" % values["optimal_load"],
                     "--engage-max", "%.4f"
                     % (ROUGH_ENGAGE_FACTOR * values["optimal_load"]),
-                    "--tool-number", str(_tool_number(self.cfg, values)),
+                    "--tool-number", str(number),
+                    *self._tools_json_args(),
                     "--out-json", check_path, "--png", png_path],
                    0.88, 0.95, on_progress)
         with open(check_path) as fh:
@@ -415,16 +599,35 @@ class EngineRun:
             "tool": {"type": values["tool_type"],
                     "diameter_mm": values["tool_diameter"],
                     "corner_radius_mm": values["corner_radius"],
-                    "number": _tool_number(self.cfg, values)},
+                    "number": number},
             "program_number": values["program_number"],
             "orientation": values["orientation"],
             "stock_box_mm": stock,
+            "origin": prep.get("origin", "model_origin"),
+            "origin_offset_mm": prep.get("origin_offset", [0.0, 0.0, 0.0]),
             "files": ["rough.nc", "check.json", "preview.png"],
         }
         files = {"rough.nc": (nc, "application/octet-stream"),
                  "check.json": (check_path, "application/json"),
                  "preview.png": (png_path, "image/png")}
+        self._record_used(values, [number])
         return result, files
+
+    # -------------------------------------------------- model.measure ----
+    def run_measure(self, step_path, values, on_progress=None):
+        """model.measure (track 2 b): the oriented model's bounding box from
+        the same engine prepare path every cutting action uses (zero stock
+        allowances, so the box is the part itself). Nothing is cut."""
+        py = self.cfg["engine_python"]
+        self._spawn([py, "-m", "engine.cli", "prepare",
+                     "--step", step_path, "--out-dir", self.work,
+                     "--orient", values["orientation"],
+                     "--stock-xy", "0", "--stock-top", "0",
+                     "--stock-bottom", "0", "--cell", "0.5"],
+                    0.05, 0.95, on_progress)
+        with open(os.path.join(self.work, "prepare.json")) as fh:
+            bb = json.load(fh)["bbox"]
+        return measure_result(bb), {}
 
     # -------------------------------------------------- check_program ----
     def run_check_program(self, program_path, step_path, values,
@@ -444,6 +647,7 @@ class EngineRun:
         py = self.cfg["engine_python"]
         fc = os.path.join(os.path.dirname(py), "freecadcmd")
         repo = self.cfg["repo_root"]
+        self._load_tools(values)
 
         # 1) every program's own tool up front, in order: one T word each,
         #    known in the X7 table (unknown tool or holder fails the run,
@@ -462,21 +666,28 @@ class EngineRun:
                 raise EngineError("multi-tool programs not supported yet "
                                   "(%s T words: %s)"
                                   % (pname, ", ".join("T%d" % n
-                                                   for n in numbers)))
+                                                   for n in numbers)),
+                                  code="multi_tool_program", field=pname,
+                                  got=["T%d" % n for n in numbers])
             number = (int(values["tool_number"])
                      if i == 0 and values.get("tool_number")
                      else (numbers[0] if numbers else None))
             if number is None:
                 raise EngineError("no T word in the program and no "
                                   "tool_number override: the tool cannot be "
-                                  "resolved")
-            tool = check_tool_entry(number, os.path.join(repo, "tools",
-                                                         "x7_tools.json"))
+                                  "resolved", code="no_t_word", field=pname)
+            # track 2: the T word resolves through the document's job
+            # renumbering (effective table), else the library T
+            tool = check_tool_entry(number, self._table_file())
             if numbers and number != numbers[0]:
                 raise EngineError("tool_number T%d does not match the "
                                   "program's T%d: refusing to judge with a "
-                                  "different tool" % (number, numbers[0]))
+                                  "different tool" % (number, numbers[0]),
+                                  code="tool_number_mismatch",
+                                  field="tool_number", got=number,
+                                  allowed=[numbers[0]])
             resolved.append((pname, ppath, number, tool))
+        self._check_library_geometry([n for _, _, n, _ in resolved])
         cell = 0.1  # judge grid: same 0.1 mm as the finishing chain
 
         # 2) orient + stock box + part heightfield (shared builder grid:
@@ -488,6 +699,7 @@ class EngineRun:
         self._spawn([py, "-m", "engine.cli", "prepare",
                      "--step", step_path, "--out-dir", self.work,
                      "--orient", values["orientation"],
+                     "--origin", values.get("origin") or "model_origin",
                      *_stock_args(values),
                      "--stock-top", "%.4f" % values["stock_top"],
                      "--stock-bottom", "%.4f" % values["stock_bottom"],
@@ -517,7 +729,7 @@ class EngineRun:
             fr.require_fresh(hf_zmap, step_sha256=step_sha, cell=cell,
                              tess_tol=0.01)
         except OSError as e:
-            raise EngineError(str(e))
+            raise EngineError(str(e), code="stale_artifact")
 
         # 4) zmap --strict per program, in order, carrying the stock: each
         #    program is judged with --stock-in = the previous program's
@@ -543,6 +755,7 @@ class EngineRun:
                     "--dia", "%.4f" % tool["diameter_mm"],
                     "--corner", "%.4f" % tool["corner_radius_mm"],
                     "--tool-number", str(number),
+                    *self._tools_json_args(),
                     "--strict", "--engage-report",
                     "--out-json", out_json]
             if stock_in is None:
@@ -566,7 +779,8 @@ class EngineRun:
                     check = json.load(fh)
                 _check_zmap_gates(check)
             except EngineError as e:
-                raise EngineError("%s failed: %s" % (pname, e))
+                raise EngineError("%s failed: %s" % (pname, e), code=e.code,
+                                  where=dict(e.where or {}, program=pname))
             entries.append({"name": pname,
                             "tool": {"number": number, "type": tool["type"],
                                      "diameter_mm": tool["diameter_mm"],
@@ -596,6 +810,8 @@ class EngineRun:
             "tool": first["tool"],
             "orientation": values["orientation"],
             "stock_box_mm": stock,
+            "origin": prep.get("origin", "model_origin"),
+            "origin_offset_mm": prep.get("origin_offset", [0.0, 0.0, 0.0]),
             "strict": True,
             "unsupported": first["check"].get("unsupported", []),
             "zmap_gouges": first["check"]["gouges"],
@@ -619,6 +835,7 @@ class EngineRun:
         files = {"check.json": (os.path.join(self.work, "check.json"),
                                  "application/json"),
                  "preview.png": (png_path, "image/png")}
+        self._record_used(values, [e["tool"]["number"] for e in entries])
         return result, files
 
     # ------------------------------------------------- slope_split_finish --
@@ -635,9 +852,7 @@ class EngineRun:
             from engine import post_lnc
             e = post_lnc.lookup_tool("ball", values["tool_diameter"],
                                      values["tool_diameter"] / 2.0,
-                                     post_lnc.load_tool_table(
-                                         os.path.join(self.cfg["repo_root"],
-                                                    "tools", "x7_tools.json")))
+                                     self.tools["tools"])
             if e:
                 return int(e["number"])
         except Exception:
@@ -645,7 +860,8 @@ class EngineRun:
         raise EngineError(
             "finish tool ball D=%.3f mm is not in tools/x7_tools.json and "
             "no tool_number was given: pass a tool_number or add the tool "
-            "to the X7 table" % values["tool_diameter"])
+            "to the X7 table" % values["tool_diameter"],
+            code="finish_tool_not_in_table", field="tool_number")
 
     def run_slope_split_finish(self, step_path, values, on_progress=None):
         """Roughing first, then slope-split finishing (a finishing ball must
@@ -657,12 +873,16 @@ class EngineRun:
         repo = self.cfg["repo_root"]
 
         # 0) tool numbers up front: refuse a missing finish-tool number
-        #    before any engine work (the run reports failed, clearly)
+        #    before any engine work (the run reports failed, clearly).
+        #    Track 2: every number comes from the effective table (library +
+        #    the document's job renumbering)
+        self._load_tools(values)
         finish_number = self._finish_tool_number(values)
         rough_number = _tool_number(self.cfg, {
             "tool_type": values["rough_tool_type"],
             "tool_diameter": values["rough_tool_diameter"],
-            "corner_radius": values["rough_corner_radius"]})
+            "corner_radius": values["rough_corner_radius"]},
+            self.tools["tools"])
 
         # 0b) optional corner rest pass (task CR): the rest tool must be a
         #     ball in tools/x7_tools.json with a known holder - an unknown
@@ -673,24 +893,28 @@ class EngineRun:
         rest = None
         if rest_number:
             rest_number = int(rest_number)
-            rest = check_tool_entry(rest_number,
-                                   os.path.join(repo, "tools", "x7_tools.json"))
+            rest = check_tool_entry(rest_number, self._table_file())
             if not rest["holder"]:
                 raise EngineError(
                     "rest tool T%d has no holder in tools/x7_tools.json: the "
                     "rest pass is never judged without the holder clearance "
-                    "check" % rest_number)
+                    "check" % rest_number, code="rest_tool_no_holder",
+                    field="rest_tool_number", got=rest_number)
             if rest["type"] != "ball":
                 raise EngineError(
                     "rest tool T%d is a %s, not a ball: the corner rest pass "
                     "runs with a ball nose from tools/x7_tools.json"
-                    % (rest_number, rest["type"]))
+                    % (rest_number, rest["type"]), code="rest_tool_not_ball",
+                    field="rest_tool_number", got=rest_number)
             if rest["diameter_mm"] >= values["tool_diameter"]:
                 raise EngineError(
                     "rest tool T%d D=%.3f mm is not smaller than the finishing "
                     "ball D=%.3f mm: the rest pass cuts with the smaller ball"
                     % (rest_number, rest["diameter_mm"],
-                       values["tool_diameter"]))
+                       values["tool_diameter"]), code="rest_tool_too_big",
+                    field="rest_tool_number", got=rest_number)
+        self._check_library_geometry([rough_number, finish_number]
+                                     + ([rest_number] if rest else []))
 
         # stage boundaries: with the rest pass the generation stages are
         # squeezed so progress stays monotone and ends at 1.0
@@ -716,6 +940,7 @@ class EngineRun:
         self._spawn([py, "-m", "engine.cli", "prepare",
                     "--step", step_path, "--out-dir", self.work,
                     "--orient", values["orientation"],
+                    "--origin", values.get("origin") or "model_origin",
                     *_stock_args(values),
                     "--stock-top", "%.4f" % values["stock_top"],
                     "--stock-bottom", "%.4f" % values["stock_bottom"],
@@ -750,7 +975,7 @@ class EngineRun:
             fr.require_fresh(hf01, step_sha256=step_sha, cell=0.1,
                              tess_tol=0.01)
         except OSError as e:
-            raise EngineError(str(e))
+            raise EngineError(str(e), code="stale_artifact")
 
         # 3) adaptive roughing (LNC post, full stock); the finish and the rest
         #    pass need the engine's own post-roughing stock for their rapid /
@@ -787,6 +1012,7 @@ class EngineRun:
         # adds 1 mm over the part and rapids crossed roughing terraces
         fr.remove_stale(rough_stock_out)
         argv += ["--stock-out", rough_stock_out]
+        argv += _origin_flags(values)
         if metric:
             argv += ["--metric"]
         self._spawn(argv, *P["rough"], on_progress)
@@ -803,7 +1029,7 @@ class EngineRun:
         try:
             fr.require_stl(stl)
         except OSError as e:
-            raise EngineError(str(e))
+            raise EngineError(str(e), code="stale_artifact")
 
         # 5) slope-split finishing (neutral G-code). PQ: the engine snaps the
         #    emitted points to the output grid matching this op's post units
@@ -835,6 +1061,7 @@ class EngineRun:
                    "--program", str(int(values["program_number"])),
                    "--op-name", "SLOPE SPLIT FINISH (RUN AFTER ROUGHING)",
                    "--tool-number", str(finish_number)]
+        argv_fp += _origin_flags(values)
         if metric:
             argv_fp += ["--metric"]
         self._spawn(argv_fp, 0.72, 0.76, on_progress)
@@ -850,7 +1077,8 @@ class EngineRun:
             raise EngineError(
                 "probe_clcheck: %d points below CL by >0.005 mm in the "
                 "finish program (max %.3f mm) - run failed"
-                % (cl["below_cl"], cl.get("max_depth_mm", 0.0)))
+                % (cl["below_cl"], cl.get("max_depth_mm", 0.0)),
+                code="clcheck", where={"program": "finish.nc"})
 
         # 8) chained zmap: roughing from full stock (--stock-out), then the
         #    finish with the roughed stock as --stock-in
@@ -867,6 +1095,7 @@ class EngineRun:
                     "--engage-max", "%.4f"
                     % (ROUGH_ENGAGE_FACTOR * values["rough_optimal_load"]),
                     "--tool-number", str(rough_number),
+                    *self._tools_json_args(),
                     "--out-json", check_rough,
                     "--stock-out", stock_out], *P["zmap_rough"], on_progress)
         check_finish = os.path.join(self.work, "check_finish.json")
@@ -889,11 +1118,11 @@ class EngineRun:
                   "--engage-max", "%.4f"
                   % (FINISH_ENGAGE_FACTOR * values["stepover"]),
                   "--tool-number", str(finish_number),
+                  *self._tools_json_args(),
                   "--out-json", check_finish]
         # the judge also checks the finish's flute/shank (over_flute), from
         # the same X7 table entry the engine's shank rule used
-        fin_tool = check_tool_entry(finish_number,
-                                    os.path.join(repo, "tools", "x7_tools.json"))
+        fin_tool = check_tool_entry(finish_number, self._table_file())
         if fin_tool["flute_mm"] is not None:
             argv_f += ["--flute", "%.4f" % fin_tool["flute_mm"]]
         if fin_tool["shank_diameter_mm"] is not None:
@@ -974,6 +1203,7 @@ class EngineRun:
                       "--tool-kind", "ball",
                       "--dia", "%.4f" % rest["diameter_mm"],
                       "--corner", "%.4f" % (rest["diameter_mm"] / 2.0)]
+            argv_rp += _origin_flags(values)
             if metric:
                 argv_rp += ["--metric"]
             self._spawn(argv_rp, *P["post_rest"], on_progress)
@@ -992,7 +1222,8 @@ class EngineRun:
                 raise EngineError(
                     "probe_clcheck: %d points below CL by >0.005 mm in the "
                     "rest program (max %.3f mm) - run failed"
-                    % (cl_rest["below_cl"], cl_rest.get("max_depth_mm", 0.0)))
+                    % (cl_rest["below_cl"], cl_rest.get("max_depth_mm", 0.0)),
+                    code="clcheck", where={"program": "rest.nc"})
 
             # 9d) chained zmap of the rest program on the stock the finish
             #     left, with the rest tool's geometry + holder; preview.png is
@@ -1006,6 +1237,7 @@ class EngineRun:
                        "--engage-max", "%.4f"
                        % (FINISH_ENGAGE_FACTOR * values["stepover"]),
                        "--tool-number", str(rest_number),
+                       *self._tools_json_args(),
                        "--out-json", check_rest_path, "--png", png_path]
             if rest["flute_mm"] is not None:
                 argv_zr += ["--flute", "%.4f" % rest["flute_mm"]]
@@ -1124,6 +1356,8 @@ class EngineRun:
             "program_number": values["program_number"],
             "orientation": values["orientation"],
             "stock_box_mm": stock,
+            "origin": prep.get("origin", "model_origin"),
+            "origin_offset_mm": prep.get("origin_offset", [0.0, 0.0, 0.0]),
             "files": ["rough.nc", "finish.nc", "check.json",
                      "preview.png"],
         }
@@ -1141,4 +1375,6 @@ class EngineRun:
             result["rest_program_number"] = int(values["program_number"]) + 2
             result["files"].insert(2, "rest.nc")
             files["rest.nc"] = (rest_nc, "application/octet-stream")
+        self._record_used(values, [rough_number, finish_number]
+                          + ([rest_number] if rest else []))
         return result, files

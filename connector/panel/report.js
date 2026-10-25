@@ -49,6 +49,7 @@
       const lines = x.lines != null ? [].concat(x.lines).join(", ") : x.line;
       return x.code + " on line " + lines;
     }
+    if (x.__attn) return [x.message || x.code || "unknown", where(x.where, unit)].filter(Boolean).join(" \u00b7 ");
     if (x.message) return String(x.message);
     const w = where(x, unit);
     const rest = Object.keys(x).filter((k) => !["program", "line", "x", "y", "z"].includes(k)).map((k) => {
@@ -218,9 +219,16 @@
     const env = (own(r, "verdict") || own(r, "attention") || own(r, "summary")) ? r : (ck || {});
     const m = {
       verdict: env.verdict, summary: env.summary,
-      attention: Array.isArray(env.attention) ? env.attention : [],
+      attention: [],
       gates: [], warnings: [], lists: [], programs: [],
     };
+    // "Left for another operation" arrives as attention items; they go in that list, not under "Good to know".
+    const LEFT_CODES = ["area_left_for_next_op"];
+    const leftAttn = [];
+    for (const a of Array.isArray(env.attention) ? env.attention : []) {
+      if (isObj(a) && LEFT_CODES.includes(a.code)) leftAttn.push(Object.assign({ __attn: true }, a));
+      else m.attention.push(a);
+    }
     // time and cut length
     let t = lookup([r], ["estimated_time_min", "chain_time_min", "time_min", "total_time_min"]);
     if (t.found) m.time_s = num(t.value) ? t.value * 60 : null;
@@ -261,13 +269,13 @@
     // lists
     const LISTS = [
       { title: "Codes the check skipped", names: ["unsupported_codes", "unsupported"] },
-      { title: "Left for another operation", names: ["areas_left", "left_for_next_op", "left_for_other_operation", "uncut_areas", "not_machined"] },
+      { title: "Left for another operation", left: true, names: ["areas_left", "left_for_next_op", "left_for_other_operation", "uncut_areas", "not_machined"] },
     ];
     for (const L of LISTS) {
       const f = lookup(gateSrc, L.names);
-      if (!f.found || f.value == null) continue;
-      const v = f.value;
-      const items = Array.isArray(v) ? v : isObj(v) ? Object.keys(v).map((k) => ({ code: k, lines: v[k] })) : [v];
+      const v = f.found ? f.value : null;
+      let items = v == null ? [] : Array.isArray(v) ? v : isObj(v) ? Object.keys(v).map((k) => ({ code: k, lines: v[k] })) : [v];
+      if (L.left) items = leftAttn.concat(items);
       if (items.length) m.lists.push({ title: L.title, items });
     }
     if (programs) m.programs = programs.filter(isObj);

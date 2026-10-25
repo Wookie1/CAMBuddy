@@ -4,6 +4,7 @@
   "tolerance_mm": 0.001,
   "tools": [
     {
+      "tool_id": "bull-12.700-r0.127",
       "number": 3,
       "type": "bull",
       "diameter_mm": 12.7,
@@ -17,6 +18,7 @@
       "shank_note": "assumed = D (not necked)"
     },
     {
+      "tool_id": "ball-5.958",
       "number": 31,
       "type": "ball",
       "diameter_mm": 5.958,
@@ -34,6 +36,7 @@
       "source": "James's STEVE tool library (My shop rev 24)"
     },
     {
+      "tool_id": "ball-9.525",
       "number": 20,
       "type": "ball",
       "diameter_mm": 9.525,
@@ -51,6 +54,7 @@
       "source": "James's STEVE tool library (My shop rev 24)"
     },
     {
+      "tool_id": "ball-19.050",
       "number": null,
       "type": "ball",
       "diameter_mm": 19.05,
@@ -66,6 +70,7 @@
       "necked": false
     },
     {
+      "tool_id": "ball-12.700",
       "number": null,
       "type": "ball",
       "diameter_mm": 12.7,
@@ -81,6 +86,7 @@
       "necked": false
     },
     {
+      "tool_id": "ball-3.142",
       "number": 33,
       "type": "ball",
       "diameter_mm": 3.142,
@@ -98,6 +104,7 @@
       "source": "James's STEVE tool library (My shop rev 24)"
     },
     {
+      "tool_id": "ball-1.587",
       "number": null,
       "type": "ball",
       "diameter_mm": 1.5875,
@@ -113,6 +120,7 @@
       "necked": false
     },
     {
+      "tool_id": "ball-0.794",
       "number": null,
       "type": "ball",
       "diameter_mm": 0.79375,
@@ -128,6 +136,7 @@
       "necked": false
     },
     {
+      "tool_id": "flat-12.686",
       "number": 13,
       "type": "flat",
       "diameter_mm": 12.686,

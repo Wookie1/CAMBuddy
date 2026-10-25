@@ -73,6 +73,7 @@ input:focus-visible, select:focus-visible, button:focus-visible, summary:focus-v
 .fld.bad input, .fld.bad select { border-color: var(--fail); background: var(--fail-bg); }
 .err { color: var(--fail); font-size: 11px; min-height: 0; }
 .err:empty { display: none; }
+.partial { color: var(--review); margin: 0 0 6px; }
 .fld .note { font-size: 11px; color: var(--muted); }
 .inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0; }
 button {

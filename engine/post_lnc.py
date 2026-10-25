@@ -347,12 +347,30 @@ def _arc_centre(mv, cur, tgt, scale, dec, metric):
     return None
 
 
+def _header_comment_lines(header_comments):
+    """Extra header comment lines (TL2 item 2) in the P3 form: upper case,
+    no parentheses inside; slashstar applies with the whole header.
+    None -> no lines (output byte-identical)."""
+    if header_comments is None:
+        return []
+    if isinstance(header_comments, str):
+        header_comments = [header_comments]
+    out = []
+    for line in header_comments:
+        s = str(line).strip()
+        if "(" in s or ")" in s:
+            raise ValueError("header comment must not nest parentheses "
+                             "(spec P3): %r" % (line,))
+        out.append("(%s)" % s.upper())
+    return out
+
+
 def post(moves, *, metric=False, units_in=1.0, program=1001,
          op_name="ENGINE ROUGH", tool_number=None, rpm=7500,
          dia_mm=12.7, corner_mm=0.127, tool_kind="bull",
          clear_mm=None, wcs=54, dwell_ms=3000, dwell_p_ms=True,
          tool_desc=None, comp_note=True, crlf=True,
-         comment_style="paren", arcs=False):
+         comment_style="paren", arcs=False, header_comments=None):
     """Build a full LNC program (single string) from neutral ``moves``.
 
     Format follows docs/lnc5800_post_spec.md (rule ids P1..P13, N1..N7).
@@ -420,6 +438,7 @@ def post(moves, *, metric=False, units_in=1.0, program=1001,
     out.append("(T%d D=%s CR=%s - ZMIN=%s - %s)"
                % (tool_number, fmt_num(dia_out, cdec), fmt_num(cr_out, cdec),
                  fmt_num(zmin_out, cdec), type_str))
+    out.extend(_header_comment_lines(header_comments))   # e.g. (ORIGIN: ...)
     out.append("G90 G94 G17 G49 G40 G80")      # P4 safety line
     out.append("G21" if metric else "G20")      # P5 units, own line
     if comp_note:

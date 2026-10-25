@@ -37,6 +37,25 @@ def stock_box(bbox, sx, sy, top, bottom):
             pzmin - bottom, pzmax + top]
 
 
+ORIGINS = ("stock_bottom_centre", "stock_top_centre", "model_origin")
+# below this (mm, under every post's output resolution) no translation is
+# applied: a model already in the chosen frame keeps today's exact STEP
+ORIGIN_EPS = 1e-4
+
+
+def origin_offset(stock, origin):
+    """Task (e): the translation (dx, dy, dz) mm that puts the chosen point
+    of the stock box at (0, 0, 0): its XY centre at the bottom or the top
+    face; model_origin keeps the model's own frame (0, 0, 0). Pure."""
+    if origin == "model_origin":
+        return (0.0, 0.0, 0.0)
+    if origin not in ORIGINS:
+        raise ValueError("unknown origin %r" % (origin,))
+    x0, x1, y0, y1, z0, z1 = stock
+    z = z0 if origin == "stock_bottom_centre" else z1
+    return (-(x0 + x1) / 2.0, -(y0 + y1) / 2.0, -z)
+
+
 def _run_post(a):
     """python -m engine.cli post --in <neutral/engine> --out F [options]"""
     from engine import post_lnc
@@ -45,7 +64,8 @@ def _run_post(a):
     kw = dict(metric=a.metric, program=a.program, op_name=a.op_name,
               wcs=a.wcs, dwell_ms=a.dwell_ms, dwell_p_ms=not getattr(a, "dwell_x_s", False),
               comment_style=getattr(a, "comment_style", "paren"),
-              tool_desc=a.tool_desc, crlf=not a.lf, arcs=a.arcs)
+              tool_desc=a.tool_desc, crlf=not a.lf, arcs=a.arcs,
+              header_comments=a.header_comments)
     if a.tool_number is not None:
         kw["tool_number"] = a.tool_number
     if a.rpm is not None:
@@ -104,6 +124,28 @@ def _run_prepare(a):
     except ValueError as e:
         raise SystemExit(str(e))
 
+    # task (e): work origin - move the oriented model so the chosen stock
+    # point is (0, 0, 0), then rebuild the stock box from the moved bbox
+    offset = origin_offset(stock, a.origin)
+    if max(abs(v) for v in offset) > ORIGIN_EPS:
+        moved = os.path.join(a.out_dir, "model_moved.step")
+        env = dict(os.environ, STEP_IN=step_out, STEP_OUT=moved,
+                   ORIENT="as_modeled", META_OUT=meta_out,
+                   TRANSLATE="%.9f %.9f %.9f" % offset)
+        os.remove(meta_out)
+        r = subprocess.run([model.freecadcmd(),
+                            os.path.join(here, "_orient.py")],
+                           env=env, capture_output=True, text=True)
+        if not os.path.exists(meta_out):
+            raise SystemExit("origin move failed: %s\n%s"
+                             % (r.stdout[-1500:], r.stderr[-1500:]))
+        os.replace(moved, step_out)
+        with open(meta_out) as fh:
+            bbox = json.load(fh)["bbox"]
+        stock = stock_box(bbox, sx, sy, a.stock_top, a.stock_bottom)
+    else:
+        offset = (0.0, 0.0, 0.0)
+
     prog(0.4, "rasterising part heightfield")
     # task HC: never accept a stale part_hf.npy from a reused out dir -
     # remove it (and its sidecar) first, then require both to exist and
@@ -125,7 +167,8 @@ def _run_prepare(a):
                                           r.stderr[-1500:]))
 
     out = {"step": step_out, "hf": hf_out, "bbox": bbox, "stock": stock,
-           "orient": a.orient}
+           "orient": a.orient, "origin": a.origin,
+           "origin_offset": list(offset)}
     with open(os.path.join(a.out_dir, "prepare.json"), "w") as fh:
         json.dump(out, fh, indent=2)
     prog(1.0, "prepared")
@@ -294,7 +337,11 @@ def main(argv=None):
     pr.add_argument("--out-dir", dest="out_dir", required=True)
     pr.add_argument("--orient", default="as_modeled",
                     choices=("as_modeled", "flip_x_180", "flip_y_180",
-                           "flip_z_180"))
+                           "flip_z_180", "rot_x_90", "rot_x_270",
+                           "rot_y_90", "rot_y_270"))
+    pr.add_argument("--origin", default="model_origin", choices=ORIGINS,
+                    help="work origin: the stock point moved to (0,0,0) "
+                         "(default model_origin: the model's own frame)")
     pr.add_argument("--stock-xy", dest="stock_xy", type=float, default=1.0,
                    help="XY stock offset per side mm")
     pr.add_argument("--stock-x", dest="stock_x", type=float, default=None,
@@ -396,6 +443,9 @@ def main(argv=None):
     r.add_argument("--tool-number", dest="tool_number", type=int, default=None,
                    help="LNC tool number (T/H) with --post lnc; default: look "
                         "the tool up in tools/x7_tools.json")
+    r.add_argument("--header-comment", dest="header_comments",
+                   action="append", default=None,
+                   help="extra LNC header comment line (P3 form); repeatable")
     r.add_argument("--json-progress", dest="json_progress", action="store_true",
                    help='emit JSON progress lines '
                        '{"progress":0.4,"message":"level 3/7"} for callers')
@@ -416,6 +466,9 @@ def main(argv=None):
     pp.add_argument("--corner", type=float, default=None, help="corner radius mm")
     pp.add_argument("--tool-kind", dest="tool_kind", default=None,
                    choices=("bull", "flat", "ball", "endmill"))
+    pp.add_argument("--header-comment", dest="header_comments",
+                    action="append", default=None,
+                    help="extra LNC header comment line (P3 form); repeatable")
     pp.add_argument("--clear", type=float, default=None,
                    help="clearance/retract height mm (default: max Z of path)")
     pp.add_argument("--wcs", type=int, default=54, help="work offset G-code (54)")
@@ -661,7 +714,7 @@ def main(argv=None):
         text = post_lnc.post(moves, metric=a.metric, program=a.program,
                              op_name=a.op_name, tool_number=a.tool_number,
                              rpm=a.spindle, dia_mm=dia, corner_mm=corner,
-                             tool_kind=kind)
+                             tool_kind=kind, header_comments=a.header_comments)
     else:
         text = moves_to_gcode(moves, spindle_rpm=a.spindle,
                               tool_comment="T1 %s D=%.3f CR=%.3f" % (kind, dia, corner))
