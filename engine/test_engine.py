@@ -1103,7 +1103,8 @@ def _main():
                test_bs1a4d2b_centred_entry_bore,
                test_bs1a4d4_credit_entry_matches_prediction,
                test_bs1a4d4_entry_pinned_to_stored_start,
-               test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load):
+               test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load,
+               test_bs1a4d6b_q4_entry_bore_in_live_stock):
         try:
             fn()
         except AssertionError as e:
@@ -2387,6 +2388,97 @@ def test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load():
           % (len(forced), sorted({acts[k] for k in forced})))
 
 
+def test_bs1a4d6b_q4_entry_bore_in_live_stock():
+    """BS1a4d6b item 2 (fallback way): when a split piece's emit re-check
+    fails, the region's ORIGINAL q4 entry stays emitted (the option pieces
+    enter at their own starts), so that entry must be real: for EVERY
+    bore-backed emit re-check (the only _simulate call with a bore_xy and no
+    ends list) the emitted bore equals the predictor's stored bore, its
+    cells read as CUT in the live stock handed to the re-check - right after
+    that entry - and at least one such entry belongs to a region whose
+    re-check then FAILED (replan0_* != ok): stock was entered for a piece
+    that replanned, so the bore must stand cut. CLCHECK stays clean (the
+    entry descent is CL-checked)."""
+    import tempfile
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.rough import rough
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+    split, checked = {}, {}
+    _orig_cr, _orig_sim = B.channel_regions, B._simulate
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None,
+               **kw):
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats,
+                       **kw)
+        for r in res:
+            if r.get("replan0") == 2:
+                split[(round(z, 3), round(r["start"][0], 4),
+                       round(r["start"][1], 4))] = tuple(r["bore"][2:])
+        return res
+
+    def sim_spy(path, stock, z, tool_r, cell, bore_r, ends=None, **kw):
+        bxy = kw.get("bore_xy")
+        key = (round(z, 3), round(path[0][0], 4), round(path[0][1], 4))
+        if bxy and ends is None and key in split and key not in checked:
+            assert max(abs(a - b) for a, b in zip(bxy, split[key])) < 1e-9, \
+                "emit re-check bore %r is not the predictor's stored bore " \
+                "%r of region %r" % (bxy, split[key], key)
+            checked[key] = bore_r
+            k = int((bore_r - 0.75) / cell)   # eroded: every such cell is
+            ci, cj = stock._ci(bxy[0]), stock._cj(bxy[1])   # surely swept
+            n_cut = n_stand = 0
+            for dj in range(-k, k + 1):
+                for di in range(-k, k + 1):
+                    if (di * di + dj * dj) * cell * cell >= (bore_r - 0.75) ** 2:
+                        continue
+                    i, j = ci + di, cj + dj
+                    if 0 <= i < stock.nx and 0 <= j < stock.ny:
+                        n_cut += 1
+                        if stock.top[j, i] > z + 0.05:
+                            n_stand += 1
+            assert n_cut >= 50 and n_stand == 0, \
+                "q4 entry bore of region %r (Z %.3f): %d of %d cells inside " \
+                "the emitted bore read UNcut in the live stock right after " \
+                "that entry (all must read cut)" % (key, z, n_stand, n_cut)
+        return _orig_sim(path, stock, z, tool_r, cell, bore_r, ends, **kw)
+
+    B._simulate = sim_spy
+    B.channel_regions = cr_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d6b_q4.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            _m, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0),
+                              6.343, 0.0, leave=0.381, axial_leave=0.381,
+                              stepdown=19.05, stepup=1.905, tolerance=0.05,
+                              threads=4, stock_cell=0.5, min_rest=0.5,
+                              corner_r=0.0, stl_path=stl)
+    finally:
+        B._simulate = _orig_sim
+        B.channel_regions = _orig_cr
+    assert checked, "no bore-backed q4 entry reached an emit re-check: vacuous"
+    fails = [f for f in stats["credit_fallback"]
+             if f[3].startswith("replan0_") and f[3] != "replan0_ok"
+             and (round(f[2], 3), round(f[0], 4), round(f[1], 4)) in checked]
+    assert fails, \
+        "no FAILED re-check region kept a cut q4 entry bore (the abandoned-" \
+        "piece case never fired): checked %s" % (sorted(checked),)
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    print("PASS bs1a4d6b q4 entry: %d bore-backed emit re-check(s), every "
+          "emitted bore cut in the live stock; %d failed-re-check region(s) "
+          "with a kept q4 bore" % (len(checked), len(fails)))
+
+
 def test_bs1a4d_credit_real_bore():
     """Task BS1a4d (c): at a helix-entered band start the planning sim's
     credit is the REAL bore footprint - the cutter disk swept along the
@@ -2537,12 +2629,13 @@ def test_bs1a4d_credit_real_bore():
         credited |= cells(cap, [cap["q"]], 6.343)   # return-feed landing disk
         cleared = cells(cap, pts, 6.343)
         # BS1a4d6 (b): the "extra > 100" bound below was written for emitted
-        # bores at the smallest helix tier (0.3 x tool_r = 1.9029 ~ 1.903); a
+        # bores at the smallest helix tier (R.MIN_BAND_HELIX_FR x tool_r =
+        # 0.3 x tool_r = 1.9029 ~ 1.903); a
         # SMALLER emitted bore legitimately credits (about) the start disk, so
         # there the bound is scoped away and replaced: the credited area must
         # equal the emitted bore's OWN sim footprint - disk(helix centre,
         # r + tool_r) plus the landing disk - within the grid tolerance.
-        if hb[2] < 0.3 * 6.343 - 1e-9:
+        if hb[2] < R.MIN_BAND_HELIX_FR * 6.343 - 1e-9:
             foot = cells(cap, [hb[:2]], hb[2] + 6.343)
             foot |= cells(cap, [cap["q"]], 6.343)
             assert len(credited ^ foot) <= 4, \
@@ -2561,7 +2654,7 @@ def test_bs1a4d_credit_real_bore():
             "chord sliver bound 30) at (%.3f,%.3f)" % (
                 len(credited - cleared), cap["q"][0], cap["q"][1])
         start_disk = cells(cap, [cap["q"]], 6.343)
-        if hb[2] >= 0.3 * 6.343 - 1e-9:   # BS1a4d6 (b): kept for r >= min_helix_r
+        if hb[2] >= R.MIN_BAND_HELIX_FR * 6.343 - 1e-9:  # BS1a4d6 (b): kept for r >= min_helix_r
             assert len(credited - start_disk) > 100, \
                 "credit is still (about) the tool_r start disk: extra %d" % \
                 len(credited - start_disk)

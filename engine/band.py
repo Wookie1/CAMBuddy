@@ -177,12 +177,15 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None):
     stand = stock.top[j0:j1, i0:i1] > z + 0.05
     bx, by = (bore_xy[:2] if bore_xy else path[0][:2])
     ci, cj = stock._ci(bx) - i0, stock._cj(by) - j0
-    if bore_xy:      # BS1a4d (c): the entry also sweeps tool_r about the
-        c0, s0 = stock._ci(path[0][0]) - i0, stock._cj(path[0][1]) - j0
-        for dj, di in offs:   # start via the helix return feed at Z
-            a, b = c0 + di, s0 + dj
-            if 0 <= a < stand.shape[1] and 0 <= b < stand.shape[0]:
-                stand[b, a] = False
+    # BS1a4d6b: the entry ladder brings the tool to path[0] at Z BEFORE the
+    # first lateral cut - the start disk is entry-feed, never a cutting-feed
+    # window's engagement - so pre-clear it even at credit 0 (that counted
+    # the whole standing start disk, up to pi x tool_r^2, as window 0).
+    c0, s0 = stock._ci(path[0][0]) - i0, stock._cj(path[0][1]) - j0
+    for dj, di in offs:   # BS1a4d (c): start via the entry at Z
+        a, b = c0 + di, s0 + dj
+        if 0 <= a < stand.shape[1] and 0 <= b < stand.shape[0]:
+            stand[b, a] = False
     for dj, di in offs_b:
         a, b = ci + di, cj + dj
         if 0 <= a < stand.shape[1] and 0 <= b < stand.shape[0]:

@@ -665,11 +665,15 @@ def hf_gouge_violation(points, stock, tool_r, tol=0.02):
     return None
 
 
+MIN_BAND_HELIX_FR = 0.3   # BS1a4d6b: min band-entry helix tier r = 0.3 x tool_r
+
+
 def _bore_pred(isl_ok, zone, stock, x, y, tool_r):
     # BS1a4d2b: helix_entry(centred=True) mirror for band entries - circle
     # THROUGH the start (d = 0), shrinking radii; bore = disk(c, r + tool_r).
     # same order as the emitted centred ladder: radius outer, direction inner
-    for rh in [fr * tool_r for fr in (0.8, 0.5, 0.3)] + [0.5, 0.35, 0.2]:
+    for rh in [fr * tool_r for fr in (0.8, 0.5, MIN_BAND_HELIX_FR)] + \
+            [0.5, 0.35, 0.2]:
         for q in range(16):
             a = q * math.pi / 8.0
             cx = x + (rh - 0.05) * math.cos(a)   # as the centred ladder
@@ -2143,6 +2147,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # tool is already at depth there (gouged); enter_at's own ladder
             # (link / side / helix, each CL-checked) is the only entry.
             drop_cut = False
+            more_pcs = []   # BS1a4d6b: lightest-option pieces after pcs[0]
             if ((res.get("credit") or 0.0) > 1e-9 and helix_n[0] == h0) \
                     or res.get("replan0"):   # BS1a4d4: plan0_split piece
                 pts_c, q4 = res["paths"][0][1], tuple(res["start"])
@@ -2170,29 +2175,15 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                             pp = [q4] + [(round(a, 4), round(b, 4))
                                        for (a, b), ok in zip(pnew, g2) if ok]
                             pcs = _split_at_jumps(isl_ok3, pp)
-                            if len(pcs[0]) >= 4:
+                            if len(pcs[0]) >= 4 or len(pcs) > 1:
+                                # BS1a4d6b: cover the WHOLE lightest option:
+                                # pcs[0] from the q4 entry, EVERY later piece
+                                # (even < 4 pts) entered at its own start via
+                                # the CL-checked enter_at ladder (more_pcs,
+                                # cut after the walker)
                                 res["paths"][0][1] = pcs[0]
+                                more_pcs = pcs[1:]
                                 act, drop_cut = "replan0_" + opt, False
-                            else:
-                                # BS1a4d6 (a): a piece that cannot rejoin q4
-                                # is NOT dropped - its lightest option goes
-                                # out as its OWN region, entered through its
-                                # own enter_at ladder (the only entry), never
-                                # at the failing load; its stock is cut here,
-                                # never left for the ring.
-                                own = next((pc for pc in pcs[1:]
-                                            if len(pc) >= 4), None)
-                                if own is not None:
-                                    i0o = len(moves)
-                                    p0o = (prev[0], prev[1], prev[2])
-                                    enter_at(own[0][0], own[0][1], z, None,
-                                             side=bool(rp2_flag))
-                                    stats["reentry_feed_mm"] += \
-                                        descend_feed(p0o, i0o)
-                                    level_pts.append((own[0][0], own[0][1],
-                                                      "own r%d" % nreg))
-                                    res["paths"][0][1] = own
-                                    act, drop_cut = "replan0_" + opt, False
                         stats["failed_region_emitted"].append(
                             {"x": q4[0], "y": q4[1], "z": round(z, 3),
                              "area": round(ba, 2),
@@ -2467,6 +2458,19 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     for (x, y) in pts:
                         emit({"g": 0, "x": round(x, 4), "y": round(y, 4),
                               "z": round(h, 4)})
+            for pc in more_pcs:   # BS1a4d6b: the lightest option's later
+                # pieces: own CL-checked enter_at entry + descend, then cut.
+                if any(abs(pc[0][0] - r["start"][0]) < 1e-4 and
+                       abs(pc[0][1] - r["start"][1]) < 1e-4 for r in regions):
+                    pc = pc[1:]   # that region enters pc[0]; start one on
+                if not pc:
+                    continue
+                enter_at(round(pc[0][0], 4), round(pc[0][1], 4), z, None,
+                         side=bool(rp2_flag))
+                for (x, y) in pc:
+                    emit({"g": 1, "x": x, "y": y, "z": z, "f": cut_feed})
+                    level_pts.append((x, y, "owncut r%d" % nreg))
+                stock.mill_path(list(pc), z, tool_r, corner_r)
 
         if allowance_check:
             # islands are the FORBIDDEN region for centres (R2): every centre
