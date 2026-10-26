@@ -41,12 +41,14 @@ test_fi1_entry_feedin_within_limit (must turn green).
 1. B2 on EVERY helix entry: the return feed-in simulation in try_cand runs for every candidate, not only gated ones;
    a refused candidate lets the ladder move on exactly as today (next candidate / radius / fallback - no new entry
    kind). If _gate is then unused, remove it. Count every refusal in a new stats counter (e.g. stats["b2_rej"]) -
-   no silent early exit. The red test turns green; every at-risk test stays green.
+   no silent early exit. When EVERY ladder option is refused, no region is dropped and nothing new is invented: the
+   existing exhausted-ladder path runs as today and is counted (stats["b2_exhausted"]). The red test turns green;
+   every at-risk test stays green.
 2. Same gates: no gouge/axial/rapid/clcheck counts may appear on any at-risk scene (n_axial_plunge must not rise
    because a refused helix fell back to a plunge - report the counter before/after on the ledge scene and the L
    channel).
 3. Not output-neutral by design: report the L-channel and test-block programs before/after (cmp; when they differ,
    the line counts removed/added and where), plus b2_rej on each.
-## engine/BS1a4d6_RESULTS.md "FI1": the change with file:line, line count vs 02bb395, the counters and cmp results,
+## engine/BS1a4d6_RESULTS.md "FI1": the change with file:line, line count vs 02bb395, the counters (b2_rej, b2_exhausted, n_axial_plunge) and cmp results,
 PASTED exit codes of all 29 at-risk tests, git diff --numstat. Then stop. (Supervisor runs the CF judge: gates 0 with
-holder, FW <= 1.1 mm, overload <= 445 / 496.6 mm, cycle within 3 % of 5,424.8 s.)
+holder, FW <= 1.1 mm, overload <= 445 / 496.6 mm, cycle within 3 % of 5,424.8 s, b2_rej and b2_exhausted reported.)
