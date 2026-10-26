@@ -3315,3 +3315,47 @@ class TestTl2OriginHeaderE2E:
         added = [l[2:] for l in difflib.ndiff(b, a) if l.startswith("+ ")]
         removed = [l[2:] for l in difflib.ndiff(b, a) if l.startswith("- ")]
         assert added == ["(ORIGIN: STOCK BOTTOM CENTRE)"] and removed == []
+
+
+# ================== zg1conn: live stock-bottom check through the chain =====
+
+class TestZg1connStockBottomE2E:
+    """A real TB slope_split_finish with a rest pass: every judge in the
+    chain (rough, finish, rest) runs a real below_stock_bottom check, never
+    "unknown", and no stock_bottom_unchecked item reaches the result. The
+    rest judge reads its stock box from stock_after_finish.json, which the
+    runner must merge into, not overwrite."""
+
+    def test_tb_rest_chain_checks_stock_bottom(self, live, tmp_path):
+        import shutil
+        mock, home, _ = live
+        serve = tmp_path / "serve"
+        serve.mkdir()
+        shutil.copy(TB_STEP, serve / "test_block.step")
+        old = mock.serve_dir
+        mock.serve_dir = str(serve)
+        try:
+            tb = box_input(mock, TB_STEP)
+            tb["document"] = {"id": "doc-zg1conn"}
+            mock.enqueue_run(1950, action=catalog_mod.SLOPE_ACTION,
+                             inputs=dict(SLOPE_GOOD_INPUTS, model=dict(tb),
+                                         stepover=1.0, stepdown=1.0,
+                                         program_number=1950,
+                                         rest_tool_number=31))
+            final, body = _final_body(mock, 1950, timeout=3600)
+        finally:
+            mock.serve_dir = old
+        with open(home / "runs" / "1950" / "check.json") as fh:
+            check = json.load(fh)
+        bsb = {n: (check.get(n) or {}).get("below_stock_bottom")
+               for n in ("rough", "finish", "rest")}
+        assert check.get("chain") == ["rough", "finish", "rest"], \
+            (final, check.get("chain"), body.get("error"))
+        for n, b in bsb.items():
+            assert isinstance(b, dict) and b.get("status") != "unknown", \
+                "%s judge below_stock_bottom: %s" % (n, b)
+            assert b["count"] == 0, "%s: %s" % (n, b)
+        r = body.get("result") or {}
+        assert "stock_bottom_unchecked" not in {
+            a["code"] for a in r.get("attention", [])}, r.get("attention")
+        assert final == "succeeded", body
