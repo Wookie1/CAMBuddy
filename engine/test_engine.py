@@ -5599,46 +5599,6 @@ def test_bs1a4d3_links_measured_as_cuts():
               stats.get("fdin_chk"), stats.get("fdin_cvt")))
 
 
-if __name__ == "__main__":
-    sys.exit(_main())
-
-_LEDGE = {}
-
-
-def _ledge_scene():
-    """FI1: open pocket with a mid-depth ledge - Adaptive2d runs only, no
-    band pieces, so NO emit-time joins. Roughed once per process; returns
-    (moves, stats, zmap ae2 windows judged on the emitted program)."""
-    if _LEDGE:
-        return _LEDGE["v"]
-    import tempfile
-    import numpy as np
-    from opencamlib import ocl
-    from engine.rough import rough, build_part_hf
-    from verify import zmap
-    B = _box_tris
-    tris = (B(0, 48, 0, 40, -1, 0) + B(0, 6, 0, 40, 0, 18) + B(42, 48, 0, 40, 0, 18)
-            + B(6, 42, 0, 6, 0, 18) + B(6, 42, 34, 40, 0, 18) + B(6, 24, 6, 34, 0, 9.0))
-    box = (0.0, 48.0, 0.0, 40.0, -1.0, 18.0)
-    with tempfile.TemporaryDirectory() as td:
-        stl = os.path.join(td, "ledge.stl")
-        _write_stl(stl, tris)
-        surf = ocl.STLSurf()
-        ocl.STLReader(stl, surf)
-        moves, stats = rough(surf, box, 6.343, 0.0, leave=0.381, axial_leave=0.381,
-                             stepdown=19.05, stepup=1.905, tolerance=0.05, threads=4,
-                             stock_cell=0.5, min_rest=0.5, corner_r=0.0, stl_path=stl)
-        pad, cell = 120, 0.1
-        x0, y0 = box[0] - pad * cell, box[2] - pad * cell
-        part = build_part_hf(surf, x0, y0, cell, int(round(48 / cell)) + 2 * pad,
-                             int(round(40 / cell)) + 2 * pad, threads=4, drop_z=-1.0)
-    part = np.where(np.isfinite(part), part, -1.0)
-    text = moves_to_gcode(moves, spindle_rpm=8000)
-    wins = zmap.simulate(zmap.parse_gcode(text), part, cell, x0, y0, box, tool="flat",
-                         dia=12.686, engage_max=2.438)["_ae2_raw"]
-    _LEDGE["v"] = (moves, stats, wins, text.split("\n"))
-    return _LEDGE["v"]
-
 def test_fi1_entry_feedin_within_limit():
     """FI1 (red until the FI1 round): an entry's final cutting-feed step into its start
     (a single F-cut move >= 0.6 mm right after a ramp-feed move at the same Z)
@@ -5668,3 +5628,7 @@ def test_fi1_entry_feedin_within_limit():
     assert not bad, "entry feed-in over 2.44: line %d ae_eff %.3f mm, a %.2f mm" % (
         worst["line"], worst["ae_eff"], worst["a"])
     print("PASS fi1 T-feedin: every entry feed-in judged <= 2.44")
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
