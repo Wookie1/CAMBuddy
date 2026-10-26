@@ -2373,7 +2373,8 @@ def _main():
                test_rr1c5c_closed_pocket_bore_entry_no_deep_axial,
                test_rr1c5d_live_grid_fine_for_coarse_stock,
                test_rra2_deep_top_scope,
-               test_rra3_straight_descent_scope):
+               test_rra3_straight_descent_scope,
+               test_fi1_entry_feedin_within_limit):
         try:
             fn()
         except AssertionError as e:
@@ -3104,3 +3105,70 @@ def test_rr1a_rough_cli_refuses_ball():
 
 if __name__ == "__main__":
     sys.exit(_main())
+
+_LEDGE = {}
+
+
+def _ledge_scene():
+    """FI1: open pocket with a mid-depth ledge - Adaptive2d runs only, no
+    band pieces, so NO emit-time joins. Roughed once per process; returns
+    (moves, stats, zmap ae2 windows judged on the emitted program)."""
+    if _LEDGE:
+        return _LEDGE["v"]
+    import tempfile
+    import numpy as np
+    from opencamlib import ocl
+    from engine.rough import rough, build_part_hf
+    from verify import zmap
+    B = _box_tris
+    tris = (B(0, 48, 0, 40, -1, 0) + B(0, 6, 0, 40, 0, 18) + B(42, 48, 0, 40, 0, 18)
+            + B(6, 42, 0, 6, 0, 18) + B(6, 42, 34, 40, 0, 18) + B(6, 24, 6, 34, 0, 9.0))
+    box = (0.0, 48.0, 0.0, 40.0, -1.0, 18.0)
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "ledge.stl")
+        _write_stl(stl, tris)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        moves, stats = rough(surf, box, 6.343, 0.0, leave=0.381, axial_leave=0.381,
+                             stepdown=19.05, stepup=1.905, tolerance=0.05, threads=4,
+                             stock_cell=0.5, min_rest=0.5, corner_r=0.0, stl_path=stl)
+        pad, cell = 120, 0.1
+        x0, y0 = box[0] - pad * cell, box[2] - pad * cell
+        part = build_part_hf(surf, x0, y0, cell, int(round(48 / cell)) + 2 * pad,
+                             int(round(40 / cell)) + 2 * pad, threads=4, drop_z=-1.0)
+    part = np.where(np.isfinite(part), part, -1.0)
+    text = moves_to_gcode(moves, spindle_rpm=8000)
+    wins = zmap.simulate(zmap.parse_gcode(text), part, cell, x0, y0, box, tool="flat",
+                         dia=12.686, engage_max=2.438)["_ae2_raw"]
+    _LEDGE["v"] = (moves, stats, wins, text.split("\n"))
+    return _LEDGE["v"]
+
+def test_fi1_entry_feedin_within_limit():
+    """FI1 (red until the FI1 round): an entry's final cutting-feed step into its start
+    (a single F-cut move >= 0.6 mm right after a ramp-feed move at the same Z)
+    is judged by verify/zmap at ae_eff <= 2.44 (main 52fe0c8: ledge line 3037,
+    a 3.0 mm feed-in after a helix, ae_eff 10.080, a 17.62)."""
+    import re
+    moves, stats, wins, lines = _ledge_scene()
+    feed, pos, fins = None, None, set()
+    for n, l in enumerate(lines, 1):
+        m = dict(re.findall(r"([GXYZF])(-?[0-9.]+)", l))
+        pf = feed
+        feed = float(m["F"]) if "F" in m else feed
+        if not any(k in m for k in "XYZ"):
+            continue
+        q = [float(m[k]) if k in m else (pos[i] if pos else None)
+             for i, k in enumerate("XYZ")]
+        if pos and pf == 1270.0 and feed == 3429.0 and q[2] == pos[2] and \
+                math.hypot(q[0] - pos[0], q[1] - pos[1]) >= 0.6:
+            fins.add(n)
+        pos = q
+    bad = [w for w in wins if w["line"] in fins and w["ae_eff"] > 2.44]
+    worst = max(bad, key=lambda w: w["ae_eff"], default=None)
+    print("fi1 T-feedin: %d entry feed-ins, %d judged over 2.44%s" % (
+        len(fins), len(bad), "" if worst is None else ", worst line %d ae_eff %.3f a %.2f"
+        % (worst["line"], worst["ae_eff"], worst["a"])))
+    assert fins, "no entry feed-in on the ledge scene: vacuous"
+    assert not bad, "entry feed-in over 2.44: line %d ae_eff %.3f mm, a %.2f mm" % (
+        worst["line"], worst["ae_eff"], worst["a"])
+    print("PASS fi1 T-feedin: every entry feed-in judged <= 2.44")
