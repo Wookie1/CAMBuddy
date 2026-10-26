@@ -2470,7 +2470,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                             trans_guard(run[0], z, bool(rp2_flag))
                         k0 = 0
                         for ki, (x, y) in enumerate(run):
-                            if ki in bnd and not res.get("band") and \
+                            if ki in bnd and \
                                     irun_guard((x, y), z, bool(rp2_flag)):
                                 stock.mill_path(run[k0:ki], z, tool_r, corner_r)
                                 k0 = ki
