@@ -984,16 +984,18 @@ def _ae2_windows(moves):
     next feed's idx is not the previous feed's idx + 1), a Z change, or a
     direction change > AE2_DIR_MAX_DEG. Windows are the MINIMAL runs of >= 1 mm
     travel: short feeds (< 1 mm) merge forward until the window reaches 1 mm;
-    a move of >= 1 mm is its own window. A trailing run below 1 mm is dropped
-    (grid noise). ae_eff = area_sum / length_sum; a = max depth over the
-    window; width_mm keeps ZE's old max chord for comparison."""
-    windows = []
+    a move of >= 1 mm is its own window. Task ZG2: a trailing run below 1 mm
+    merges into a kept neighbour (last kept before, else first kept after;
+    none: ungated in .iso). ae_eff = area/length; a, width_mm as before."""
+    windows, tails, iso = [], [], []
     cur = None
 
     def close(w):
         if w["length_mm"] >= AE2_WINDOW_MM:
             w["ae_eff"] = round(w["area_mm2"] / w["length_mm"], 4)
             windows.append(w)
+        else:
+            tails.append((w, len(windows)))
 
     for e in moves:
         link = (cur is not None and e["idx"] == cur["idx"] + 1
@@ -1030,7 +1032,26 @@ def _ae2_windows(moves):
             cur = None
     if cur is not None:
         close(cur)
-    return windows
+    for w, n in tails:
+        tgt = windows[n - 1] if n else (windows[0] if windows else None)
+        if tgt is None:
+            iso.append(w)
+        else:
+            tgt["area_mm2"] += w["area_mm2"]
+            tgt["length_mm"] += w["length_mm"]
+            tgt["n_moves"] += w["n_moves"]
+            tgt["a"] = max(tgt["a"], w["a"])
+            if w["hist"] is not None:
+                tgt["hist"] = (w["hist"] if tgt["hist"] is None
+                               else tgt["hist"] + w["hist"])
+            tgt["ae_eff"] = round(tgt["area_mm2"] / tgt["length_mm"], 4)
+    wins = _Wins(windows)
+    wins.iso = iso
+    return wins
+
+
+class _Wins(list):  # task ZG2: ae2 windows; .iso = unjudged sub-1 mm cuts
+    pass
 
 
 def _helix_radius(run):
@@ -1068,6 +1089,7 @@ def _ae2_engagement_keys(win_recs, dia):
       a > SLOT_AXIAL_MM (the SE2 merge bar, area form).
     Each with count, total length and worst 10 by ae_eff (line, x, y, z,
     ae_eff, a, old width)."""
+    iso = getattr(win_recs, "iso", ())
     def brief(w):
         return {"line": w["line"], "x": w["x"], "y": w["y"], "z": w["z"],
                 "ae_eff": w["ae_eff"], "a": round(w["a"], 4),
@@ -1139,6 +1161,10 @@ def _ae2_engagement_keys(win_recs, dia):
             "fw_entry_not_allowed": len(fw_ent_bad),
             "met": not fw_cut and not fw_ent_bad},
         "ae2": _engage_stats([w["ae_eff"] for w in win_recs]),
+        **({"ae2_isolated_sub1mm": {
+            "count": len(iso), "worst_ae_eff_mm": round(min(max(
+                [w["area_mm2"] / w["length_mm"] for w in iso
+                 if w["length_mm"] > 0] or [0.0]), dia), 4)}} if iso else {}),
         "full_width_slots_ae2": {
             "count": len(fws),
             "total_length_mm": round(sum(w["length_mm"] for w in fws), 1),
