@@ -1655,10 +1655,18 @@ def test_bs1a4d8b_no_unsimulated_link_into_path():
     assert not cross or stats.get("bstd_chk", 0) >= len(cross), \
         "%d cross-corridor cutting-feed step(s) but only %d simulated " \
         "link check(s) ran" % (len(cross), stats.get("bstd_chk", 0))
-    # (iii) the transition left piece -> right piece is lift + entry
-    i1 = next(i for i in cuts if moves[i]["x"] > 1.5)
-    j0 = max(i for i in cuts if i < i1 and moves[i]["x"] < -1.5)
-    mid = moves[j0 + 1:i1]
+    # (iii) the transition left piece -> right piece is lift + entry,
+    # anchored on the injected pieces themselves (approved FI1 test change):
+    # the left piece's last cut (ending at (-13, 2)) -> the right piece's
+    # first move at Z at its path (x = 10). Other regions' cuts may run
+    # before or after this window; they are not this transition.
+    j0 = max(i for i in cuts if abs(moves[i]["x"] + 13.0) < 1e-4
+             and abs(moves[i]["y"] - 2.0) < 1e-4)
+    i1 = next(i for i in range(j0 + 1, len(moves))
+              if abs(moves[i]["x"] - 10.0) < 1e-4
+              and moves[i].get("z") is not None
+              and moves[i]["z"] <= Z + 1e-9)
+    mid = moves[j0 + 1:i1 + 1]
     assert not [m for m in mid if m["g"] == 1 and m.get("f") == CUT_F
                 and m.get("z") is not None and abs(m["z"] - Z) < 1e-6], \
         "cutting-feed move at Z inside the piece-to-piece transition"
