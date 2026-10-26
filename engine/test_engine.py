@@ -2054,6 +2054,56 @@ def test_bs1a4d8c_replan_far_piece_enters_own_start():
              max((w["ae_eff"] for w in along), default=0.0)))
 
 
+_D9 = {}
+
+
+def _bs1a4d9_replan():
+    """BS1a4d9: the d8c re-plan scene's (moves, judged windows), captured
+    through _bs1a4d8c_judge while that test runs (its own asserts report
+    on their own; the capture is all these tests need). Once per process."""
+    if "v" not in _D9:
+        g = globals()
+        orig = g["_bs1a4d8c_judge"]
+
+        def cap(moves, *a, **k):
+            _D9["v"] = (moves, orig(moves, *a, **k))
+            return _D9["v"][1]
+
+        g["_bs1a4d8c_judge"] = cap
+        try:
+            test_bs1a4d8c_replan_far_piece_enters_own_start()
+        except AssertionError:
+            pass
+        finally:
+            g["_bs1a4d8c_judge"] = orig
+    return _D9["v"]
+
+
+def test_bs1a4d9_no_entry_at_stale_q4():
+    """BS1a4d9 (1): when the region's piece is far (rjoin), nothing is
+    emitted at the stale q4 = (-13, 0): no helix, no feed-in, no lift-off.
+    Measured: non-rapid moves below the stock top (6.03) ending within 2 mm
+    of q4 must be 0 (the decoy at (-13, -8) stays > 6 mm away). Fails on
+    498ebae: 12 moves, 4 judged windows, max ae_eff 6.303 mm (covering
+    the helix and line-206 feed-in)."""
+    from engine.gcode import moves_to_gcode
+    moves, wj = _bs1a4d9_replan()
+    q4 = (-13.0, 0.0)
+    gl = moves_to_gcode(moves, spindle_rpm=7500).split("\n")
+    off = next(k for k, l in enumerate(gl, 1)
+               if l.lstrip().startswith(("G0", "G1")) and "X" in l)
+    at = [off + i for i, m in enumerate(moves)
+          if m["g"] != 0 and m.get("z") is not None and m["z"] < 6.03
+          and math.dist((m["x"], m["y"]), q4) <= 2.0]
+    lw = [w for w in wj if any(w["line"] <= L <= w.get("end_line", w["line"])
+                               for L in at)]
+    assert not at, \
+        ("%d move(s) still emitted at the stale q4 (lines %s); judged "
+         "windows there: %d, max ae_eff %.3f mm"
+         % (len(at), at[:6], len(lw),
+            max((w["ae_eff"] for w in lw), default=0.0)))
+
+
 _LEDGE = {}
 
 
@@ -3412,6 +3462,7 @@ def _main():
                test_bs1a4d8c_inrun_jump_simulated,
                test_bs1a4d8c_replan_far_piece_enters_own_start,
                test_bs1a4d8e_inrun_guard_skips_planned_paths,
+               test_bs1a4d9_no_entry_at_stale_q4,
                test_rr1b_rest_rough_synth_pocket,
                test_rr1b_rest_rough_reports_small_pocket,
                test_rr1c_thin_band_inpass_ramp,
