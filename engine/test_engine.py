@@ -1655,10 +1655,18 @@ def test_bs1a4d8b_no_unsimulated_link_into_path():
     assert not cross or stats.get("bstd_chk", 0) >= len(cross), \
         "%d cross-corridor cutting-feed step(s) but only %d simulated " \
         "link check(s) ran" % (len(cross), stats.get("bstd_chk", 0))
-    # (iii) the transition left piece -> right piece is lift + entry
-    i1 = next(i for i in cuts if moves[i]["x"] > 1.5)
-    j0 = max(i for i in cuts if i < i1 and moves[i]["x"] < -1.5)
-    mid = moves[j0 + 1:i1]
+    # (iii) the transition left piece -> right piece is lift + entry,
+    # anchored on the injected pieces themselves (approved FI1 test change):
+    # the left piece's last cut (ending at (-13, 2)) -> the right piece's
+    # first move at Z at its path (x = 10). Other regions' cuts may run
+    # before or after this window; they are not this transition.
+    j0 = max(i for i in cuts if abs(moves[i]["x"] + 13.0) < 1e-4
+             and abs(moves[i]["y"] - 2.0) < 1e-4)
+    i1 = next(i for i in range(j0 + 1, len(moves))
+              if abs(moves[i]["x"] - 10.0) < 1e-4
+              and moves[i].get("z") is not None
+              and moves[i]["z"] <= Z + 1e-9)
+    mid = moves[j0 + 1:i1 + 1]
     assert not [m for m in mid if m["g"] == 1 and m.get("f") == CUT_F
                 and m.get("z") is not None and abs(m["z"] - Z) < 1e-6], \
         "cutting-feed move at Z inside the piece-to-piece transition"
@@ -3480,7 +3488,8 @@ def _main():
                test_rr1c5c_closed_pocket_bore_entry_no_deep_axial,
                test_rr1c5d_live_grid_fine_for_coarse_stock,
                test_rra2_deep_top_scope,
-               test_rra3_straight_descent_scope):
+               test_rra3_straight_descent_scope,
+               test_fi1_entry_feedin_within_limit):
         try:
             fn()
         except AssertionError as e:
@@ -5596,6 +5605,37 @@ def test_bs1a4d3_links_measured_as_cuts():
               nmeas, stats.get("flnk_chk"), stats.get("flnk_cvt"),
               stats.get("brdg_chk"), stats.get("brdg_cvt"),
               stats.get("fdin_chk"), stats.get("fdin_cvt")))
+
+
+def test_fi1_entry_feedin_within_limit():
+    """FI1 (red until the FI1 round): an entry's final cutting-feed step into its start
+    (a single F-cut move >= 0.6 mm right after a ramp-feed move at the same Z)
+    is judged by verify/zmap at ae_eff <= 2.44 (main 52fe0c8: ledge line 3037,
+    a 3.0 mm feed-in after a helix, ae_eff 10.080, a 17.62)."""
+    import re
+    moves, stats, wins, lines = _ledge_scene()
+    feed, pos, fins = None, None, set()
+    for n, l in enumerate(lines, 1):
+        m = dict(re.findall(r"([GXYZF])(-?[0-9.]+)", l))
+        pf = feed
+        feed = float(m["F"]) if "F" in m else feed
+        if not any(k in m for k in "XYZ"):
+            continue
+        q = [float(m[k]) if k in m else (pos[i] if pos else None)
+             for i, k in enumerate("XYZ")]
+        if pos and pf == 1270.0 and feed == 3429.0 and q[2] == pos[2] and \
+                math.hypot(q[0] - pos[0], q[1] - pos[1]) >= 0.6:
+            fins.add(n)
+        pos = q
+    bad = [w for w in wins if w["line"] in fins and w["ae_eff"] > 2.44]
+    worst = max(bad, key=lambda w: w["ae_eff"], default=None)
+    print("fi1 T-feedin: %d entry feed-ins, %d judged over 2.44%s" % (
+        len(fins), len(bad), "" if worst is None else ", worst line %d ae_eff %.3f a %.2f"
+        % (worst["line"], worst["ae_eff"], worst["a"])))
+    assert fins, "no entry feed-in on the ledge scene: vacuous"
+    assert not bad, "entry feed-in over 2.44: line %d ae_eff %.3f mm, a %.2f mm" % (
+        worst["line"], worst["ae_eff"], worst["a"])
+    print("PASS fi1 T-feedin: every entry feed-in judged <= 2.44")
 
 
 if __name__ == "__main__":
