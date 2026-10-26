@@ -449,6 +449,8 @@ def main(argv=None):
     r.add_argument("--json-progress", dest="json_progress", action="store_true",
                    help='emit JSON progress lines '
                        '{"progress":0.4,"message":"level 3/7"} for callers')
+    r.add_argument("--tools-json", dest="tools_json", default=None,
+                   help="tool table JSON for every tool lookup of this call")
 
     pp = sub.add_parser("post", help="post neutral/engine moves to LNC G-code")
     pp.add_argument("--in", dest="inp", required=True,
@@ -483,6 +485,8 @@ def main(argv=None):
     pp.add_argument("--arcs", action="store_true",
                    help="fit G17 G02/G03 arcs (I/J) to G01 runs within 0.002 mm "
                         "(spec A1-A8); default off: lines only")
+    pp.add_argument("--tools-json", dest="tools_json", default=None,
+                   help="tool table JSON for every tool lookup of this call")
 
     f = sub.add_parser("finish",
                        help="slope-split finishing (action: slope_split_finish) "
@@ -574,6 +578,8 @@ def main(argv=None):
                    help="PQ: output grid mm the emitted points are snapped to "
                         "(0.001 for a metric post, 0.00254 for inch output; "
                         "the caller passes the grid matching its post units)")
+    f.add_argument("--tools-json", dest="tools_json", default=None,
+                   help="tool table JSON for every tool lookup of this call")
 
     rr = sub.add_parser("rest-rough",
                        help="z-level ball rest-rough restricted to zones where "
@@ -625,6 +631,18 @@ def main(argv=None):
     rr.add_argument("--tool-number", dest="tool_number", type=int, default=None)
 
     a = p.parse_args(argv)
+
+    # TLG1: --tools-json redirects BOTH table constants (finish.py
+    # geometry/holder, post_lnc lookup_tool; both read at call time), so no
+    # call can read two tables. Unset: nothing is changed (byte-identical).
+    if getattr(a, "tools_json", None):
+        from engine import post_lnc as _pl
+        _pl.TOOL_TABLE_PATH = a.tools_json
+        try:
+            from engine import finish as _fin
+            _fin.TOOL_TABLE_PATH = a.tools_json
+        except ImportError:   # no opencamlib: no finish lookup can run here
+            pass
 
     if a.cmd == "finish":
         return finish_main(a)

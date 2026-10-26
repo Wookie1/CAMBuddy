@@ -5,6 +5,7 @@ ENGINE_WORKERS=4, cwd = repo root, and its own work dir
 ~/.stevecam/runs/<run_id>/. Engine JSON progress lines
 ({"progress":0.4,"message":"level 3/7"}) are mapped to run progress.
 """
+import hashlib
 import json
 import os
 import re
@@ -355,6 +356,13 @@ class EngineRun:
     def _tools_json_args(self):
         return ["--tools-json", self.tools_path] if self.tools_path else []
 
+    def _table_record(self):
+        """TLG1 item 2: the effective table this run read (check.json)."""
+        path = self._table_file()
+        with open(path, "rb") as fh:
+            return {"path": path,
+                    "sha256": hashlib.sha256(fh.read()).hexdigest()}
+
     def _record_used(self, values, numbers):
         try:
             toollib.record_used(self.cfg.get("home"),
@@ -364,9 +372,10 @@ class EngineRun:
             pass  # bookkeeping only: never fails a finished run
 
     def _check_library_geometry(self, numbers):
-        """TL2 item 4: the library geometry of every tool this run posts or
-        judges must equal the repo table the engine and judges read; a
-        difference refuses the run, naming the field and both values."""
+        """TLG1 item 3 (was TL2 item 4): a used library tool needs every
+        geometry field in the run's effective table (which the engine and
+        judges now read) or the run is refused (tool_not_in_table); repo-
+        table geometry differences stay refused (tool_geometry_mismatch)."""
         if not self.cfg.get("home"):
             return  # no library: the effective table IS the repo table
         repo = {t.get("tool_id"): t for t in toollib._read(
@@ -375,14 +384,7 @@ class EngineRun:
             if e.get("number") not in numbers:
                 continue   # unused library-only tools stay allowed
             r = repo.get(e.get("tool_id"))
-            if r is None:
-                raise EngineError(
-                    "tool %s (T%s) is not in tools/x7_tools.json, the table "
-                    "the engine and judges read" % (e.get("tool_id"),
-                                                    e.get("number")),
-                    code="tool_not_in_table", field="tool_id",
-                    got=e.get("tool_id"), allowed=sorted(repo))
-            for key in _GEOMETRY_KEYS:
+            for key in _GEOMETRY_KEYS if r is not None else ():
                 a, b = e.get(key), r.get(key)
                 if not (abs(a - b) <= toollib.TOL if isinstance(
                         a, (int, float)) and isinstance(b, (int, float))
@@ -393,6 +395,15 @@ class EngineRun:
                         % (e.get("tool_id"), key, a, b),
                         code="tool_geometry_mismatch", field=key, got=a,
                         allowed=b)
+            missing = [k for k in _GEOMETRY_KEYS if e.get(k) is None] \
+                if r is None else []   # repo-table rows: TL2 compare only
+            if missing:
+                raise EngineError(
+                    "tool %s (T%s) has no complete geometry in the tool "
+                    "library (%s missing)" % (e.get("tool_id"),
+                        e.get("number"), ", ".join(missing)),
+                    code="tool_not_in_table", field="tool_id",
+                    got=e.get("tool_id"), allowed=sorted(repo))
 
     def cancel(self):
         self.cancelled = True
@@ -516,6 +527,7 @@ class EngineRun:
                  "--post", "lnc", "--program",
                  str(int(values["program_number"])),
                  "--tool-number", str(number),
+                 *self._tools_json_args(),
                  "--json-progress", "--stats-json", stats_path]
         argv_r += _origin_flags(values)
         if metric:
@@ -577,6 +589,9 @@ class EngineRun:
         with open(check_path) as fh:
             check = json.load(fh)
         _check_zmap_gates(check)
+        check["tools_table"] = self._table_record()
+        with open(check_path, "w") as fh:
+            json.dump(check, fh, indent=2)
 
         result = {
             "units": values["units"],
@@ -605,6 +620,7 @@ class EngineRun:
             "stock_box_mm": stock,
             "origin": prep.get("origin", "model_origin"),
             "origin_offset_mm": prep.get("origin_offset", [0.0, 0.0, 0.0]),
+            "tools_table": self._table_record(),
             "files": ["rough.nc", "check.json", "preview.png"],
         }
         files = {"rough.nc": (nc, "application/octet-stream"),
@@ -798,6 +814,7 @@ class EngineRun:
         # top-level keys for the first program kept exactly as they were
         # (single-program callers see no change)
         check.update(first["check"])
+        check["tools_table"] = self._table_record()
         with open(os.path.join(self.work, "check.json"), "w") as fh:
             json.dump(check, fh, indent=2)
 
@@ -830,6 +847,7 @@ class EngineRun:
                 first["check"]["cycle_time_s"] / 60.0, 2),
             "cut_length_mm": first["check"]["cutting_length_mm"],
             "rapid_length_mm": first["check"]["rapid_length_mm"],
+            "tools_table": self._table_record(),
             "files": ["check.json", "preview.png"],
         }
         files = {"check.json": (os.path.join(self.work, "check.json"),
@@ -1006,6 +1024,7 @@ class EngineRun:
                 "--post", "lnc", "--program",
                 str(int(values["program_number"])),
                 "--tool-number", str(rough_number),
+                *self._tools_json_args(),
                 "--json-progress", "--stats-json", stats_path]
         # always: the finish (and any rest pass) plans its rapids, lifts and
         # holder clearance against this stock - without it the engine only
@@ -1050,6 +1069,7 @@ class EngineRun:
                     "--spindle", str(int(values["rpm"])),
                     "--post-grid-mm", post_grid,
                     "--stock-from", rough_stock_out,
+                    *self._tools_json_args(),
                     "--stats-json", fin_stats], 0.50, 0.72, on_progress)
 
         # 6) post to LNC in the requested units (task UN: --metric only for
@@ -1061,6 +1081,7 @@ class EngineRun:
                    "--program", str(int(values["program_number"])),
                    "--op-name", "SLOPE SPLIT FINISH (RUN AFTER ROUGHING)",
                    "--tool-number", str(finish_number)]
+        argv_fp += self._tools_json_args()
         argv_fp += _origin_flags(values)
         if metric:
             argv_fp += ["--metric"]
@@ -1181,6 +1202,7 @@ class EngineRun:
                         "--ramp-feed", "%.1f" % values["ramp_feed"],
                         "--spindle", str(int(values["rpm"])),
                         "--post-grid-mm", post_grid,
+                        *self._tools_json_args(),
                         "--stats-json", rest_stats]
             if rest["flute_mm"] is not None:
                 argv_rest += ["--flute", "%.4f" % rest["flute_mm"]]
@@ -1203,6 +1225,7 @@ class EngineRun:
                       "--tool-kind", "ball",
                       "--dia", "%.4f" % rest["diameter_mm"],
                       "--corner", "%.4f" % (rest["diameter_mm"] / 2.0)]
+            argv_rp += self._tools_json_args()
             argv_rp += _origin_flags(values)
             if metric:
                 argv_rp += ["--metric"]
@@ -1269,6 +1292,7 @@ class EngineRun:
             }
         chain = ["rough", "finish"] + (["rest"] if rest else [])
         check = {
+            "tools_table": self._table_record(),
             "chain": chain,
             "part_hf": {"file": "part_hf01.npy", "cell_mm": 0.1,
                        "tess_tol_mm": 0.01},
@@ -1358,6 +1382,7 @@ class EngineRun:
             "stock_box_mm": stock,
             "origin": prep.get("origin", "model_origin"),
             "origin_offset_mm": prep.get("origin_offset", [0.0, 0.0, 0.0]),
+            "tools_table": self._table_record(),
             "files": ["rough.nc", "finish.nc", "check.json",
                      "preview.png"],
         }

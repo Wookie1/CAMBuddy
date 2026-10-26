@@ -449,10 +449,11 @@ def _tl2_check_run(home, tmp_path, monkeypatch):
 
 
 def test_tl2_library_only_tool_refused(home, tmp_path, monkeypatch):
-    """Coordinator (TL2 review a): a run that USES a library tool with no
-    repo-table row is refused (tool_not_in_table, the repo tool_ids as
-    `allowed`) before any engine work; an unused library-only tool does not
-    block a run."""
+    """TLG1 item 3 (was TL2 review a): a USED library-only tool WITH
+    complete geometry is now allowed and judged with the library geometry;
+    a used library tool WITHOUT complete geometry is refused
+    (tool_not_in_table) before any engine work; an unused library-only
+    tool does not block a run."""
     step = os.path.join(HERE, "testdata", "synth_pocket.step")
     calls, eng, prog = _tl2_check_run(home, tmp_path, monkeypatch)
     lib = toollib.load_library(home, REPO)
@@ -460,18 +461,27 @@ def test_tl2_library_only_tool_refused(home, tmp_path, monkeypatch):
     t13["tool_id"] = "lib-only-flat"          # same T13, no repo row
     toollib.write_json(os.path.join(home, "tools.json"), lib)
     eng2 = runner_mod.EngineRun(eng.cfg, eng.work)
-    err = None
-    try:
-        eng2.run_check_program(str(prog), step, dict(CP_VALS))
-    except runner_mod.EngineError as ex:
-        err = ex.as_error()
-    assert err is not None and len(calls) == 0, \
-        "library-only tool used: run proceeded with %d engine call(s) " \
-        "(must be refused before any)" % len(calls)
+    result, _ = eng2.run_check_program(str(prog), step, dict(CP_VALS))
+    assert calls, "a library-only tool with complete geometry must run"
+    assert result["tool"]["diameter_mm"] == 12.686
+    z = [a for a in calls if "verify.zmap" in a][0]
+    assert z[z.index("--dia") + 1] == "12.6860"     # judged with the library dia
+    tj = z[z.index("--tools-json") + 1]
+    with open(tj) as fh:
+        assert "lib-only-flat" in {t["tool_id"] for t in json.load(fh)["tools"]}
+    # the same tool WITHOUT complete library geometry: refused before any
+    # engine work, with the existing code
+    t13["holder"] = None
+    t13["stickout_mm"] = None
+    toollib.write_json(os.path.join(home, "tools.json"), lib)
+    calls.clear()
+    with pytest.raises(runner_mod.EngineError) as e:
+        runner_mod.EngineRun(eng.cfg, eng.work).run_check_program(
+            str(prog), step, dict(CP_VALS))
+    err = e.value.as_error()
     assert err["code"] == "tool_not_in_table", err
     assert err["got"] == "lib-only-flat" and ROUGH in err["allowed"]
-    assert err["next_step"].startswith("add this tool to tools/x7_tools.json")
-    assert len(calls) == 0, "engine calls: %d (refused before any)" % len(calls)
+    assert calls == [], "engine calls: %d (refused before any)" % len(calls)
     # the same library-only tool, renumbered so this run does not use it
     t13["number"] = 40
     lib["tools"].append(dict(next(t for t in toollib._read(
