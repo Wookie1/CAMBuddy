@@ -1231,7 +1231,6 @@ def test_bs1a4d7_sub1mm_tail_merges_not_dropped():
     feeding the SAME per-move cell areas through zg2 verify/zmap's
     _ae2_windows. Both printed. Dropping the tail again (mutation) leaves
     ~0.6 mm and the measured-value assert fails."""
-    import importlib.util as ilu
     import numpy as np
     import engine.band as B
     from engine.stock import StockField
@@ -1259,14 +1258,7 @@ def test_bs1a4d7_sub1mm_tail_merges_not_dropped():
     # the engine's cell-centre disk sampling), fed through ZG2's own
     # _ae2_windows; the tail chain breaks on a non-consecutive idx, exactly
     # where the engine's chord break fires.
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo = os.path.dirname(here)
-    zp = os.path.normpath(os.path.join(repo, "..", "stevecam-zg2", "verify",
-                                       "zmap.py"))
-    assert os.path.exists(zp), "zg2 worktree zmap missing: %s" % zp
-    spec = ilu.spec_from_file_location("zg2_zmap", zp)
-    zm = ilu.module_from_spec(spec)
-    spec.loader.exec_module(zm)
+    from verify import zmap as zm   # ZG2 is on main: this repo's zmap merges tails
     st = wall_stock()
     xs = st.x0 + (np.arange(st.nx) + 0.5) * cell
     ys = st.y0 + (np.arange(st.ny) + 0.5) * cell
