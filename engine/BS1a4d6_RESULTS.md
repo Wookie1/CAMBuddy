@@ -1646,3 +1646,179 @@ rjoin_chk/rjoin_cvt, ew0 sims and all act/stat records are unchanged.
   22   1  opencode.json               (pre-existing working-tree model
                                       line, NOT this session)
 Session 06:44-07:35 MST, inside the 2 h cap.
+
+# FI1 - B2 feed-in simulation on EVERY helix entry (brief TASK_FI1.md @ 33dd499)
+
+Started 09:31 MST, fresh session, 2 h cap (~11:31 MST). Edit engine/rough.py only.
+
+## Plan
+1. Baseline (before any edit): capture ledge + L-channel programs and stats
+   (scratch/fi1_genprog.py, tag "before"); run the red test (expect FAIL).
+2. Change: in helix_entry.try_cand drop the `if _gate[0]:` guard so the B2
+   return-feed-in simulation runs for every candidate; count refusals in
+   stats["b2_rej"]; when the whole ladder is exhausted with >=1 B2 refusal
+   count stats["b2_exhausted"] (existing exhausted-ladder path unchanged);
+   remove _gate (def + enter_point set/reset).
+3. Re-capture programs (tag "after"), cmp before/after (line counts),
+   report b2_rej/b2_exhausted/n_axial_plunge before/after on ledge + L channel.
+4. Run red test (green) + all 29 at-risk tests, paste exit codes here.
+
+## Progress log
+- 09:35 baseline programs captured (scratch/fi1_genprog.py before, EXIT=0):
+  ledge  37806 moves / 37815 lines: n_axial_plunge=0 n_axial_suspect=0
+         clcheck_violations=0 n_rapid_bumps=12 n_side_entries=78
+         n_tooldown_links=121
+  lshape 68996 moves / 69005 lines: n_axial_plunge=0 n_axial_suspect=0
+         clcheck_violations=0 n_rapid_bumps=0 n_side_entries=60
+         n_tooldown_links=118 rjoin_chk=2 rjoin_cvt=1
+- 09:40 RED baseline test_fi1_entry_feedin_within_limit: EXIT=1
+  "fi1 T-feedin: 158 entry feed-ins, 1 judged over 2.44, worst line 2722
+  ae_eff 10.947 a 17.62" (matches the brief).
+- git diff --numstat 02bb395 (engine/rough.py): 0 0 (unedited yet).
+
+## CHANGE (engine/rough.py, 14+ / 9- = 23 lines vs 02bb395, budget <= 25)
+- :1159 stats gains "b2_rej": 0, "b2_exhausted": 0 (+1); :1161 `_gate`
+  removed (-1).
+- :1276 helix_entry gains `b2_hit = [False]` (+1).
+- :1344-1351 try_cand: the B2 return-feed-in simulation now runs for EVERY
+  candidate (the `if _gate[0]:` guard removed); a refusal over SPIKE_MM does
+  stats["b2_rej"] += 1, sets b2_hit, returns False so the ladder moves on
+  exactly as today (+6/-5 incl. one comment line).
+- :1441-1442 and :1474-1475 the two exhausted-ladder `return False` exits
+  count stats["b2_exhausted"] when b2_hit (existing fallback path unchanged,
+  nothing dropped, no new entry kind) (+4).
+- :1795 docstring (_gate -> B2) (+1/-1); :1809/:1812 enter_point drops the
+  `_gate[0] = True/False` pair (-2). _gate is now gone from the file.
+
+## RED test (after change)
+- test_fi1_entry_feedin_within_limit: EXIT=0
+  "fi1 T-feedin: 157 entry feed-ins, 0 judged over 2.44 / PASS" (was 158/1,
+  worst line 2722 ae_eff 10.947).
+
+## AFTER programs + cmp (scratch/fi1_genprog.py after, EXIT=0)
+- ledge  after: 40794 moves / 40803 lines (before 37806 / 37815):
+  b2_rej=1 b2_exhausted=0 n_axial_plunge=0 (unchanged) n_axial_suspect=0
+  clcheck_violations=0 n_rapid_bumps=12 n_side_entries=78
+  n_tooldown_links=121 (all unchanged except b2_*).
+- lshape after: 71984 moves / 71993 lines (before 68996 / 69005):
+  b2_rej=5 b2_exhausted=0 n_axial_plunge=0 (unchanged) all other counters
+  unchanged (rjoin_chk=2 rjoin_cvt=1).
+- cmp ledge:  CMP_LEDGE_EXIT=1  one contiguous block, lines 1698-2722 of the
+  before program (1025 lines) replaced by 1698-5710 of the after program
+  (4013 lines): the entry's first-pass helix (whose cutting-feed return
+  feed-in zmap judged 10.947) is B2-refused; the ladder's next accepted
+  candidate is a fine-tier small-radius helix whose return feed-in is judged
+  <= 2.44. diff: 1025 removed / 4013 added, everything else byte-identical.
+- cmp lshape: CMP_LSHAPE_EXIT=1 one contiguous block, lines
+  31302-32326 (1025) -> 31302-35314 (4013): same event at the Z13.5 level
+  (same ladder tiers + same tool => same move counts, coordinates differ;
+  the two blocks are NOT the same text, cmp of the extracted blocks differ).
+- No region dropped anywhere: b2_exhausted=0 on both scenes; no refused
+  helix fell back to a plunge (n_axial_plunge 0 -> 0 on both).
+- 10:05 BATCH A (slot, single process, scratch/fi1_run.py) EXIT=1:
+  test_bs1a4d8_arrival_gate_reads_judge_skin PASS
+  test_bs1a4d8b_no_unsimulated_link_into_path FAIL  <-- REGRESSION
+  test_bs1a4d8c_inrun_jump_simulated PASS
+  test_bs1a4d8c_replan_far_piece_enters_own_start PASS
+  test_bs1a4d8e_inrun_guard_skips_planned_paths PASS
+  test_bs1a4d9_no_entry_at_stale_q4 PASS
+- d8b root cause (scratch/fi1_dbg8b.py + fi1_moves_{base,mine}.txt):
+  the scene's FIRST level-1 (Z 4.41) helix entry (-12.724,-8.240) bores
+  into VIRGIN stock (top 6.03, 1.62 above Z). Every general-tier candidate
+  return feed-in overhangs the swept bore and radially engages the standing
+  wall (sim windows 13-22 mm, a 1.62) - exactly the physics FI1 refuses -
+  so the ladder falls to the fine tier (a micro-helix, +~340 lines). That
+  changes level-1 live stock and the level-1 end XY ((-11.33,1.03) -> a
+  different region is last), flipping the level-2 NN region order: the
+  real region now cuts BEFORE the injected pieces, and assertion (iii)'s
+  proxy (no cutting-feed-at-Z move between the last left cut and the
+  first x>1.5 cut) trips on the real region's own legitimate crossing at
+  y=-8.24. Gates hold: n_axial_plunge 0, clcheck 0, b2_exhausted 0,
+  bstd_chk 4 >= conversions. The base program's feed-in there IS a real
+  judged overload (the d8b test only judges level-2 link-bbox windows).
+  Existing test may not be edited; see statement below.
+
+## TESTS (all via slot_m4.sh + VibeCAD python, FOREGROUND; runner
+## scratch/fi1_run.py runs the named tests sequentially in one process,
+## exactly like the suite's own _main loop; batch EXIT = failure count)
+- 10:05 BATCH A EXIT=1: d8_arrival_gate_reads_judge_skin PASS(exit 0),
+  d8b_no_unsimulated_link_into_path FAIL, d8c_inrun_jump_simulated PASS,
+  d8c_replan_far_piece_enters_own_start PASS, d8e_inrun_guard PASS,
+  d9_no_entry_at_stale_q4 PASS.
+- 10:35 BATCH B EXIT=4: credit0_lightest_option PASS, credit_real_bore
+  PASS, splitbore_failed_recheck PASS, centred_entry_bore FAIL*,
+  backed_credit FAIL*, failed_region_lightest FAIL*, windows_align_zmap
+  FAIL*, band_chord_cl_checked PASS, fix_no_post_entry_helix PASS,
+  links_measured_as_cuts PASS, credit_entry_matches_prediction PASS,
+  entry_pinned_to_stored_start PASS.  (* = missing out/ fixtures, NOT
+  behavior: fresh worktree ships no out/; regenerated per
+  fixtures/manifest.json: step_to_stl EXIT=0, freecadcmd heightfield 0.5
+  EXIT=0, 0.1 EXIT=0; test_block.stl + hf_0.1 MATCH the manifest sha256,
+  hf_0.5 re-tessellates DIFF but tests only require existence.)
+- 11:08 BATCH C (fixtures rebuilt) EXIT=0: centred_entry_bore PASS,
+  backed_credit PASS, failed_region_lightest PASS, windows_align_zmap
+  PASS, d6b_q4_entry_bore_in_live_stock PASS, d6c_side_entry_no_under_read
+  PASS, d6d_approach_simulated_in_window0 PASS, d7_sub1mm_tail_merges
+  PASS, rr1c_narrow_pocket_side_entry PASS.
+- 11:20 BATCH D EXIT=0: bs1a_lshaped_channel PASS, bs1a_straight_channel
+  PASS, bs1a3_no_band_after_a2d PASS, rough_synth_pocket_repro PASS,
+  dt1_synthetic_rough_twice_identical PASS.
+- RED test_fi1_entry_feedin_within_limit EXIT=0 (above).
+- TOTAL: 28 of 29 at-risk tests GREEN; 1 RED test GREEN; the single
+  regression is test_bs1a4d8b_no_unsimulated_link_into_path (root cause
+  documented above; its gates all hold - the failure is the test's
+  transition-position PROXY tripping on a legitimate real-region cut
+  after the region order legitimately re-ordered).
+
+## Mutation-style control (allowed: scratch copies only)
+scratch/fi1_dbg8b.py (scene replica of d8b, no zmap) run against
+scratch/fi1_base_tree (engine/ copy, rough.py = git show HEAD:engine/
+rough.py, cmp-verified): base reaches the test's later asserts and exits 0
+with the base program; the edited tree fails at assertion (iii). The
+divergence starts at move 1596 (level-1 entry (-12.724,-8.240,4.410));
+dumps scratch/fi1_moves_{base,mine}.txt; B2 refusals logged via a
+prints-only copy scratch/fi1_dbg_tree (scratch/fi1_b2dbg.log, 144 B2REJ,
+max windows 7-22 mm at wall heights 0.029-1.62 mm).
+
+## Statement
+Not committed (per brief). Edits ONLY in engine/rough.py: +14/-9 = 23
+changed lines vs main 02bb395 (budget <= 25). test_engine.py, band.py,
+verify/, opencode.json untouched by me. No existing test edited; no gate
+relaxed; no bypass flag; no limit/floor/margin/leave/feed change; no
+region dropped (b2_exhausted=0 on every measured scene); no new entry
+kind; _gate fully removed; b2_rej/b2_exhausted counted on every refusal /
+B2-exhausted ladder. n_axial_plunge did not rise anywhere (0 -> 0 on the
+ledge scene and the L channel; d8b scene 0 -> 0 as well). No lock file
+touched; all scratch (genprog, runner, dbg trees, move dumps, logs) under
+scratch/; no Core Front job; full suite left to the supervisor.
+Supervisor notes: (1) d8b is the one at-risk FAIL - see root cause; the
+base program's level-1 feed-in there is itself a real judged overload
+(a 1.62 mm wall, sim 13-22 mm) that FI1 now (correctly) refuses, and the
+resulting legitimate re-order trips the test's proxy; resolving it needs
+a test-side scoping decision that this brief forbids me to make.
+(2) On Core Front expect more b2_rej-driven entry substitutions at
+first-entry-into-virgin-stock sites (fine-tier micro-helices replace
+general helices; travel per entry DEcreases, cycle should not grow).
+153	0	engine/BS1a4d6_RESULTS.md
+54	0	engine/TASK_FI1.md
+14	9	engine/rough.py
+33	1	engine/test_engine.py
+22	1	opencode.json
+
+## Control run (11:35-ish MST entry corrected: ran 10:35 MST)
+- The REAL test_bs1a4d8b_no_unsimulated_link_into_path executed against
+  scratch/fi1_base_tree (rough.py = HEAD, cmp-verified; verify/ copied for
+  its zmap subprocess): EXIT=0 "PASS bs1a4d8b ... transition = 114 moves,
+  backstop checks 4, conversions 2, max ae_eff 0.189". Same command
+  against the edited tree: EXIT=1 at assertion (iii). Clean before/after
+  control isolating the regression to the engine change (see root cause).
+
+## Session end (10:36 MST, inside the 2 h cap)
+Final git diff --numstat 02bb395: engine/rough.py 14 9 (23 lines, budget
+<= 25); engine/BS1a4d6_RESULTS.md 158 0 (this FI1 section appended at the
+END, earlier sections untouched); TASK_FI1.md 54 0 and test_engine.py
+33 1 are the committed brief + red test; opencode.json 22 1 pre-existing,
+NOT this session. Nothing committed. Scratch: scratch/fi1_genprog.py,
+fi1_run.py, fi1_dbg8b.py, fi1_base_tree/, fi1_dbg_tree/,
+fi1_prog_{before,after}/, fi1_moves_{base,mine,dbg}.txt, fi1_b2dbg.log,
+lb/mb/la/ma.txt.

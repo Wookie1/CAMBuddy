@@ -1156,9 +1156,9 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
              "n_reentry_descends": 0, "reentry_feed_mm": 0.0,
              "n_side_entries": 0, "side_entry_feed_mm": 0.0,
              "credit_fallback": [],  # BS1a4c: every credit fallback at emit
+             "b2_rej": 0, "b2_exhausted": 0,  # FI1: helix-entry B2 refusals
              "mandatory_levels": sorted(round(z, 3) for z in mand)}
     helix_n = [0]   # BS1a4c: successful entry helices emitted (f3f2165)
-    _gate = [False]  # BS1a4d8d (B2): enter_point entries simulate feed-in
     # RP0 diagnosis (engine/TASK_RP0.md): env-gated instrumentation only, no
     # behavior change when RT_RP is unset.
     _RP = bool(os.environ.get("RT_RP"))
@@ -1273,6 +1273,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         z_top0 = max(disk_top(x, y, offs_rt), -1e8)
         z_top = min(clearance_z, max(z_top0 + rapid_margin if z_top0 > -1e8
                                      else z, z + 0.3))
+        b2_hit = [False]  # FI1: a candidate of THIS entry was B2-refused
 
         def circle_ok(cx, cy, r):
             n = max(16, int(2 * math.pi * r / 0.5))
@@ -1340,12 +1341,14 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # BS1a4d8d (B2): the return feed-in at CUTTING feed is a real cut
             # - simulate it with only the swept bore pre-cleared (d6c/d6d
             # rule); over SPIKE_MM refuse the candidate, the ladder follows.
+            # FI1: EVERY helix entry runs this, not only gated ones.
             from engine.band import _simulate as _sim, SPIKE_MM as _SPK
-            if _gate[0]:   # BS1a4d8e (c): only gated entries consume this
-                _w = _sim(list(seg), stock, z, tool_r, stock.cell, r + tool_r,
-                          bore_xy=(cx, cy, r), entry="bore", eps=0.0)
-                if _w and max(_w) > _SPK:
-                    return False
+            _w = _sim(list(seg), stock, z, tool_r, stock.cell, r + tool_r,
+                      bore_xy=(cx, cy, r), entry="bore", eps=0.0)
+            if _w and max(_w) > _SPK:
+                stats["b2_rej"] += 1
+                b2_hit[0] = True
+                return False
             # RT2: the traverse height must clear BOTH the entry column and
             # the corridor from the entry to the helix start. The old code
             # descended at the entry to z_top (column-clear only) and then ran
@@ -1435,6 +1438,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     if try_cand(x + (rh - 0.05) * math.cos(a),
                                y + (rh - 0.05) * math.sin(a), rh):
                         return True
+            if b2_hit[0]:   # FI1: B2 helped exhaust this entry's ladder
+                stats["b2_exhausted"] += 1
             return False
         # RT2: every tier now EMITS at the validated radius and the pitch is
         # capped so no segment descends steeper than ~12 deg (zmap's axial
@@ -1466,6 +1471,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 for rh in (0.5, 0.35, 0.2):
                     if try_cand(px_ + rh * nx_, py_ + rh * ny_, rh):
                         return True
+        if b2_hit[0]:   # FI1: B2 helped exhaust this entry's ladder
+            stats["b2_exhausted"] += 1
         return False
 
     def lnk_cut_ok(st, path, z, key):
@@ -1785,7 +1792,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         """BS1a4d8d (A)+(B): the ONE entry decision for a run starting at
         its OWN point - credit recomputed on the LIVE stock (real centred
         bore via _bore_pred, else 0), stored in res, entered through
-        enter_at with its feed-in SIMULATED (_gate, B2). Only a re-plan
+        enter_at with its feed-in SIMULATED (B2). Only a re-plan
         piece start enters WITH a (small-tier) stored bore - pinned to
         that decision; a guard conversion keeps the normal ladder tiers,
         never a centred bore re-chosen at an arbitrary point."""
@@ -1799,10 +1806,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             res["bore"], res["credit"] = bore, (cr if bore else 0.0)
         if bore and (res is None or bxy[2] > ENTER_BORE_TIER * tool_r):
             bore = None
-        _gate[0] = True
         enter_at(round(pt[0], 4), round(pt[1], 4), z, None, side=side,
                  bore=bore)
-        _gate[0] = False
 
     def mill_now(x, y, z_bot):
         """Vertical plunge: the tool physically clears its footprint down to
