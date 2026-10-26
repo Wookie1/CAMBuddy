@@ -1699,6 +1699,353 @@ def test_bs1a4d8b_no_unsimulated_link_into_path():
              max((w["ae_eff"] for w in along), default=0.0)))
 
 
+def _bs1a4d8c_pocket_tris():
+    """BS1a4d8c scenes: the d8b pocket block (pocket -20..20 x -15..15,
+    floor 4.0, top 6.03) - roughed at levels [4.41, 4.381] the final level
+    leaves a 0.029 mm skin standing over the floor: clear inside the OLD
+    eps 0.05 band, STANDING at the judge's eps 0 (the CF signature)."""
+
+    def quad(a, b, c, d):
+        return [(a, b, c), (a, c, d)]
+
+    X0, X1, Y0, Y1, px, py, zf, zt = -25.0, 25.0, -20.0, 20.0, 20.0, 15.0, \
+        4.0, 6.03
+    t = []
+    t += quad((X0, Y0, 0), (X0, Y1, 0), (X1, Y1, 0), (X1, Y0, 0))
+    t += quad((X1, Y0, 0), (X1, Y1, 0), (X1, Y1, zt), (X1, Y0, zt))
+    t += quad((X0, Y0, 0), (X0, Y0, zt), (X0, Y1, zt), (X0, Y1, 0))
+    t += quad((X0, Y1, 0), (X0, Y1, zt), (X1, Y1, zt), (X1, Y1, 0))
+    t += quad((X0, Y0, 0), (X1, Y0, 0), (X1, Y0, zt), (X0, Y0, zt))
+    t += quad((X0, Y0, zt), (X0, -py, zt), (-px, -py, zt), (-px, Y0, zt))
+    t += quad((px, Y0, zt), (px, -py, zt), (X1, -py, zt), (X1, Y0, zt))
+    t += quad((X0, py, zt), (X0, Y1, zt), (-px, Y1, zt), (-px, py, zt))
+    t += quad((px, py, zt), (px, Y1, zt), (X1, Y1, zt), (X1, py, zt))
+    t += quad((-px, -py, zf), (-px, py, zf), (-px, py, zt), (-px, -py, zt))
+    t += quad((px, -py, zf), (px, -py, zt), (px, py, zt), (px, py, zf))
+    t += quad((-px, -py, zf), (-px, -py, zt), (px, -py, zt), (px, -py, zf))
+    t += quad((-px, py, zf), (-px, py, zt), (px, py, zt), (px, py, zf))
+    t += quad((-px, -py, zf), (-px, py, zf), (px, py, zf), (px, -py, zf))
+    return t
+
+
+def _bs1a4d8c_judge(moves, surf, box, td2):
+    """zmap the program (the judge's own ae2 windows); returns the dump."""
+    import subprocess
+    import json as _json
+    import numpy as np
+    from engine.rough import build_part_hf
+    from engine.gcode import moves_to_gcode
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    ngc = os.path.join(td2, "bs1a4d8c.ngc")
+    with open(ngc, "w") as fh:
+        fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+    hf = build_part_hf(surf, box[0], box[2], 0.5, 180, 140, threads=4,
+                       drop_z=box[4] - 1.0)
+    hf_p = os.path.join(td2, "part_hf.npy")
+    pad = int(math.ceil((6.343 + 5.0) / 0.5))
+    padded = np.full((hf.shape[0] + 2 * pad, hf.shape[1] + 2 * pad),
+                     np.nan, dtype=hf.dtype)
+    padded[pad:pad + hf.shape[0], pad:pad + hf.shape[1]] = hf
+    np.save(hf_p, padded)
+    with open(hf_p[:-4] + ".json", "w") as fh:
+        _json.dump({"x0": box[0] - pad * 0.5, "y0": box[2] - pad * 0.5,
+                    "cell": 0.5, "tess_tol": 0.01}, fh)
+    dj = os.path.join(td2, "ae2.json")
+    rr = subprocess.run(
+        [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+         "--part", hf_p, "--tool", "flat", "--dia", "12.686",
+         "--stock", *[str(v) for v in box], "--engage-max", "2.438",
+         "--ae2-dump", dj],
+        capture_output=True, text=True, cwd=repo)
+    assert rr.returncode == 0, "zmap failed: %s | %s" % (
+        rr.stdout[-300:], rr.stderr[-300:])
+    return _json.load(open(dj))
+
+
+def _bs1a4d8c_near(w, a, b, tol=2.5, m=4.0):
+    """window w within tol mm of segment a->b, projection at least m mm
+    from either end (keeps the pieces' own entries out of the corridor)."""
+    vx, vy = b[0] - a[0], b[1] - a[1]
+    L = math.hypot(vx, vy)
+    t = ((w["x"] - a[0]) * vx + (w["y"] - a[1]) * vy) / (L * L)
+    if not (m / L <= t <= 1.0 - m / L):
+        return False
+    return math.dist((w["x"], w["y"]), (a[0] + t * vx, a[1] + t * vy)) <= tol
+
+
+def test_bs1a4d8c_inrun_jump_simulated():
+    """BS1a4d8c (1): a run [p, q] whose second point sits 23.8 mm away
+    through STANDING skin (d8b pocket block, levels [4.41, 4.381]: the
+    final level's floor stands 0.029 mm above Z - clear at the old eps
+    0.05, standing at the judge's eps 0), the tool entered AT p. The
+    in-run backstop must simulate the pair on the live stock at eps 0
+    (lnk_cut_ok, the d8b rule) right before writing it and convert it:
+    measured from the emitted moves (i) NO cutting-feed move at Z longer
+    than one step (0.6 mm) crosses the corridor; (ii) the transition is
+    a rapid at Z + lift plus an entry descent at q, with no cutting-feed
+    move at Z between; (iii) stats irun_chk >= 1 AND irun_cvt >= 1 (the
+    pair was checked and converted) and bstd_cvt >= 1; (iv) zmap shows no
+    cutting-feed window longer than 3 mm over 2.44 mm inside the corridor. MUTATION
+    (scratch copy, the irun_guard call removed from the run loop): the
+    23.8 mm G1 at cutting feed is emitted and the test fails by the
+    MEASURED zmap ae_eff (ae_eff and a of the worst window printed)."""
+    import tempfile
+    from opencamlib import ocl
+    import engine.rough as R
+    from engine.rough import rough
+    assert HAVE_AREA, "area module missing: run with VibeCAD python"
+    Z, LIFT, CUT_F = 4.381, 1.9, 3429.0
+    box = (-25.0, 25.0, -20.0, 20.0, 0.0, 6.03)
+    p, q = (-13.0, 0.0), (10.0, -6.0)
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a4d8c_i.stl")
+        _write_stl(stl, _bs1a4d8c_pocket_tris())
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        calls = {"n": 0}
+        _orig_a2d = R._run_a2d
+
+        def a2d_spy(*a, **k):
+            regs = _orig_a2d(*a, **k)
+            calls["n"] += 1
+            if calls["n"] == 2:   # Z 4.381: ONE region, run [p, q] over skin
+                regs = [{"start": list(p), "helix": None,
+                         "paths": [["cutting", [list(p), list(q)]]]}]
+            return regs
+
+        R._run_a2d = a2d_spy
+        try:
+            moves, stats = rough(surf, box, 6.343, 4.0, leave=0.381,
+                                 axial_leave=0.381, stepdown=1.62,
+                                 stepup=1.905, stepover=0.16,
+                                 tolerance=0.05, threads=4, stock_cell=0.5,
+                                 min_rest=0.3, corner_r=0.0, stl_path=stl)
+        finally:
+            R._run_a2d = _orig_a2d
+    print("BS1a4d8c in-run scene: levels %s, moves %d, irun_chk %s, "
+          "irun_cvt %s, bstd_cvt %s" % (stats["levels_planned"], len(moves),
+                                        stats.get("irun_chk", 0),
+                                        stats.get("irun_cvt", 0),
+                                        stats.get("bstd_cvt", 0)))
+    assert stats["levels_planned"] == [4.41, 4.381], stats["levels_planned"]
+    assert calls["n"] == 2
+    cuts = [i for i, m in enumerate(moves)
+            if m["g"] == 1 and m.get("f") == CUT_F and m.get("z") is not None
+            and abs(m["z"] - Z) < 1e-6]
+    assert cuts, "no cutting-feed move at Z emitted: vacuous"
+
+    def _span(i):
+        a, b = moves[i - 1], moves[i]
+        return math.dist((a["x"], a["y"]), (b["x"], b["y"]))
+
+    # (iv) FIRST the judged load: with the in-run check bypassed this is
+    # the failing evidence (the 23.8 mm G1 over standing skin).
+    with tempfile.TemporaryDirectory() as td2:
+        wj = _bs1a4d8c_judge(moves, surf, box, td2)
+    along = [w for w in wj if abs(w["z"] - Z) < 2e-3 and w.get("feed", 0)
+             > 3000.0 and w.get("length_mm", 0.0) > 3.0
+             and _bs1a4d8c_near(w, p, q, m=0.0)]
+    worst = max(along, key=lambda w: w["ae_eff"]) if along else None
+    over = [w for w in along if w["ae_eff"] > 2.44]
+    assert not over, \
+        ("in-run pair p->q emitted UNSIMULATED at cutting feed: zmap "
+         "corridor window ae_eff %.3f mm, a %.3f mm (line %s)"
+         % (worst["ae_eff"], worst["a"], worst.get("line", "?")))
+    # (i) no cutting-feed step > one step crosses the corridor
+    cross = [i for i in cuts if _span(i) > 0.6
+             and ((moves[i - 1]["x"] < -1.5 and moves[i]["x"] > 1.5)
+                  or (moves[i - 1]["x"] > 1.5 and moves[i]["x"] < -1.5))]
+    assert not cross, "cutting-feed step(s) > 0.6 mm cross the corridor"
+    # (ii) p -> q transition: lift rapid + entry descent, no cut feed at Z
+    ip = min(i for i, m in enumerate(moves)
+             if abs(m["x"] - p[0]) < 1e-4 and abs(m["y"] - p[1]) < 1e-4
+             and abs((m.get("z") or 9e9) - Z) < 1e-6)
+    iq = min(i for i, m in enumerate(moves)
+             if abs(m["x"] - q[0]) < 1e-4 and abs(m["y"] - q[1]) < 1e-4
+             and abs((m.get("z") or 9e9) - Z) < 1e-6 and i > ip)
+    mid = moves[ip + 1:iq + 1]
+    assert mid and not [m for m in mid if m["g"] == 1
+                        and m.get("f") == CUT_F and m.get("z") is not None
+                        and abs(m["z"] - Z) < 1e-6], \
+        "cutting-feed move at Z inside the p -> q transition"
+    assert any(m["g"] == 0 and m["z"] >= Z + LIFT - 0.01 for m in mid), \
+        "no rapid at Z + lift between p and q: %s" % (
+            [(m["g"], round(m["z"], 3)) for m in mid][:12])
+    assert any(k and m["g"] == 1 and m["z"] <= Z + 1e-9
+               and mid[k - 1]["z"] > m["z"] + 1e-9
+               for k, m in enumerate(mid) if k), \
+        "no entry descent to Z at q"
+    # (iii) the guard ran AND converted
+    assert stats.get("irun_chk", 0) >= 1 and stats.get("irun_cvt", 0) >= 1 \
+            and stats.get("bstd_cvt", 0) >= 1, \
+        "in-run backstop did not check+convert the pair: irun_chk %s, " \
+        "irun_cvt %s, bstd_cvt %s" % (stats.get("irun_chk", 0),
+                                      stats.get("irun_cvt", 0),
+                                      stats.get("bstd_cvt", 0))
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    print("PASS bs1a4d8c in-run: 23.8 mm pair checked %d, converted %d; "
+          "corridor judged clean (%d windows, max ae_eff %.3f mm)"
+          % (stats.get("irun_chk", 0), stats.get("irun_cvt", 0), len(along),
+             max((w["ae_eff"] for w in along), default=0.0)))
+
+
+def test_bs1a4d8c_replan_far_piece_enters_own_start():
+    """BS1a4d8c (2) root fix: an emit-time re-plan whose lightest option
+    starts FAR from the stale stored start q4 must never keep q4 as run[0]
+    with the piece appended behind it (CF 64233: a 25.2 mm G1 inside one
+    run, judged ae_eff 9.319 / a 18.61). SYNTHETIC scene: the d8b pocket
+    block at its SINGLE level 4.381 (stepdown 1.649: the whole floor
+    stands at Z) with ONE injected region (replan0=1) whose own path
+    slot-cuts the standing stock (so the emit re-check
+    ew0 fails) and whose shrink_ladder is pinned by seg identity to a
+    light piece starting at (10, -6) - 23.8 mm from q4 = (-13, 0). With
+    (2): shrink_ladder is called TWICE for that seg - first with
+    approach=q4, then WITHOUT one (the predictor mirrors the entry at the
+    piece's own first point); the entry goes there via the enter_at
+    ladder; bstd_cvt == 0 (the backstop never fires: run[0] IS the entry)
+    and the piece's first cutting move ends at its own entered first point
+    (no move jumps off the stale q4). MUTATIONS (scratch copies): (2) reverted with (1) on -> the
+    in-run backstop catches the q4 -> piece chord: bstd_cvt == 1 and the
+    bstd assert fails (value printed); BOTH reverted -> the test fails by
+    the MEASURED zmap ae_eff over the q4 -> piece corridor (ae_eff and a
+    printed)."""
+    import tempfile
+    from opencamlib import ocl
+    import engine.rough as R
+    import engine.band as B
+    from engine.rough import rough
+    assert HAVE_AREA, "area module missing: run with VibeCAD python"
+    Z, CUT_F = 4.381, 3429.0
+    box = (-25.0, 25.0, -20.0, 20.0, 0.0, 6.03)
+    q4 = (-13.0, 0.0)
+    piece = [(10.0, round(-6.0 + 0.4 * i, 4)) for i in range(16)]
+    MY_SEG = []   # identity-pinned: only the injected region carries it
+    sl = []
+    _orig_sl = B.shrink_ladder
+    def sl_spy(seg, stock, z, tool_r, cell, credit=None, dropopt=None,
+               borefn=None, approach=None):
+        if seg is MY_SEG:
+            sl.append(tuple(approach) if approach is not None else None)
+            return "shrink0.4", list(piece), [0.5] * 8, 5.0, False
+        return _orig_sl(seg, stock, z, tool_r, cell, credit, dropopt, borefn,
+                        approach)
+
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a4d8c_r.stl")
+        _write_stl(stl, _bs1a4d8c_pocket_tris())
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        calls = {"n": 0}
+        _orig_a2d, _orig_hug = R._run_a2d, R.hug_regions
+        _orig_cr = B.channel_regions
+        my_region = {"start": list(q4), "helix": None, "replan0": 1,
+                     "credit": 0.0, "seg": MY_SEG, "dropkey": "d8c",
+                     "paths": [["cutting", [[q4[0],
+                                             round(q4[1] + 0.4 * i, 4)]
+                                            for i in range(11)]]]}
+
+        def a2d_spy(*a, **k):
+            # one single-point decoy: the real passes would mill the floor
+            # and the re-plan scene must see standing stock at Z
+            calls["n"] += 1
+            return [{"start": [-13.0, -8.0], "helix": None,
+                     "paths": [["cutting", [[-13.0, -8.0]]]]}]
+
+        def hug_spy(islands, grown, stock, isl_ok, **k):
+            # no rings -> channel_regions is my spy alone: the scene's ONLY
+            # bstd / irun activity is the q4 -> piece join itself
+            return []
+
+        def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None,
+                   **kw):
+            if stats is not None:   # the contract of the real channel_regions
+                stats.setdefault("failed_region_emitted", [])
+            return [my_region]
+
+        B.shrink_ladder = sl_spy
+        B.channel_regions = cr_spy
+        R._run_a2d = a2d_spy
+        R.hug_regions = hug_spy
+        try:
+            moves, stats = rough(surf, box, 6.343, 4.0, leave=0.381,
+                                 axial_leave=0.381, stepdown=1.649,
+                                 stepup=1.905, stepover=0.16,
+                                 tolerance=0.05, threads=4, stock_cell=0.5,
+                                 min_rest=0.3, corner_r=0.0, stl_path=stl)
+        finally:
+            B.shrink_ladder = _orig_sl
+            B.channel_regions = _orig_cr
+            R._run_a2d = _orig_a2d
+            R.hug_regions = _orig_hug
+    print("BS1a4d8c re-plan scene: levels %s, sl calls %s, bstd_cvt %s, "
+          "irun_chk %s, irun_cvt %s" % (stats["levels_planned"], sl,
+                                        stats.get("bstd_cvt", 0),
+                                        stats.get("irun_chk", 0),
+                                        stats.get("irun_cvt", 0)))
+    assert stats["levels_planned"] == [4.381], stats["levels_planned"]
+    assert calls["n"] == 1
+    fb = [f for f in stats["credit_fallback"]
+          if abs(f[0] - q4[0]) < 1e-6 and abs(f[1] - q4[1]) < 1e-6]
+    assert fb and fb[0][3] == "replan0_shrink0.4", \
+        "scene did not reach the emit re-plan with the lightest option: %r" \
+        % (fb,)
+    assert any(f["x"] == q4[0] and f["y"] == q4[1]
+               and f["option"] == "shrink0.4"
+               for f in stats["failed_region_emitted"]), \
+        "failed_region_emitted does not record the pinned option"
+    # the judged load FIRST (the both-reverted mutation's evidence)
+    with tempfile.TemporaryDirectory() as td2:
+        wj = _bs1a4d8c_judge(moves, surf, box, td2)
+    along = [w for w in wj if abs(w["z"] - Z) < 2e-3 and w.get("feed", 0)
+             > 3000.0 and w.get("length_mm", 0.0) > 3.0
+             and _bs1a4d8c_near(w, q4, piece[0], m=0.0)]
+    worst = max(along, key=lambda w: w["ae_eff"]) if along else None
+    over = [w for w in along if w["ae_eff"] > 2.44]
+    assert not over, \
+        ("stale q4 kept as run[0] and the far piece appended: zmap "
+         "corridor window ae_eff %.3f mm, a %.3f mm (line %s)"
+         % (worst["ae_eff"], worst["a"], worst.get("line", "?")))
+    # (2) correct: the backstop never had to convert anything
+    assert stats.get("bstd_cvt", 0) == 0 and \
+        stats.get("n_backstop_links", 0) == 0, \
+        "backstop converted %d link(s) (bstd_cvt %s, n_backstop_links %s): " \
+        "the run still starts at the stale q4" % (
+            stats.get("n_backstop_links", 0), stats.get("bstd_cvt", 0),
+            stats.get("n_backstop_links", 0))
+    # the predictor mirrored the entry: approach=q4, then a re-prediction
+    # WITHOUT one at the piece's own first point
+    assert len(sl) == 2 and sl[0] is not None and \
+        math.dist(sl[0], q4) < 1e-6 and sl[1] is None, \
+        "shrink_ladder calls %r: expected approach=q4 then a mirrored " \
+        "re-prediction without approach" % (sl,)
+    # the piece's first cutting move ends AT its own first point (where the
+    # entry landed) within feed-in reach - and nothing jumps off the stale q4
+    cuts = [i for i, m in enumerate(moves)
+            if m["g"] == 1 and m.get("f") == CUT_F and m.get("z") is not None
+            and abs(m["z"] - Z) < 1e-6 and m["x"] > 1.5]
+    assert cuts, "no cutting-feed move at Z in the right bay: vacuous"
+    i1 = cuts[0]
+    a0 = (moves[i1 - 1]["x"], moves[i1 - 1]["y"])
+    b0 = (moves[i1]["x"], moves[i1]["y"])
+    assert math.dist(b0, piece[0]) <= 0.6 and \
+        math.dist(a0, b0) <= 3.0, \
+        "first cutting move at the piece (%.3f, %.3f) -> (%.3f, %.3f) does " \
+        "not end at its own entered first point" % (a0[0], a0[1], b0[0], b0[1])
+    jump = [i for i in cuts
+            if math.dist((moves[i - 1]["x"], moves[i - 1]["y"]), q4) <= 0.6
+            and math.dist((moves[i]["x"], moves[i]["y"]), q4) > 0.6]
+    assert not jump, "a cutting-feed move still jumps off the stale q4"
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    print("PASS bs1a4d8c re-plan: far piece entered at its own start; "
+          "bstd_cvt 0, first cut ends %.3f mm from the piece start; %d "
+          "judged corridor windows, max ae_eff %.3f mm"
+          % (math.dist(b0, piece[0]), len(along),
+             max((w["ae_eff"] for w in along), default=0.0)))
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -1739,7 +2086,9 @@ def _main():
                test_bs1a4d6d_approach_simulated_in_window0,
                test_bs1a4d7_sub1mm_tail_merges_not_dropped,
                test_bs1a4d8_arrival_gate_reads_judge_skin,
-               test_bs1a4d8b_no_unsimulated_link_into_path):
+               test_bs1a4d8b_no_unsimulated_link_into_path,
+               test_bs1a4d8c_inrun_jump_simulated,
+               test_bs1a4d8c_replan_far_piece_enters_own_start):
         try:
             fn()
         except AssertionError as e:

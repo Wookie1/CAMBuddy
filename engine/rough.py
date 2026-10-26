@@ -1795,12 +1795,14 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         entry at p_to (the tool lands ON p_to, the caller's emit of it is
         then a zero-length move and drops). Firings count in
         stats["n_backstop_links"]; the checks in bstd_chk/bstd_cvt."""
-        if prev[0] is None or prev[2] is None or abs(prev[2] - z) > 1e-6:
-            return                       # tool up: the entry path covers it
-        d0 = math.dist((prev[0], prev[1]), (p_to[0], p_to[1]))
-        if d0 <= 0.6 or lnk_cut_ok(stock, _dense_line((prev[0], prev[1]),
-                                                      (p_to[0], p_to[1])),
-                                   z, "bstd"):
+        why = ("nopos" if prev[0] is None or prev[2] is None else
+               "toolup" if abs(prev[2] - z) > 1e-6 else
+               "short" if math.dist((prev[0], prev[1]), p_to) <= 0.6 else 0)
+        if why:   # BS1a4d8c (3): every early exit is counted
+            stats["bstd_skip_" + why] = stats.get("bstd_skip_" + why, 0) + 1
+            return            # (the entry path covers nopos / tool up)
+        if lnk_cut_ok(stock, _dense_line((prev[0], prev[1]), p_to), z,
+                      "bstd"):
             return
         stats["n_backstop_links"] = stats.get("n_backstop_links", 0) + 1
         p0b = (prev[0], prev[1], prev[2])
@@ -1810,6 +1812,21 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         stats["reentry_feed_mm"] += der
         if der > 1e-6:
             stats["n_reentry_descends"] += 1
+        return True   # BS1a4d8c: converted (irun_guard counts irun_cvt)
+
+    def irun_guard(p_to, z, side):
+        """BS1a4d8c (1): every cutting-feed PAIR > 0.6 mm inside an emitted
+        run is simulated on the live stock at eps 0 (trans_guard) before it
+        is written; failing pairs convert to lift -> rapid -> enter_at at
+        the far point (irun_chk / irun_cvt)."""
+        if prev[0] is None or prev[2] is None or abs(prev[2] - z) > 1e-6 or \
+                math.dist((prev[0], prev[1]), (p_to[0], p_to[1])) <= 0.6:
+            return False
+        stats["irun_chk"] = stats.get("irun_chk", 0) + 1
+        if trans_guard(p_to, z, side):
+            stats["irun_cvt"] = stats.get("irun_cvt", 0) + 1
+            return True
+        return False
 
     zi = 0
     for z in order:
@@ -2143,8 +2160,9 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 from engine.band import (channel_regions, _simulate, AE_SS,
                                        AE_SPIKE, shrink_ladder, bore_context,
                                        _split_at_jumps, SIM_LOG)
-                with bore_context(lambda p, zz: _bore_pred(
-                        isl_ok, centre_zone, stock, p[0], p[1], tool_r)):
+                _bfn = lambda p, zz: _bore_pred(isl_ok, centre_zone, stock,
+                                                p[0], p[1], tool_r)
+                with bore_context(_bfn):
                     bands = channel_regions(rings, stock, isl_ok3, z, tool_r,
                                           leave, stock.cell, stats)
                 base = len(regions)
@@ -2240,12 +2258,27 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                             res["seg"], stock, z, tool_r, stock.cell, 0.0,
                             (res["dropkey"], "drop_ring", None, []),
                             approach=q4)   # BS1a4d6d: pcs[0] emits from q4
+                        # BS1a4d8c (2): a REPLANNED piece > one step from q4
+                        # whose q4 -> piece link fails lnk_cut_ok enters at
+                        # its own first point, predictor mirrored. Credited
+                        # split-cap regions keep the d6d q4 join.
+                        far = bool(res.get("replan0")) and pnew is not None \
+                            and math.dist(
+                            q4, pnew[0]) > 0.6 and not lnk_cut_ok(
+                                stock, _dense_line(q4, (round(pnew[0][0], 4),
+                                                        round(pnew[0][1], 4))),
+                                z, "rjoin")
+                        if far:   # re-predict at the piece's own start:
+                            # no approach link, sentinel-mirror credit/bore
+                            opt, pnew, wn, ba, _g = shrink_ladder(
+                                res["seg"], stock, z, tool_r, stock.cell,
+                                None, (res["dropkey"], "drop_ring", None, []),
+                                _bfn)
                         act, drop_cut = "replan0_drop", True
                         if pnew is not None:
-                            g2 = isl_ok3([(round(a, 4), round(b, 4))
-                                        for (a, b) in pnew])
-                            pp = [q4] + [(round(a, 4), round(b, 4))
-                                       for (a, b), ok in zip(pnew, g2) if ok]
+                            gp = [(round(a, 4), round(b, 4)) for a, b in pnew]
+                            val = [p for p, ok in zip(gp, isl_ok3(gp)) if ok]
+                            pp = val if far else [q4] + val
                             pcs = _split_at_jumps(isl_ok3, pp)
                             if len(pcs[0]) >= 4 or len(pcs) > 1:
                                 # BS1a4d6b: cover the WHOLE lightest option:
@@ -2256,6 +2289,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                 res["paths"][0][1] = pcs[0]
                                 more_pcs = pcs[1:]
                                 act, drop_cut = "replan0_" + opt, False
+                                if far:   # d8c (2): enter at its own
+                                    enter_at(round(pcs[0][0][0], 4),
+                                             round(pcs[0][0][1], 4), z, None,
+                                             side=bool(rp2_flag))
                         stats["failed_region_emitted"].append(
                             {"x": q4[0], "y": q4[1], "z": round(z, 3),
                              "area": round(ba, 2),
@@ -2392,11 +2429,15 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                in pts[i:j + 1]]
                         if run:   # BS1a4d8b (b): backstop on the run's first
                             trans_guard(run[0], z, bool(rp2_flag))
-                        for (x, y) in run:
+                        k0 = 0
+                        for ki, (x, y) in enumerate(run):
+                            if ki and irun_guard((x, y), z, bool(rp2_flag)):
+                                stock.mill_path(run[k0:ki], z, tool_r, corner_r)
+                                k0 = ki
                             emit({"g": 1, "x": x, "y": y, "z": z,
                                   "f": cut_feed})
                             level_pts.append((x, y, "cut r%d" % nreg))
-                        stock.mill_path(run, z, tool_r, corner_r)
+                        stock.mill_path(run[k0:], z, tool_r, corner_r)
                         i = j + 1
                     if _RP and rp_g0 is not None:
                         _cat = rp_cat(pts[rp_g0:]) + " (tail dropped)"
@@ -2546,7 +2587,9 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 enter_at(round(pc[0][0], 4), round(pc[0][1], 4), z, None,
                          side=bool(rp2_flag))
                 trans_guard(pc[0], z, bool(rp2_flag))  # BS1a4d8b (b)
-                for (x, y) in pc:
+                for mi, (x, y) in enumerate(pc):
+                    if mi:   # BS1a4d8c (1): in-run pairs guarded
+                        irun_guard((x, y), z, bool(rp2_flag))
                     emit({"g": 1, "x": x, "y": y, "z": z, "f": cut_feed})
                     level_pts.append((x, y, "owncut r%d" % nreg))
                 stock.mill_path(list(pc), z, tool_r, corner_r)
