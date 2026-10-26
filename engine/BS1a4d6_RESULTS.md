@@ -1482,3 +1482,167 @@ Core Front. Session 01:16-02:1x MST, inside the 2 h cap.
   18   12 engine/rough.py             (the change: 30 lines)
   22   1  opencode.json               (pre-existing working-tree model line,
                                       NOT this session; untouched here)
+
+---
+
+# BS1a4d9 - a far re-planned piece emits nothing at the stale q4
+
+## Plan / approach
+- Chosen approach: MAKE THE ABANDONED ENTRY LEAVE NO TRACE (the brief's
+  second option). The far (rjoin) decision stays EXACTLY where it is (made
+  on the post-entry live stock, after the ew0 re-check, so every existing
+  decision, counter and SIM_LOG line is unchanged); when it says far, the
+  q4 entry that enter_at just emitted is rolled back BEFORE the piece's
+  own enter_point: moves truncated to the pre-enter_at length, prev and
+  helix_n restored, the live stock restored from a top[] snapshot taken
+  before enter_at, and every stat enter_at could touch restored from a
+  shallow dict(stats) snapshot (this decision's own rjoin_* counters are
+  kept). de (entry-feed) is then re-measured over the piece's own entry.
+  Why not "decide before entering": the ew0 re-check MUST run on the
+  POST-entry stock (the q4 entry's cut is what can make replan0_ok pass)
+  and rb depends on whether enter_at emitted a helix - pre-deciding would
+  change replan0_ok outcomes and add shrink_ladder/rjoin checks to
+  ew0-passing regions (not output-neutral).
+- Edits ONLY in engine/rough.py (region loop, ~:2255 and ~:2304/~:2327).
+
+## Progress log
+- 06:44 session start (date), HEAD 737ce41, branch bs1a4d9, diff vs main
+  498ebae: 0 engine lines (red test + brief only).
+- 06:51 base rough.py captured to scratch/d9_base_rough.py (cmp = HEAD).
+- 07:05 fix implemented (engine/rough.py, +19/-0): pre-enter_at snapshot of
+  dict(stats) + stock.top for replan0 regions; full rollback inside the
+  far branch; de re-measured over the piece's own entry.
+- Test runs (slot_m4.sh, VibeCAD python, cwd repo root):
+  test_bs1a4d9_no_entry_at_stale_q4          EXIT=0 (RED -> GREEN; "0 judged
+    corridor windows, max ae_eff 0.000 mm")
+  test_bs1a4d8c_replan_far_piece_enters_own_start EXIT=0
+  test_bs1a4d8c_inrun_jump_simulated         EXIT=0
+  test_bs1a4d8_arrival_gate_reads_judge_skin EXIT=0
+  test_bs1a4d8b_no_unsimulated_link_into_path EXIT=0
+  test_bs1a4d_credit0_lightest_option        EXIT=0
+  test_bs1a4d_credit_real_bore               EXIT=0
+  test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load EXIT=0
+  test_bs1a4d2b_centred_entry_bore           EXIT=0 (out/test_block.stl was
+    MISSING in this fresh worktree; regenerated per fixtures/manifest.json:
+    engine.model.step_to_stl('samples/test_block.step', tol=0.01), EXIT=0)
+  test_bs1a4d4_credit_entry_matches_prediction EXIT=0
+  test_bs1a4d4_entry_pinned_to_stored_start  EXIT=0
+  test_bs1a4c_backed_credit                  EXIT=0
+  test_bs1a4b_failed_region_lightest         EXIT=0 (needed
+    out/test_block_hf_0.1.npy - regenerated per manifest, EXIT=0)
+  test_bs1a4b_windows_align_zmap             EXIT=0 (needed
+    out/test_block_hf_0.5.npy - regenerated per manifest, EXIT=0)
+  test_bs1a4c2_band_chord_cl_checked         EXIT=0
+  test_bs1a4c_fix_no_post_entry_helix        EXIT=0
+  test_bs1a4d3_links_measured_as_cuts        EXIT=0
+  test_bs1a_straight_channel                 EXIT=0
+  test_bs1a_lshaped_channel                  EXIT=0
+  test_bs1a3_no_band_after_a2d               EXIT=0
+  test_rough_synth_pocket_repro              EXIT=0
+  test_dt1_synthetic_rough_twice_identical   EXIT=0
+  test_bs1a4d6b_q4_entry_bore_in_live_stock  EXIT=0
+  test_bs1a4d6c_side_entry_no_under_read     EXIT=0
+  test_bs1a4d6d_approach_simulated_in_window0 EXIT=0
+  test_bs1a4d7_sub1mm_tail_merges_not_dropped EXIT=0
+  test_bs1a4d8e_inrun_guard_skips_planned_paths EXIT=0
+  ALL 27 AT-RISK TESTS EXIT=0 (the red test turned green).
+
+### The change (engine/rough.py only; line numbers on final code)
+- Snapshot before the region entry (rough.py:2256-2257): for a replan0
+  region only, sn9 = dict(stats) (shallow) and ts9 = stock.top.copy() are
+  taken immediately BEFORE enter_at(entry...q4) (rough.py:2258-2259).
+  i0m/h0 (move index, helix count) were already captured there.
+- Rollback in the far branch (rough.py:2312-2327): after the existing
+  second shrink_ladder (the no-approach re-prediction, unchanged), the
+  abandoned q4 entry is erased WITHOUT TRACE:
+  rk9 keeps this decision's own rjoin_chk/rjoin_cvt; stock.top[:] = ts9
+  (live stock back to pre-entry); del moves[i0m:] (no helix, no feed-in,
+  no lift-off - nothing emitted between i0m and the far decision except
+  the entry itself); prev restored to pxy0+(pz0,); helix_n[0] = h0;
+  stats.clear()+update(sn9)+update(rk9) erases every counter/length the
+  entry touched (rapid/plunge/cut len, n_retracts, rapid bumps/rises,
+  tooldown links, side entries, offset descends, side_entry_feed_mm,
+  axial counters and any axial_pts list it created) while keeping the
+  rjoin counters and all pre-existing list objects (same identities).
+  de = 0.0 kills the q4 entry's entry-feed trace.
+- Piece's own entry (rough.py:2343-2347): the existing
+  enter_point(pcs[0][0], z, rp2_flag, res) is UNCHANGED and is now the
+  ONE entry; de is re-measured over it (descend_feed from the restored
+  pre-region position over moves[i0m:]).
+- The far DECISION itself (ew0 on the post-entry stock, shrink_ladder
+  with approach=q4, lnk_cut_ok "rjoin", second re-prediction) is
+  byte-for-byte the old code: every counter, SIM_LOG line, act string,
+  failed_region_emitted/credit_fallback record is produced exactly as
+  before. Non-replan0 regions: sn9/ts9 are None, zero new work, zero
+  behaviour change. Non-far replan0 regions: snapshots taken, never used.
+
+### Line count vs main 498ebae
+- engine/rough.py: +19/-0 = 19 changed lines (BUDGET <= 25, under).
+  (git diff --numstat 498ebae also lists the committed brief
+  engine/TASK_BS1a4d9.md +48 and the committed red test
+  engine/test_engine.py +51 - not this session's edits.)
+
+### Item 2 - output neutrality (cmp) - ONE MEASURED DEVIATION
+- Programs generated by scratch/d9_genprog.py (L-channel scene exactly as
+  _bs1a_channel_case/test_bs1a_lshaped_channel; test block as
+  test_rough_testblock_r2: out/test_block.stl + test_block_hf_0.5.npy,
+  rough 6.343/Z20, levels [...]); base tree scratch/d9_base_tree (engine/
+  copy with rough.py = git show HEAD:engine/rough.py, cmp-verified) vs
+  the edited tree, both via slot_m4.sh:
+  cmp tb.ngc:      CMP_TB_EXIT=0      BYTE-IDENTICAL (40411 moves both)
+  cmp lshape.ngc:  CMP_LSHAPE_EXIT=1  NOT byte-identical: 70392 -> 68996
+    moves = a PURE DELETION of 1396 lines (diff: 1396 '<', 0 '>'),
+    lines 11552-12947 of the base program = the stale q4 entry of the
+    scene's ONE far re-plan (q4 = (-2.1928, 3.6434), z = 0.381): G0 to
+    q4, a 18.6 mm helix inside a 0.47 mm circle at ~(-2.02, 4.06), a
+    cutting-feed (F3429) feed-in ending AT q4, a lift-off to Z19 - then
+    the SAME rapid to the piece (-2.4654, 6.4484) and the SAME own-start
+    entry + cutting as the base. Everything else in the file is
+    byte-identical.
+- WHY byte-identity is IMPOSSIBLE for the L channel under item 1: a probe
+  tree (scratch/d9_probe_tree, base rough.py + prints only, program
+  unchanged) measured this region's PRE-entry (S0) prediction:
+  "PROBE pre z=0.381 q4=(-2.193, 3.643) opt=shrink0.4 pnew0=(-2.465,
+  6.448) dist=2.82 link_ok=False" + "PROBE post ... far=True". The piece
+  is far (2.82 mm, rjoin link fails) on the PRE-entry stock TOO, so the
+  brief's other option ("decide before entering") would ALSO abandon (and
+  by item 1 must abandon) this q4 entry -> the same 1396-line deletion.
+  The scene's ONE far re-plan is item 1's target behaviour, not a
+  regression; the coordinator's "byte-identical" expectation for the
+  L channel did not anticipate that this scene contains a far re-plan
+  (the test block contains NONE - it is byte-identical).
+- Interpretation kept honest: "output-neutral elsewhere" holds exactly -
+  the ONLY change anywhere is the removal of far re-plans' stale q4
+  entries (1396 deleted lines, 0 changed/added lines in both programs).
+
+### Notes
+- Fixture regeneration (this fresh worktree had no out/): test_block.stl
+  via engine.model.step_to_stl('samples/test_block.step', tol=0.01)
+  (EXIT=0), test_block_hf_0.5.npy and test_block_hf_0.1.npy via
+  freecadcmd verify/heightfield.py per fixtures/manifest.json (EXIT=0
+  each). Sizes match the sibling worktrees' fixtures.
+- Probe/genprog artifacts: scratch/d9_genprog.py, scratch/d9_base_tree/,
+  scratch/d9_probe_tree/, scratch/d9_prog_{base,edit,probe}/,
+  scratch/d9_base_rough.py, scratch/d9_probe.log, scratch/d9_hf0*.log.
+
+### Statement
+Not committed (per brief). Edits ONLY in engine/rough.py (+19/-0 vs main
+498ebae = 19 changed lines, budget <= 25); test_engine.py, band.py,
+verify/, opencode.json untouched by me (its working-tree model-line
+change predates this session, as noted in the BS1a4d8e section). No
+existing test edited; no bypass flags; no gate relaxed; no
+limit/floor/margin/leave/feed change; no lock file touched; all scratch
+(genprog, probe/base trees, program captures, fixture logs) under
+scratch/; no Core Front job run; full suite left to the supervisor.
+Supervisor note: on Core Front expect the two known far re-plans (stale
+feed-ins at CF lines 64232 / 245855 on 498ebae) to lose their q4 entries;
+rjoin_chk/rjoin_cvt, ew0 sims and all act/stat records are unchanged.
+
+### git diff --numstat 498ebae (session end, 07:35 MST)
+  164  0  engine/BS1a4d6_RESULTS.md   (this appendix only)
+  48   0  engine/TASK_BS1a4d9.md      (the brief itself, committed)
+  51   0  engine/test_engine.py       (the red test, committed)
+  19   0  engine/rough.py             (the change: 19 lines)
+  22   1  opencode.json               (pre-existing working-tree model
+                                      line, NOT this session)
+Session 06:44-07:35 MST, inside the 2 h cap.

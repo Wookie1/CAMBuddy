@@ -60,6 +60,7 @@ the corridor-checked entry instead of diving across the forbidden gap; a flat
 level already in the step-up order (the final floor+axl level) keeps its
 mandatory flag so it can never be skipped.
 """
+import copy
 import math
 import os
 import time
@@ -2253,6 +2254,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             pz0 = prev[2]
             i0m = len(moves)
             h0 = helix_n[0]
+            sn9 = copy.deepcopy(stats) if res.get("replan0") else None
+            ts9 = stock.top.copy() if sn9 is not None else None
             enter_at(round(entry[0], 4), round(entry[1], 4), z, res["helix"],
                      side=bool(rp2_flag), bore=res.get("bore"))
             de = descend_feed(pxy0 + (pz0,), i0m)
@@ -2307,6 +2310,22 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                 res["seg"], stock, z, tool_r, stock.cell,
                                 None, (res["dropkey"], "drop_ring", None, []),
                                 _bfn)
+                            # BS1a4d9: the abandoned q4 entry leaves NO trace:
+                            # moves, prev, helix_n, the live stock and every
+                            # stat enter_at touched are restored to the state
+                            # before it (this far/rjoin decision's own rjoin_*
+                            # counters stay); the piece is entered ONLY at its
+                            # own start, by the enter_point below.
+                            rk9 = {k: v for k, v in stats.items()
+                                   if k.startswith("rjoin")}
+                            stock.top[:] = ts9
+                            del moves[i0m:]
+                            prev[0], prev[1], prev[2] = pxy0 + (pz0,)
+                            helix_n[0] = h0
+                            stats.clear()
+                            stats.update(sn9)
+                            stats.update(rk9)
+                            de = 0.0
                         act, drop_cut = "replan0_drop", True
                         if pnew is not None:
                             gp = [(round(a, 4), round(b, 4)) for a, b in pnew]
@@ -2326,6 +2345,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                     # ONE entry decision (bore + credit)
                                     enter_point(pcs[0][0], z,
                                                 bool(rp2_flag), res)
+                                    de = descend_feed(pxy0 + (pz0,), i0m)
                         stats["failed_region_emitted"].append(
                             {"x": q4[0], "y": q4[1], "z": round(z, 3),
                              "area": round(ba, 2),
