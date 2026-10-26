@@ -435,6 +435,8 @@ TB_STL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
                       "out", "test_block.stl")
 TB_HF = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "out", "test_block_hf_0.5.npy")
+TB_HF_01 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "out", "test_block_hf_0.1.npy")   # padded judge grid
 
 
 def test_rough_testblock_r2():
@@ -1067,6 +1069,1090 @@ def test_rough_rapids_clear_stock():
             % (n_bad, worst)
     print("PASS rough rapids clear stock: two-level %d moves, %d rapids "
           "lifted to verified heights" % (len(moves), stats["n_rapid_bumps"]))
+
+
+def test_bs1a4d6c_side_entry_no_under_read():
+    """BS1a4d6c item 2: a credit-0 piece entered from the SIDE into standing
+    stock. The predictor's max for that arrival (band._simulate at credit 0,
+    entry="side" - no start-disk pre-clear) must be >= the verify/zmap-judged
+    engagement of the SAME arrival as emitted (no under-read). Both numbers
+    printed."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import subprocess
+    import tempfile
+    import json as _json
+    import numpy as np
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.stock import StockField
+    from engine.gcode import moves_to_gcode
+    from engine.rough import build_part_hf
+    tr, cell, z = 6.343, 0.5, 6.0
+    box = (-25.0, 25.0, -20.0, 20.0, 0.0, 6.15)   # skin stands 0.15 over Z
+    # live stock AT PREDICT time: bore + channel cleared to Z at y=0, the
+    # rest of the blank still standing (a credit-0 arrival has no bore).
+    st = StockField(box, cell=cell)
+    st.mill_segment(-20.0, 0.0, -20.0, 0.0, z, tr, 0.0)
+    st.mill_path([(-20.0, 0.0), (-17.0, 0.0)], z, tr, 0.0)
+    # the piece: start P0 lies inside standing stock (its disk covers
+    # standing cells - the arrival load), then feeds along the cleared
+    # channel; credit 0, entry side (no helix, no bore).
+    p0 = (-17.0, 3.0)
+    path = [(p0[0], round(p0[1] - 0.4 * i, 4)) for i in range(16)]
+    ends = []
+    # BS1a4d6d: the emitted arrival feeds sideways at depth from (-17.0, 0.0)
+    # onto P0 (the offset_down shape below), so predict that approach too.
+    wins = B._simulate(path, st, z, tr, cell, 0.0, ends=ends, entry="side",
+                       approach=(-17.0, 0.0))
+    # window value is AREA (mm^2); as a width: area / that window's travel
+    lens = [e - (ends[i - 1] if i else 0.0) for i, e in enumerate(ends)]
+    pred = max((a / ln for a, ln in zip(wins, lens)), default=0.0)
+    # the SAME arrival as emitted: feed-down in the cleared bore column
+    # (0.15 mm <= AXIAL_FLOOR), channel slot, ONE sideways feed-in move at
+    # cutting feed onto P0 (the offset_down shape), then the piece.
+    moves = [{"g": 0, "x": -20.0, "y": 0.0, "z": 7.0},
+             {"g": 1, "x": -20.0, "y": 0.0, "z": z, "f": 250.0},
+             {"g": 1, "x": -17.0, "y": 0.0, "z": z, "f": 1000.0},
+             {"g": 1, "x": p0[0], "y": p0[1], "z": z, "f": 1000.0}]
+    for q in path[1:]:
+        moves.append({"g": 1, "x": q[0], "y": q[1], "z": z, "f": 1000.0})
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a4d6c_floor.stl")
+        _write_stl(stl, _box_tris(-45.0, 45.0, -35.0, 35.0, -1.0, 0.0))
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        ngc = os.path.join(td, "bs1a4d6c.ngc")
+        with open(ngc, "w") as fh:
+            fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+        hf = build_part_hf(surf, -45.0, -35.0, 0.5, 180, 140, threads=4,
+                           drop_z=-1.0)
+        hf_p = os.path.join(td, "part_hf.npy")
+        pad = int(math.ceil((tr + 5.0) / 0.5))
+        padded = np.full((hf.shape[0] + 2 * pad, hf.shape[1] + 2 * pad),
+                         np.nan, dtype=hf.dtype)
+        padded[pad:pad + hf.shape[0], pad:pad + hf.shape[1]] = hf
+        np.save(hf_p, padded)
+        with open(hf_p[:-4] + ".json", "w") as fh:
+            _json.dump({"x0": -45.0 - pad * 0.5, "y0": -35.0 - pad * 0.5,
+                        "cell": 0.5, "tess_tol": 0.01}, fh)
+        dj = os.path.join(td, "ae2.json")
+        rr = subprocess.run(
+            [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+             "--part", hf_p, "--tool", "flat", "--dia", "%.3f" % (2 * tr),
+             "--stock", *[str(v) for v in box], "--engage-max", "2.438",
+             "--ae2-dump", dj],
+            capture_output=True, text=True, cwd=repo)
+        assert rr.returncode == 0, "zmap failed: %s | %s" % (
+            rr.stdout[-500:], rr.stderr[-500:])
+        wj = _json.load(open(dj))
+    # arrival windows = windows ending at the feed-in end (P0) or a piece
+    # path point, at Z, that actually cut (a > 0): the feed-in and the
+    # piece as emitted (the channel slot window ends at (-17, 0) - not the
+    # arrival - and is excluded).
+    key = {(round(q[0], 3), round(q[1], 3)) for q in path}
+    own = [w for w in wj if abs(w["z"] - z) < 1e-3 and w["a"] > 0.0
+           and (round(w["x"], 3), round(w["y"], 3)) in key]
+    assert own, "no judged arrival window at the side entry: vacuous test"
+    judged = max(w["ae_eff"] for w in own)
+    D = 2.0 * tr
+    print("BS1a4d6c/d side entry into standing stock: predictor max width "
+          "%.3f mm vs zmap-judged max ae_eff %.3f mm (arrival windows %d, "
+          "D %.3f mm)" % (pred, judged, len(own), D))
+    assert pred >= judged, \
+        "UNDER-READ: credit-0 side arrival predictor width %.3f mm < " \
+        "zmap-judged %.3f mm (the entry's own engagement is missing from the " \
+        "prediction)" % (pred, judged)
+    assert pred <= D, \
+        "OVER-READ: credit-0 side arrival predictor width %.3f mm > " \
+        "D %.3f mm - impossible as an engagement width (the approach move " \
+        "into path[0] is not being simulated)" % (pred, D)
+    print("PASS bs1a4d6c side-entry no-under-read: predictor %.3f mm >= "
+          "judged %.3f mm and <= D %.3f mm" % (pred, judged, D))
+
+
+def test_bs1a4d6d_approach_simulated_in_window0():
+    """BS1a4d6d item 1 (pure engine, no zmap): for entry="side"/"link" with
+    approach=A, band._simulate replays the move A -> path[0] through the live
+    stock, so window 0 holds the approach's own engagement (width <= D)
+    instead of the whole standing start disk (width > D). entry="bore" must
+    ignore approach (pre-clear route unchanged)."""
+    import engine.band as B
+    from engine.stock import StockField
+    tr, cell, z = 6.343, 0.5, 6.0
+    D = 2.0 * tr
+
+    def fresh():
+        st = StockField((-25.0, 25.0, -20.0, 20.0, 0.0, 6.15), cell=cell)
+        st.mill_segment(-20.0, 0.0, -20.0, 0.0, z, tr, 0.0)
+        st.mill_path([(-20.0, 0.0), (-17.0, 0.0)], z, tr, 0.0)
+        return st
+    p0 = (-17.0, 3.0)
+    path = [(p0[0], round(p0[1] - 0.4 * i, 4)) for i in range(16)]
+    A = (-17.0, 0.0)
+
+    def widths(bore_r=0.0, **kw):
+        ends = []
+        wins = B._simulate(path, fresh(), z, tr, cell, bore_r, ends=ends,
+                           **kw)
+        lens = [e - (ends[i - 1] if i else 0.0) for i, e in enumerate(ends)]
+        return [a / ln for a, ln in zip(wins, lens)]
+    w_no = widths(entry="side")
+    w_ap = widths(entry="side", approach=A)
+    print("BS1a4d6d window0 width: no-approach %.3f mm, with-approach "
+          "%.3f mm (D %.3f mm)" % (w_no[0], w_ap[0], D))
+    assert w_no[0] > D, "today's bug should over-read window 0 (> D): %.3f" \
+        % w_no[0]
+    assert 0.0 < w_ap[0] <= D, "approach's own engagement must be in window " \
+        "0 and a possible width: %.3f mm (D %.3f)" % (w_ap[0], D)
+    assert w_ap[0] < w_no[0], "simulating the approach must lower window 0 " \
+        "below the standing disk"
+    assert max(w_ap) <= max(w_no), "the approach may not invent load"
+    # entry="bore" keeps its pre-clear route and ignores approach
+    b_plain = [round(v, 6) for v in widths(entry="bore", bore_r=tr)]
+    b_appr = [round(v, 6) for v in widths(entry="bore", bore_r=tr,
+                                           approach=A)]
+    assert b_plain == b_appr, "approach must not touch entry='bore'"
+    print("PASS bs1a4d6d approach simulated in window 0: %.3f -> %.3f mm"
+          % (w_no[0], w_ap[0]))
+
+
+def test_bs1a4d7_sub1mm_tail_merges_not_dropped():
+    """Task BS1a4d7 item 2: ZG2's pushed-over synthetic THROUGH
+    band._simulate. A 1.2 mm side cut along a wall whose face sits 0.865 mm
+    inside the tool radius (ZG2's _zg2_wall_stock width) plus a 0.99 mm tail
+    turned >45 deg into fresh standing wall below the path's disk - the
+    engine's chain break where ZG2's case has the rapid+plunge. ZG2 merges
+    the sub-1 mm tail into the kept window (zg2 zmap merged ae_eff 5.857 mm
+    vs dropped-tail 0.800 mm), so the engine must read the merged window
+    over the 2.25 spike bar too. Engine value = area / that window's travel
+    (mm), like the side-entry test; the ZG2 zmap value is measured by
+    feeding the SAME per-move cell areas through zg2 verify/zmap's
+    _ae2_windows. Both printed. Dropping the tail again (mutation) leaves
+    ~0.6 mm and the measured-value assert fails."""
+    import numpy as np
+    import engine.band as B
+    from engine.stock import StockField
+    tr, cell, z = 6.343, 0.5, 6.0
+    box = (-25.0, 25.0, -20.0, 20.0, 0.0, 6.15)
+    face = tr - 0.865            # ZG2 wall: face 0.865 mm inside the radius
+
+    def wall_stock():
+        st = StockField(box, cell=cell)
+        ys = st.y0 + (np.arange(st.ny) + 0.5) * cell
+        st.top = np.where(st.inb & (ys <= -face + 1e-9)[:, None], 6.15,
+                          -np.inf)
+        return st
+    # chain: 2 x 0.6 mm side cut along y=0 (start disk pre-cleared = the
+    # plunge), then a 0.99 mm tail turned 90 deg into fresh wall (< 1 mm).
+    path = [(-20.0, 0.0), (-19.4, 0.0), (-18.8, 0.0), (-18.8, -0.99)]
+    ends = []
+    wins = B._simulate(path, wall_stock(), z, tr, cell, tr, ends=ends,
+                       entry="bore", bore_xy=(-20.0, 0.0))
+    assert len(wins) == 1, "ZG2 keeps ONE window (tail merges): %r" % (wins,)
+    lens = [e - (ends[i - 1] if i else 0.0) for i, e in enumerate(ends)]
+    assert abs(lens[0] - 1.2) < 1e-9, "kept window must close at 1.2 mm"
+    eng_w = wins[0] / lens[0]
+    # the same cell areas move by move (plunge clears the start disk, then
+    # the engine's cell-centre disk sampling), fed through ZG2's own
+    # _ae2_windows; the tail chain breaks on a non-consecutive idx, exactly
+    # where the engine's chord break fires.
+    from verify import zmap as zm   # ZG2 is on main: this repo's zmap merges tails
+    st = wall_stock()
+    xs = st.x0 + (np.arange(st.nx) + 0.5) * cell
+    ys = st.y0 + (np.arange(st.ny) + 0.5) * cell
+    wall = st.inb & (ys <= -face + 1e-9)[:, None]
+    gone = np.zeros(wall.shape, dtype=bool)
+
+    def cut(x, y):               # cells this move's disk newly removes
+        nonlocal gone
+        ax = st.x0 + (st._ci(x) + 0.5) * cell    # engine anchors the disk
+        ay = st.y0 + (st._cj(y) + 0.5) * cell    # to the cell centre
+        d2 = ((xs - ax)[None, :] ** 2 + (ys - ay)[:, None] ** 2)
+        new = wall & (d2 <= tr * tr) & ~gone
+        gone |= new
+        return float(new.sum()) * cell * cell
+    cut(-20.0, 0.0)                              # the entry plunge
+    areas = [cut(-19.4, 0.0), cut(-18.8, 0.0), cut(-18.8, -0.99)]
+    mv = [dict(idx=k, line=10 + k, x=p[0], y=p[1], z=round(z, 3),
+               dx=d[0], dy=d[1], length_mm=L, area_mm2=a, depth_mm=0.15,
+               width_mm=0.865, feed=1000.0)
+          for k, (p, d, L, a) in enumerate(zip(
+              path[1:], [(1.0, 0.0), (1.0, 0.0), (0.0, -1.0)],
+              [0.6, 0.6, 0.99], areas))]
+    mv[2]["idx"] = 3             # rapid+plunge gap: the tail is its own chain
+    zw = zm._ae2_windows(mv)
+    assert len(zw) == 1, "ZG2 zmap must keep 1 merged window: %r" % (zw,)
+    z_w = zw[0]["ae_eff"]
+    pre_merge = (areas[0] + areas[1]) / 1.2      # what dropping the tail left
+    print("BS1a4d7 merged window: engine %.3f mm (area %.3f / len %.3f), "
+          "ZG2 zmap ae_eff %.3f mm (area %.3f / len %.3f); dropped-tail "
+          "value %.3f mm" % (eng_w, wins[0], lens[0], z_w, zw[0]["area_mm2"],
+                             zw[0]["length_mm"], pre_merge))
+    assert eng_w > 2.25, \
+        "engine merged window %.3f mm not judged over the 2.25 spike bar" \
+        % eng_w
+    assert z_w > 2.25, "ZG2 zmap merged ae_eff %.3f mm not over 2.25" % z_w
+    assert pre_merge < 2.25, \
+        "the dropped-tail value %.3f mm must sit UNDER the bar (the merge " \
+        "is what pushes the window over)" % pre_merge
+    assert abs(wins[0] - sum(areas)) < 1e-9, \
+        "engine merged area %.3f != per-move cell areas %.3f" % (
+            wins[0], sum(areas))
+    print("PASS bs1a4d7 sub-1 mm tail merges: engine %.3f mm > 2.25 > "
+          "%.3f mm dropped" % (eng_w, pre_merge))
+
+
+def test_bs1a4d8_arrival_gate_reads_judge_skin():
+    """BS1a4d8 item 1+2: a straight cutting-feed arrival across a floor that
+    stands inside the OLD link-clear eps band (Z, Z+0.05] - the CF 64232/
+    64233 signature (engine 0.000 vs judged 8.486/9.319: the corridor floor
+    left by the previous level's disk rim stands a hair above Z, which the
+    engine read as clear while zmap counts EVERY cell above Z at full area).
+    The arrival gate (lnk_cut_ok) now simulates the link through the LIVE
+    stock at the judge's own threshold (eps=0). Asserts, with values printed:
+    (a) stock.link_clear at the old eps=0.05 says the corridor is clear;
+    (b) band._simulate at the old eps reads ZERO load on that link;
+    (c) at eps=0 (what the gate uses now) the same link reads a full-disk
+    cut, and verify/zmap judging the link AS EMITTED reads the same load;
+    a dense eps=0 replay of the same corridor mirrors zmap's continuous
+    sweep with no under-read (the single-chord gate reading is a
+    point-sample floor pi*r^2/L, still far over 2.44);
+    (d) WIRED: during a real rough() every entry="link" _simulate call the
+    arrival gate makes carries eps=0.0 (mutation: revert the gate's eps to
+    0.05 and this assert fails by the measured eps)."""
+    import subprocess
+    import tempfile
+    import json as _json
+    import numpy as np
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.stock import StockField
+    from engine.gcode import moves_to_gcode
+    from engine.rough import rough, build_part_hf
+    tr, cell, z = 6.343, 0.5, 6.0
+    D = 2.0 * tr
+    box = (-25.0, 25.0, -20.0, 20.0, 0.0, 6.01)
+
+    def skin():
+        st = StockField(box, cell=cell)
+        st.top = np.where(st.inb, 6.01, -np.inf)   # floor stands 0.01 over Z
+        st.set_tool(tr, 0.0)
+        return st
+    line = [(-8.0, 0.0), (8.0, 0.0)]
+    # (a) the OLD gate waved this through
+    assert skin().link_clear(line, z), \
+        "scenario broken: old-eps link_clear must pass this corridor"
+    assert not skin().link_clear(line, z, eps=0.0), \
+        "scenario broken: the judge-threshold clear must fail"
+
+    def widths(eps):
+        ends = []
+        w = (B._simulate(line, skin(), z, tr, cell, 0.0, ends=ends,
+                         entry="link", eps=eps) if eps is not None else
+             B._simulate(line, skin(), z, tr, cell, 0.0, ends=ends,
+                         entry="link"))
+        ln = [e - (ends[i - 1] if i else 0.0) for i, e in enumerate(ends)]
+        return [a / l for a, l in zip(w, ln)] or [0.0]
+    w_old = widths(None)                       # default eps = 0.05 (blind)
+    w_new = widths(0.0)                        # what the gate reads now
+    dense = [(round(-8.0 + 0.5 * i, 3), 0.0) for i in range(33)]
+    ends_d = []
+    w_dense = [a / l for a, l in zip(
+        B._simulate(dense, skin(), z, tr, cell, 0.0, ends=ends_d,
+                    entry="link", eps=0.0),
+        [e - (ends_d[i - 1] if i else 0.0) for i, e in enumerate(ends_d)])]
+    print("BS1a4d8 skin link: old-eps engine widths %s, eps=0 widths %s, "
+          "dense-replay widths %s (D %.3f mm)"
+          % ([round(v, 3) for v in w_old], [round(v, 3) for v in w_new],
+             [round(v, 3) for v in w_dense[:4]], D))
+    # (b) old reading: zero
+    assert max(w_old) == 0.0, "old eps must still read 0 (bug preserved " \
+        "as documented): %r" % (w_old,)
+    # (c) new reading: a full-disk cut, over the bar
+    assert max(w_new) > 2.44, "eps=0 gate reads %.3f mm - not the judged " \
+        "load" % max(w_new)
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a4d8_floor.stl")
+        _write_stl(stl, _box_tris(-45.0, 45.0, -35.0, 35.0, -1.0, 0.0))
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        moves = [{"g": 0, "x": -8.0, "y": 0.0, "z": 7.0},
+                 {"g": 1, "x": -8.0, "y": 0.0, "z": z, "f": 250.0},
+                 {"g": 1, "x": 8.0, "y": 0.0, "z": z, "f": 3429.0}]
+        ngc = os.path.join(td, "bs1a4d8.ngc")
+        with open(ngc, "w") as fh:
+            fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+        hf = build_part_hf(surf, -45.0, -35.0, 0.5, 180, 140, threads=4,
+                           drop_z=-1.0)
+        hf_p = os.path.join(td, "part_hf.npy")
+        pad = int(math.ceil((tr + 5.0) / 0.5))
+        padded = np.full((hf.shape[0] + 2 * pad, hf.shape[1] + 2 * pad),
+                         np.nan, dtype=hf.dtype)
+        padded[pad:pad + hf.shape[0], pad:pad + hf.shape[1]] = hf
+        np.save(hf_p, padded)
+        with open(hf_p[:-4] + ".json", "w") as fh:
+            _json.dump({"x0": -45.0 - pad * 0.5, "y0": -35.0 - pad * 0.5,
+                        "cell": 0.5, "tess_tol": 0.01}, fh)
+        dj = os.path.join(td, "ae2.json")
+        rr = subprocess.run(
+            [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+             "--part", hf_p, "--tool", "flat", "--dia", "%.3f" % D,
+             "--stock", *[str(v) for v in box], "--engage-max", "2.438",
+             "--ae2-dump", dj],
+            capture_output=True, text=True, cwd=repo)
+        assert rr.returncode == 0, "zmap failed: %s | %s" % (
+            rr.stdout[-500:], rr.stderr[-500:])
+        wj = _json.load(open(dj))
+    cut = [w for w in wj if abs(w["z"] - z) < 1e-3 and w["feed"] > 3000.0
+           and w["area_mm2"] > 0.0]
+    assert cut, "no judged cutting-feed window on the link: vacuous"
+    judged = max(w["ae_eff"] for w in cut)
+    print("BS1a4d8 skin link judged by zmap: ae_eff %.3f mm vs gate "
+          "reading %.3f mm (old reading 0.000)" % (judged, max(w_new)))
+    assert judged > 2.44, "zmap judged the skin link %.3f mm - not over " \
+        "2.44 (scenario broken)" % judged
+    # the gate's single-chord reading is a point-sample floor (pi*r^2/L);
+    # the dense replay mirrors zmap's continuous sweep: no under-read.
+    assert max(w_dense) >= judged - 1e-6, \
+        "UNDER-READ: dense eps=0 replay %.3f mm < zmap-judged %.3f mm" % (
+            max(w_dense), judged)
+    # (d) wired: every entry="link" sim the engine makes for an arrival gate
+    # runs at the judge's threshold.
+    assert HAVE_AREA, "area module missing"
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+    link_calls = []
+    _orig_sim = B._simulate
+
+    def sim_spy(path, stock, z_, tool_r_, cell_, bore_r, ends=None, **kw):
+        if kw.get("entry") == "link":
+            link_calls.append(kw.get("eps", 0.05))
+        return _orig_sim(path, stock, z_, tool_r_, cell_, bore_r, ends, **kw)
+    B._simulate = sim_spy
+    try:
+        with tempfile.TemporaryDirectory() as td2:
+            stl2 = os.path.join(td2, "bs1a4d8_wire.stl")
+            _write_stl(stl2, tris)
+            surf2 = ocl.STLSurf()
+            ocl.STLReader(stl2, surf2)
+            _m, st2 = rough(surf2, (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0),
+                            6.343, 0.0, leave=0.381, axial_leave=0.381,
+                            stepdown=19.05, stepup=1.905, tolerance=0.05,
+                            threads=4, stock_cell=0.5, min_rest=0.5,
+                            corner_r=0.0, stl_path=stl2)
+    finally:
+        B._simulate = _orig_sim
+    print("BS1a4d8 wiring: %d entry='link' arrival sims, eps values %s"
+          % (len(link_calls), sorted(set(link_calls))))
+    assert link_calls, "no entry='link' arrival sim ran: wiring vacuous"
+    assert all(e == 0.0 for e in link_calls), \
+        "arrival gate simulated at eps %r - must be the judge's 0.0" % (
+            sorted(set(link_calls)),)
+    assert st2.get("clcheck_violations", 0) == 0, st2.get(
+        "clcheck_violations")
+    print("PASS bs1a4d8 arrival gate: skin link old 0.000 mm, gate %.3f mm, "
+          "zmap %.3f mm; %d wired link sims at eps=0"
+          % (max(w_new), judged, len(link_calls)))
+
+
+def test_bs1a4d8b_no_unsimulated_link_into_path():
+    """BS1a4d8b (c): a region ENTERED at a stored start that is NOT its
+    path's first point must never be linked into that path straight at
+    cutting feed (CF 64233: 25.2 mm G1 F3429 entry-end -> path[0], judged
+    ae_eff 9.319 / a 18.61, lnk_cut_ok never called). SYNTHETIC scene only
+    (no James-part fixture): a pocket block roughed at two levels 0.029 mm
+    apart, so at the final level Z = 4.381 the floor stands a hair
+    (0.029 <= 0.05 mm) above Z - inside the OLD link-clear eps band, the
+    CF skin signature. Two pieces at Z are injected honestly through the
+    engine's own emitter loop: one cuts in the LEFT bay; the other's stored
+    start is 1 mm from the previous piece's end (left bay) while its path's
+    FIRST point sits in the RIGHT bay, 22.4 mm straight across the skin
+    floor. Asserts, measured from the emitted moves: (i) the live engine
+    stock reads that link CLEAR at the old eps 0.05 and STANDING at the
+    judge's eps 0 (the backstop is not redundant with link_clear); (ii) NO
+    cutting-feed move at Z longer than one step (0.6 mm) leaves the left
+    side of the corridor and lands on its right side; (iii) the left-piece
+    -> right-piece transition IS a lift + rapid at Z + lift + entry descent
+    (the fallback the brief prescribes); (iv) the run-loop backstop fired
+    (stats["n_backstop_links"] >= 1 - the test measures the guard, and a
+    2 mm intra-run chord over the same skin is exactly what it caught);
+    (v) verify/zmap's raw ae2 windows show NO cutting-feed window over
+    2.44 mm anywhere along the link line. MUTATIONS (scratch copies):
+    backstop off AND (a) reverted -> this fails by the MEASURED overloaded
+    link (ae_eff and a printed); backstop off with (a) kept -> the link
+    assertions pass ((a) alone removes the CF site) and only the backstop
+    counter assert fails (the general net is off). NOTE: the injected
+    right-bay piece is a deliberate full-width slotting pass at x = 10 -
+    path INTERIORS are outside this brief's backstop (transitions only),
+    so the window assert is scoped to the link bbox, not the whole level.
+    """
+    import subprocess
+    import tempfile
+    import json as _json
+    import numpy as np
+    from opencamlib import ocl
+    import engine.rough as R
+    from engine.rough import rough, build_part_hf
+    from engine.gcode import moves_to_gcode
+    assert HAVE_AREA, "area module missing: run with VibeCAD python"
+    Z, LIFT, CUT_F, RAMP_F = 4.381, 1.9, 3429.0, 1270.0
+    box = (-25.0, 25.0, -20.0, 20.0, 0.0, 6.03)
+    link = [(-12.0, 2.0), (10.0, -6.0)]      # entry-end -> path[0]
+
+    def quad(a, b, c, d):
+        return [(a, b, c), (a, c, d)]
+
+    X0, X1, Y0, Y1, px, py, zf, zt = -25.0, 25.0, -20.0, 20.0, 20.0, 15.0, \
+        4.0, 6.03
+    t = []
+    t += quad((X0, Y0, 0), (X0, Y1, 0), (X1, Y1, 0), (X1, Y0, 0))
+    t += quad((X1, Y0, 0), (X1, Y1, 0), (X1, Y1, zt), (X1, Y0, zt))
+    t += quad((X0, Y0, 0), (X0, Y0, zt), (X0, Y1, zt), (X0, Y1, 0))
+    t += quad((X0, Y1, 0), (X0, Y1, zt), (X1, Y1, zt), (X1, Y1, 0))
+    t += quad((X0, Y0, 0), (X1, Y0, 0), (X1, Y0, zt), (X0, Y0, zt))
+    # top annulus (frame around the pocket mouth)
+    t += quad((X0, Y0, zt), (X0, -py, zt), (-px, -py, zt), (-px, Y0, zt))
+    t += quad((px, Y0, zt), (px, -py, zt), (X1, -py, zt), (X1, Y0, zt))
+    t += quad((X0, py, zt), (X0, Y1, zt), (-px, Y1, zt), (-px, py, zt))
+    t += quad((px, py, zt), (px, Y1, zt), (X1, Y1, zt), (X1, py, zt))
+    # pocket walls (material outside, air inside: normals face inward)
+    t += quad((-px, -py, zf), (-px, py, zf), (-px, py, zt), (-px, -py, zt))
+    t += quad((px, -py, zf), (px, -py, zt), (px, py, zt), (px, py, zf))
+    t += quad((-px, -py, zf), (-px, -py, zt), (px, -py, zt), (px, -py, zf))
+    t += quad((-px, py, zf), (-px, py, zt), (px, py, zt), (px, py, zf))
+    t += quad((-px, -py, zf), (-px, py, zf), (px, py, zf), (px, -py, zf))
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a4d8b.stl")
+        _write_stl(stl, t)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        calls = {"n": 0}
+        skin = {}
+        _orig_a2d, _orig_hug = R._run_a2d, R.hug_regions
+
+        def a2d_spy(*a, **k):
+            regs = _orig_a2d(*a, **k)
+            calls["n"] += 1
+            if calls["n"] == 2:   # the Z 4.381 level (levels: 4.41, 4.381)
+                regs = ([{"start": [-13.0, 0.0], "helix": None,
+                          "paths": [["cutting", [[-13.0, 0.0],
+                                                  [-13.0, 2.0]]]]},
+                         {"start": [-12.0, 2.0], "helix": None,
+                          "paths": [["cutting", [[10.0, -6.0],
+                                                  [10.0, 6.0]]]]},
+                         # piece whose linkclear corridor LIFTS (its mid
+                         # point is island-illegal) and lands at (6, 8)
+                         # while its cutting path starts at (-4, -6): a
+                         # 14.4 mm piece-to-piece transition straight
+                         # across the uncut skin corridor that the run-loop
+                         # backstop must simulate (the (a) redirect cannot
+                         # pre-empt it: entry and path[0] already agree)
+                         {"start": [6.0, 8.0], "helix": None,
+                          "paths": [["linkclear",
+                                     [[2.0, 8.0], [4.0, 14.0],
+                                      [6.0, 8.0]]],
+                                    ["cutting", [[-4.0, -6.0],
+                                                 [-4.0, 6.0]]]]}]
+                        + regs)
+            return regs
+
+        def hug_spy(islands, grown, stock, isl_ok, **k):
+            if "lc" not in skin:
+                lc05 = stock.link_clear(link, Z)
+                if lc05:   # only the Z 4.381 level reads the skin as clear
+                    skin["lc"] = (lc05, stock.link_clear(link, Z, eps=0.0))
+            return _orig_hug(islands, grown, stock, isl_ok, **k)
+
+        R._run_a2d, R.hug_regions = a2d_spy, hug_spy
+        try:
+            moves, stats = rough(surf, box, 6.343, 4.0, leave=0.381,
+                                 axial_leave=0.381, stepdown=1.62,
+                                 stepup=1.905, stepover=0.16,
+                                 tolerance=0.05, threads=4,
+                                 stock_cell=0.5, min_rest=0.3, corner_r=0.0,
+                                 stl_path=stl)
+        finally:
+            R._run_a2d, R.hug_regions = _orig_a2d, _orig_hug
+    print("BS1a4d8b scene: levels %s, moves %d, backstop firings %s"
+          % (stats["levels_planned"], len(moves),
+             stats.get("n_backstop_links", 0)))
+    assert stats["levels_planned"] == [4.41, 4.381], stats["levels_planned"]
+    assert calls["n"] == 2, "expected 2 levels, _run_a2d ran %d time(s)" \
+        % calls["n"]
+    # (i) the CF eps signature on the LIVE engine model
+    assert skin.get("lc") == (True, False), \
+        "scenario broken: skin link must read clear at eps 0.05 and " \
+        "standing at eps 0 on the live model, got %r" % (skin.get("lc"),)
+    cuts = [i for i, m in enumerate(moves)
+            if m["g"] == 1 and m.get("f") == CUT_F and m.get("z") is not None
+            and abs(m["z"] - Z) < 1e-6]
+    assert cuts, "no cutting-feed move at Z emitted: vacuous"
+
+    def _span(i):
+        a, b = moves[i - 1], moves[i]
+        return math.dist((a["x"], a["y"]), (b["x"], b["y"]))
+
+    # (ii) no cutting-feed step > one step (0.6 mm) crosses the corridor
+    cross = [i for i in cuts if _span(i) > 0.6
+             and ((moves[i - 1]["x"] < -1.5 and moves[i]["x"] > 1.5)
+                  or (moves[i - 1]["x"] > 1.5
+                      and moves[i]["x"] < -1.5))]
+    # (v) judge the program: raw ae2 windows along the link line
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    with tempfile.TemporaryDirectory() as td2:
+        ngc = os.path.join(td2, "bs1a4d8b.ngc")
+        with open(ngc, "w") as fh:
+            fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+        hf = build_part_hf(surf, box[0], box[2], 0.5, 180, 140, threads=4,
+                           drop_z=box[4] - 1.0)
+        hf_p = os.path.join(td2, "part_hf.npy")
+        pad = int(math.ceil((6.343 + 5.0) / 0.5))
+        padded = np.full((hf.shape[0] + 2 * pad, hf.shape[1] + 2 * pad),
+                         np.nan, dtype=hf.dtype)
+        padded[pad:pad + hf.shape[0], pad:pad + hf.shape[1]] = hf
+        np.save(hf_p, padded)
+        with open(hf_p[:-4] + ".json", "w") as fh:
+            _json.dump({"x0": box[0] - pad * 0.5, "y0": box[2] - pad * 0.5,
+                        "cell": 0.5, "tess_tol": 0.01}, fh)
+        dj = os.path.join(td2, "ae2.json")
+        rr = subprocess.run(
+            [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+             "--part", hf_p, "--tool", "flat", "--dia", "12.686",
+             "--stock", *[str(v) for v in box], "--engage-max", "2.438",
+             "--ae2-dump", dj],
+            capture_output=True, text=True, cwd=repo)
+        assert rr.returncode == 0, "zmap failed: %s | %s" % (
+            rr.stdout[-300:], rr.stderr[-300:])
+        wj = _json.load(open(dj))
+    along = [w for w in wj if abs(w["z"] - Z) < 2e-3 and w.get("feed", 0)
+             > 3000.0 and -12.5 <= w["x"] <= 10.5 and -6.5 <= w["y"] <= 2.5]
+    over = [w for w in along if w["ae_eff"] > 2.44]
+    # (ii) failure FIRST with the judged load (the mutation's evidence):
+    # a cross-corridor cutting-feed step is legal ONLY if the backstop
+    # simulated it (bstd_chk counts those lnk_cut_ok calls).
+    if cross and not stats.get("bstd_chk", 0):
+        worst = max(along, key=lambda w: w["ae_eff"]) if along else None
+        raise AssertionError(
+            "run loop linked entry-end -> path[0] UNSIMULATED straight at "
+            "cutting feed: %d move(s), e.g. line %s (%.3f, %.3f) -> "
+            "(%.3f, %.3f) %.2f mm; zmap-judged link windows: ae_eff %.3f "
+            "mm, a %.3f mm"
+            % (len(cross), moves[cross[0]].get("line", "?"),
+               moves[cross[0] - 1]["x"], moves[cross[0] - 1]["y"],
+               moves[cross[0]]["x"], moves[cross[0]]["y"], _span(cross[0]),
+               worst["ae_eff"] if worst else -1,
+               worst["a"] if worst else -1))
+    assert not cross or stats.get("bstd_chk", 0) >= len(cross), \
+        "%d cross-corridor cutting-feed step(s) but only %d simulated " \
+        "link check(s) ran" % (len(cross), stats.get("bstd_chk", 0))
+    # (iii) the transition left piece -> right piece is lift + entry
+    i1 = next(i for i in cuts if moves[i]["x"] > 1.5)
+    j0 = max(i for i in cuts if i < i1 and moves[i]["x"] < -1.5)
+    mid = moves[j0 + 1:i1]
+    assert not [m for m in mid if m["g"] == 1 and m.get("f") == CUT_F
+                and m.get("z") is not None and abs(m["z"] - Z) < 1e-6], \
+        "cutting-feed move at Z inside the piece-to-piece transition"
+    assert any(m["g"] == 0 and m["z"] >= Z + LIFT - 0.01 for m in mid), \
+        "no rapid at Z + lift between the pieces: transition %s" % (
+            [(m["g"], round(m["z"], 3)) for m in mid][:12])
+    assert any(m["g"] == 1 and m["z"] <= Z + 1e-9 and
+               mid[k - 1]["z"] > m["z"] + 1e-9
+               for k, m in enumerate(mid) if k), \
+        "no entry descent to Z at the right-bay piece"
+    # (iv) the backstop is wired and measured in this scene: it ran its
+    # simulated-link check on the piece-to-piece transition(s) and/or
+    # converted one into a lift + entry.
+    assert stats.get("bstd_chk", 0) + stats.get("n_backstop_links", 0) \
+        >= 1, \
+        "run-loop backstop never engaged (bstd_chk/n_backstop_links both " \
+        "zero): the guard is off"
+    assert not over, \
+        "cutting-feed window(s) over 2.44 mm on the link: worst ae_eff " \
+        "%.3f mm, a %.3f mm (line %s)" % (
+            max(w["ae_eff"] for w in over),
+            max(over, key=lambda w: w["ae_eff"])["a"],
+            max(over, key=lambda w: w["ae_eff"]).get("line", "?"))
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    print("PASS bs1a4d8b: no UNSIMULATED cutting-feed link crosses the skin "
+          "corridor; transition = %d moves incl. rapid >= %.2f + entry "
+          "descent; backstop checks %d, conversions %d; %d judged link "
+          "windows, max ae_eff %.3f mm"
+          % (len(mid), Z + LIFT, stats.get("bstd_chk", 0),
+             stats.get("n_backstop_links", 0), len(along),
+             max((w["ae_eff"] for w in along), default=0.0)))
+
+
+def _bs1a4d8c_pocket_tris():
+    """BS1a4d8c scenes: the d8b pocket block (pocket -20..20 x -15..15,
+    floor 4.0, top 6.03) - roughed at levels [4.41, 4.381] the final level
+    leaves a 0.029 mm skin standing over the floor: clear inside the OLD
+    eps 0.05 band, STANDING at the judge's eps 0 (the CF signature)."""
+
+    def quad(a, b, c, d):
+        return [(a, b, c), (a, c, d)]
+
+    X0, X1, Y0, Y1, px, py, zf, zt = -25.0, 25.0, -20.0, 20.0, 20.0, 15.0, \
+        4.0, 6.03
+    t = []
+    t += quad((X0, Y0, 0), (X0, Y1, 0), (X1, Y1, 0), (X1, Y0, 0))
+    t += quad((X1, Y0, 0), (X1, Y1, 0), (X1, Y1, zt), (X1, Y0, zt))
+    t += quad((X0, Y0, 0), (X0, Y0, zt), (X0, Y1, zt), (X0, Y1, 0))
+    t += quad((X0, Y1, 0), (X0, Y1, zt), (X1, Y1, zt), (X1, Y1, 0))
+    t += quad((X0, Y0, 0), (X1, Y0, 0), (X1, Y0, zt), (X0, Y0, zt))
+    t += quad((X0, Y0, zt), (X0, -py, zt), (-px, -py, zt), (-px, Y0, zt))
+    t += quad((px, Y0, zt), (px, -py, zt), (X1, -py, zt), (X1, Y0, zt))
+    t += quad((X0, py, zt), (X0, Y1, zt), (-px, Y1, zt), (-px, py, zt))
+    t += quad((px, py, zt), (px, Y1, zt), (X1, Y1, zt), (X1, py, zt))
+    t += quad((-px, -py, zf), (-px, py, zf), (-px, py, zt), (-px, -py, zt))
+    t += quad((px, -py, zf), (px, -py, zt), (px, py, zt), (px, py, zf))
+    t += quad((-px, -py, zf), (-px, -py, zt), (px, -py, zt), (px, -py, zf))
+    t += quad((-px, py, zf), (-px, py, zt), (px, py, zt), (px, py, zf))
+    t += quad((-px, -py, zf), (-px, py, zf), (px, py, zf), (px, -py, zf))
+    return t
+
+
+def _bs1a4d8c_judge(moves, surf, box, td2):
+    """zmap the program (the judge's own ae2 windows); returns the dump."""
+    import subprocess
+    import json as _json
+    import numpy as np
+    from engine.rough import build_part_hf
+    from engine.gcode import moves_to_gcode
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    ngc = os.path.join(td2, "bs1a4d8c.ngc")
+    with open(ngc, "w") as fh:
+        fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+    hf = build_part_hf(surf, box[0], box[2], 0.5, 180, 140, threads=4,
+                       drop_z=box[4] - 1.0)
+    hf_p = os.path.join(td2, "part_hf.npy")
+    pad = int(math.ceil((6.343 + 5.0) / 0.5))
+    padded = np.full((hf.shape[0] + 2 * pad, hf.shape[1] + 2 * pad),
+                     np.nan, dtype=hf.dtype)
+    padded[pad:pad + hf.shape[0], pad:pad + hf.shape[1]] = hf
+    np.save(hf_p, padded)
+    with open(hf_p[:-4] + ".json", "w") as fh:
+        _json.dump({"x0": box[0] - pad * 0.5, "y0": box[2] - pad * 0.5,
+                    "cell": 0.5, "tess_tol": 0.01}, fh)
+    dj = os.path.join(td2, "ae2.json")
+    rr = subprocess.run(
+        [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+         "--part", hf_p, "--tool", "flat", "--dia", "12.686",
+         "--stock", *[str(v) for v in box], "--engage-max", "2.438",
+         "--ae2-dump", dj],
+        capture_output=True, text=True, cwd=repo)
+    assert rr.returncode == 0, "zmap failed: %s | %s" % (
+        rr.stdout[-300:], rr.stderr[-300:])
+    return _json.load(open(dj))
+
+
+def _bs1a4d8c_near(w, a, b, tol=2.5, m=4.0):
+    """window w within tol mm of segment a->b, projection at least m mm
+    from either end (keeps the pieces' own entries out of the corridor)."""
+    vx, vy = b[0] - a[0], b[1] - a[1]
+    L = math.hypot(vx, vy)
+    t = ((w["x"] - a[0]) * vx + (w["y"] - a[1]) * vy) / (L * L)
+    if not (m / L <= t <= 1.0 - m / L):
+        return False
+    return math.dist((w["x"], w["y"]), (a[0] + t * vx, a[1] + t * vy)) <= tol
+
+
+def test_bs1a4d8c_inrun_jump_simulated():
+    """BS1a4d8c (1): a run [p, q] whose second point sits 23.8 mm away
+    through STANDING skin (d8b pocket block, levels [4.41, 4.381]: the
+    final level's floor stands 0.029 mm above Z - clear at the old eps
+    0.05, standing at the judge's eps 0), the tool entered AT p. The
+    in-run backstop must simulate the pair on the live stock at eps 0
+    (lnk_cut_ok, the d8b rule) right before writing it and convert it:
+    measured from the emitted moves (i) NO cutting-feed move at Z longer
+    than one step (0.6 mm) crosses the corridor; (ii) the transition is
+    a rapid at Z + lift plus an entry descent at q, with no cutting-feed
+    move at Z between; (iii) stats irun_chk >= 1 AND irun_cvt >= 1 (the
+    pair was checked and converted) and bstd_cvt >= 1; (iv) zmap shows no
+    cutting-feed window longer than 3 mm over 2.44 mm inside the corridor. MUTATION
+    (scratch copy, the irun_guard call removed from the run loop): the
+    23.8 mm G1 at cutting feed is emitted and the test fails by the
+    MEASURED zmap ae_eff (ae_eff and a of the worst window printed)."""
+    import tempfile
+    from opencamlib import ocl
+    import engine.rough as R
+    from engine.rough import rough
+    assert HAVE_AREA, "area module missing: run with VibeCAD python"
+    Z, LIFT, CUT_F = 4.381, 1.9, 3429.0
+    box = (-25.0, 25.0, -20.0, 20.0, 0.0, 6.03)
+    p, q = (-13.0, 0.0), (10.0, -6.0)
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a4d8c_i.stl")
+        _write_stl(stl, _bs1a4d8c_pocket_tris())
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        calls = {"n": 0}
+        _orig_a2d = R._run_a2d
+
+        def a2d_spy(*a, **k):
+            regs = _orig_a2d(*a, **k)
+            calls["n"] += 1
+            if calls["n"] == 2:   # Z 4.381: ONE region, run [p, q] over skin
+                regs = [{"start": list(p), "helix": None,
+                         "paths": [["cutting", [list(p), list(q)]]]}]
+            return regs
+
+        R._run_a2d = a2d_spy
+        try:
+            moves, stats = rough(surf, box, 6.343, 4.0, leave=0.381,
+                                 axial_leave=0.381, stepdown=1.62,
+                                 stepup=1.905, stepover=0.16,
+                                 tolerance=0.05, threads=4, stock_cell=0.5,
+                                 min_rest=0.3, corner_r=0.0, stl_path=stl)
+        finally:
+            R._run_a2d = _orig_a2d
+    print("BS1a4d8c in-run scene: levels %s, moves %d, irun_chk %s, "
+          "irun_cvt %s, bstd_cvt %s" % (stats["levels_planned"], len(moves),
+                                        stats.get("irun_chk", 0),
+                                        stats.get("irun_cvt", 0),
+                                        stats.get("bstd_cvt", 0)))
+    assert stats["levels_planned"] == [4.41, 4.381], stats["levels_planned"]
+    assert calls["n"] == 2
+    cuts = [i for i, m in enumerate(moves)
+            if m["g"] == 1 and m.get("f") == CUT_F and m.get("z") is not None
+            and abs(m["z"] - Z) < 1e-6]
+    assert cuts, "no cutting-feed move at Z emitted: vacuous"
+
+    def _span(i):
+        a, b = moves[i - 1], moves[i]
+        return math.dist((a["x"], a["y"]), (b["x"], b["y"]))
+
+    # (iv) FIRST the judged load: with the in-run check bypassed this is
+    # the failing evidence (the 23.8 mm G1 over standing skin).
+    with tempfile.TemporaryDirectory() as td2:
+        wj = _bs1a4d8c_judge(moves, surf, box, td2)
+    along = [w for w in wj if abs(w["z"] - Z) < 2e-3 and w.get("feed", 0)
+             > 3000.0 and w.get("length_mm", 0.0) > 3.0
+             and _bs1a4d8c_near(w, p, q, m=0.0)]
+    worst = max(along, key=lambda w: w["ae_eff"]) if along else None
+    over = [w for w in along if w["ae_eff"] > 2.44]
+    assert not over, \
+        ("in-run pair p->q emitted UNSIMULATED at cutting feed: zmap "
+         "corridor window ae_eff %.3f mm, a %.3f mm (line %s)"
+         % (worst["ae_eff"], worst["a"], worst.get("line", "?")))
+    # (i) no cutting-feed step > one step crosses the corridor
+    cross = [i for i in cuts if _span(i) > 0.6
+             and ((moves[i - 1]["x"] < -1.5 and moves[i]["x"] > 1.5)
+                  or (moves[i - 1]["x"] > 1.5 and moves[i]["x"] < -1.5))]
+    assert not cross, "cutting-feed step(s) > 0.6 mm cross the corridor"
+    # (ii) p -> q transition: lift rapid + entry descent, no cut feed at Z
+    ip = min(i for i, m in enumerate(moves)
+             if abs(m["x"] - p[0]) < 1e-4 and abs(m["y"] - p[1]) < 1e-4
+             and abs((m.get("z") or 9e9) - Z) < 1e-6)
+    iq = min(i for i, m in enumerate(moves)
+             if abs(m["x"] - q[0]) < 1e-4 and abs(m["y"] - q[1]) < 1e-4
+             and abs((m.get("z") or 9e9) - Z) < 1e-6 and i > ip)
+    mid = moves[ip + 1:iq + 1]
+    assert mid and not [m for m in mid if m["g"] == 1
+                        and m.get("f") == CUT_F and m.get("z") is not None
+                        and abs(m["z"] - Z) < 1e-6], \
+        "cutting-feed move at Z inside the p -> q transition"
+    assert any(m["g"] == 0 and m["z"] >= Z + LIFT - 0.01 for m in mid), \
+        "no rapid at Z + lift between p and q: %s" % (
+            [(m["g"], round(m["z"], 3)) for m in mid][:12])
+    assert any(k and m["g"] == 1 and m["z"] <= Z + 1e-9
+               and mid[k - 1]["z"] > m["z"] + 1e-9
+               for k, m in enumerate(mid) if k), \
+        "no entry descent to Z at q"
+    # (iii) the guard ran AND converted
+    assert stats.get("irun_chk", 0) >= 1 and stats.get("irun_cvt", 0) >= 1 \
+            and stats.get("bstd_cvt", 0) >= 1, \
+        "in-run backstop did not check+convert the pair: irun_chk %s, " \
+        "irun_cvt %s, bstd_cvt %s" % (stats.get("irun_chk", 0),
+                                      stats.get("irun_cvt", 0),
+                                      stats.get("bstd_cvt", 0))
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    print("PASS bs1a4d8c in-run: 23.8 mm pair checked %d, converted %d; "
+          "corridor judged clean (%d windows, max ae_eff %.3f mm)"
+          % (stats.get("irun_chk", 0), stats.get("irun_cvt", 0), len(along),
+             max((w["ae_eff"] for w in along), default=0.0)))
+
+
+def test_bs1a4d8c_replan_far_piece_enters_own_start():
+    """BS1a4d8c (2) root fix: an emit-time re-plan whose lightest option
+    starts FAR from the stale stored start q4 must never keep q4 as run[0]
+    with the piece appended behind it (CF 64233: a 25.2 mm G1 inside one
+    run, judged ae_eff 9.319 / a 18.61). SYNTHETIC scene: the d8b pocket
+    block at its SINGLE level 4.381 (stepdown 1.649: the whole floor
+    stands at Z) with ONE injected region (replan0=1) whose own path
+    slot-cuts the standing stock (so the emit re-check
+    ew0 fails) and whose shrink_ladder is pinned by seg identity to a
+    light piece starting at (10, -6) - 23.8 mm from q4 = (-13, 0). With
+    (2): shrink_ladder is called TWICE for that seg - first with
+    approach=q4, then WITHOUT one (the predictor mirrors the entry at the
+    piece's own first point); the entry goes there via the enter_at
+    ladder; bstd_cvt == 0 (the backstop never fires: run[0] IS the entry)
+    and the piece's first cutting move ends at its own entered first point
+    (no move jumps off the stale q4). MUTATIONS (scratch copies): (2) reverted with (1) on -> the
+    in-run backstop catches the q4 -> piece chord: bstd_cvt == 1 and the
+    bstd assert fails (value printed); BOTH reverted -> the test fails by
+    the MEASURED zmap ae_eff over the q4 -> piece corridor (ae_eff and a
+    printed)."""
+    import tempfile
+    from opencamlib import ocl
+    import engine.rough as R
+    import engine.band as B
+    from engine.rough import rough
+    assert HAVE_AREA, "area module missing: run with VibeCAD python"
+    Z, CUT_F = 4.381, 3429.0
+    box = (-25.0, 25.0, -20.0, 20.0, 0.0, 6.03)
+    q4 = (-13.0, 0.0)
+    piece = [(10.0, round(-6.0 + 0.4 * i, 4)) for i in range(16)]
+    MY_SEG = []   # identity-pinned: only the injected region carries it
+    sl = []
+    _orig_sl = B.shrink_ladder
+    def sl_spy(seg, stock, z, tool_r, cell, credit=None, dropopt=None,
+               borefn=None, approach=None):
+        if seg is MY_SEG:
+            sl.append(tuple(approach) if approach is not None else None)
+            return "shrink0.4", list(piece), [0.5] * 8, 5.0, False
+        return _orig_sl(seg, stock, z, tool_r, cell, credit, dropopt, borefn,
+                        approach)
+
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a4d8c_r.stl")
+        _write_stl(stl, _bs1a4d8c_pocket_tris())
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        calls = {"n": 0}
+        _orig_a2d, _orig_hug = R._run_a2d, R.hug_regions
+        _orig_cr = B.channel_regions
+        my_region = {"start": list(q4), "helix": None, "replan0": 1,
+                     "credit": 0.0, "seg": MY_SEG, "dropkey": "d8c",
+                     "paths": [["cutting", [[q4[0],
+                                             round(q4[1] + 0.4 * i, 4)]
+                                            for i in range(11)]]]}
+
+        def a2d_spy(*a, **k):
+            # one single-point decoy: the real passes would mill the floor
+            # and the re-plan scene must see standing stock at Z
+            calls["n"] += 1
+            return [{"start": [-13.0, -8.0], "helix": None,
+                     "paths": [["cutting", [[-13.0, -8.0]]]]}]
+
+        def hug_spy(islands, grown, stock, isl_ok, **k):
+            # no rings -> channel_regions is my spy alone: the scene's ONLY
+            # bstd / irun activity is the q4 -> piece join itself
+            return []
+
+        def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None,
+                   **kw):
+            if stats is not None:   # the contract of the real channel_regions
+                stats.setdefault("failed_region_emitted", [])
+            return [my_region]
+
+        B.shrink_ladder = sl_spy
+        B.channel_regions = cr_spy
+        R._run_a2d = a2d_spy
+        R.hug_regions = hug_spy
+        try:
+            moves, stats = rough(surf, box, 6.343, 4.0, leave=0.381,
+                                 axial_leave=0.381, stepdown=1.649,
+                                 stepup=1.905, stepover=0.16,
+                                 tolerance=0.05, threads=4, stock_cell=0.5,
+                                 min_rest=0.3, corner_r=0.0, stl_path=stl)
+        finally:
+            B.shrink_ladder = _orig_sl
+            B.channel_regions = _orig_cr
+            R._run_a2d = _orig_a2d
+            R.hug_regions = _orig_hug
+    print("BS1a4d8c re-plan scene: levels %s, sl calls %s, bstd_cvt %s, "
+          "irun_chk %s, irun_cvt %s" % (stats["levels_planned"], sl,
+                                        stats.get("bstd_cvt", 0),
+                                        stats.get("irun_chk", 0),
+                                        stats.get("irun_cvt", 0)))
+    assert stats["levels_planned"] == [4.381], stats["levels_planned"]
+    assert calls["n"] == 1
+    fb = [f for f in stats["credit_fallback"]
+          if abs(f[0] - q4[0]) < 1e-6 and abs(f[1] - q4[1]) < 1e-6]
+    assert fb and fb[0][3] == "replan0_shrink0.4", \
+        "scene did not reach the emit re-plan with the lightest option: %r" \
+        % (fb,)
+    assert any(f["x"] == q4[0] and f["y"] == q4[1]
+               and f["option"] == "shrink0.4"
+               for f in stats["failed_region_emitted"]), \
+        "failed_region_emitted does not record the pinned option"
+    # the judged load FIRST (the both-reverted mutation's evidence)
+    with tempfile.TemporaryDirectory() as td2:
+        wj = _bs1a4d8c_judge(moves, surf, box, td2)
+    along = [w for w in wj if abs(w["z"] - Z) < 2e-3 and w.get("feed", 0)
+             > 3000.0 and w.get("length_mm", 0.0) > 3.0
+             and _bs1a4d8c_near(w, q4, piece[0], m=0.0)]
+    # the q4 -> piece LINK itself: cutting-feed moves at Z that leave the
+    # stale q4; judged by the zmap windows covering exactly those moves
+    # (approved narrowing: short feed-in overloads in the corridor belong to
+    # FI1, not to this link check)
+    from engine.gcode import moves_to_gcode as _m2g
+    gl = _m2g(moves, spindle_rpm=7500).split("\n")
+    off = next(k for k, l in enumerate(gl, 1)
+               if l.lstrip().startswith(("G0", "G1")) and "X" in l)
+    link = {off + i for i, m in enumerate(moves)
+            if i and m["g"] == 1 and m.get("f") == CUT_F
+            and m.get("z") is not None and abs(m["z"] - Z) < 1e-6
+            and math.dist((moves[i - 1]["x"], moves[i - 1]["y"]), q4) <= 0.6
+            and math.dist((m["x"], m["y"]), q4) > 0.6}
+    lw = [w for w in wj if any(w["line"] <= L <= w.get("end_line", w["line"])
+                               for L in link)]
+    worst = max(lw, key=lambda w: w["ae_eff"]) if lw else None
+    assert worst is None or worst["ae_eff"] <= 2.44, \
+        ("stale q4 kept as run[0] and the far piece appended: zmap "
+         "link window ae_eff %.3f mm, a %.3f mm (line %s)"
+         % (worst["ae_eff"], worst["a"], worst.get("line", "?")))
+    # (2) correct: the backstop never had to convert anything
+    assert stats.get("bstd_cvt", 0) == 0 and \
+        stats.get("n_backstop_links", 0) == 0, \
+        "backstop converted %d link(s) (bstd_cvt %s, n_backstop_links %s): " \
+        "the run still starts at the stale q4" % (
+            stats.get("n_backstop_links", 0), stats.get("bstd_cvt", 0),
+            stats.get("n_backstop_links", 0))
+    # the predictor mirrored the entry: approach=q4, then a re-prediction
+    # WITHOUT one at the piece's own first point
+    assert len(sl) == 2 and sl[0] is not None and \
+        math.dist(sl[0], q4) < 1e-6 and sl[1] is None, \
+        "shrink_ladder calls %r: expected approach=q4 then a mirrored " \
+        "re-prediction without approach" % (sl,)
+    # the piece's first cutting move ends AT its own first point (where the
+    # entry landed) within feed-in reach - and nothing jumps off the stale q4
+    cuts = [i for i, m in enumerate(moves)
+            if m["g"] == 1 and m.get("f") == CUT_F and m.get("z") is not None
+            and abs(m["z"] - Z) < 1e-6 and m["x"] > 1.5]
+    assert cuts, "no cutting-feed move at Z in the right bay: vacuous"
+    i1 = cuts[0]
+    a0 = (moves[i1 - 1]["x"], moves[i1 - 1]["y"])
+    b0 = (moves[i1]["x"], moves[i1]["y"])
+    assert math.dist(b0, piece[0]) <= 0.6 and \
+        math.dist(a0, b0) <= 3.0, \
+        "first cutting move at the piece (%.3f, %.3f) -> (%.3f, %.3f) does " \
+        "not end at its own entered first point" % (a0[0], a0[1], b0[0], b0[1])
+    jump = [i for i in cuts
+            if math.dist((moves[i - 1]["x"], moves[i - 1]["y"]), q4) <= 0.6
+            and math.dist((moves[i]["x"], moves[i]["y"]), q4) > 0.6]
+    assert not jump, "a cutting-feed move still jumps off the stale q4"
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    print("PASS bs1a4d8c re-plan: far piece entered at its own start; "
+          "bstd_cvt 0, first cut ends %.3f mm from the piece start; %d "
+          "judged corridor windows, max ae_eff %.3f mm"
+          % (math.dist(b0, piece[0]), len(along),
+             max((w["ae_eff"] for w in along), default=0.0)))
+
+
+_D9 = {}
+
+
+def _bs1a4d9_replan():
+    """BS1a4d9: the d8c re-plan scene's (moves, judged windows), captured
+    through _bs1a4d8c_judge while that test runs (its own asserts report
+    on their own; the capture is all these tests need). Once per process."""
+    if "v" not in _D9:
+        g = globals()
+        orig = g["_bs1a4d8c_judge"]
+
+        def cap(moves, *a, **k):
+            _D9["v"] = (moves, orig(moves, *a, **k))
+            return _D9["v"][1]
+
+        g["_bs1a4d8c_judge"] = cap
+        try:
+            test_bs1a4d8c_replan_far_piece_enters_own_start()
+        except AssertionError:
+            pass
+        finally:
+            g["_bs1a4d8c_judge"] = orig
+    return _D9["v"]
+
+
+def test_bs1a4d9_no_entry_at_stale_q4():
+    """BS1a4d9 (1): when the region's piece is far (rjoin), nothing is
+    emitted at the stale q4 = (-13, 0): no helix, no feed-in, no lift-off.
+    Measured: non-rapid moves below the stock top (6.03) ending within 2 mm
+    of q4 must be 0 (the decoy at (-13, -8) stays > 6 mm away). Fails on
+    498ebae: 12 moves, 4 judged windows, max ae_eff 6.303 mm (covering
+    the helix and line-206 feed-in)."""
+    from engine.gcode import moves_to_gcode
+    moves, wj = _bs1a4d9_replan()
+    q4 = (-13.0, 0.0)
+    gl = moves_to_gcode(moves, spindle_rpm=7500).split("\n")
+    off = next(k for k, l in enumerate(gl, 1)
+               if l.lstrip().startswith(("G0", "G1")) and "X" in l)
+    at = [off + i for i, m in enumerate(moves)
+          if m["g"] != 0 and m.get("z") is not None and m["z"] < 6.03
+          and math.dist((m["x"], m["y"]), q4) <= 2.0]
+    lw = [w for w in wj if any(w["line"] <= L <= w.get("end_line", w["line"])
+                               for L in at)]
+    assert not at, \
+        ("%d move(s) still emitted at the stale q4 (lines %s); judged "
+         "windows there: %d, max ae_eff %.3f mm"
+         % (len(at), at[:6], len(lw),
+            max((w["ae_eff"] for w in lw), default=0.0)))
+
+
+_LEDGE = {}
+
+
+def _ledge_scene():
+    """BS1a4d8e: open pocket with a mid-depth ledge - Adaptive2d runs only, no
+    band pieces, so NO emit-time joins. Roughed once per process; returns
+    (moves, stats, zmap ae2 windows judged on the emitted program)."""
+    if _LEDGE:
+        return _LEDGE["v"]
+    import tempfile
+    import numpy as np
+    from opencamlib import ocl
+    from engine.rough import rough, build_part_hf
+    from verify import zmap
+    B = _box_tris
+    tris = (B(0, 48, 0, 40, -1, 0) + B(0, 6, 0, 40, 0, 18) + B(42, 48, 0, 40, 0, 18)
+            + B(6, 42, 0, 6, 0, 18) + B(6, 42, 34, 40, 0, 18) + B(6, 24, 6, 34, 0, 9.0))
+    box = (0.0, 48.0, 0.0, 40.0, -1.0, 18.0)
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "ledge.stl")
+        _write_stl(stl, tris)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        moves, stats = rough(surf, box, 6.343, 0.0, leave=0.381, axial_leave=0.381,
+                             stepdown=19.05, stepup=1.905, tolerance=0.05, threads=4,
+                             stock_cell=0.5, min_rest=0.5, corner_r=0.0, stl_path=stl)
+        pad, cell = 120, 0.1
+        x0, y0 = box[0] - pad * cell, box[2] - pad * cell
+        part = build_part_hf(surf, x0, y0, cell, int(round(48 / cell)) + 2 * pad,
+                             int(round(40 / cell)) + 2 * pad, threads=4, drop_z=-1.0)
+    part = np.where(np.isfinite(part), part, -1.0)
+    text = moves_to_gcode(moves, spindle_rpm=8000)
+    wins = zmap.simulate(zmap.parse_gcode(text), part, cell, x0, y0, box, tool="flat",
+                         dia=12.686, engage_max=2.438)["_ae2_raw"]
+    _LEDGE["v"] = (moves, stats, wins, text.split("\n"))
+    return _LEDGE["v"]
+
+
+def test_bs1a4d8e_inrun_guard_skips_planned_paths():
+    """BS1a4d8e T-scope: the in-run guard checks only joins assembled at emit,
+    never pairs inside one planned path. The ledge scene has none, so it must
+    convert nothing (5431aba converted 4 planned Adaptive2d pairs here)."""
+    moves, stats, wins, _ = _ledge_scene()
+    cvt = (stats.get("irun_cvt", 0), stats.get("n_backstop_links", 0))
+    print("bs1a4d8e T-scope: ledge %d moves, irun_chk %s, irun_cvt %d, backstop links %d"
+          % (len(moves), stats.get("irun_chk", 0), cvt[0], cvt[1]))
+    assert cvt == (0, 0), "planned-path pairs converted on a join-free scene: " \
+        "irun_cvt %d, n_backstop_links %d" % cvt
+    print("PASS bs1a4d8e T-scope: 0 conversions on the join-free ledge scene")
 
 
 def _rr1b_pocket_scene(pocket):
@@ -2356,6 +3442,27 @@ def _main():
                test_bs1a3_no_band_after_a2d,
                test_stl_cache_keyed_by_content,
                test_rr1a_rough_cli_refuses_ball,
+               test_bs1a4b_failed_region_lightest,
+               test_bs1a4b_windows_align_zmap,
+               test_bs1a4c_backed_credit,
+               test_bs1a4c_fix_no_post_entry_helix,
+               test_bs1a4c2_band_chord_cl_checked,
+               test_bs1a4d_credit0_lightest_option,
+               test_bs1a4d_credit_real_bore,
+               test_bs1a4d2b_centred_entry_bore,
+               test_bs1a4d4_credit_entry_matches_prediction,
+               test_bs1a4d4_entry_pinned_to_stored_start,
+               test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load,
+               test_bs1a4d6b_q4_entry_bore_in_live_stock,
+               test_bs1a4d6c_side_entry_no_under_read,
+               test_bs1a4d6d_approach_simulated_in_window0,
+               test_bs1a4d7_sub1mm_tail_merges_not_dropped,
+               test_bs1a4d8_arrival_gate_reads_judge_skin,
+               test_bs1a4d8b_no_unsimulated_link_into_path,
+               test_bs1a4d8c_inrun_jump_simulated,
+               test_bs1a4d8c_replan_far_piece_enters_own_start,
+               test_bs1a4d8e_inrun_guard_skips_planned_paths,
+               test_bs1a4d9_no_entry_at_stale_q4,
                test_rr1b_rest_rough_synth_pocket,
                test_rr1b_rest_rough_reports_small_pocket,
                test_rr1c_thin_band_inpass_ramp,
@@ -3101,6 +4208,1395 @@ def test_rr1a_rough_cli_refuses_ball():
         assert "G1" in text and len(text) > 1000, "flat program not written"
     print("PASS rr1a rough cli: ball and corner-less bull refused (no "
           "program), flat still roughs (%d bytes)" % len(text))
+
+
+def test_bs1a4b_failed_region_lightest():
+    """Task BS1a4b: on samples/test_block (James's cutting data) exactly one
+    band region fails its gate at every shrink level. It must take the
+    LIGHTEST measured option among {each shrink level, dropping it to the
+    ring} - fewest full-width windows at cutting feed, then lowest max ae,
+    then shortest travel over 2.44 mm - and the decision is NEVER silent:
+    the region is listed in stats["failed_region_emitted"] with place, Z,
+    area, option and engine max ae. On this part the trochoid (zmap 8.47)
+    is lighter than the full-width ring slot (zmap 12.6) that would inherit
+    its stock, so the trochoid is kept and FW at cutting feed on the padded
+    0.1 judge grid stays at main's level (0). FAILS on e5e783e: there the
+    stat does not exist (ungated emit happens silently)."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    _need(TB_STL, TB_HF_01)
+    import subprocess
+    import tempfile
+    import json as _json
+    from opencamlib import ocl
+    from engine.gcode import moves_to_gcode
+    from engine.rough import rough
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    stock_box = (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0)
+    tool_r = 6.343
+    dia = 2.0 * tool_r
+    surf = ocl.STLSurf()
+    ocl.STLReader(TB_STL, surf)
+    moves, stats = rough(surf, stock_box, tool_r, 20.0, leave=0.381,
+                         axial_leave=0.381, stepdown=19.05, stepover=0.16,
+                         stl_path=TB_STL, workers=None, threads=4,
+                         stock_cell=0.5, final_zmin=20.381)
+    fre = stats.get("failed_region_emitted")
+    assert fre is not None, \
+        "stats has no failed_region_emitted: a gate-failing region was " \
+        "emitted silently (main's fall-through)"
+    assert len(fre) >= 1, \
+        "expected the ungated test-block region in failed_region_emitted, " \
+        "got %r" % (fre,)
+    for e in fre:
+        assert set(("x", "y", "z", "area", "option", "max_ae")) <= set(e), \
+            "failed_region_emitted entry lacks fields: %r" % (e,)
+        assert e["option"] != "drop_ring", \
+            "the ungated region must keep its trochoid (zmap 8.47) instead " \
+            "of handing its stock to the full-width ring slot (zmap 12.6):" \
+            " %r" % (e,)
+    with tempfile.TemporaryDirectory() as td:
+        ngc = os.path.join(td, "tb.ngc")
+        with open(ngc, "w") as fh:
+            fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+        rj = os.path.join(td, "zmap.json")
+        dj = os.path.join(td, "ae2.json")
+        rr = subprocess.run(
+            [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+             "--part", TB_HF_01, "--tool", "flat", "--dia", "%.3f" % dia,
+             "--stock", *[str(v) for v in stock_box],
+             "--engage-max", "2.438", "--ae2-dump", dj, "--out-json", rj],
+            capture_output=True, text=True, cwd=repo)
+        assert rr.returncode == 0, "zmap failed: %s | %s" % (
+            rr.stdout[-800:], rr.stderr[-600:])
+        rep = _json.load(open(rj))
+        wins = _json.load(open(dj))
+        cut_feed = rep["engagement"]["ae2_cutting_feed"]
+        fw = [w for w in wins
+              if w["ae_eff"] >= 0.9 * dia and w["a"] > 0.5
+              and w.get("feed") is not None
+              and abs(w["feed"] - cut_feed) < 1e-6]
+        assert not fw, "FW at cutting feed rose to %d (main: 0): %s" % (
+            len(fw), [(w["x"], w["y"], round(w["ae_eff"], 2))
+                     for w in fw[:6]])
+    print("PASS bs1a4b failed region: %d ungated region(s) recorded %s, "
+          "0 full-width windows at cutting feed" % (
+              len(fre), [(e["x"], e["y"], e["z"], e["area"], e["option"],
+                         e["max_ae"]) for e in fre]))
+
+
+def test_bs1a4b_windows_align_zmap():
+    """Task BS1a4b alignment proof: replay the SAME emitted band moves on
+    samples/test_block through engine band._simulate and through zmap's AE2
+    engagement measure (--ae2-dump, on the 0.5 mm grid - the same cell the
+    engine stock model uses, so quantisation cannot fake a difference): the
+    window boundaries (closing move index within the region) must be identical
+    and the max per-window ae difference is reported BOTH ways. FAILS on
+    e5e783e: its first window is zero-length (the whole first-move disk), so
+    every engine boundary closes one move late."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    _need(TB_STL, TB_HF)
+    import subprocess
+    import tempfile
+    import json as _json
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.gcode import moves_to_gcode
+    from engine.rough import rough
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    replay = []
+    _orig_sim = B._simulate
+    _orig_cr = B.channel_regions
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None):
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats)
+        for r in res:                # replay the EMITTED moves, live stock
+            pts = [tuple(q) for q in r["paths"][0][1]]
+            e = []
+            w = _orig_sim(pts, stock, z, tool_r, cell, r.get("credit") or 0.0,
+                          e)
+            idxs = []
+            k = 0
+            tot = 0.0
+            prev = (pts[0][0], pts[0][1])
+            for j, p in enumerate(pts[1:], start=1):
+                tot += math.dist(prev, (p[0], p[1]))
+                prev = (p[0], p[1])
+                if k < len(e) and tot >= e[k] - 1e-9:
+                    idxs.append(j)
+                    k += 1
+            replay.append({"z": round(z, 3), "start": tuple(r["start"]),
+                          "pts": pts, "wins": w, "ends": e, "idxs": idxs})
+        return res
+
+    B.channel_regions = cr_spy
+    try:
+        stock_box = (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0)
+        tool_r = 6.343
+        dia = 2.0 * tool_r
+        surf = ocl.STLSurf()
+        ocl.STLReader(TB_STL, surf)
+        moves, stats = rough(surf, stock_box, tool_r, 20.0, leave=0.381,
+                             axial_leave=0.381, stepdown=19.05, stepover=0.16,
+                             stl_path=TB_STL, workers=None, threads=4,
+                             stock_cell=0.5, final_zmin=20.381)
+    finally:
+        B.channel_regions = _orig_cr
+    assert replay, "no band regions emitted on the test block"
+    with tempfile.TemporaryDirectory() as td:
+        ngc = os.path.join(td, "tb.ngc")
+        with open(ngc, "w") as fh:
+            fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+        # pad the 0.5 mm hf like the judge grid: edge values, tool_r + 5 mm
+        import numpy as _np
+        hf = _np.load(TB_HF)
+        with open(TB_HF[:-4] + ".json") as fh:
+            meta = _json.load(fh)
+        pad = int(math.ceil((tool_r + 5.0) / float(meta["cell"])))
+        hf_p = os.path.join(td, "part_hf_0.5_padded.npy")
+        _np.save(hf_p, _np.pad(hf, pad, mode="edge"))
+        with open(hf_p[:-4] + ".json", "w") as fh:
+            _json.dump({"x0": float(meta["x0"]) - pad * float(meta["cell"]),
+                       "y0": float(meta["y0"]) - pad * float(meta["cell"]),
+                       "cell": float(meta["cell"]),
+                       "tess_tol": meta.get("tess_tol", 0.01)}, fh)
+        rj = os.path.join(td, "zmap.json")
+        dj = os.path.join(td, "ae2.json")
+        rr = subprocess.run(
+            [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+             "--part", hf_p, "--tool", "flat", "--dia", "%.3f" % dia,
+             "--stock", *[str(v) for v in stock_box],
+             "--engage-max", "2.438", "--ae2-dump", dj, "--out-json", rj],
+            capture_output=True, text=True, cwd=repo)
+        assert rr.returncode == 0, "zmap failed: %s | %s" % (
+            rr.stdout[-800:], rr.stderr[-600:])
+        wins = _json.load(open(dj))
+    worst_ez = -9.0          # max (engine - zmap) over all windows
+    worst_ze = -9.0          # max (zmap - engine) over all windows
+    n_cmp = 0
+    for reg in replay:
+        pts = reg["pts"]
+        i0 = None
+        for i in range(len(moves) - len(pts)):
+            m = moves[i]
+            if (m["g"] == 1 and abs(m["x"] - pts[0][0]) < 1e-6
+                    and abs(m["y"] - pts[0][1]) < 1e-6):
+                if all(moves[i + k]["g"] == 1
+                       and abs(moves[i + k]["x"] - pts[k][0]) < 1e-6
+                       and abs(moves[i + k]["y"] - pts[k][1]) < 1e-6
+                       for k in range(min(len(pts), 40))):
+                    i0 = i
+                    break
+        assert i0 is not None, \
+            "emitted region %s not found in the moves" % (reg["start"],)
+        lo = 7 + i0   # moves[i0] ENDS at pts[0]; the region's own feed
+        # moves are lines lo+1.. (an earlier link move is not the region)
+        zw = sorted([w for w in wins if w["line"] >= lo + 1
+                     and w["end_line"] <= 7 + i0 + len(pts) - 1],
+                    key=lambda w: w["line"])
+        assert len(reg["wins"]) == len(zw), \
+            "window count differs for region %s: engine %d vs zmap %d" % (
+                reg["start"], len(reg["wins"]), len(zw))
+        zidx = [w["end_line"] - lo for w in zw]
+        assert zidx == reg["idxs"], \
+            "window boundaries differ for region %s: zmap %s vs engine %s" % (
+                reg["start"], zidx[:8], reg["idxs"][:8])
+        diffs = []
+        for k, w in enumerate(zw):
+            elen = reg["ends"][k] - (reg["ends"][k - 1] if k else 0.0)
+            diffs.append(reg["wins"][k] / elen - w["ae_eff"])
+        worst_ez = max(worst_ez, max(diffs))
+        worst_ze = max(worst_ze, -min(diffs))
+        n_cmp += 1
+    assert n_cmp == len(replay), "some region could not be compared"
+    # BS1a4c finding: with the honest entry credit (entry_credit, replayed
+    # here at the region's carried credit) the entry-bore under-read of
+    # BS1a4b (3.865 mm at k=1) is GONE - the residual under-read (~1.5 mm,
+    # max window 0.25..1.49 mm) is the engine's cell-centre disk sampling on
+    # the 0.5 mm grid vs zmap's replay, spread over light-load windows along
+    # the trochoid, plus one credit-geometry window at the start (the credit
+    # disk about the start point vs the emitted helix's stadium). Boundaries
+    # stay identical (asserted above). The 0.15 mm bar is therefore NOT met
+    # by the credit port alone; per the brief's STOP rule both directions are
+    # reported, not asserted (see BS1a4_RESULTS.md section 10).
+    print("bs1a4b max diff both ways: engine-zmap %+.3f mm, zmap-engine "
+          "%.3f mm" % (worst_ez, worst_ze))
+    print("PASS bs1a4b alignment: %d region(s), window boundaries identical;"
+          " max engine-zmap %+.3f mm, max zmap-engine %.3f mm" % (
+              n_cmp, worst_ez, worst_ze))
+
+
+def test_bs1a4c_fix_no_post_entry_helix():
+    """BS1a4c-fix (supervisor): a credited band start that is not backed at
+    emit must never get a helix emitted AFTER enter_at (the tool is already
+    at depth there): the L-shaped channel must rough without a CLCHECK
+    refusal (no sample below CL + axial_leave) and record no 'ladder_helix'
+    fallback. FAILS on a29696d (CLCHECK: 18 mm below CL at X-4.208 Y-0.704)."""
+    from opencamlib import ocl
+    import tempfile
+    from engine.rough import rough
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a4c_fix.stl")
+        _write_stl(stl, tris)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        try:
+            _m, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0),
+                              6.343, 0.0, leave=0.381, axial_leave=0.381,
+                              stepdown=19.05, stepup=1.905, tolerance=0.05,
+                              threads=4, stock_cell=0.5, min_rest=0.5,
+                              corner_r=0.0, stl_path=stl)
+        except RuntimeError as e:
+            raise AssertionError("rough refused on CL (a backing move gouged): %s"
+                                 % str(e)[:200])
+    acts = [f[3] for f in stats.get("credit_fallback", [])]
+    assert "ladder_helix" not in acts, "post-entry helix emitted: %s" % acts
+    assert stats.get("clcheck_violations", 0) == 0, stats.get("clcheck_violations")
+    print("PASS bs1a4c-fix: L channel roughs CL-clean, fallbacks %s" % acts)
+
+
+def test_bs1a4c_backed_credit():
+    """Task BS1a4c: honest (backed) entry credit. channel_regions plans its
+    ZE2 replays with entry_credit - tool_r ONLY where standing stock under
+    the start disk forces a helix descent at emit time, else 0 (never the
+    synthetic 1.3 x tool_r pre-clear) - and every band region carries that
+    credit; rough.py backs it at emit time (ladder helix, else credit-0
+    re-check against the gates, else not emitted) and records every fallback
+    in stats["credit_fallback"]. Assert here: the stat exists, every emitted
+    band region carries an honest credit (0 or tool_r) equal to
+    entry_credit on the LIVE planning stock, and every recorded fallback is
+    one of the three backed actions. FAILS on e5e783e: there the stat does
+    not exist and regions carry no credit (the sim pre-clears 1.3 x tool_r
+    unconditionally)."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    _need(TB_STL)
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.rough import rough
+    captured = []
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None):
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats)
+        for r in res:
+            assert "credit" in r, \
+                "band region carries no honest entry credit: the planning " \
+                "sim still assumes the synthetic 1.3 x tool_r entry bore"
+            assert -1e-9 <= r["credit"] <= tool_r + 1e-9, \
+                "credit %r exceeds the disk an emitted helix can bore " \
+                "(tool_r = %r)" % (r["credit"], tool_r)
+            assert abs(r["credit"] - B.entry_credit(stock, r["start"], z,
+                                                    tool_r)) < 1e-9, \
+                "region credit %r != entry_credit on the live stock at %s" % (
+                    r["credit"], r["start"])
+            captured.append((round(z, 3), tuple(r["start"]), r["credit"]))
+        return res
+
+    _orig_cr = B.channel_regions
+    B.channel_regions = cr_spy
+    try:
+        stock_box = (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0)
+        tool_r = 6.343
+        surf = ocl.STLSurf()
+        ocl.STLReader(TB_STL, surf)
+        moves, stats = rough(surf, stock_box, tool_r, 20.0, leave=0.381,
+                             axial_leave=0.381, stepdown=19.05, stepover=0.16,
+                             stl_path=TB_STL, workers=None, threads=4,
+                             stock_cell=0.5, final_zmin=20.381)
+    finally:
+        B.channel_regions = _orig_cr
+    assert "credit_fallback" in stats, \
+        "stats has no credit_fallback: emit does not back entry credits"
+    assert captured, "no band regions emitted on the test block"
+    for f in stats["credit_fallback"]:
+        assert f[3] in ("ladder_helix", "replan0_ok", "replan0_drop"), \
+            "unknown credit fallback action: %r" % (f,)
+    print("PASS bs1a4c backed credit: %d region(s) %s, fallbacks %s" % (
+        len(captured), captured, stats["credit_fallback"]))
+
+
+
+def test_bs1a4c2_band_chord_cl_checked():
+    """Task BS1a4c-2: every emitted band cutting chord is CL-checked
+    SEGMENT-SAMPLED (every <= 0.25 mm, the way validate_exact samples
+    segments), not only its points; a discontinuous trochoid is split at the
+    jump into separate regions joined through enter_at's CL-checked ladder,
+    and a piece with no legal join is rejected AND listed in
+    stats["failed_region_emitted"]. FAILS on 351ce50: with honest credit both
+    L-channel regions fail every shrink level and the chosen shrunk path
+    carries a 5.4 mm straight chord across the part that reaches CLCHECK
+    (bad moves 2068/2107, 18 mm below CL)."""
+    import math
+    import os
+    from opencamlib import ocl
+    import tempfile
+    import engine.band as B
+    from engine.rough import rough
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)       # floor
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)     # left wall
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)      # bottom wall
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)          # inner crn
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)          # right wall
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)         # upr-left
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))         # top cap
+    jumps = []
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None):
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats)
+        for r in res:
+            for (kind, pts) in r["paths"]:
+                if kind != "cutting":
+                    continue
+                for a, b in zip(pts[:-1], pts[1:]):
+                    d = math.dist(a, b)
+                    n = max(1, int(math.ceil(d / 0.25)))
+                    if not all(isl_ok3([(a[0] + (b[0] - a[0]) * t / n,
+                                          a[1] + (b[1] - a[1]) * t / n)
+                                         for t in range(n + 1)])):
+                        jumps.append((round(z, 3), a, b, round(d, 2)))
+        return res
+
+    _orig_cr = B.channel_regions
+    B.channel_regions = cr_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4c2.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            try:
+                _m, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0,
+                                         18.0), 6.343, 0.0, leave=0.381,
+                                 axial_leave=0.381, stepdown=19.05,
+                                 stepup=1.905, tolerance=0.05, threads=4,
+                                 stock_cell=0.5, min_rest=0.5, corner_r=0.0,
+                                 stl_path=stl)
+            except RuntimeError as e:
+                raise AssertionError(
+                    "rough refused on CL (an unsegment-checked chord gouged):"
+                    " %s" % str(e)[:200])
+    finally:
+        B.channel_regions = _orig_cr
+    assert not jumps, "emitted band chord fails the segment-sampled CL check" \
+                      " (or an unsplit jump): %s" % jumps[:4]
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    assert "failed_region_emitted" in stats, "no failed_region_emitted list"
+    print("PASS bs1a4c-2: every emitted band chord CL-checked at 0.25 mm; "
+          "%d band region(s), %d listed failed piece(s)" % (
+              stats.get("n_band_regions", 0),
+              len(stats["failed_region_emitted"])))
+
+
+def test_bs1a4d_credit0_lightest_option():
+    """Task BS1a4d (a0): a credited band region that fails the credit-0
+    re-check at emit is NOT silently dropped - it takes Fix 1's lightest
+    option (the shrink ladder re-simulated at credit 0 on the LIVE stock vs
+    drop-to-ring, same ranking) and is listed in
+    stats["failed_region_emitted"] with place, Z, area, option and engine max
+    ae; the program still passes CLCHECK. The unbacked credit is forced
+    honestly: every single-point stock.link_clear([q,q], z) - the backing
+    check itself - reports False, i.e. no emitted move backed the credit.
+    FAILS on 22cdff7: there the real-bore planning credit (which proposes the
+    region that fails its credit-0 re-check at emit) does not exist, so no
+    credit-0 failure ever fires in this scene (every re-check passes at
+    credit 0) - vacuous there; and any credit-0 failure 22cdff7 did hit was
+    an unconditional drop, never listed in failed_region_emitted."""
+    from opencamlib import ocl
+    import tempfile
+    import engine.band as B
+    from engine.rough import rough
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+    _orig_cr = B.channel_regions
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None,
+               **kw):
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats,
+                       **kw)
+        if not getattr(stock, "_bs1a4d_forced", False):
+            stock._bs1a4d_forced = True
+            lc0 = stock.link_clear
+
+            def lc(pts, h, eps=0.05):
+                if abs(h - z) <= 1e-6 and len(set(pts)) == 1:
+                    return False   # the credit-backing single-point check
+                return lc0(pts, h, eps)
+            stock.link_clear = lc
+        return res
+
+    B.channel_regions = cr_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d_a0.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            try:
+                _m, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0,
+                                         18.0), 6.343, 0.0, leave=0.381,
+                                 axial_leave=0.381, stepdown=19.05,
+                                 stepup=1.905, tolerance=0.05, threads=4,
+                                 stock_cell=0.5, min_rest=0.5, corner_r=0.0,
+                                 stl_path=stl)
+            except RuntimeError as e:
+                raise AssertionError(
+                    "rough refused on CL (a credit-0 fallback move gouged):"
+                    " %s" % str(e)[:200])
+    finally:
+        B.channel_regions = _orig_cr
+    acts = [f[3] for f in stats.get("credit_fallback", [])]
+    bad = [f for f in stats.get("credit_fallback", [])
+           if f[3].startswith("replan0_") and f[3] != "replan0_ok"]
+    assert bad, \
+        "no credit-0 FAILING re-check fired - scenario vacuous: %s" % (acts,)
+    fre = stats.get("failed_region_emitted", [])
+    for f in stats["credit_fallback"]:
+        if f[3].startswith("replan0_") and f[3] != "replan0_ok":
+            assert any(abs(e["x"] - f[0]) < 1.5 and abs(e["y"] - f[1]) < 1.5
+                      and abs(e["z"] - f[2]) < 1e-6 for e in fre), \
+                "credit-0 failure %r was silently dropped - not listed in " \
+                "failed_region_emitted: %s" % (f, fre)
+            e = [e for e in fre if abs(e["x"] - f[0]) < 1.5
+                 and abs(e["y"] - f[1]) < 1.5 and abs(e["z"] - f[2]) < 1e-6][0]
+            assert e["option"] != "drop_ring" and f[3] == "replan0_" + e["option"], \
+                "credit-0 failure %r not EMITTED as its lightest option: %s" % (f, e)
+            cut = [m for m in _m if m["g"] == 1 and m.get("z") is not None
+                   and abs(m["z"] - f[2]) < 1e-6
+                   and math.dist((m["x"], m["y"]), (f[0], f[1])) < 1.0]
+            assert cut, "credit-0 failure %r: no cut emitted at its start" % (f,)
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    print("PASS bs1a4d(a0): credit-0 failures %s, listed %s" % (
+        [a for a in acts if a.startswith("replan0_")],
+        [(e["x"], e["y"], e["z"], e["option"], e["max_ae"]) for e in fre]))
+
+
+def test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load():
+    """BS1a4d5 (supervisor): a credited split piece whose real-bore emit
+    re-check FAILS its gate is never emitted at the failing load: it goes
+    through the re-check's own shrink ladder (like plan0_split) and is listed
+    in failed_region_emitted at its lightest option (or dropped to the ring).
+    The L scene of test_bs1a4d_credit_real_bore has plan0_splitbore pieces;
+    the test forces each one's real-bore re-check (the band._simulate call at
+    emit with the piece start and its stored bore) to read 0.75 mm over
+    AE_SPIKE. FAILS when the engine keeps the piece instead
+    (plan0_splitbore_keep): the message gives the measured overload in mm."""
+    import tempfile
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.rough import rough
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+    split, forced = {}, {}
+    _orig_cr, _orig_sim = B.channel_regions, B._simulate
+    over = B.AE_SPIKE + 0.75
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None,
+               **kw):
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats,
+                       **kw)
+        for r in res:
+            if r.get("replan0") == 2:
+                split[(round(z, 3), round(r["start"][0], 4),
+                       round(r["start"][1], 4))] = tuple(r["bore"][2:])
+        return res
+
+    def sim_spy(path, stock, z, tool_r, cell, bore_r, ends=None, **kw):
+        w = _orig_sim(path, stock, z, tool_r, cell, bore_r, ends, **kw)
+        key = (round(z, 3), round(path[0][0], 4), round(path[0][1], 4))
+        bxy = kw.get("bore_xy")
+        if bxy and key in split and max(abs(a - b) for a, b in
+                                        zip(bxy, split[key])) < 1e-9:
+            forced[key] = over          # the emit-time real-bore re-check
+            return list(w) + [over]
+        return w
+
+    B._simulate = sim_spy
+    B.channel_regions = cr_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d5.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            moves, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0,
+                                        18.0), 6.343, 0.0, leave=0.381,
+                                axial_leave=0.381, stepdown=19.05,
+                                stepup=1.905, tolerance=0.05, threads=4,
+                                stock_cell=0.5, min_rest=0.5, corner_r=0.0,
+                                stl_path=stl)
+    finally:
+        B.channel_regions = _orig_cr
+        B._simulate = _orig_sim
+    assert split, "no plan0_splitbore piece on the L scene: vacuous"
+    assert forced, "no real-bore re-check reached at emit: vacuous"
+    acts = {(z, round(x, 4), round(y, 4)): a
+            for (x, y, z, a) in stats["credit_fallback"]}
+    fre = {(f["z"], round(f["x"], 4), round(f["y"], 4))
+           for f in stats["failed_region_emitted"]}
+    for key, ae in forced.items():
+        act = acts.get(key)
+        assert act is not None and act.startswith("replan0_") \
+            and act != "replan0_ok", \
+            "split piece %r emitted at the failing load (act %r): re-check " \
+            "measured %.3f mm > AE_SPIKE %.2f, overload %.3f mm" % (
+                key, act, ae, B.AE_SPIKE, ae - B.AE_SPIKE)
+        assert key in fre, "failed split piece %r not in " \
+            "failed_region_emitted (act %r)" % (key, act)
+    print("PASS bs1a4d5 splitbore fail path: %d forced re-check(s), acts %s"
+          % (len(forced), sorted({acts[k] for k in forced})))
+
+
+def test_bs1a4d6b_q4_entry_bore_in_live_stock():
+    """BS1a4d6b item 2 (fallback way): when a split piece's emit re-check
+    fails, the region's ORIGINAL q4 entry stays emitted (the option pieces
+    enter at their own starts), so that entry must be real: for EVERY
+    bore-backed emit re-check (the only _simulate call with a bore_xy and no
+    ends list) the emitted bore equals the predictor's stored bore, its
+    cells read as CUT in the live stock handed to the re-check - right after
+    that entry - and at least one such entry belongs to a region whose
+    re-check then FAILED (replan0_* != ok): stock was entered for a piece
+    that replanned, so the bore must stand cut. CLCHECK stays clean (the
+    entry descent is CL-checked)."""
+    import tempfile
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.rough import rough
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+    split, checked = {}, {}
+    _orig_cr, _orig_sim = B.channel_regions, B._simulate
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None,
+               **kw):
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats,
+                       **kw)
+        for r in res:
+            if r.get("replan0") == 2:
+                split[(round(z, 3), round(r["start"][0], 4),
+                       round(r["start"][1], 4))] = tuple(r["bore"][2:])
+        return res
+
+    def sim_spy(path, stock, z, tool_r, cell, bore_r, ends=None, **kw):
+        bxy = kw.get("bore_xy")
+        key = (round(z, 3), round(path[0][0], 4), round(path[0][1], 4))
+        if bxy and ends is None and key in split and key not in checked:
+            assert max(abs(a - b) for a, b in zip(bxy, split[key])) < 1e-9, \
+                "emit re-check bore %r is not the predictor's stored bore " \
+                "%r of region %r" % (bxy, split[key], key)
+            checked[key] = bore_r
+            k = int((bore_r - 0.75) / cell)   # eroded: every such cell is
+            ci, cj = stock._ci(bxy[0]), stock._cj(bxy[1])   # surely swept
+            n_cut = n_stand = 0
+            for dj in range(-k, k + 1):
+                for di in range(-k, k + 1):
+                    if (di * di + dj * dj) * cell * cell >= (bore_r - 0.75) ** 2:
+                        continue
+                    i, j = ci + di, cj + dj
+                    if 0 <= i < stock.nx and 0 <= j < stock.ny:
+                        n_cut += 1
+                        if stock.top[j, i] > z + 0.05:
+                            n_stand += 1
+            assert n_cut >= 50 and n_stand == 0, \
+                "q4 entry bore of region %r (Z %.3f): %d of %d cells inside " \
+                "the emitted bore read UNcut in the live stock right after " \
+                "that entry (all must read cut)" % (key, z, n_stand, n_cut)
+        return _orig_sim(path, stock, z, tool_r, cell, bore_r, ends, **kw)
+
+    B._simulate = sim_spy
+    B.channel_regions = cr_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d6b_q4.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            _m, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0),
+                              6.343, 0.0, leave=0.381, axial_leave=0.381,
+                              stepdown=19.05, stepup=1.905, tolerance=0.05,
+                              threads=4, stock_cell=0.5, min_rest=0.5,
+                              corner_r=0.0, stl_path=stl)
+    finally:
+        B._simulate = _orig_sim
+        B.channel_regions = _orig_cr
+    assert checked, "no bore-backed q4 entry reached an emit re-check: vacuous"
+    fails = [f for f in stats["credit_fallback"]
+             if f[3].startswith("replan0_") and f[3] != "replan0_ok"
+             and (round(f[2], 3), round(f[0], 4), round(f[1], 4)) in checked]
+    assert fails, \
+        "no FAILED re-check region kept a cut q4 entry bore (the abandoned-" \
+        "piece case never fired): checked %s" % (sorted(checked),)
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    print("PASS bs1a4d6b q4 entry: %d bore-backed emit re-check(s), every "
+          "emitted bore cut in the live stock; %d failed-re-check region(s) "
+          "with a kept q4 bore" % (len(checked), len(fails)))
+
+
+def test_bs1a4d_credit_real_bore():
+    """Task BS1a4d (c): at a helix-entered band start the planning sim's
+    credit is the REAL bore footprint - the cutter disk swept along the
+    emitted helix path plus its floor circle - not a tool_r disk centred on
+    the path start: every cell the emitted entry clears is credited, and the
+    credit is centred on the helix centre (offset from the start), covering
+    far more than the start disk. FAILS on 22cdff7: there the credit is a
+    tool_r disk about path[0] (bore_xy None) and hundreds of cells cleared by
+    the emitted helix are re-counted as fresh loop cut."""
+    import math
+    import tempfile
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.rough import rough
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+    caps, sims, helixes = [], [], []
+    _orig_cr, _orig_sim = B.channel_regions, B._simulate
+    import engine.rough as R
+    _orig_hm = R._helix_moves
+
+    def hm_spy(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg=2.0):
+        mv = _orig_hm(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg)
+        helixes.append((cx, cy, r, z_bot))   # the EXACT emitted bore
+        return mv
+
+    def sim_spy(path, stock, z, tool_r, cell, bore_r, ends=None, **kw):
+        # forward in the CALLER's form: on 22cdff7 the engine never passes
+        # bore_xy, so base is called through its OLD signature there and this
+        # test FAILS BY ASSERTION below, not with a TypeError.
+        w = _orig_sim(path, stock, z, tool_r, cell, bore_r, ends, **kw)
+        sims.append((round(z, 3), tuple(path[0]), bore_r,
+                     tuple(kw["bore_xy"]) if kw.get("bore_xy") else None))
+        return w
+
+    def cr_spy(rings, stock, isl_ok3, z, tool_r, leave, cell, stats=None,
+               **kw):
+        snap = stock.top.copy()
+        res = _orig_cr(rings, stock, isl_ok3, z, tool_r, leave, cell, stats,
+                       **kw)
+        for r in res:
+            caps.append({"z": round(z, 3), "q": tuple(r["start"]),
+                        "credit": r.get("credit") or 0.0, "snap": snap,
+                        "x0": stock.x0, "y0": stock.y0, "cell": stock.cell})
+        return res
+
+    B._simulate = sim_spy
+    B.channel_regions = cr_spy
+    R._helix_moves = hm_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d_c.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            moves, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0,
+                                        18.0), 6.343, 0.0, leave=0.381,
+                                axial_leave=0.381, stepdown=19.05,
+                                stepup=1.905, tolerance=0.05, threads=4,
+                                stock_cell=0.5, min_rest=0.5, corner_r=0.0,
+                                stl_path=stl)
+    finally:
+        B.channel_regions = _orig_cr
+        B._simulate = _orig_sim
+        R._helix_moves = _orig_hm
+
+    def entry_pts(q, z):
+        # the bore that matters for pre-crediting: cutter-disk sweep AT Z -
+        # the HB1v2 floor circle (ramp feed, z == Z) plus the landing point.
+        idx = next((i for i, mv in enumerate(moves) if mv.get("g") == 1
+                    and abs((mv.get("z") or 9e9) - z) < 1e-6
+                    and mv.get("x") is not None
+                    and abs(mv["x"] - q[0]) < 1e-4
+                    and abs(mv["y"] - q[1]) < 1e-4), None)
+        if idx is None:
+            return None
+        pts, j = [q], idx - 1
+        while j >= 0 and moves[j].get("g") == 1 \
+                and abs(moves[j].get("f", 0) - 1270.0) < 1e-6 \
+                and moves[j].get("x") is not None \
+                and abs(moves[j]["z"] - z) < 1e-6:
+            pts.append((moves[j]["x"], moves[j]["y"]))
+            j -= 1
+        return pts if len(pts) > 9 else None   # floor circle at Z + landing
+
+    def cells(cap, pts, rad):
+        out, c = set(), cap["cell"]
+        k = int(math.ceil(rad / c))
+        offs = [(di, dj) for dj in range(-k, k + 1)
+                for di in range(-k, k + 1)
+                if (di * di + dj * dj) * c * c <= rad * rad]
+        for (px, py) in pts:
+            i0 = int(math.floor((px - cap["x0"]) / c))
+            j0 = int(math.floor((py - cap["y0"]) / c))
+            for di, dj in offs:
+                a, b = i0 + di, j0 + dj
+                if 0 <= a < cap["snap"].shape[1] \
+                        and 0 <= b < cap["snap"].shape[0] \
+                        and cap["snap"][b, a] > cap["z"] + 0.05:
+                    out.add((a, b))
+        return out
+
+    checked = 0
+    for cap in caps:
+        if cap["credit"] <= 1e-9:
+            continue
+        pts = entry_pts(cap["q"], cap["z"])
+        if pts is None:
+            continue                      # entry without an emitted helix
+        # BS1a4d5 matcher: pair the cap with the planning or re-check sim
+        # whose bore_xy IS its emitted helix (centre 1e-6, r 1e-6) - the
+        # emitted helix captured exactly at _helix_moves, identified by its
+        # own floor-circle run. No proximity matching.
+        own = [h for h in helixes if abs(h[3] - cap["z"]) < 1e-6
+               and all(abs(math.dist(p, (h[0], h[1])) - h[2]) < 1.5e-4
+                       for p in pts[1:])]
+        assert len(own) == 1, \
+            "entry bore run at (%.4f,%.4f)@Z%.3f matches %d emitted helices" \
+            % (cap["q"][0], cap["q"][1], cap["z"], len(own))
+        hb = own[0]
+        sim = next((s for s in sims if s[0] == cap["z"] and s[3] is not None
+                    and math.dist(s[3][:2], hb[:2]) <= 1e-6
+                    and abs(s[3][2] - hb[2]) <= 1e-6), None)
+        if sim is None:
+            near = min((s for s in sims if s[0] == cap["z"]
+                        and s[3] is not None),
+                       key=lambda s: math.dist(s[3][:2], hb[:2]),
+                       default=None)
+            raise AssertionError(
+                "credited split cap (%.4f,%.4f)@Z%.3f emitted helix centre "
+                "(%.4f,%.4f) r %.4f has NO planning or re-check sim with "
+                "that bore: nearest planned bore centre (%.4f,%.4f) r %.4f, "
+                "planning-vs-emitted bore offset %.4f mm" % (
+                    cap["q"][0], cap["q"][1], cap["z"], hb[0], hb[1], hb[2],
+                    near[3][0] if near else -1.0,
+                    near[3][1] if near else -1.0,
+                    near[3][2] if near else -1.0,
+                    math.dist(near[3][:2], hb[:2]) if near else -1.0))
+        assert sim[3] is not None, \
+            "credited plan sim pre-cleared a disk about the path START " \
+            "(%r), not the real helix-centred bore" % (sim,)
+        credited = cells(cap, [sim[3][:2]], sim[2])
+        credited |= cells(cap, [cap["q"]], 6.343)   # return-feed landing disk
+        cleared = cells(cap, pts, 6.343)
+        # BS1a4d6 (b): the "extra > 100" bound below was written for emitted
+        # bores at the smallest helix tier (R.MIN_BAND_HELIX_FR x tool_r =
+        # 0.3 x tool_r = 1.9029 ~ 1.903); a
+        # SMALLER emitted bore legitimately credits (about) the start disk, so
+        # there the bound is scoped away and replaced: the credited area must
+        # equal the emitted bore's OWN sim footprint - disk(helix centre,
+        # r + tool_r) plus the landing disk - within the grid tolerance.
+        if hb[2] < R.MIN_BAND_HELIX_FR * 6.343 - 1e-9:
+            foot = cells(cap, [hb[:2]], hb[2] + 6.343)
+            foot |= cells(cap, [cap["q"]], 6.343)
+            assert len(credited ^ foot) <= 4, \
+                "small-bore credit != the emitted bore's own footprint: " \
+                "credited %d cells, emitted-helix footprint %d cells, area " \
+                "difference %d > grid tolerance 4 at (%.3f,%.3f) r %.4f" % (
+                    len(credited), len(foot), len(credited ^ foot),
+                    cap["q"][0], cap["q"][1], hb[2])
+        assert len(cleared - credited) <= 20, \
+            "%d cell(s) cleared by the emitted entry are not credited at " \
+            "(%.3f,%.3f) (bound 20 = return-feed stadium between helix end " \
+            "and landing, not modelled at plan time)" % (
+                len(cleared - credited), cap["q"][0], cap["q"][1])
+        assert len(credited - cleared) <= 30, \
+            "credit exceeds the swept floor-circle bore by %d cells (grid " \
+            "chord sliver bound 30) at (%.3f,%.3f)" % (
+                len(credited - cleared), cap["q"][0], cap["q"][1])
+        start_disk = cells(cap, [cap["q"]], 6.343)
+        if hb[2] >= R.MIN_BAND_HELIX_FR * 6.343 - 1e-9:  # BS1a4d6 (b): kept for r >= min_helix_r
+            assert len(credited - start_disk) > 100, \
+                "credit is still (about) the tool_r start disk: extra %d" % \
+                len(credited - start_disk)
+        checked += 1
+    assert checked >= 1, "no helix-entered credited region was checked"
+    print("PASS bs1a4d(c): %d helix-entered region(s) - credited cells cover "
+          "the swept helix + floor-circle bore exactly (offset centre)"
+          % checked)
+
+
+def test_bs1a4d2b_centred_entry_bore():
+    """Task BS1a4d2b: a band channel region's entry bores AT its trochoid
+    start (centred helix). On the test block and the L-channel scenes, every
+    credited band entry that bores (helix + HB1v2 floor circle emitted for
+    it) has NO fresh stock under its start disk at the cut Z: 0 cells
+    standing above Z + 0.05 inside disk(start, tool_r) that the entry did
+    not sweep (cells cleared earlier at <= Z do not count), and the bore
+    circle passes through the start (centre within r of it). An entry
+    without its own bore must either find the disk already clear at emit or
+    be listed in credit_fallback - never silent.
+    FAILS on 2c8e11d: the main-tier bore centre sits d >= 1.5 mm from the
+    start, so the start disk pokes past the bore edge - 43 fresh cells stand
+    under the test-block region's start disk."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    _need(TB_STL)
+    import tempfile
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.rough import rough
+    tool_r = 6.343
+    k_off = int(math.ceil(tool_r / 0.5))
+    offs = [(di, dj) for dj in range(-k_off, k_off + 1)
+            for di in range(-k_off, k_off + 1)
+            if (di * di + dj * dj) * 0.25 <= tool_r * tool_r]
+    l_tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+              + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+              + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+              + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+              + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+              + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+              + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0))
+
+    def run_scene(name, stl_src, box, kw):
+        caps = []
+        _orig_cr = B.channel_regions
+
+        def cr_spy(rings, stock, isl_ok3, z, tr_, leave, cell, stats=None,
+                   **k2):
+            res = _orig_cr(rings, stock, isl_ok3, z, tr_, leave, cell, stats,
+                          **k2)
+            for r in res:
+                if (r.get("credit") or 0.0) > 1e-9:
+                    caps.append({"z": z, "q": tuple(r["start"]),
+                                "snap": stock.top.copy(), "x0": stock.x0,
+                                "y0": stock.y0, "cell": cell})
+            return res
+
+        B.channel_regions = cr_spy
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                stl = stl_src or os.path.join(td, "%s.stl" % name)
+                if stl_src is None:
+                    _write_stl(stl, l_tris)
+                surf = ocl.STLSurf()
+                ocl.STLReader(stl, surf)
+                try:
+                    mv, st = rough(surf, box, tool_r, **kw)
+                except RuntimeError as e:
+                    raise AssertionError("%s: rough refused: %s"
+                                       % (name, str(e)[:160]))
+        finally:
+            B.channel_regions = _orig_cr
+        checked, nlink, seen = [], 0, set()
+        fb = st.get("credit_fallback", [])
+        for cap in caps:
+            q, z = cap["q"], cap["z"]
+            key = (round(z, 3), round(q[0], 2), round(q[1], 2))
+            if key in seen:
+                continue
+            seen.add(key)
+            cands = [i for i, m in enumerate(mv) if m["g"] == 1
+                     and m["x"] is not None and m["z"] is not None
+                     and abs(m["z"] - z) < 1e-6
+                     and math.dist((m["x"], m["y"]), q) < 1e-4]
+            if not cands:
+                continue          # dropped region (listed by BS1a4d/-f tests)
+            # the entry's OWN bore = the contiguous ramp-feed run ending just
+            # before the return link (helix segments + HB1v2 floor circle;
+            # links and cutting paths run at cutting feed and break the run).
+            fz, own, idx = [], False, cands[0]
+            for i in cands:
+                run_fz, run_own = [], False
+                for m in reversed(mv[:i]):
+                    if m["g"] != 1 or m["x"] is None \
+                            or abs(m.get("f", 0.0) - 1270.0) > 1e-6:
+                        break
+                    if m["z"] > z + 0.05:
+                        run_own = True
+                    elif abs(m["z"] - z) <= 1e-6:
+                        run_fz.append((m["x"], m["y"]))
+                if run_own and len(run_fz) >= 4:
+                    fz, own, idx = run_fz, True, i
+                    break
+            # cells standing above Z+0.05 under the start disk: plan-time
+            # fresh stock minus everything a feed move at <= Z swept before
+            # the entry's landing move (the landing / return link itself is
+            # NOT credited - that bite is what this task removes).
+            ci = int(math.floor((q[0] - cap["x0"]) / cap["cell"]))
+            cj = int(math.floor((q[1] - cap["y0"]) / cap["cell"]))
+            fresh = set()
+            for di, dj in offs:
+                a, b = ci + di, cj + dj
+                if 0 <= a < cap["snap"].shape[1] \
+                        and 0 <= b < cap["snap"].shape[0] \
+                        and cap["snap"][b, a] > z + 0.05:
+                    fresh.add((a, b))
+            cleared = set()
+            for m in mv[:idx]:          # everything swept at <= Z beforehand
+                if m["g"] != 1 or m["x"] is None or m["z"] > z + 1e-6 \
+                        or math.dist((m["x"], m["y"]), q) > tool_r + 0.5:
+                    continue
+                mi = int(math.floor((m["x"] - cap["x0"]) / cap["cell"]))
+                mj = int(math.floor((m["y"] - cap["y0"]) / cap["cell"]))
+                cleared.update((mi + di, mj + dj) for di, dj in offs)
+            standing = fresh - cleared
+            if not own:
+                # entry without its own bore: the start disk must already be
+                # clear, else the entry must be recorded in credit_fallback.
+                if standing:
+                    assert any(abs(f[0] - q[0]) < 1.5 and abs(f[1] - q[1]) < 1.5
+                             and abs(f[2] - round(z, 3)) < 1e-6 for f in fb), \
+                        "%s: credited entry (%.3f,%.3f)@Z%.3f reached its " \
+                        "start through %d fresh cell(s) with no bore and no " \
+                        "credit_fallback listing - silent emit" % (
+                            name, q[0], q[1], z, len(standing))
+                else:
+                    nlink += 1          # disk already cleared at emit time
+                continue
+            checked.append(key)
+            cx = sum(p[0] for p in fz) / len(fz)
+            cy = sum(p[1] for p in fz) / len(fz)
+            rad = sum(math.dist(p, (cx, cy)) for p in fz) / len(fz)
+            assert not standing, \
+                "%s: %d cell(s) stand above Z+0.05 under the start disk " \
+                "(%.3f,%.3f)@Z%.3f after its entry bore (centre (%.2f,%.2f) " \
+                "r %.2f): the start disk pokes past the swept bore" % (
+                    name, len(standing), q[0], q[1], z, cx, cy, rad)
+            assert math.dist((cx, cy), q) <= rad + 0.3, \
+                "%s: entry bore at (%.3f,%.3f)@Z%.3f is not centred on the " \
+                "start: centre (%.2f,%.2f) is %.2f mm away > r + 0.3" % (
+                    name, q[0], q[1], z, cx, cy, math.dist((cx, cy), q))
+        return checked, nlink, st
+
+    chk_tb, nl_tb, st_tb = run_scene(
+        "bs1a4d2b_tb", TB_STL, (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0),
+        dict(floor_z=20.0, leave=0.381, axial_leave=0.381, stepdown=19.05,
+             stepover=0.16, stl_path=TB_STL, workers=None, threads=4,
+             stock_cell=0.5, final_zmin=20.381))
+    chk_ls, nl_ls, st_ls = run_scene(
+        "bs1a4d2b_lshape", None, (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0),
+        dict(floor_z=0.0, leave=0.381, axial_leave=0.381, stepdown=19.05,
+             stepup=1.905, tolerance=0.05, threads=4, stock_cell=0.5,
+             min_rest=0.5, corner_r=0.0))
+    assert any(abs(k[0] - 27.381) < 1e-6
+               and math.dist((k[1], k[2]), (6.276, -2.078)) < 1.0
+               for k in chk_tb), \
+        "test-block region (6.28,-2.08)@Z27.381 not helix-entered+checked: %s" \
+        % (chk_tb,)
+    assert any(abs(k[0] - 0.381) < 1e-6
+               and math.dist((k[1], k[2]), (-18.724, 0.685)) < 1.0
+               for k in chk_ls), \
+        "the L-channel arm start (-18.72,0.69)@Z0.381 was not helix-entered" \
+        "+checked: %s" % (chk_ls,)
+    assert len(chk_tb) >= 1 and len(chk_ls) >= 2, \
+        "too few centred-bore entries checked (TB %d, L %d): vacuous" % (
+            len(chk_tb), len(chk_ls))
+    print("PASS bs1a4d2b: centred entry bores - %d bore-entered region(s) "
+          "checked on the test block (+%d link-backed), %d on the L channel "
+          "(+%d link-backed); credit_fallback TB=%s LS=%s" % (
+              len(chk_tb), nl_tb, len(chk_ls), nl_ls,
+              [f[3] for f in st_tb.get("credit_fallback", [])],
+              [f[3] for f in st_ls.get("credit_fallback", [])]))
+
+
+def test_bs1a4d4_credit_entry_matches_prediction():
+    """Task BS1a4d4: band entry credit and the emitted entry are ONE
+    decision. Where the bore predictor (_bore_pred via band.bore_context)
+    accepts a centred bore for a credited band start, channel_regions stores
+    that exact bore in the region (res["bore"] = start x, start y, centre x,
+    centre y, radius) and rough.py enters at exactly that stored start with
+    exactly that stored bore - no re-search. A region whose start disk stands
+    (credit > 0) but where NO centred bore fits gets the normal full-tier
+    ladder (centred=False), never the centred-only ladder that failed closed
+    on Core Front. Scene: the L channel plus an island box beside the
+    vertical arm; the trochoid starts hugging the inner-corner block have
+    credit > 0 with no centred bore that fits, while other credited regions
+    get predicted bores. Assert: rough generates; every credited region with
+    a stored bore that bored entered at exactly that stored centre (within
+    1e-6, centres captured exactly at _helix_moves) and radius; no region
+    without a stored bore used the centred-only ladder (its own bore circle
+    never passes through the entry: centred bores have |centre dist - r| =
+    0.05, normal tiers >= 0.17); clcheck and axial counts are 0.
+    FAILS on 6793ad9: band.py:471 stores no bore at all (0 stored bores) and
+    rough.py:2129 passes centred="credit" in res - always True for band
+    regions - so every band entry takes the centred-only ladder (the two
+    corner entries there exhaust all 96 centred candidates)."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    from opencamlib import ocl
+    import engine.band as B
+    import engine.rough as R
+    from engine.rough import rough
+    tool_r = 6.343
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)      # floor
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)    # left wall
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)     # bottom wall
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)        # inner crn
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)        # right wall
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)       # upr-left
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0)        # top cap
+            + _box_tris(5.5, 9.5, 12.0, 16.0, 0.0, 18.0))        # island
+    caps = []
+    _orig_cr, _orig_hm = B.channel_regions, R._helix_moves
+
+    def cr_spy(rings, stock, isl_ok3, z, tr_, leave, cell, stats=None, **kw):
+        res = _orig_cr(rings, stock, isl_ok3, z, tr_, leave, cell, stats, **kw)
+        for r in res:
+            caps.append({"z": round(z, 3), "q": tuple(r["start"]),
+                         "credit": r.get("credit") or 0.0,
+                         "bore": r.get("bore")})
+        return res
+
+    helixes = []
+
+    def hm_spy(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg=2.0):
+        mv = _orig_hm(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg)
+        helixes.append((cx, cy, r, z_bot))   # the EXACT emitted bore
+        return mv
+
+    B.channel_regions = cr_spy
+    R._helix_moves = hm_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d4.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            try:
+                moves, stats = rough(
+                    surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0), tool_r, 0.0,
+                    leave=0.381, axial_leave=0.381, stepdown=19.05,
+                    stepup=1.905, tolerance=0.05, threads=4, stock_cell=0.5,
+                    min_rest=0.5, corner_r=0.0, stl_path=stl)
+            except RuntimeError as e:
+                raise AssertionError("rough refused: %s" % str(e)[:160])
+    finally:
+        B.channel_regions = _orig_cr
+        R._helix_moves = _orig_hm
+
+    def own_helix(q, z):
+        """the helix event whose floor-circle run ends in this region's
+        landing move (its own bore), or None if the entry did not bore."""
+        idx = next((i for i, m in enumerate(moves) if m["g"] == 1
+                    and m["x"] is not None and m["z"] is not None
+                    and abs(m["z"] - z) < 1e-6
+                    and math.dist((m["x"], m["y"]), q) < 1e-4), None)
+        if idx is None:
+            return None
+        fz, j = [], idx - 1
+        while j >= 0:
+            m = moves[j]
+            if m["g"] == 0:
+                j -= 1
+                continue
+            if m["g"] == 1 and m["x"] is not None:
+                if abs(m.get("f", 0.0) - 1270.0) < 1e-6:
+                    if abs(m["z"] - z) <= 1e-6:
+                        fz.append((m["x"], m["y"]))
+                    elif m["z"] > z + 0.05:
+                        pass               # helix descent above Z
+                    else:
+                        break
+                else:
+                    break                  # cutting feed / link: other's run
+            j -= 1
+        if len(fz) < 5:
+            return None
+        own = [h for h in helixes if abs(h[3] - z) < 1e-6
+               and all(abs(math.dist(p, (h[0], h[1])) - h[2]) < 1.5e-4
+                       for p in fz)]
+        assert len(own) == 1, \
+            "entry bore run at (%.3f,%.3f)@Z%.3f matches %d emitted helices" \
+            % (q[0], q[1], z, len(own))
+        return own[0]
+
+    bored = [c for c in caps if c["bore"] is not None]
+    assert bored, \
+        "no band region carries the bore its planner accepted: the credit " \
+        "and the emitted entry are still two separate decisions"
+    n_bore_helix = n_nobore_helix = 0
+    for c in caps:
+        q, z = c["q"], c["z"]
+        if c["bore"] is not None:
+            b = c["bore"]
+            assert math.dist(b[:2], q) < 1e-4, \
+                "stored bore start (%.3f,%.3f) != region start (%.3f,%.3f)" \
+                % (b[0], b[1], q[0], q[1])
+            own = own_helix(q, z)
+            if own is None:
+                continue                   # link-backed entry (disk cleared)
+            n_bore_helix += 1
+            assert math.dist((own[0], own[1]), (b[2], b[3])) < 1e-6 \
+                and abs(own[2] - b[4]) < 1e-9, \
+                "credited region (%.3f,%.3f)@Z%.3f bored at (%.4f,%.4f) " \
+                "r %.4f, not its stored bore centre (%.4f,%.4f) r %.4f: " \
+                "the emit re-searched its own ladder" % (
+                    q[0], q[1], z, own[0], own[1], own[2], b[2], b[3], b[4])
+        else:   # BS1a4d4 (c): every region WITHOUT a stored bore (credit now 0)
+            own = own_helix(q, z)
+            if own is None:
+                continue
+            n_nobore_helix += 1
+            d = math.dist(own[:2], q)
+            assert abs(d - own[2]) > 0.12, \
+                "region (%.3f,%.3f)@Z%.3f with no predicted bore entered " \
+                "through a centred-only bore (centre %.3f mm from entry, " \
+                "r %.3f: circle passes through the entry)" % (
+                    q[0], q[1], z, d, own[2])
+    assert n_bore_helix >= 1, \
+        "no credited region bored with its stored bore: vacuous"
+    assert n_nobore_helix >= 1, \
+        "no credit-0 region needed a descent (no bore to deny it): vacuous"
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    assert stats.get("n_axial_plunge", 0) == 0, stats.get("axial_pts")
+    print("PASS bs1a4d4: %d credited region(s), %d stored bore(s), %d "
+          "entered with exactly their stored bore, %d credit-0 descents all "
+          "on the normal ladder; clcheck/axial 0" % (
+              sum(1 for c in caps if c["credit"] > 1e-9), len(bored),
+              n_bore_helix, n_nobore_helix))
+
+
+def test_bs1a4d4_entry_pinned_to_stored_start():
+    """Task BS1a4d4 (coordinator): the emitted band entry is the predicted
+    start even when the emitter's own pick would differ. Core Front's
+    fail-closed entry was chosen from [res["start"], first cutting point]
+    nearest the previous position - not the point the predictor evaluated.
+    Scene: the L channel + island of test_bs1a4d4_credit_entry_matches_
+    prediction. A channel_regions spy moves every bored region's
+    res["start"] to a DECOY - the far end of its own (legal) cutting path -
+    so the emitter's nearest-to-prev pick is the decoy wherever that is
+    closer; the stored bore (planned at the true start) is untouched.
+    Assert: no emitted helix is a centred bore through a decoy (circle
+    through the decoy, not through the stored start), and at least one
+    region bored with exactly its stored centre (1e-6) and radius. FAILS
+    with an emitter that ignores res["bore"] (no pin, no stored-bore
+    branch): it enters at the decoy with a centred bore there."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    from opencamlib import ocl
+    import engine.band as B
+    import engine.rough as R
+    from engine.rough import rough
+    tool_r = 6.343
+    tris = (_box_tris(-40.0, 40.0, -30.0, 30.0, -1.0, 0.0)
+            + _box_tris(-40.0, -28.0, -30.0, 30.0, 0.0, 18.0)
+            + _box_tris(-28.0, 40.0, -30.0, -9.5, 0.0, 18.0)
+            + _box_tris(2.0, 40.0, -9.5, -2.0, 0.0, 18.0)
+            + _box_tris(9.5, 40.0, -2.0, 30.0, 0.0, 18.0)
+            + _box_tris(-40.0, -9.5, 9.5, 30.0, 0.0, 18.0)
+            + _box_tris(-9.5, 9.5, 28.0, 30.0, 0.0, 18.0)
+            + _box_tris(5.5, 9.5, 12.0, 16.0, 0.0, 18.0))
+    decoys = []                    # (z, decoy xy, stored bore)
+    _orig_cr, _orig_hm = B.channel_regions, R._helix_moves
+
+    def cr_spy(rings, stock, isl_ok3, z, tr_, leave, cell, stats=None, **kw):
+        res = _orig_cr(rings, stock, isl_ok3, z, tr_, leave, cell, stats, **kw)
+        for r in res:
+            b = r.get("bore")
+            pts = r["paths"][0][1]
+            if b and math.dist(pts[-1][:2], b[:2]) > 1.0:
+                r["start"] = [pts[-1][0], pts[-1][1]]
+                decoys.append((round(z, 4), tuple(pts[-1][:2]), b))
+        return res
+
+    helixes = []
+
+    def hm_spy(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg=2.0):
+        helixes.append((cx, cy, r, z_bot))
+        return _orig_hm(cx, cy, sx, sy, z_top, z_bot, feed, r, angle_deg)
+
+    B.channel_regions = cr_spy
+    R._helix_moves = hm_spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d4_pin.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            try:
+                moves, stats = rough(
+                    surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0), tool_r, 0.0,
+                    leave=0.381, axial_leave=0.381, stepdown=19.05,
+                    stepup=1.905, tolerance=0.05, threads=4, stock_cell=0.5,
+                    min_rest=0.5, corner_r=0.0, stl_path=stl)
+            except RuntimeError as e:
+                raise AssertionError("rough refused: %s" % str(e)[:160])
+    finally:
+        B.channel_regions = _orig_cr
+        R._helix_moves = _orig_hm
+    assert decoys, "no bored band region to decoy: vacuous"
+    n_exact = 0
+    for (z, dxy, b) in decoys:
+        at_z = [h for h in helixes if abs(h[3] - z) < 1e-6]
+        for (cx, cy, r, _zb) in at_z:
+            # the centred ladder's exact signature: centre = pick + (r - 0.05) u
+            # (an off-centre normal-ladder bore of another region can pass
+            # near a decoy, but not at exactly r - 0.05 from it)
+            thru_decoy = abs(math.dist((cx, cy), dxy) - (r - 0.05)) < 1e-3
+            thru_start = abs(math.dist((cx, cy), b[:2]) - (r - 0.05)) < 1e-3
+            assert not (thru_decoy and not thru_start), \
+                "band entry (%.3f,%.3f)@Z%.3f bored through the emitter's own " \
+                "pick (%.3f,%.3f) with centre (%.4f,%.4f), not the stored start " \
+                "and bore centre (%.4f,%.4f): entry re-chosen at emit" % (
+                    b[0], b[1], z, dxy[0], dxy[1], cx, cy, b[2], b[3])
+        if any(math.dist((cx, cy), b[2:4]) < 1e-6 and abs(r - b[4]) < 1e-9
+               for (cx, cy, r, _zb) in at_z):
+            n_exact += 1
+    assert n_exact >= 1, "no decoyed region bored with its stored bore: vacuous"
+    assert stats.get("clcheck_violations", 0) == 0
+    assert stats.get("n_axial_plunge", 0) == 0
+    print("PASS bs1a4d4 pin: %d decoyed region(s), %d bored with exactly "
+          "their stored bore at the stored start; no entry re-chosen" % (
+              len(decoys), n_exact))
+
+
+def test_bs1a4d3_links_measured_as_cuts():
+    """Task BS1a4d3 (e): a cutting-feed link that is not stock-clear on the
+    cut-time stock at its Z is checked AS A CUT (band._simulate on the live
+    stock at Z, credit 0); over SPIKE_MM 2.44 it is not emitted as a link -
+    lift and re-entry through enter_at's ladder instead. Replay the emitted
+    link moves of this open pocket (40 x 30, floor -1, stock top Z2.0,
+    stepdown 1.5: links at the lower level cross the shelf the level above
+    left) on pre-mill live-stock snapshots and require EVERY emitted flink /
+    clip-bridge / flank-feed-in link to measure max window <= 2.44 mm.
+    FAILS BY ASSERTION on d4ced08: there a flank feed-in at Z 0.381 (3.5 mm,
+    past the descent column at (10.0, 5.4)) shears the shelf and measures
+    4.00 mm > 2.44 with no window check at all."""
+    import math
+    import tempfile
+    from opencamlib import ocl
+    import engine.stock as S
+    import engine.band as B
+    from engine.rough import rough, AXIAL_FLOOR
+    LIFT = 1.9                     # rough()'s default lift, unchanged here
+    snaps, lcs = [], []
+    orig_mp = S.StockField.mill_path
+    orig_lc = S.StockField.link_clear
+
+    def _snap(self):
+        st = S.StockField.__new__(S.StockField)
+        st.cell, st.x0, st.y0 = self.cell, self.x0, self.y0
+        st.nx, st.ny = self.nx, self.ny
+        st.top = self.top.copy()
+        return st
+
+    def spy_mp(self, pts, z, tool_r, corner_r=0.0):
+        snaps.append((list(pts), z, tool_r, _snap(self)))
+        return orig_mp(self, pts, z, tool_r, corner_r)
+
+    def spy_lc(self, pts, h, eps=0.05):
+        r = orig_lc(self, pts, h, eps)
+        lcs.append((list(pts), h, r))
+        return r
+
+    def key(pts):
+        return [(round(q[0], 4), round(q[1], 4)) for q in pts]
+
+    def lc_ok(pts, h):
+        kp = key(pts)
+        return any(lok and abs(lh - h) <= 1e-6 and key(lp) == kp
+                   for (lp, lh, lok) in lcs)
+
+    def chord(pts):
+        out, d0 = [pts[0]], None
+        for a, b in zip(pts[1:], pts[2:]):
+            d = math.dist(a, b)
+            if not (1e-9 < d <= 0.55):
+                break
+            v = ((b[0] - a[0]) / d, (b[1] - a[1]) / d)
+            if d0 is None:
+                d0, _ = v, out.append(a)
+            elif v[0] * d0[0] + v[1] * d0[1] < 0.7071:
+                break
+            else:
+                out.append(b)
+        ln = sum(math.dist(out[i], out[i + 1]) for i in range(len(out) - 1))
+        return out if len(out) >= 2 and ln <= 5.0 else None
+
+    tris = (_box_tris(-20.0, 20.0, -15.0, 15.0, -1.0, 0.0)     # pocket floor
+            + _box_tris(-40.0, -20.0, -30.0, 30.0, 0.0, 2.0)
+            + _box_tris(20.0, 40.0, -30.0, 30.0, 0.0, 2.0)
+            + _box_tris(-20.0, 20.0, -30.0, -15.0, 0.0, 2.0)
+            + _box_tris(-20.0, 20.0, 15.0, 30.0, 0.0, 2.0))
+    S.StockField.mill_path = spy_mp
+    S.StockField.link_clear = spy_lc
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "bs1a4d3.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            moves, stats = rough(
+                surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 2.0), 6.343, 0.0,
+                leave=0.381, axial_leave=0.381, stepdown=1.5, stepup=1.905,
+                tolerance=0.05, threads=4, stock_cell=0.5, min_rest=0.5,
+                corner_r=0.0, stl_path=stl)
+    finally:
+        S.StockField.mill_path = orig_mp
+        S.StockField.link_clear = orig_lc
+    # classify: dlink (stock-clear at Z - covered), flink (cleared only at
+    # z+lift), flank feed-in (floor-checked at z+AXIAL_FLOOR), clip bridge
+    # (run starting at the previous mill end, same Z, no stock check).
+    cls = [None] * len(snaps)
+    for k, (pts, z, tr, st) in enumerate(snaps):
+        if len(pts) < 2:
+            continue
+        if lc_ok(pts, z):
+            cls[k] = "dlink"
+        elif lc_ok(pts, z + LIFT):
+            cls[k] = "flink"
+        elif lc_ok(pts, z + AXIAL_FLOOR):
+            cls[k] = "feedin"
+        elif k + 1 < len(snaps) and abs(snaps[k + 1][1] - z) <= 1e-6 and \
+                key(pts[-1:]) == key(snaps[k + 1][0][:1]):
+            cls[k] = "helixret"          # inside the swept bore: covered
+    bad, nmeas = [], 0
+    for k, (pts, z, tr, st) in enumerate(snaps):
+        path = None
+        if cls[k] in ("flink", "feedin"):
+            path = pts
+        elif cls[k] is None and k and abs(snaps[k - 1][1] - z) <= 1e-6 \
+                and cls[k - 1] in (None, "bridge") and \
+                key(snaps[k - 1][0][-1:]) == key(pts[:1]):
+            path = chord(pts)          # the bridge chord only
+            if path is not None:
+                cls[k] = "bridge"
+        if path is None or len(path) < 2:
+            continue
+        nmeas += 1
+        wins = B._simulate([tuple(q[:2]) for q in path], st, z, tr,
+                           st.cell, 0.0)
+        mx = max(wins) if wins else 0.0
+        if mx > 2.44 + 1e-9:
+            bad.append((cls[k], round(z, 3), len(path), round(mx, 2),
+                       (round(path[0][0], 2), round(path[0][1], 2))))
+    assert nmeas >= 1, "no cutting-feed link was emitted/replayed: vacuous"
+    assert not bad, \
+        "cutting-feed link(s) cross stock at Z and measure over AE_SPIKE " \
+        "2.44 (not checked as a cut): %s" % bad[:6]
+    print("PASS bs1a4d3: %d cutting-feed link(s) replayed, all <= 2.44 mm; "
+          "checked/converted flnk %s/%s brdg %s/%s fdin %s/%s" % (
+              nmeas, stats.get("flnk_chk"), stats.get("flnk_cvt"),
+              stats.get("brdg_chk"), stats.get("brdg_cvt"),
+              stats.get("fdin_chk"), stats.get("fdin_cvt")))
 
 
 if __name__ == "__main__":
