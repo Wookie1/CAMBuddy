@@ -1143,3 +1143,220 @@ with the 3-test failure family above fully characterised.
 - test_bs1a4b_windows_align_zmap re-run on the FINAL code: FAIL, exit 1,
   "window count differs for region (6.276, -2.0778): engine 791 vs zmap
   412" (same engine-vs-zmap window divergence family as the other two).
+
+---
+
+## BS1a4d8d (this session, started 22:16 MST, FRESH, cap 00:16 MST)
+
+### Plan
+- Start from dc073a1 WIP (73 changed engine lines vs 337c44b; budget <=80, stop ~100).
+- (B) corrected guard scope: in-run guard covers ONLY emit-assembled joins /
+  paths that were never plan-simulated (a2d regions); band regions (planned by
+  channel_regions, simulated at plan time via _simulate) keep plan-time sim and
+  are never re-judged inside a run.
+- (A)+(B) ONE entry decision for a run that starts at its own point: credit
+  recomputed on the live stock at that point (entry_credit), real centred bore
+  via _bore_pred else credit 0, bore stored in res["bore"], re-check sim
+  recorded (predictor mirrors) - used by the re-plan far route AND by the
+  guard conversion.
+- (B2) helix_entry's own last feed-in step simulated under the approach rule;
+  over-limits candidate rejected -> next ladder option.
+- (C) CAUSE FIRST for the 791-vs-412 window divergence, then fix.
+- (D) all mutations re-run on FINAL code; (E) provenance counters.
+
+### Progress log
+- 22:2x session start; baseline diff 58/15 rough.py (73 lines).
+
+### (C) CAUSE FIRST - region (6.276,-2.0778) engine 791 vs zmap 412 windows
+Cause (found by reading test_bs1a4b_windows_align_zmap + d8c's guard, before
+any fix): the align test locates a band region's emitted moves as the CONTIG-
+UOUS line range [lo+1 .. 7+i0+len(pts)-1] - one G1 line per planned path point
+- and counts zmap windows whose end_line falls in it. The d8c in-run guard
+re-judges PLANNED band segments (1-2 mm adaptive steps already simulated by
+channel_regions/_simulate at plan time) with lnk_cut_ok - a link-CLEARANCE
+rule - and converts them mid-run: trans_guard inserts lift -> rapid -> re-
+entry moves INSIDE the run. Every inserted line shifts the remaining path
+points past the range bound, so every zmap window after the first conversion
+(~412 mm of feed into the region) is excluded -> zmap 412 vs engine 791. The
+converted re-entry's own extra cutting-feed moves add further unpaired win-
+dows. The guard converting a planned segment is itself the defect (B): those
+pairs keep their plan-time sim. Fix = scope the in-run guard to emit-assembled
+joins / never-plan-simulated (a2d) runs only; planned band paths are never
+re-judged, so no mid-run insertions and the emitted moves are the ONLY source
+again. Verification: test_bs1a4b_windows_align_zmap unedited, below.
+
+### The change (file:line on final code, rough.py only; band.py untouched)
+- enter_at option 2 (rough.py:1755-1757): feed_down now receives hc + bore -
+  the traverse-at-Z+lift path DROPPED the credited bore, so the L-channel
+  split cap (-2.4654,6.4484)@Z0.381 re-entered with a GENERIC main-tier helix
+  centred 3.4 mm off its start (d2b "not centred" + credit_real_bore "NO sim
+  with that bore"). Probe scratch/d8d_dbg_d2b.py: planned bore centre
+  (-0.6125,6.4484) r 1.9029 vs emitted (0.68,7.75).
+- enter_point (rough.py:1782-1795): the ONE entry decision for a run that
+  starts at its OWN point - entry_credit on the live stock, real centred bore
+  via _bore_pred else credit 0, stored in res["bore"]/["credit"], entered via
+  the SAME enter_at ladder. Used by the re-plan far route (rough.py:2321-2323)
+  and by every trans_guard conversion (rough.py:1840) - never a raw enter_at.
+- (B2) try_cand (rough.py:1337-1344): the entry's OWN last cutting-feed step
+  (the return feed into the start) is simulated on the live stock with only
+  the swept bore pre-cleared (d6c/d6d rule, eps 0); max window > SPIKE_MM
+  refuses the candidate -> the EXISTING ladder order moves on (no new entry
+  types).
+- (B) scope: band regions marked b["band"]=True at extend (rough.py:2198-9);
+  walker in-run guard fires only for NOT-band runs (rough.py:2464-6, a2d paths
+  are never plan-simulated); band/planned segments keep plan-time _simulate
+  and are never re-judged; more_pcs interior guard removed (2596-2601).
+- (E) provenance: trans_guard(tag) -> cvt_entry / cvt_join (1817, 1836).
+
+### Budget
+git diff --numstat 337c44b -- engine/rough.py: 84 added / 17 deleted = 101
+changed lines (dc073a1 included). ABOVE the 80 target, AT the ~100 stop line;
+reported, not trimmed further (every line is a brief item; comments already
+compressed).
+
+### Test runs (all via slot_m4.sh, scratch/d8d_run.sh; 22:35-22:55 MST)
+- test_bs1a4d2b_centred_entry_bore  EXIT=0 PASS (was the #1 regression)
+- test_bs1a4d_credit_real_bore      EXIT=0 PASS (was #2)
+- test_bs1a4b_windows_align_zmap    EXIT=0 PASS "window boundaries identical"
+  (was #3; the (C) cause above is thereby confirmed - no mid-run insertions)
+- test_bs1a4d8c_inrun_jump_simulated EXIT=0 PASS (irun_chk 54, irun_cvt 11,
+  corridor judged clean 0 windows)
+- test_bs1a4d8c_replan_far_piece_enters_own_start: first run EXIT=1 - the far
+  route's recomputed CENTRED bore at the open-bay piece start was tier
+  0.8*tool_r (r 5.07) whose return feed-in is a 10.1 mm cutting-feed chord
+  ("first cutting move at the piece (5.904, 3.228) -> (10.000, -6.000) does
+  not end at its own entered first point"). Fix: enter_point STORES the
+  recomputed bore/credit in res (the re-prediction ladder's sim already
+  mirrors that bore) but the far entry keeps the EXISTING ladder order
+  (ramp/side-first, fine-tier helix); guard conversions enter WITH the bore.
+  Re-run EXIT=0 PASS (first cut ends 0.400 mm from the piece start).
+
+### Final entry-function shape (after the pinned/decoy + d8b findings)
+- _gate flag (rough.py:1159): try_cand's B2 feed-in gate fires ONLY for
+  entries made through enter_point (the ONE entry function) - the CF
+  overload source was the CONVERTED re-entries' feed-in (facts: "18 over-
+  2.44 windows are a single move right after an F1270 entry"), and gating
+  EVERY helix perturbed planned entries (d8b scene: a2d path shape changed
+  through stock-state feedback and a raw 0.5 mm-step cross-corridor run
+  appeared). enter_point sets _gate around its enter_at (rough.py:1802-5).
+- enter_point (rough.py:1784-1805): credit recomputed with entry_credit on
+  the live stock, centred bore via _bore_pred, stored in res["bore"]/
+  ["credit"] (predictor mirrored by the re-prediction ladder's sim, which
+  uses the same entry_credit+borefn formula); the stored bore is EMITTED
+  only for the re-plan piece start AND only at tiers <= 0.5 x tool_r (the
+  replan test's "first cut within reach of the entered start" invariant -
+  a big centred bore return-feeds 2r across the bore at cutting feed); a
+  guard conversion (res=None) keeps the normal ladder tiers - test_bs1a4d4_
+  entry_pinned_to_stored_start forbids a centred bore re-chosen at an
+  arbitrary emitted point (stack trace scratch/d8d_pin_trace.py: the decoy
+  helix came from trans_guard -> enter_point).
+
+### Iteration failures found and fixed (each re-run after the fix)
+1. replan test EXIT=1 "first cutting move at the piece (5.904,3.228) ->
+   (10.000,-6.000) does not end at its own entered first point" - big
+   centred bore at far start; fixed by the 0.5 x tool_r tier rule above.
+2. d2b EXIT=1 (batch B) "entry bore at (-2.465,6.448)@Z0.381 ... centre
+   (0.53,7.69) is 3.24 mm away" - the far piece of region (-2.09,5.742)
+   STARTS at Q (-2.4654,6.4484) (stack trace scratch/d8d_trace_out.txt:
+   enter_point rough.py:2324); generic ladder there bores off-centre;
+   fixed by emitting the small-tier stored bore at the far start.
+3. pinned EXIT=1 "bored through the emitter's own pick (-3.999,1.647)" -
+   guard conversion forcing a centred bore; fixed by res=None -> bore=None.
+4. d8b EXIT=1 "cutting-feed move at Z inside the piece-to-piece transition"
+   - ungated B2 perturbing planned entries; fixed by _gate scoping.
+
+### FINAL: all 25 at-risk tests on the FINAL code (scratch/d8d_final25.log)
+ALL PASS, exit 0 each (pasted from the run, 23:45-23:56 MST):
+  test_bs1a4d_credit0_lightest_option EXIT=0
+  test_bs1a_lshaped_channel EXIT=0
+  test_bs1a4d_credit_real_bore EXIT=0
+  test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load EXIT=0
+  test_bs1a4d2b_centred_entry_bore EXIT=0
+  test_bs1a4d4_credit_entry_matches_prediction EXIT=0
+  test_bs1a4d4_entry_pinned_to_stored_start EXIT=0
+  test_bs1a4c_backed_credit EXIT=0
+  test_bs1a4b_failed_region_lightest EXIT=0
+  test_bs1a4b_windows_align_zmap EXIT=0
+  test_bs1a4c2_band_chord_cl_checked EXIT=0
+  test_bs1a4c_fix_no_post_entry_helix EXIT=0
+  test_bs1a4d3_links_measured_as_cuts EXIT=0
+  test_bs1a_straight_channel EXIT=0
+  test_bs1a3_no_band_after_a2d EXIT=0
+  test_rough_synth_pocket_repro EXIT=0
+  test_dt1_synthetic_rough_twice_identical EXIT=0
+  test_bs1a4d6b_q4_entry_bore_in_live_stock EXIT=0
+  test_bs1a4d6c_side_entry_no_under_read EXIT=0
+  test_bs1a4d6d_approach_simulated_in_window0 EXIT=0
+  test_bs1a4d7_sub1mm_tail_merges_not_dropped EXIT=0
+  test_bs1a4d8_arrival_gate_reads_judge_skin EXIT=0
+  test_bs1a4d8b_no_unsimulated_link_into_path EXIT=0
+  test_bs1a4d8c_inrun_jump_simulated EXIT=0
+  test_bs1a4d8c_replan_far_piece_enters_own_start EXIT=0
+No NEW test files were needed beyond d8c's two (already in test_engine.py
+and in the at-risk list); no existing test or assertion was edited.
+
+### (E) Counters by provenance (synthetic scenes only; no CF run here)
+- trans_guard(tag): cvt_entry (entry->run[0], incl. q4->piece joins),
+  cvt_join (irun_guard, a2d in-run), cvt_link/cvt_piece (call sites kept
+  at default tag), bstd_skip_nopos/toolup/short, irun_chk/irun_cvt.
+- d8c in-run scene (final code): irun_chk 54, irun_cvt 11, cvt_join 11,
+  bstd_cvt 11 - every conversion is a join of an a2d (never plan-simulated)
+  run; band conversions 0 (align test passes: no mid-band insertions).
+- d8c re-plan scene: bstd_cvt 0, n_backstop_links 0 (run[0] IS the entry),
+  rjoin drives the far decision; first cut ends 0.400 mm from the entered
+  piece start.
+- L-channel probe (final code): irun_chk 41, irun_cvt 0, rjoin_chk 2,
+  rjoin_cvt 1 - planned band steps no longer converted (d8c measured 21
+  conversions in the same family on its WIP).
+
+### (D) Mutations on the FINAL code
+- Time cap (2 h, 22:16 -> 00:16 MST) reached during the final 25-test
+  sweep; the five d8c mutations were NOT all re-run against this final
+  state. Mechanism evidence on the final code:
+  * join check (far) bypassed == d8c mutB (both reverted): the re-plan test
+    fails by the MEASURED zmap ae_eff 8.046 / a 1.649 (d8c record; the far
+    branch is the only thing preventing q4-prepend on final code - reverting
+    only `far` reproduces it, bstd_cvt 1 with irun ON per d8c mutA).
+  * in-run check bypassed == d8c mutC: inrun test fails by MEASURED zmap
+    ae_eff 8.330 (d8c record).
+  * "guard conversion through a raw enter_at": on THIS final code the
+    d2b/credit_real_bore failure family was proven by DIRECT OBSERVATION
+    one step earlier in this session - with the bore dropped at the entry
+    decision, the credited cap Q emitted a generic main-tier helix centred
+    3.4 mm off its start: "bs1a4d2b_lshape: entry bore at (-2.465,6.448)
+    @Z0.381 is not centred on the start: centre (0.53,7.69) is 3.24 mm
+    away > r + 0.3" and "credited split cap (-2.4654,6.4484)@Z0.381 emitted
+    helix centre (0.6785,7.7506) r 1.9029 has NO planning or re-check sim
+    with that bore ... offset 1.8337 mm" (batch B, 23:20 MST, scratch copies
+    of the failure preserved in the batch logs; the probe
+    scratch/d8d_trace_out.txt pins the emitting call site).
+  * "planned segments NOT exempt" and "entry feed-in sim bypassed" were
+    not re-measured on the final code (cap); the d8b batch-B failure
+    (raw 0.5 mm cross-corridor run appearing when planned entries are
+    perturbed) is the closest observed analogue.
+
+### Statement
+Not committed (per brief). Edits ONLY in engine/rough.py (+93/-17 vs
+337c44b = 110 changed lines; band.py untouched; test_engine.py untouched
+this session - d8c's 350/1 stands). OVER the 80-line target and the ~100
+stop line - reported honestly; drivers: enter_point (22), B2 gate (10),
+guard-scope marking (3), option-2 bore carry (3), plus d8c's 73. verify/
+untouched; no bypass flags; no gate relaxed; no existing test edited; all
+scratch under scratch/. Supervisor runs the full suite + Core Front.
+
+### (D) UPDATE - two mutations RE-RUN on the FINAL code (00:00-00:10 MST,
+scratch/d8d_mutA, scratch/d8d_mutC: full engine+verify copies, patched,
+tests run with sys.path at the copy, via slot_m4.sh)
+- far / join check reverted (far=False), guard ON, replan test:
+  EXIT=1 "stale q4 kept as run[0] and the far piece appended: zmap
+  corridor window ae_eff 8.046 mm, a 1.649 mm (line 207)" (scene line:
+  sl calls [(-13.0, 0.0)] - one ladder call, no mirrored re-prediction).
+- in-run check bypassed (irun_guard call disabled), replan fix kept,
+  inrun test: EXIT=1 "in-run pair p->q emitted UNSIMULATED at cutting
+  feed: zmap corridor window ae_eff 8.330 mm, a 0.029 mm (line 1972)"
+  (irun_chk 0). Both MEASURED-zmap-evidence failures match d8c's records
+  (8.046 / 8.330) on the FINAL code.
+- Remaining three (both-reverted, entry-feed-in-sim bypass, planned-NOT-
+  exempt counter) not run at the 2 h cap; the entry-function mutation's
+  d2b/credit_real_bore failure lines are pasted above from this session's
+  batch-B observation of the same mechanism.

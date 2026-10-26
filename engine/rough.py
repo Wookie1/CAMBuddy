@@ -1156,6 +1156,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
              "credit_fallback": [],  # BS1a4c: every credit fallback at emit
              "mandatory_levels": sorted(round(z, 3) for z in mand)}
     helix_n = [0]   # BS1a4c: successful entry helices emitted (f3f2165)
+    _gate = [False]  # BS1a4d8d (B2): enter_point entries simulate feed-in
     # RP0 diagnosis (engine/TASK_RP0.md): env-gated instrumentation only, no
     # behavior change when RT_RP is unset.
     _RP = bool(os.environ.get("RT_RP"))
@@ -1333,6 +1334,14 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 if os.environ.get("RT2_DEBUG"):
                     print("  helix cand (%.2f,%.2f,r=%.2f): entry outside bore"
                           % (cx, cy, r), flush=True)
+                return False
+            # BS1a4d8d (B2): the return feed-in at CUTTING feed is a real cut
+            # - simulate it with only the swept bore pre-cleared (d6c/d6d
+            # rule); over SPIKE_MM refuse the candidate, the ladder follows.
+            from engine.band import _simulate as _sim, SPIKE_MM as _SPK
+            _w = _sim(list(seg), stock, z, tool_r, stock.cell, r + tool_r,
+                      bore_xy=(cx, cy, r), entry="bore", eps=0.0)
+            if _gate[0] and _w and max(_w) > _SPK:
                 return False
             # RT2: the traverse height must clear BOTH the entry column and
             # the corridor from the entry to the helix start. The old code
@@ -1742,7 +1751,9 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     emit({"g": 1, "x": px, "y": py, "z": z + lift,
                           "f": ramp_feed})
             emit({"g": 0, "x": x, "y": y, "z": z + lift})
-            feed_down(x, y, z, side=side, centred=centred)
+            # BS1a4d8d (A): keep the bore - dropping it made a credited cap
+            # re-enter with a GENERIC off-centre helix (d2b/credit_real_bore).
+            feed_down(x, y, z, hc, side=side, centred=centred, bore=bore)
             stats["n_tooldown_links"] += 1
             return
         # 3) RP2_1 side-first (OPEN region): find the verified clear column
@@ -1767,6 +1778,29 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         retract_to(x, y)
         feed_down(x, y, z, hc, centred=centred, bore=bore)
 
+    def enter_point(pt, z, side, res=None):
+        """BS1a4d8d (A)+(B): the ONE entry decision for a run starting at
+        its OWN point - credit recomputed on the LIVE stock (real centred
+        bore via _bore_pred, else 0), stored in res, entered through
+        enter_at with its feed-in SIMULATED (_gate, B2). Only a re-plan
+        piece start enters WITH a (small-tier) stored bore - pinned to
+        that decision; a guard conversion keeps the normal ladder tiers,
+        never a centred bore re-chosen at an arbitrary point."""
+        from engine.band import entry_credit
+        cr = entry_credit(stock, pt, z, tool_r)
+        bxy = _bore_pred(isl_ok, centre_zone, stock, pt[0], pt[1],
+                         tool_r) if cr > 1e-9 else None
+        bore = (round(pt[0], 4), round(pt[1], 4), bxy[0], bxy[1], bxy[2]) \
+            if bxy else None
+        if res is not None:
+            res["bore"], res["credit"] = bore, (cr if bore else 0.0)
+        if bore and (res is None or bxy[2] > 0.5 * tool_r):
+            bore = None
+        _gate[0] = True
+        enter_at(round(pt[0], 4), round(pt[1], 4), z, None, side=side,
+                 bore=bore)
+        _gate[0] = False
+
     def mill_now(x, y, z_bot):
         """Vertical plunge: the tool physically clears its footprint down to
         z_bot, so update the stock model immediately at the LOW end - the
@@ -1785,7 +1819,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             a = b
         return tot
 
-    def trans_guard(p_to, z, side):
+    def trans_guard(p_to, z, side, tag="entry"):
         """BS1a4d8b (b): emission backstop - the run loop never writes a
         straight cutting-feed move from the CURRENT position to p_to that is
         farther than one step (0.6 mm, the loop's own re-entry bound) unless
@@ -1805,9 +1839,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                       "bstd"):
             return
         stats["n_backstop_links"] = stats.get("n_backstop_links", 0) + 1
+        stats["cvt_" + tag] = stats.get("cvt_" + tag, 0) + 1
         p0b = (prev[0], prev[1], prev[2])
         i0b = len(moves)
-        enter_at(round(p_to[0], 4), round(p_to[1], 4), z, None, side=side)
+        enter_point(p_to, z, side)   # BS1a4d8d: never a raw enter_at
         der = descend_feed(p0b, i0b)
         stats["reentry_feed_mm"] += der
         if der > 1e-6:
@@ -1815,15 +1850,13 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         return True   # BS1a4d8c: converted (irun_guard counts irun_cvt)
 
     def irun_guard(p_to, z, side):
-        """BS1a4d8c (1): every cutting-feed PAIR > 0.6 mm inside an emitted
-        run is simulated on the live stock at eps 0 (trans_guard) before it
-        is written; failing pairs convert to lift -> rapid -> enter_at at
-        the far point (irun_chk / irun_cvt)."""
+        """BS1a4d8c (1) + d8d (B) scope: only pairs inside runs NEVER plan-
+        simulated (a2d; bands keep plan-time _simulate). irun_chk/cvt, cvt_join."""
         if prev[0] is None or prev[2] is None or abs(prev[2] - z) > 1e-6 or \
                 math.dist((prev[0], prev[1]), (p_to[0], p_to[1])) <= 0.6:
             return False
         stats["irun_chk"] = stats.get("irun_chk", 0) + 1
-        if trans_guard(p_to, z, side):
+        if trans_guard(p_to, z, side, "join"):
             stats["irun_cvt"] = stats.get("irun_cvt", 0) + 1
             return True
         return False
@@ -2166,6 +2199,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     bands = channel_regions(rings, stock, isl_ok3, z, tool_r,
                                           leave, stock.cell, stats)
                 base = len(regions)
+                for b in bands:
+                    b["band"] = True   # BS1a4d8d (B): plan-simulated paths
                 regions.extend(bands)
                 for res in bands:                 # candidate rule as above
                     fc = next((p for (k, p) in res["paths"]
@@ -2258,10 +2293,9 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                             res["seg"], stock, z, tool_r, stock.cell, 0.0,
                             (res["dropkey"], "drop_ring", None, []),
                             approach=q4)   # BS1a4d6d: pcs[0] emits from q4
-                        # BS1a4d8c (2): a REPLANNED piece > one step from q4
-                        # whose q4 -> piece link fails lnk_cut_ok enters at
-                        # its own first point, predictor mirrored. Credited
-                        # split-cap regions keep the d6d q4 join.
+                        # BS1a4d8c (2)/d8d: a REPLANNED piece > one step from
+                        # q4 whose q4 -> piece link fails lnk_cut_ok enters at
+                        # its own first point, predictor mirrored.
                         far = bool(res.get("replan0")) and pnew is not None \
                             and math.dist(
                             q4, pnew[0]) > 0.6 and not lnk_cut_ok(
@@ -2289,10 +2323,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                 res["paths"][0][1] = pcs[0]
                                 more_pcs = pcs[1:]
                                 act, drop_cut = "replan0_" + opt, False
-                                if far:   # d8c (2): enter at its own
-                                    enter_at(round(pcs[0][0][0], 4),
-                                             round(pcs[0][0][1], 4), z, None,
-                                             side=bool(rp2_flag))
+                                if far:   # d8c (2)/d8d (A): own start, the
+                                    # ONE entry decision (bore + credit)
+                                    enter_point(pcs[0][0], z,
+                                                bool(rp2_flag), res)
                         stats["failed_region_emitted"].append(
                             {"x": q4[0], "y": q4[1], "z": round(z, 3),
                              "area": round(ba, 2),
@@ -2431,7 +2465,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                             trans_guard(run[0], z, bool(rp2_flag))
                         k0 = 0
                         for ki, (x, y) in enumerate(run):
-                            if ki and irun_guard((x, y), z, bool(rp2_flag)):
+                            if ki and not res.get("band") and \
+                                    irun_guard((x, y), z, bool(rp2_flag)):
                                 stock.mill_path(run[k0:ki], z, tool_r, corner_r)
                                 k0 = ki
                             emit({"g": 1, "x": x, "y": y, "z": z,
@@ -2587,9 +2622,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 enter_at(round(pc[0][0], 4), round(pc[0][1], 4), z, None,
                          side=bool(rp2_flag))
                 trans_guard(pc[0], z, bool(rp2_flag))  # BS1a4d8b (b)
-                for mi, (x, y) in enumerate(pc):
-                    if mi:   # BS1a4d8c (1): in-run pairs guarded
-                        irun_guard((x, y), z, bool(rp2_flag))
+                for (x, y) in pc:
                     emit({"g": 1, "x": x, "y": y, "z": z, "f": cut_feed})
                     level_pts.append((x, y, "owncut r%d" % nreg))
                 stock.mill_path(list(pc), z, tool_r, corner_r)
