@@ -60,6 +60,7 @@ the corridor-checked entry instead of diving across the forbidden gap; a flat
 level already in the step-up order (the final floor+axl level) keeps its
 mandatory flag so it can never be skipped.
 """
+import copy
 import math
 import os
 import time
@@ -2253,7 +2254,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             pz0 = prev[2]
             i0m = len(moves)
             h0 = helix_n[0]
-            sn9 = dict(stats) if res.get("replan0") else None
+            sn9 = copy.deepcopy(stats) if res.get("replan0") else None
             ts9 = stock.top.copy() if sn9 is not None else None
             enter_at(round(entry[0], 4), round(entry[1], 4), z, res["helix"],
                      side=bool(rp2_flag), bore=res.get("bore"))
