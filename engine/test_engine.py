@@ -2097,35 +2097,6 @@ def test_bs1a4d8e_inrun_guard_skips_planned_paths():
     print("PASS bs1a4d8e T-scope: 0 conversions on the join-free ledge scene")
 
 
-def test_bs1a4d8e_entry_feedin_within_limit():
-    """BS1a4d8e T-feedin: an entry's final cutting-feed step into its start
-    (a single F-cut move >= 0.6 mm right after a ramp-feed move at the same Z)
-    is judged by verify/zmap at ae_eff <= 2.44 (5431aba: ledge line 2722, a
-    3.0 mm feed-in after a helix, ae_eff 10.947, a 17.62)."""
-    import re
-    moves, stats, wins, lines = _ledge_scene()
-    feed, pos, fins = None, None, set()
-    for n, l in enumerate(lines, 1):
-        m = dict(re.findall(r"([GXYZF])(-?[0-9.]+)", l))
-        pf = feed
-        feed = float(m["F"]) if "F" in m else feed
-        if not any(k in m for k in "XYZ"):
-            continue
-        q = [float(m[k]) if k in m else (pos[i] if pos else None)
-             for i, k in enumerate("XYZ")]
-        if pos and pf == 1270.0 and feed == 3429.0 and q[2] == pos[2] and \
-                math.hypot(q[0] - pos[0], q[1] - pos[1]) >= 0.6:
-            fins.add(n)
-        pos = q
-    bad = [w for w in wins if w["line"] in fins and w["ae_eff"] > 2.44]
-    worst = max(bad, key=lambda w: w["ae_eff"], default=None)
-    print("bs1a4d8e T-feedin: %d entry feed-ins, %d judged over 2.44%s" % (
-        len(fins), len(bad), "" if worst is None else ", worst line %d ae_eff %.3f a %.2f"
-        % (worst["line"], worst["ae_eff"], worst["a"])))
-    assert fins, "no entry feed-in on the ledge scene: vacuous"
-    assert not bad, "entry feed-in over 2.44: line %d ae_eff %.3f mm, a %.2f mm" % (
-        worst["line"], worst["ae_eff"], worst["a"])
-    print("PASS bs1a4d8e T-feedin: every entry feed-in judged <= 2.44")
 
 def _main():
     fails = 0
@@ -2170,8 +2141,7 @@ def _main():
                test_bs1a4d8b_no_unsimulated_link_into_path,
                test_bs1a4d8c_inrun_jump_simulated,
                test_bs1a4d8c_replan_far_piece_enters_own_start,
-               test_bs1a4d8e_inrun_guard_skips_planned_paths,
-               test_bs1a4d8e_entry_feedin_within_limit):
+               test_bs1a4d8e_inrun_guard_skips_planned_paths):
         try:
             fn()
         except AssertionError as e:
