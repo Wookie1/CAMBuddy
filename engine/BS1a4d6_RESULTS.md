@@ -1360,3 +1360,125 @@ tests run with sys.path at the copy, via slot_m4.sh)
   exempt counter) not run at the 2 h cap; the entry-function mutation's
   d2b/credit_real_bore failure lines are pasted above from this session's
   batch-B observation of the same mechanism.
+
+## BS1a4d8e (this session, started 01:16 MST, FRESH, cap 03:16 MST)
+
+### Plan
+- Item 1: in-run guard checks ONLY recorded piece boundaries (q4 -> piece,
+  piece -> piece, re-plan rejoin, bridge -> path); never a pair inside one
+  planned path (a2d or band). Red test test_bs1a4d8e_inrun_guard_skips_planned_paths
+  must go green; test_bs1a4d8c_inrun_jump_simulated must stay green.
+- Item 2 (cleanup b): irun_guard drops copied skip tests; trans_guard counts
+  every skip; rename bstd_skip_toolup -> bstd_skip_zdiff. Output-neutral.
+- Item 3 (cleanup c): B2 feed-in _simulate inside try_cand only when _gate[0].
+  Output-neutral.
+- Item 4: name the 0.5 tier in enter_point as a module constant + 1-line comment.
+- Items 2-4 cmp-verified byte-identical on L-channel + test-block programs.
+
+### Progress log
+- 01:16 session start; HEAD ad74dab; baseline diff vs a830ce2: 0 lines.
+- NOTE: an early write clobbered this file; restored byte-identical from
+  HEAD via `git show HEAD:... > file` (read-only git; numstat empty).
+
+### Test runs (all via slot_m4.sh)
+- Baseline (HEAD): test_bs1a4d8e_inrun_guard_skips_planned_paths EXIT=1
+  "irun_cvt 4, n_backstop_links 4" (red, reproduced).
+- Item 1 implemented (boundary-recorded guard) + items 2-4:
+  test_bs1a4d8e_inrun_guard_skips_planned_paths EXIT=0 PASS
+  ("ledge 37806 moves, irun_chk 66, irun_cvt 0, backstop links 0")
+  test_bs1a4d8c_inrun_jump_simulated EXIT=0 PASS
+  ("irun_chk 4, irun_cvt 1, bstd_cvt 1; corridor judged clean")
+- git diff --numstat a830ce2 -- engine/rough.py: 18 12 (=30 changed lines).
+- test_bs1a4d8c_replan_far_piece_enters_own_start EXIT=0 PASS
+  ("bstd_cvt 0, first cut ends 0.400 mm from the piece start")
+  - test_bs1a4b_windows_align_zmap EXIT=0 PASS ("window boundaries identical")
+- Items 2-4 OUTPUT-NEUTRALITY (cmp, full gcode programs; scratch/d8e_neutral =
+  item-1-only copy of the engine, items 2-4 reverted there; scratch/d8e_genprog.py
+  writes L-channel + test-block programs from each tree):
+  cmp lshape.ngc: CMP_LSHAPE_EXIT=0 (byte-identical, 70392 moves)
+  cmp tb.ngc:     CMP_TB_EXIT=0     (byte-identical, 40411 moves)
+
+### The change (engine/rough.py only; file:line on final code)
+- Item 1 (behaviour): recorded piece boundaries. Run assembly
+  (rough.py:2460-2468): nb = bridge length; bnd = {nb} when a bridge
+  prefixes the run (bridge -> path) plus {nb+1} when q4b and i == 0 and the
+  run has a point past the head (entry q4 -> first piece point, head of the
+  region's FIRST cutting path). q4b set per region (rough.py:2360), spent
+  after that path's walker (rough.py:2482). Guard call site
+  (rough.py:2472): `if ki in bnd and not res.get("band") and irun_guard(...)`
+  - the in-run guard now checks ONLY the pair crossing a recorded boundary,
+  never a pair inside one planned path (Adaptive2d or band). The re-plan
+  q4-prepend (pcs[0] = [q4] + val) puts its join at path index 1, covered by
+  the q4b boundary; the far route enters at the piece's own start (unchanged).
+- Item 2 (cleanup b): irun_guard (rough.py:1857-1862) dropped its copied skip
+  tests (nopos / Z equality / <= 0.6) and lets trans_guard judge and COUNT
+  every skip in bstd_skip_*; the Z rule itself is unchanged (abs(prev_z - z)
+  > 1e-6), its counter renamed bstd_skip_toolup -> bstd_skip_zdiff
+  (rough.py:1835).
+- Item 3 (cleanup c): try_cand's B2 feed-in _simulate now runs only inside
+  `if _gate[0]:` (rough.py:1342-1347) - only enter_point entries consume the
+  verdict.
+- Item 4: ENTER_BORE_TIER = 0.5 module constant (rough.py:669, one-line
+  comment: empirical from the d8c re-plan scene; 0.4/0.6 untested), used at
+  enter_point (rough.py:1799).
+
+### Budget
+git diff --numstat a830ce2 -- engine/rough.py: 18 added / 12 deleted = 30
+changed lines (target <= 25, under the ~35 stop line; reported). Full
+`git diff --numstat a830ce2` at session end below.
+
+### FINAL: all 26 at-risk tests on the FINAL code (pasted exit codes)
+Every run via /private/tmp/claude-502/.../scratchpad/slot_m4.sh with
+scratch/d8e_run.sh (VibeCAD python, one process per test), 01:40-02:08 MST:
+  test_bs1a4d8e_inrun_guard_skips_planned_paths       EXIT=0  (RED -> GREEN:
+      "ledge 37806 moves, irun_chk 66, irun_cvt 0, backstop links 0")
+  test_bs1a4d8c_inrun_jump_simulated                  EXIT=0  (irun_chk 4,
+      irun_cvt 1, bstd_cvt 1; corridor judged clean)
+  test_bs1a4d8c_replan_far_piece_enters_own_start     EXIT=0  (bstd_cvt 0,
+      first cut ends 0.400 mm from the piece start)
+  test_bs1a4b_windows_align_zmap                      EXIT=0  (window
+      boundaries identical; band exemption kept - supervisor M5 family)
+  test_bs1a4d_credit0_lightest_option                 EXIT=0
+  test_bs1a4d_credit_real_bore                        EXIT=0
+  test_bs1a4d5_splitbore_failed_recheck_not_emitted_at_load  EXIT=0
+  test_bs1a4d2b_centred_entry_bore                    EXIT=0
+  test_bs1a4d4_credit_entry_matches_prediction        EXIT=0
+  test_bs1a4d4_entry_pinned_to_stored_start           EXIT=0
+  test_bs1a4c_backed_credit                           EXIT=0
+  test_bs1a4b_failed_region_lightest                  EXIT=0
+  test_bs1a4c2_band_chord_cl_checked                  EXIT=0
+  test_bs1a4c_fix_no_post_entry_helix                 EXIT=0
+  test_bs1a4d3_links_measured_as_cuts                 EXIT=0
+  test_bs1a3_no_band_after_a2d                        EXIT=0
+  test_bs1a_straight_channel                          EXIT=0
+  test_bs1a_lshaped_channel                           EXIT=0
+  test_rough_synth_pocket_repro                       EXIT=0
+  test_dt1_synthetic_rough_twice_identical            EXIT=0
+  test_bs1a4d6b_q4_entry_bore_in_live_stock           EXIT=0
+  test_bs1a4d6c_side_entry_no_under_read              EXIT=0
+  test_bs1a4d6d_approach_simulated_in_window0         EXIT=0
+  test_bs1a4d7_sub1mm_tail_merges_not_dropped         EXIT=0
+  test_bs1a4d8_arrival_gate_reads_judge_skin          EXIT=0
+  test_bs1a4d8b_no_unsimulated_link_into_path         EXIT=0
+26/26 PASS. The d8c in-run jump p->q stays caught: its pair is the recorded
+q4 -> piece boundary (run[0] IS the entered start), checked and converted;
+the ledge scene's 4 former conversions were planned Adaptive2d ring-jump
+steps (measured 3.55 / 4.55 / 5.24 / 1.35 mm at ki 51/71/90/16, no bridge,
+no re-plan) - inside one planned path, now never judged.
+
+### Statement
+Not committed (per brief). Edits ONLY in engine/rough.py (+18/-12 vs
+a830ce2 = 30 changed lines) plus this RESULTS appendix; test_engine.py,
+band.py, verify/ untouched; opencode.json untouched by me (its working-tree
+model-line change predates this session). No existing test edited; no
+bypass flags; no gate relaxed; no limit/floor/margin/leave/feed change;
+all scratch (d8e_run.sh, d8e_genprog.py, d8e_neutral item-1-only copy,
+program captures, probes) under scratch/. Supervisor runs the full suite +
+Core Front. Session 01:16-02:1x MST, inside the 2 h cap.
+
+### git diff --numstat a830ce2 (session end, 02:09 MST)
+  115  0  engine/BS1a4d6_RESULTS.md   (this appendix only)
+  53   0  engine/TASK_BS1a4d8e.md     (the brief itself, committed at ad74dab)
+  18   12 engine/rough.py             (the change: 30 lines)
+  22   1  opencode.json               (pre-existing working-tree model line,
+                                      NOT this session; untouched here)

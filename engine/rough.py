@@ -666,6 +666,7 @@ def hf_gouge_violation(points, stock, tool_r, tol=0.02):
 
 
 MIN_BAND_HELIX_FR = 0.3   # BS1a4d6b: min band-entry helix tier r = 0.3 x tool_r
+ENTER_BORE_TIER = 0.5   # BS1a4d8e: empirical from the d8c re-plan scene; 0.4/0.6 untested
 
 
 def _bore_pred(isl_ok, zone, stock, x, y, tool_r):
@@ -1339,10 +1340,11 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # - simulate it with only the swept bore pre-cleared (d6c/d6d
             # rule); over SPIKE_MM refuse the candidate, the ladder follows.
             from engine.band import _simulate as _sim, SPIKE_MM as _SPK
-            _w = _sim(list(seg), stock, z, tool_r, stock.cell, r + tool_r,
-                      bore_xy=(cx, cy, r), entry="bore", eps=0.0)
-            if _gate[0] and _w and max(_w) > _SPK:
-                return False
+            if _gate[0]:   # BS1a4d8e (c): only gated entries consume this
+                _w = _sim(list(seg), stock, z, tool_r, stock.cell, r + tool_r,
+                          bore_xy=(cx, cy, r), entry="bore", eps=0.0)
+                if _w and max(_w) > _SPK:
+                    return False
             # RT2: the traverse height must clear BOTH the entry column and
             # the corridor from the entry to the helix start. The old code
             # descended at the entry to z_top (column-clear only) and then ran
@@ -1794,7 +1796,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             if bxy else None
         if res is not None:
             res["bore"], res["credit"] = bore, (cr if bore else 0.0)
-        if bore and (res is None or bxy[2] > 0.5 * tool_r):
+        if bore and (res is None or bxy[2] > ENTER_BORE_TIER * tool_r):
             bore = None
         _gate[0] = True
         enter_at(round(pt[0], 4), round(pt[1], 4), z, None, side=side,
@@ -1830,7 +1832,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         then a zero-length move and drops). Firings count in
         stats["n_backstop_links"]; the checks in bstd_chk/bstd_cvt."""
         why = ("nopos" if prev[0] is None or prev[2] is None else
-               "toolup" if abs(prev[2] - z) > 1e-6 else
+               "zdiff" if abs(prev[2] - z) > 1e-6 else
                "short" if math.dist((prev[0], prev[1]), p_to) <= 0.6 else 0)
         if why:   # BS1a4d8c (3): every early exit is counted
             stats["bstd_skip_" + why] = stats.get("bstd_skip_" + why, 0) + 1
@@ -1850,11 +1852,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         return True   # BS1a4d8c: converted (irun_guard counts irun_cvt)
 
     def irun_guard(p_to, z, side):
-        """BS1a4d8c (1) + d8d (B) scope: only pairs inside runs NEVER plan-
-        simulated (a2d; bands keep plan-time _simulate). irun_chk/cvt, cvt_join."""
-        if prev[0] is None or prev[2] is None or abs(prev[2] - z) > 1e-6 or \
-                math.dist((prev[0], prev[1]), (p_to[0], p_to[1])) <= 0.6:
-            return False
+        """BS1a4d8c (1) + d8d (B) + d8e (1): fires ONLY at recorded piece
+        boundaries; trans_guard judges and COUNTS every skip (bstd_skip_*)."""
         stats["irun_chk"] = stats.get("irun_chk", 0) + 1
         if trans_guard(p_to, z, side, "join"):
             stats["irun_cvt"] = stats.get("irun_cvt", 0) + 1
@@ -2358,6 +2357,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                              "start r%d" % nreg))
             region_dump.append({"start": entry, "helix": res["helix"],
                               "paths": [[k, len(p)] for (k, p) in res["paths"]]})
+            q4b = True   # BS1a4d8e: the FIRST cutting path starts at entered q4
             for (kind, pts) in res["paths"]:
                 if kind == "cutting" and not drop_cut:  # BS1a4c: unbacked
                     good = isl_ok(pts)
@@ -2457,15 +2457,20 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                         j = i
                         while j + 1 < len(pts) and good[j + 1]:
                             j += 1
+                        nb = len(bridge) if bridge else 0
                         run = list(bridge) if bridge else []
                         bridge = None
                         run += [(round(x, 4), round(y, 4)) for (x, y)
                                in pts[i:j + 1]]
+                        # BS1a4d8e piece boundaries: bridge -> path, q4 -> piece
+                        bnd = ({nb} if nb else set()) | \
+                            ({nb + 1} if q4b and i == 0 and
+                             len(run) > nb + 1 else set())
                         if run:   # BS1a4d8b (b): backstop on the run's first
                             trans_guard(run[0], z, bool(rp2_flag))
                         k0 = 0
                         for ki, (x, y) in enumerate(run):
-                            if ki and not res.get("band") and \
+                            if ki in bnd and not res.get("band") and \
                                     irun_guard((x, y), z, bool(rp2_flag)):
                                 stock.mill_path(run[k0:ki], z, tool_r, corner_r)
                                 k0 = ki
@@ -2474,6 +2479,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                             level_pts.append((x, y, "cut r%d" % nreg))
                         stock.mill_path(run[k0:], z, tool_r, corner_r)
                         i = j + 1
+                    q4b = False   # BS1a4d8e: the q4 head join is spent
                     if _RP and rp_g0 is not None:
                         _cat = rp_cat(pts[rp_g0:]) + " (tail dropped)"
                         rp["breaks"][_cat] = rp["breaks"].get(_cat, 0) + 1
