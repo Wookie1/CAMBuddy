@@ -1995,11 +1995,25 @@ def test_bs1a4d8c_replan_far_piece_enters_own_start():
     along = [w for w in wj if abs(w["z"] - Z) < 2e-3 and w.get("feed", 0)
              > 3000.0 and w.get("length_mm", 0.0) > 3.0
              and _bs1a4d8c_near(w, q4, piece[0], m=0.0)]
-    worst = max(along, key=lambda w: w["ae_eff"]) if along else None
-    over = [w for w in along if w["ae_eff"] > 2.44]
-    assert not over, \
+    # the q4 -> piece LINK itself: cutting-feed moves at Z that leave the
+    # stale q4; judged by the zmap windows covering exactly those moves
+    # (approved narrowing: short feed-in overloads in the corridor belong to
+    # FI1, not to this link check)
+    from engine.gcode import moves_to_gcode as _m2g
+    gl = _m2g(moves, spindle_rpm=7500).split("\n")
+    off = next(k for k, l in enumerate(gl, 1)
+               if l.lstrip().startswith(("G0", "G1")) and "X" in l)
+    link = {off + i for i, m in enumerate(moves)
+            if i and m["g"] == 1 and m.get("f") == CUT_F
+            and m.get("z") is not None and abs(m["z"] - Z) < 1e-6
+            and math.dist((moves[i - 1]["x"], moves[i - 1]["y"]), q4) <= 0.6
+            and math.dist((m["x"], m["y"]), q4) > 0.6}
+    lw = [w for w in wj if any(w["line"] <= L <= w.get("end_line", w["line"])
+                               for L in link)]
+    worst = max(lw, key=lambda w: w["ae_eff"]) if lw else None
+    assert worst is None or worst["ae_eff"] <= 2.44, \
         ("stale q4 kept as run[0] and the far piece appended: zmap "
-         "corridor window ae_eff %.3f mm, a %.3f mm (line %s)"
+         "link window ae_eff %.3f mm, a %.3f mm (line %s)"
          % (worst["ae_eff"], worst["a"], worst.get("line", "?")))
     # (2) correct: the backstop never had to convert anything
     assert stats.get("bstd_cvt", 0) == 0 and \
