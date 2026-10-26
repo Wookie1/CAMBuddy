@@ -1349,8 +1349,13 @@ def test_ze2_full_slot_short_segments_ae_eff_is_dia():
         assert abs(w["a"] - 5.0) <= 0.2  # 18.6 - tip 13.6
         # window closes at the first travel >= 1 mm; ten 0.1 mm floats sum to
         # just under/over 1.0, so accept 10 or 11 segments
-        assert w["n_moves"] in (10, 11)
-        assert 1.0 <= w["length_mm"] <= 1.15
+        if w is not wins[-1]:
+            assert w["n_moves"] in (10, 11)
+            assert 1.0 <= w["length_mm"] <= 1.15
+    # ZG2: the program's last 0.7 mm tail merges into the last kept window
+    assert abs(wins[-1]["length_mm"] - 1.7) <= 1e-6, wins[-1]["length_mm"]
+    assert wins[-1]["n_moves"] == 10 + 7, wins[-1]["n_moves"]
+    assert abs(wins[-1]["ae_eff"] - D_ZE2) <= 0.05 * D_ZE2, wins[-1]["ae_eff"]
     eng = res["engagement"]
     assert eng["ae2"]["n"] == len(wins)
     assert abs(eng["ae2"]["p50"] - D_ZE2) <= 0.05 * D_ZE2
@@ -1548,6 +1553,94 @@ def test_ze2_parallel_merge_matches_serial():
             "jobs=%d: ae2 windows differ from serial" % jobs
         assert par["engagement"] == ser["engagement"], \
             "jobs=%d: engagement keys differ from serial" % jobs
+
+
+# ---------------------------------------------------------------------------
+# Task ZG2: sub-1 mm tails are MERGED into their kept window, never dropped
+# ---------------------------------------------------------------------------
+
+def _zg2_wall_stock(width):
+    """stock 18.6 under a wall whose face sits `width` mm inside the tool
+    radius from the y=0 path (and solid for x >= 10, fresh material for the
+    neighbour-free tail), 13.6 (tip level) elsewhere."""
+    ys = _centers_f()[:, None]
+    xs = _centers_f()[None, :]
+    face = D_ZE2 / 2.0 - width
+    return np.broadcast_to(
+        np.where((ys <= -face + 1e-9) | (xs >= 10.0 - 1e-9), 18.6, 13.6),
+        (NF, NF)).copy()
+
+
+def test_zg2_merged_tail_pushes_window_over_spike():
+    """ZG2 (a): a ~0.865 mm-wide side-cut window (2 x 0.6 = 1.2 mm, pre-merge
+    ae_eff ~0.865) plus a sub-1 mm tail from a neighbour-free chain (one
+    0.9 mm feed into fresh solid, area ~11 mm2) merge into ONE window whose
+    ae_eff is judged over the AE_SPIKE 2.25 limit (and over the SE2 merge
+    bar 2.4384). Dropping the tail again leaves 0.865 -> test fails by the
+    measured ae_eff."""
+    part = np.zeros((NF, NF))
+    gcode = _ae2_gcode([(-19.4, 0.0), (-18.8, 0.0)], (-20.0, 0.0), 13.6)
+    gcode += "G0 X20. Y20. Z20.\nG1 X20. Y20. Z13.6 F100.\n"
+    gcode += "G1 X20.9 Y20. F500.\n"
+    res = _run_ae2(gcode, part, stock_init=_zg2_wall_stock(0.865))
+    wins = res["_ae2_raw"]
+    assert len(wins) == 1, "expected 1 merged window: %r" % wins
+    w = wins[0]
+    print("ZG2(a) measured merged ae_eff %.3f mm (area %.3f / length %.3f, "
+          "line %s)" % (w["ae_eff"], w["area_mm2"], w["length_mm"],
+                        w["line"]))
+    assert w["ae_eff"] > 2.25, \
+        "merged ae_eff %.3f mm not judged over 2.25" % w["ae_eff"]
+    assert abs(w["length_mm"] - 2.1) <= 0.05, \
+        "merged window length %.3f not 1.2 + 0.9" % w["length_mm"]
+    eng = res["engagement"]
+    assert eng["ae2"]["n"] == 1
+    assert eng["ae2"]["max"] == w["ae_eff"]
+    assert eng["overload_feeds_ae2"]["count"] == 1
+    assert "ae2_isolated_sub1mm" not in eng  # the tail had a neighbour
+
+
+def test_zg2_merged_tail_under_limit_changes_nothing():
+    """ZG2 (b): uniform ~0.865 mm side cut: with a 0.6 mm tail the window
+    grows 1.2 -> 1.8 mm but ae_eff stays ~0.865 (< 2.25, unchanged vs the
+    no-tail run) and the window count stays 1; nothing is flagged."""
+    part = np.zeros((NF, NF))
+    base = _run_ae2(_ae2_gcode([(-19.4, 0.0), (-18.8, 0.0)],
+                               (-20.0, 0.0), 13.6), part,
+                    stock_init=_zg2_wall_stock(0.865))
+    tail = _run_ae2(_ae2_gcode([(-19.4, 0.0), (-18.8, 0.0), (-18.2, 0.0)],
+                               (-20.0, 0.0), 13.6), part,
+                    stock_init=_zg2_wall_stock(0.865))
+    wb, wt = base["_ae2_raw"], tail["_ae2_raw"]
+    print("ZG2(b) ae_eff before %.3f / after %.3f mm (len %.3f -> %.3f)"
+          % (wb[0]["ae_eff"], wt[0]["ae_eff"], wb[0]["length_mm"],
+             wt[0]["length_mm"]))
+    assert len(wb) == len(wt) == 1, "window count changed"
+    assert abs(wt[0]["length_mm"] - 1.8) <= 0.05
+    assert abs(wt[0]["ae_eff"] - wb[0]["ae_eff"]) <= 0.05, \
+        "ae_eff changed %.3f -> %.3f" % (wb[0]["ae_eff"], wt[0]["ae_eff"])
+    assert wt[0]["ae_eff"] < 2.25
+    eng = tail["engagement"]
+    assert eng["ae2"]["n"] == 1
+    assert eng["full_width_slots_ae2"]["count"] == 0
+    assert eng["overload_feeds_ae2"]["count"] == 0
+
+
+def test_zg2_isolated_sub1mm_cut_reported_not_gated():
+    """ZG2 item 2: a lone 0.6 mm cut with no kept window anywhere is NOT
+    judged (no ae2 window, nothing flagged) but reported in
+    engagement.ae2_isolated_sub1mm (count 1, worst area/length capped D)."""
+    part = np.zeros((NF, NF))
+    res = _run_ae2(_ae2_gcode([(-19.4, 0.0)], (-20.0, 0.0), 13.6), part)
+    assert res["_ae2_raw"] == [], "isolated cut must not become a window"
+    eng = res["engagement"]
+    assert eng["ae2"]["n"] == 0
+    assert eng["overload_feeds_ae2"]["count"] == 0
+    iso = eng["ae2_isolated_sub1mm"]
+    print("ZG2(c) isolated sub-1 mm: %r" % (iso,))
+    assert iso["count"] == 1
+    assert 0.0 < iso["worst_ae_eff_mm"] <= D_ZE2, \
+        "worst %.3f not capped at D %.3f" % (iso["worst_ae_eff_mm"], D_ZE2)
 
 
 # ---------------------------------------------------------------------------
@@ -2598,3 +2691,510 @@ def test_ze2d_full_width_depth_true_slot_vs_ridge_plus_graze():
         [w["full_width_depth"] for w in fw2]
     bands = res2["engagement"]["full_width_depth_bands_ae2"]
     assert bands["cutting_feed"]["0.5-2"]["count"] == len(fw2)
+
+
+# ---------------------------------------------------------------------------
+# Task ZE2B: ball-tool engagement vs the live stock zmap (report-only).
+# BOTH widths: w_plan vs the ball chord c(a) for the full-width flag, and
+# ae_eq (removed volume per mm of 3D travel / a) vs --engage-max for load.
+# Fixtures: ball D = 9.525, cell 0.05 mm; a >= 0.05 gate; descents (horiz
+# < 10 % of 3D travel) are tagged and never full width.
+# ---------------------------------------------------------------------------
+
+D_ZB = 9.525
+CELL_B = 0.05
+NB = 400                      # grid covers [-10, 10] x [-10, 10]
+X0_B = Y0_B = -10.0
+STOCK_B = (-10.0, 10.0, -10.0, 10.0, 0.0, 10.0)
+NB_L = 900                    # long grid covers [-12, 33] (long side pass)
+X0_L = Y0_L = -12.0
+STOCK_L = (-12.0, 33.0, -12.0, 33.0, 0.0, 10.0)
+
+
+def _run_zb(gcode, part, stock_init=None, x0=X0_B, y0=Y0_B, stock=STOCK_B):
+    moves = zmap.parse_gcode(gcode)
+    return zmap.simulate(moves, part, CELL_B, x0, y0, stock, tool="ball",
+                        dia=D_ZB, engage_max=2.286, stock_init=stock_init)
+
+
+def _zb_pass_gcode(y, z, x0=-5.0, x1=5.0):
+    """rapid above (x0, y), vertical feed descent to the tip Z=z (a descent
+    window: horiz = 0), then the X-direction feed pass at lateral y, F500."""
+    return "\n".join([
+        "G21 G90 F500",
+        "G0 X%.4f Y%.4f Z12." % (x0, y),
+        "G1 X%.4f Y%.4f Z%.4f F100." % (x0, y, z),
+        "G1 X%.4f Y%.4f F500." % (x1, y),
+    ]) + "\n"
+
+
+def _check_side_pass(res):
+    """Design case 1: straight pass at a = 2.0 beside a cleared pass at
+    stepover s = 1.905 -> ae_eq ~ s (+-5 %); w_plan/c(a) ~ 0.62 (contact from
+    the scallop crest at -s/2 to the far chord edge); NOT full width."""
+    a = 2.0
+    c_a = 2.0 * math.sqrt(a * (D_ZB - a))
+    horiz = [w for w in res["_zb_raw"] if not w["descent"]]
+    assert len(horiz) == 1, "expected one non-descent window: %d" % len(horiz)
+    w = horiz[0]
+    assert abs(w["a"] - a) <= 0.1
+    assert abs(w["c_a"] - c_a) <= 0.05
+    assert abs(w["theta"] - math.degrees(
+        math.acos(1.0 - a / (D_ZB / 2.0)))) <= 1.0
+    assert abs(w["ae_eq"] - 1.905) <= 0.05 * 1.905, \
+        "ae_eq %.3f not within 5%% of stepover" % w["ae_eq"]
+    assert abs(w["w_plan"] / w["c_a"] - 0.62) <= 0.08, \
+        "w_plan/c(a) %.3f not ~0.62" % (w["w_plan"] / w["c_a"])
+    eng = res["engagement"]["ze2b"]
+    assert eng["full_width"]["count"] == 0, \
+        "side pass flagged full width: %r" % eng["full_width"]["worst"]
+    assert eng["descent"]["count"] >= 1
+
+
+def test_ze2b_side_pass_ae_eq_is_stepover():
+    part = np.zeros((NB_L, NB_L))
+    g_a = _zb_pass_gcode(-2.905, 8.0, x0=-5.0, x1=20.0)
+    res_a = _run_zb(g_a, part, x0=X0_L, y0=Y0_L, stock=STOCK_L)
+    res = _run_zb(_zb_pass_gcode(-1.0, 8.0, x0=-5.0, x1=20.0), part,
+                  stock_init=res_a["stock"], x0=X0_L, y0=Y0_L, stock=STOCK_L)
+    _check_side_pass(res)
+
+
+def _check_full_slot(res):
+    """Design case 2: full-width slot at a = 2.0 into flat stock -> w_plan ~
+    c(2.0) = 7.76 and full_width flagged; ae_eq = segment area / a ~ 5.44."""
+    a = 2.0
+    c_a = 2.0 * math.sqrt(a * (D_ZB - a))
+    assert abs(c_a - 7.759) <= 0.01
+    horiz = [w for w in res["_zb_raw"] if not w["descent"]]
+    assert len(horiz) == 1, "expected one non-descent window: %d" % len(horiz)
+    w = horiz[0]
+    assert abs(w["w_plan"] - c_a) <= 0.15, \
+        "w_plan %.3f vs c(a) %.3f" % (w["w_plan"], c_a)
+    assert abs(w["ae_eq"] - 5.44) <= 0.27, "ae_eq %.3f" % w["ae_eq"]
+    eng = res["engagement"]["ze2b"]
+    assert eng["full_width"]["count"] == 1, \
+        "slot pass not flagged full width: %r" % eng["full_width"]
+    assert eng["overload"]["count"] >= 1        # ae_eq ~5.4 > 2.286
+    assert eng["descent"]["count"] == 1         # plunge tagged...
+    assert eng["full_width"]["worst"][0]["line"] == w["line"]  # ... not flagged
+
+
+def test_ze2b_full_slot_flagged_chord_and_ae_eq():
+    res = _run_zb(_zb_pass_gcode(0.0, 8.0), np.zeros((NB, NB)))
+    _check_full_slot(res)
+
+
+def test_ze2b_slope_skim_not_flagged():
+    """Design case 3: 0.2 mm normal-thickness skim on a 45 deg slope -> not
+    full width, not overload at the spike load 2.286."""
+    ys = X0_B + (np.arange(NB) + 0.5) * CELL_B
+    stock = np.broadcast_to(ys[:, None] + 10.0, (NB, NB)).copy()
+    # ball centre 0.2 mm (normal) off the plane z = y + 10 at y = 0
+    tip = (10.0 + (D_ZB / 2.0 - 0.2) * math.sqrt(2.0)) - D_ZB / 2.0
+    res = _run_zb(_zb_pass_gcode(0.0, tip), np.zeros((NB, NB)),
+                  stock_init=stock)
+    eng = res["engagement"]["ze2b"]
+    assert eng["full_width"]["count"] == 0
+    assert eng["overload"]["count"] == 0
+    assert eng["ae_eq"]["max"] < 2.286
+    assert eng["ae_eq"]["max"] > 0.0           # it does cut
+
+
+def test_ze2b_helix_finite_and_descent_tagged():
+    """Design case 4: 2 deg helix descent (r 3, ~5 mm deep): finite
+    ae_eq/w_plan everywhere, nothing above D, the vertical entry tagged."""
+    lines = ["G21 G90 F500", "G0 X3. Y0. Z12.", "G1 X3. Y0. Z9.5 F100."]
+    pitch = 0.658                              # 2 deg at r 3 per turn
+    for i in range(1, 229):                   # 12 deg steps, 7.6 turns
+        th = math.radians(12.0 * i)
+        lines.append("G1 X%.4f Y%.4f Z%.4f F100."
+                     % (3.0 * math.cos(th), 3.0 * math.sin(th),
+                        9.5 - pitch * i / 30.0))
+    res = _run_zb("\n".join(lines) + "\n", np.zeros((NB, NB)))
+    wins = res["_zb_raw"]
+    assert len(wins) >= 50
+    for w in wins:
+        assert math.isfinite(w["ae_eq"]) and math.isfinite(w["w_plan"])
+        assert w["w_plan"] <= D_ZB + 1e-9
+        assert w["ae_eq"] <= D_ZB
+    eng = res["engagement"]["ze2b"]
+    assert eng["descent"]["count"] >= 1       # the vertical entry is tagged
+    assert wins[0]["descent"] is True
+    assert wins[-1]["descent"] is False      # helix windows are not descents
+    assert eng["a"]["max"] <= D_ZB / 2.0 + 1e-9   # a clipped to R
+
+
+def test_ze2b_flat_and_bull_json_byte_identical(tmp_path):
+    """Design case 5: flat/bull --out-json stays BYTE-IDENTICAL to b1688b8's
+    zmap (the ZE2B block is ball-only)."""
+    import subprocess
+    here = os.path.dirname(os.path.abspath(zmap.__file__))
+    root = os.path.dirname(here)
+    old = tmp_path / "zmap_b1688b8.py"
+    old.write_bytes(subprocess.check_output(
+        ["git", "-C", root, "show", "b1688b8:verify/zmap.py"]))
+    part = block_part(hi=10.0, half=15.0)
+    npf = tmp_path / "part.npy"
+    np.save(npf, part)
+    with open(tmp_path / "part.json", "w") as f:
+        json.dump({"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}, f)
+    ngc = tmp_path / "prog.ngc"
+    ngc.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\nG1 Z5. F100.\n"
+                   "G1 X20. Y0. F500.\nG0 X-20. Y2. Z20.\nG1 Z5. F100.\n"
+                   "G1 X20. Y2. F500.\n")
+    stock_args = ["-15.0", "15.0", "-15.0", "15.0", "0.0", "10.0"]
+    for extra in ([], ["--tool", "bull", "--corner", "1.0"]):
+        outs = []
+        for script in (str(old), os.path.join(here, "zmap.py")):
+            o = tmp_path / ("out_%d_%s.json"
+                            % (len(extra), os.path.basename(script)))
+            rc = subprocess.call(
+                [sys.executable, script, str(ngc), "--part", str(npf),
+                 "--stock"] + stock_args + ["--engage-max", "2.0"]
+                + ["--out-json", str(o)] + extra)
+            assert rc == 0, "zmap run failed: %s %s" % (script, extra)
+            outs.append(json.loads(o.read_bytes()))
+        _assert_pinned_plus_zg1(outs[0], outs[1], "missing", extra)
+
+
+def _assert_pinned_plus_zg1(pinned, new, part_mask, label):
+    """ZG1 (supervisor, coordinator-approved): every key of the b1688b8 JSON is
+    present with a byte-identical value (json.dumps, sort_keys); the ONLY
+    extra keys are below_stock_bottom (count 0) and part_mask (this synthetic
+    part has no .hit.npy, so "missing")."""
+    for k, v in pinned.items():
+        assert k in new, "pinned key %r gone: %r" % (k, label)
+        assert json.dumps(new[k], sort_keys=True) == \
+            json.dumps(v, sort_keys=True), \
+            "flat/bull JSON changed at %r: %r" % (k, label)
+    extra = set(new) - set(pinned)
+    assert extra == {"below_stock_bottom", "part_mask"}, \
+        "extra keys %r: %r" % (sorted(extra), label)
+    assert new["below_stock_bottom"]["count"] == 0, new["below_stock_bottom"]
+    assert new["part_mask"] == part_mask, (new["part_mask"], label)
+
+
+def test_ze2b_cli_ball_block_and_dump(tmp_path):
+    """ball + engagement: report carries engagement.ze2b and the ZE2 semantics
+    marker; --ae2b-dump writes the windows with the design's fields."""
+    part = np.zeros((NB, NB))
+    npf = tmp_path / "p.npy"
+    np.save(npf, part)
+    with open(tmp_path / "p.json", "w") as f:
+        json.dump({"cell": CELL_B, "x0": X0_B, "y0": Y0_B, "tess_tol": 0.01},
+                  f)
+    ngc = tmp_path / "slot.ngc"
+    ngc.write_text(_zb_pass_gcode(0.0, 8.0))
+    out = tmp_path / "rep.json"
+    dump = tmp_path / "wins.json"
+    rc = zmap.main([str(ngc), "--part", str(npf), "--tool", "ball",
+                    "--dia", str(D_ZB), "--stock"]
+                   + [str(v) for v in STOCK_B]
+                   + ["--engage-max", "2.286", "--out-json", str(out),
+                      "--ae2b-dump", str(dump)])
+    assert rc == 0                                  # report-only, never fails
+    with open(out) as f:
+        eng = json.load(f)["engagement"]
+    assert eng["semantics"] == "flat-only, see ze2b"
+    zb = eng["ze2b"]
+    for k in ("n_windows", "full_width", "overload", "ae_eq",
+              "w_plan_over_chord", "a", "descent"):
+        assert k in zb, "missing ze2b key %s" % k
+    assert zb["n_windows"] >= 1
+    with open(dump) as f:
+        wins = json.load(f)
+    assert wins
+    need = {"line", "x", "y", "z", "a", "theta", "w_plan", "c_a", "ae_eq",
+            "length_3d", "feed", "descent"}
+    assert need <= set(wins[0]), sorted(need - set(wins[0]))
+
+
+def test_ze2b_mutation_broken_chord_breaks_assertions(monkeypatch):
+    """Design case 6, mutation proof: with c(a) replaced by D (a broken chord
+    formula - monkeypatched wrapper, no edit to zmap.py) the full-width slot
+    and side-pass checks must FAIL BY ASSERTION."""
+    monkeypatch.setattr(zmap, "_ze2b_chord", lambda a, dia: dia)
+    with pytest.raises(AssertionError):
+        _check_full_slot(_run_zb(_zb_pass_gcode(0.0, 8.0),
+                                 np.zeros((NB, NB))))
+    part = np.zeros((NB_L, NB_L))
+    res_a = _run_zb(_zb_pass_gcode(-2.905, 8.0, x0=-5.0, x1=20.0), part,
+                    x0=X0_L, y0=Y0_L, stock=STOCK_L)
+    with pytest.raises(AssertionError):
+        _check_side_pass(_run_zb(_zb_pass_gcode(-1.0, 8.0, x0=-5.0, x1=20.0),
+                                 part, stock_init=res_a["stock"],
+                                 x0=X0_L, y0=Y0_L, stock=STOCK_L))
+
+
+# ---------------------------------------------------------------------------
+# Task ZG1: the gouge rule's blind spot at the global part minimum.
+# A plate whose top face IS the part's global minimum must have cuts into
+# it reported as gouges (via <stem>.hit.npy, or fail-closed strict when the
+# mask is missing); below_stock_bottom is a hard gate.
+# ---------------------------------------------------------------------------
+
+def _zg1_plate(tmp_path, hit=None, top=10.0, stem="plate"):
+    """Uniform plate: top face == the part's global minimum (the blind
+    spot), flush with the stock top. Optional bool hit mask as .hit.npy."""
+    npy = tmp_path / (stem + ".npy")
+    np.save(npy, np.full((N, N), top))
+    (tmp_path / (stem + ".json")).write_text(json.dumps(
+        {"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}))
+    if hit is not None:
+        np.save(str(npy)[:-4] + ".hit.npy", hit)
+    return npy
+
+
+def _zg1_cli(tmp_path, npy, body, tool=None):
+    gc = tmp_path / "zg1.ngc"
+    gc.write_text("G21 G90 F500\n" + body)
+    out = tmp_path / "zg1.json"
+    argv = [str(gc), "--part", str(npy), "--stock"]
+    argv += [str(v) for v in STOCK] + ["--out-json", str(out)]
+    if tool:
+        argv += tool
+    rc = zmap.main(argv)
+    return rc, json.loads(out.read_text())
+
+
+def test_zg1_plate_minimum_face_gouge_with_hit_mask(tmp_path):
+    """Cut 0.1 mm into a plate face sitting at the part's global minimum:
+    with a .hit.npy mask it is a gouge (fails under the old footprint rule)."""
+    npy = _zg1_plate(tmp_path, hit=np.ones((N, N), dtype=bool))
+    rc, rep = _zg1_cli(tmp_path, npy, "G0 X-20. Y0. Z20.\n"
+                                      "G1 Z9.9 F100.\nG1 X20. F500.\n")
+    assert rep["part_mask"] == "present"
+    assert abs(rep["gouges"]["max_depth"] - 0.1) < 1e-6, \
+        "measured gouge depth must be 0.1 mm: %r" % rep["gouges"]
+    assert rep["gouges"]["worst_xy"] is not None
+    assert rc == 0  # gouges stay report-only
+
+
+def test_zg1_plate_minimum_face_gouge_without_mask(tmp_path):
+    """Same cut with NO .hit.npy: fail closed, judge every valid cell
+    strictly, and say so in the JSON."""
+    npy = _zg1_plate(tmp_path)
+    rc, rep = _zg1_cli(tmp_path, npy, "G0 X-20. Y0. Z20.\n"
+                                      "G1 Z9.9 F100.\nG1 X20. F500.\n")
+    assert rep["part_mask"] == "missing"
+    assert abs(rep["gouges"]["max_depth"] - 0.1) < 1e-6, \
+        "fail-closed fallback must report the 0.1 mm gouge: %r" % rep["gouges"]
+    assert rc == 0
+
+
+def test_zg1_hit_mask_excludes_part_free_cells(tmp_path):
+    """Mask present: cuts BELOW the zmin fill outside the part footprint
+    (depth 0.15) must NOT count as gouges; the 0.1 mm cut into real part
+    geometry must. Drop the mask use -> measured depth becomes 0.15."""
+    xs = centers()[None, :]
+    ys = centers()[:, None]
+    hit = (np.abs(xs) <= 5.0) & (np.abs(ys) <= 5.0)
+    npy = _zg1_plate(tmp_path, hit=hit)
+    rc, rep = _zg1_cli(tmp_path, npy,
+                       "G0 X-5. Y0. Z20.\nG1 Z9.9 F100.\nG1 X5. F500.\n"
+                       "G0 X-10. Y10. Z20.\nG1 Z9.85 F100.\nG1 X10. F500.\n")
+    assert rep["part_mask"] == "present"
+    assert abs(rep["gouges"]["max_depth"] - 0.1) < 1e-6, \
+        "only the 0.1 mm cut into part geometry may gouge: %r" % rep["gouges"]
+    assert rc == 0
+
+
+def test_zg1_below_stock_bottom_hard_gate(tmp_path):
+    """Tip 0.1 mm below the stock bottom Z0: non-zero exit, with count,
+    max depth, worst xy and first line."""
+    npy = _zg1_plate(tmp_path)
+    rc, rep = _zg1_cli(tmp_path, npy,
+                       "G0 X-20. Y0. Z20.\nG1 Z-0.1 F100.\nG1 X20. F500.\n",
+                       tool=["--tool", "ball"])  # ball: axial stays report-only
+    bs = rep["below_stock_bottom"]
+    assert bs["count"] > 0
+    assert abs(bs["max_depth"] - 0.1) < 1e-6, \
+        "measured depth below the stock bottom must be 0.1 mm: %r" % bs
+    assert bs["worst_xy"] == [-20.0, 0.0], bs
+    assert bs["first_line"] == 3, bs
+    assert rc == 1, "below_stock_bottom must exit non-zero"
+
+
+def test_zg1_at_stock_bottom_not_flagged(tmp_path):
+    """Cutting exactly TO the stock bottom is not below it: gate stays 0."""
+    npy = _zg1_plate(tmp_path)
+    rc, rep = _zg1_cli(tmp_path, npy,
+                       "G0 X-20. Y0. Z20.\nG1 Z0. F100.\nG1 X20. F500.\n",
+                       tool=["--tool", "ball"])
+    assert rep["below_stock_bottom"]["count"] == 0
+    assert rep["below_stock_bottom"]["max_depth"] == 0.0
+    assert rc == 0
+
+
+def test_zg1_heightfield_writes_hit_mask(tmp_path):
+    """rasterize(hit_out=...) writes the bool geometry-hit mask: True where
+    part geometry was hit (even a top face AT zmin), False in the grown,
+    part-free zmin-fill ring."""
+    import types
+    sys.modules.setdefault("FreeCAD", types.ModuleType("FreeCAD"))
+    sys.modules.setdefault("Part", types.ModuleType("Part"))
+    import heightfield
+
+    class _Square:
+        """Flat square top at z=top over [-10, 8] x [-6, 5]."""
+        def __init__(self, top):
+            self.top = top
+            self.BoundBox = types.SimpleNamespace(
+                XMin=-10.0, XMax=8.0, YMin=-6.0, YMax=5.0,
+                ZMin=0.0, ZMax=top)
+
+        def tessellate(self, tol):
+            v = [types.SimpleNamespace(x=x, y=y, z=self.top)
+                 for x, y in ((-10.0, -6.0), (8.0, -6.0),
+                              (8.0, 5.0), (-10.0, 5.0))]
+            return v, [(0, 1, 2), (0, 2, 3)]
+
+    for top in (10.0, 0.0):  # 0.0: top face IS the global minimum
+        hp = tmp_path / ("hf_%s.hit.npy" % top)
+        hf, meta = heightfield.rasterize(_Square(top), cell=0.5, tol=0.01,
+                                         stock_box=[-20.0, 20.0, -15.0, 15.0],
+                                         tool_r=6.35, margin=5.0,
+                                         hit_out=str(hp))
+        hit = np.load(str(hp))
+        assert hit.dtype == bool and hit.shape == hf.shape
+        i0 = int((0.0 - meta["x0"]) / 0.5)
+        j0 = int((0.0 - meta["y0"]) / 0.5)
+        assert bool(hit[j0, i0]), "geometry column must be hit (top=%s)" % top
+        assert not bool(hit[0, 0]), "grown ring is part-free (top=%s)" % top
+        assert hf[0, 0] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Task ZG1b: below_stock_bottom must use the TRUE stock bottom through
+# --stock-in chains. --stock-out records the ORIGINAL stock box in the stock
+# sidecar <stem>.json under "stock_box"; --stock-in reads it back. Without a
+# box (old stock files) the check is "unknown" and never gates.
+# ---------------------------------------------------------------------------
+
+_ZG1B_BOX = [-25.0, 25.0, -25.0, 25.0, 0.0, 10.0]  # == list(STOCK)
+
+
+def _zg1b_prog1_out(tmp_path, stem="st1"):
+    """Stage 1: cut to Z 6.0 with --stock, --stock-out -> grid + sidecar."""
+    npy = _zg1_plate(tmp_path, stem="zg1b")
+    g1 = tmp_path / "p1.ngc"
+    g1.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
+                  "G1 Z6. F100.\nG1 X20. F500.\n")
+    st = tmp_path / (stem + ".npy")
+    rc = zmap.main([str(g1), "--part", str(npy), "--tool", "ball", "--stock"]
+                   + [str(v) for v in STOCK]
+                   + ["--stock-out", str(st),
+                      "--out-json", str(tmp_path / (stem + ".json"))])
+    assert rc == 0, "stage 1 (legal cut to Z 6.0) must pass"
+    return npy, st
+
+
+def test_zg1b_chain_below_true_bottom_fails_by_value(tmp_path):
+    """Chained run, program 2 with --stock-in and NO --stock: a tip 0.25 mm
+    below the TRUE bottom Z 0.0 must exit 1 with measured depth 0.25 mm
+    (the remaining stock bottoms out at Z 6.0 - gating on that would
+    measure 6.25 mm and reject the legal part too)."""
+    npy, st1 = _zg1b_prog1_out(tmp_path)
+    box = json.loads((tmp_path / "st1.json").read_text())["stock_box"]
+    assert box == _ZG1B_BOX, "sidecar must carry the ORIGINAL box: %r" % box
+    g2 = tmp_path / "p2.ngc"
+    g2.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
+                  "G1 Z-0.25 F100.\nG1 X20. F500.\n")
+    j2 = tmp_path / "j2.json"
+    st2 = tmp_path / "st2.npy"
+    rc = zmap.main([str(g2), "--part", str(npy), "--tool", "ball",
+                    "--stock-in", str(st1), "--stock-out", str(st2),
+                    "--out-json", str(j2)])
+    bs = json.loads(j2.read_text())["below_stock_bottom"]
+    assert bs["count"] > 0, bs
+    assert abs(bs["max_depth"] - 0.25) < 1e-6, \
+        "measured depth below the TRUE bottom must be 0.25 mm: %r" % bs
+    assert rc == 1, "below the true stock bottom must exit non-zero"
+    # the true bottom travels on: stage 2's sidecar keeps the ORIGINAL box
+    assert json.loads((tmp_path / "st2.json").read_text())["stock_box"] \
+        == _ZG1B_BOX
+
+
+def test_zg1b_stock_without_sidecar_box_is_unknown(tmp_path):
+    """Old stock file (no sidecar stock_box): below_stock_bottom is
+    'unknown', the report says the check was NOT done and why, and a cut
+    below the lowest REMAINING stock (Z 6.0) does NOT exit 1 for that
+    reason (the old nanmin derivation would have failed it with 1.5 mm)."""
+    npy, st1 = _zg1b_prog1_out(tmp_path)
+    (tmp_path / "st1.json").unlink()  # simulate a pre-ZG1b stock file
+    g2 = tmp_path / "p2.ngc"
+    g2.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
+                  "G1 Z4.5 F100.\nG1 X20. F500.\n")
+    j2 = tmp_path / "j2.json"
+    rc = zmap.main([str(g2), "--part", str(npy), "--tool", "ball",
+                    "--stock-in", str(st1), "--out-json", str(j2)])
+    rep = json.loads(j2.read_text())
+    bs = rep["below_stock_bottom"]
+    assert bs["status"] == "unknown", bs
+    assert bs["count"] == 0, bs
+    assert "NOT done" in bs["reason"], bs
+    assert bs["next_step"] == \
+        "pass --stock or regenerate the stock file with this version", bs
+    assert rc == 0, "an unknown bottom must never gate: rc=%d %r" % (rc, bs)
+
+
+def test_zg1b_stock_vs_sidecar_box_disagreement_fails(tmp_path, capsys):
+    """--stock plus a --stock-in sidecar box differing by > 1e-6 mm must
+    fail with an error naming BOTH boxes (an exact match stays OK)."""
+    npy, st1 = _zg1b_prog1_out(tmp_path)
+    sc = tmp_path / "st1.json"
+    meta = json.loads(sc.read_text())
+    meta["stock_box"][4] = 0.5
+    sc.write_text(json.dumps(meta))
+    g2 = tmp_path / "p2.ngc"
+    g2.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
+                  "G1 Z4.5 F100.\nG1 X20. F500.\n")
+    rc = zmap.main([str(g2), "--part", str(npy), "--tool", "ball", "--stock"]
+                   + [str(v) for v in STOCK]
+                   + ["--stock-in", str(st1),
+                      "--out-json", str(tmp_path / "j2.json")])
+    err = capsys.readouterr().err
+    assert rc == 1, "a >1e-6 mm box disagreement must exit 1"
+    assert "disagree" in err and "0.5" in err and "0.0" in err, err
+
+
+def test_zg1b_stock_out_merges_existing_sidecar(tmp_path):
+    """--stock-out adds stock_box to an existing chain sidecar instead of
+    dropping its keys (chain scripts write x0/y0/cell there)."""
+    npy = _zg1_plate(tmp_path, stem="zg1bm")
+    g1 = tmp_path / "p1.ngc"
+    g1.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
+                  "G1 Z6. F100.\nG1 X20. F500.\n")
+    st = tmp_path / "stm.npy"
+    (tmp_path / "stm.json").write_text(json.dumps(
+        {"x0": X0, "y0": Y0, "cell": CELL}))
+    rc = zmap.main([str(g1), "--part", str(npy), "--tool", "ball", "--stock"]
+                   + [str(v) for v in STOCK]
+                   + ["--stock-out", str(st),
+                      "--out-json", str(tmp_path / "jm.json")])
+    assert rc == 0
+    meta = json.loads((tmp_path / "stm.json").read_text())
+    assert meta["x0"] == X0 and meta["y0"] == Y0 and meta["cell"] == CELL, meta
+    assert meta["stock_box"] == _ZG1B_BOX, meta
+
+
+def test_zg1_window_is_speed_only_off_window_gouge_not_judged(tmp_path):
+    """ZG1 (coordinator): --window is a SPEED option that simulates and
+    judges only cells within 2 mm of steep walls. A 0.1 mm gouge on the flat
+    block top, more than 2 mm from any wall, is reported without --window
+    and NOT judged with it; the --window report says so plainly."""
+    npy = tmp_path / "blk.npy"
+    np.save(npy, block_part(hi=10.0, half=15.0))
+    (tmp_path / "blk.json").write_text(json.dumps(
+        {"cell": CELL, "x0": X0, "y0": Y0, "tess_tol": 0.01}))
+    body = "G0 X-5. Y0. Z20.\nG1 Z9.9 F100.\nG1 X5. F500.\n"
+    _rc0, plain = _zg1_cli(tmp_path, npy, body)
+    _rc1, win = _zg1_cli(tmp_path, npy, body, tool=["--window"])
+    assert plain["gouges"]["count"] >= 1, plain["gouges"]
+    assert abs(plain["gouges"]["max_depth"] - 0.1) < 1e-6, plain["gouges"]
+    assert win["gouges"]["count"] == 0, \
+        "--window restricts what is simulated: off-window gouge measured " \
+        "count %r, expected 0 (not judged)" % win["gouges"]["count"]
+    assert "NOT judged" in (win["window"] or ""), win["window"]
+    assert plain["window"] is None

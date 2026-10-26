@@ -82,7 +82,7 @@ def get_args():
 
 
 def rasterize(shape, cell=0.5, tol=0.01, pad=0.0, stock_box=None,
-              tool_r=0.0, margin=5.0):
+              tool_r=0.0, margin=5.0, hit_out=None):
     """Tessellate `shape` and rasterize triangles into a max-Z grid.
 
     Returns (hf, meta). Empty cells get the shape's bottom Z. When
@@ -98,6 +98,7 @@ def rasterize(shape, cell=0.5, tol=0.01, pad=0.0, stock_box=None,
     x0, y0, nx, ny = ext["x0"], ext["y0"], ext["nx"], ext["ny"]
     zmin = float(bb.ZMin)
     hf = np.full((ny, nx), zmin, dtype=np.float64)
+    hit = np.zeros((ny, nx), dtype=bool)  # task ZG1: geometry-hit mask
 
     for tri in tris:
         ax, ay, az = (float(verts[tri[0]].x), float(verts[tri[0]].y),
@@ -124,6 +125,7 @@ def rasterize(shape, cell=0.5, tol=0.01, pad=0.0, stock_box=None,
         inside = (l0 >= -1e-9) & (l1 >= -1e-9) & (l2 >= -1e-9)
         if not inside.any():
             continue
+        hit[jlo:jhi + 1, ilo:ihi + 1] |= inside
         z = l0 * az + l1 * bz + l2 * cz
         win = hf[jlo:jhi + 1, ilo:ihi + 1]
         np.maximum(win, np.where(inside, z, -np.inf), out=win)
@@ -133,6 +135,9 @@ def rasterize(shape, cell=0.5, tol=0.01, pad=0.0, stock_box=None,
             "stock_box": list(stock_box) if stock_box is not None else None,
             "tool_r": tool_r, "margin": margin,
             "pad_mm": ext["pad_mm"], "grid_bounds": ext["grid_bounds"]}
+    if hit_out is not None:
+        os.makedirs(os.path.dirname(hit_out) or ".", exist_ok=True)
+        np.save(hit_out, hit)
     return hf, meta
 
 
@@ -141,7 +146,8 @@ def main():
     shape = Part.read(step)
     tol = float(os.environ.get("TESS_TOL", 0.01))  # 0.01 = the engine STL tolerance
     hf, meta = rasterize(shape, cell=cell, tol=tol, pad=pad,
-                         stock_box=stock_box, tool_r=tool_r, margin=margin)
+                         stock_box=stock_box, tool_r=tool_r, margin=margin,
+                         hit_out=os.path.splitext(out)[0] + ".hit.npy")
     # task HC: the sidecar pins WHICH STEP this field came from, so a
     # reused run dir can never pass off a stale heightfield
     meta["step_sha256"] = hashlib.sha256(open(step, "rb").read()).hexdigest()

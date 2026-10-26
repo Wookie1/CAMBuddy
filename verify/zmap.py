@@ -76,6 +76,10 @@ AE2_CARRY_EXTRA_MM = 1.0
 # Removed heights are binned per move at FWD_BIN_MM (resolution of the result).
 FWD_BIN_MM = 0.25
 FWD_NBINS = 100
+# Task ZE2B (report-only, ball only): engagement vs the pre-move stock zmap;
+# descent = horizontal travel < ZE2B_DESCENT_FRAC of 3D travel (u undefined,
+# never full-width: axial plunges stay ZB's job).
+ZE2B_DESCENT_FRAC = 0.1
 TOOLS_JSON = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "tools", "x7_tools.json")
 
@@ -980,16 +984,18 @@ def _ae2_windows(moves):
     next feed's idx is not the previous feed's idx + 1), a Z change, or a
     direction change > AE2_DIR_MAX_DEG. Windows are the MINIMAL runs of >= 1 mm
     travel: short feeds (< 1 mm) merge forward until the window reaches 1 mm;
-    a move of >= 1 mm is its own window. A trailing run below 1 mm is dropped
-    (grid noise). ae_eff = area_sum / length_sum; a = max depth over the
-    window; width_mm keeps ZE's old max chord for comparison."""
-    windows = []
+    a move of >= 1 mm is its own window. Task ZG2: a trailing run below 1 mm
+    merges into a kept neighbour (last kept before, else first kept after;
+    none: ungated in .iso). ae_eff = area/length; a, width_mm as before."""
+    windows, tails, iso = [], [], []
     cur = None
 
     def close(w):
         if w["length_mm"] >= AE2_WINDOW_MM:
             w["ae_eff"] = round(w["area_mm2"] / w["length_mm"], 4)
             windows.append(w)
+        else:
+            tails.append((w, len(windows)))
 
     for e in moves:
         link = (cur is not None and e["idx"] == cur["idx"] + 1
@@ -1026,7 +1032,26 @@ def _ae2_windows(moves):
             cur = None
     if cur is not None:
         close(cur)
-    return windows
+    for w, n in tails:
+        tgt = windows[n - 1] if n else (windows[0] if windows else None)
+        if tgt is None:
+            iso.append(w)
+        else:
+            tgt["area_mm2"] += w["area_mm2"]
+            tgt["length_mm"] += w["length_mm"]
+            tgt["n_moves"] += w["n_moves"]
+            tgt["a"] = max(tgt["a"], w["a"])
+            if w["hist"] is not None:
+                tgt["hist"] = (w["hist"] if tgt["hist"] is None
+                               else tgt["hist"] + w["hist"])
+            tgt["ae_eff"] = round(tgt["area_mm2"] / tgt["length_mm"], 4)
+    wins = _Wins(windows)
+    wins.iso = iso
+    return wins
+
+
+class _Wins(list):  # task ZG2: ae2 windows; .iso = unjudged sub-1 mm cuts
+    pass
 
 
 def _helix_radius(run):
@@ -1064,6 +1089,7 @@ def _ae2_engagement_keys(win_recs, dia):
       a > SLOT_AXIAL_MM (the SE2 merge bar, area form).
     Each with count, total length and worst 10 by ae_eff (line, x, y, z,
     ae_eff, a, old width)."""
+    iso = getattr(win_recs, "iso", ())
     def brief(w):
         return {"line": w["line"], "x": w["x"], "y": w["y"], "z": w["z"],
                 "ae_eff": w["ae_eff"], "a": round(w["a"], 4),
@@ -1135,6 +1161,10 @@ def _ae2_engagement_keys(win_recs, dia):
             "fw_entry_not_allowed": len(fw_ent_bad),
             "met": not fw_cut and not fw_ent_bad},
         "ae2": _engage_stats([w["ae_eff"] for w in win_recs]),
+        **({"ae2_isolated_sub1mm": {
+            "count": len(iso), "worst_ae_eff_mm": round(min(max(
+                [w["area_mm2"] / w["length_mm"] for w in iso
+                 if w["length_mm"] > 0] or [0.0]), dia), 4)}} if iso else {}),
         "full_width_slots_ae2": {
             "count": len(fws),
             "total_length_mm": round(sum(w["length_mm"] for w in fws), 1),
@@ -1147,6 +1177,95 @@ def _ae2_engagement_keys(win_recs, dia):
             "total_length_mm": round(sum(w["length_mm"] for w in ovl), 1),
             "worst": [brief(w) for w in ovl[:10]],
         },
+    }
+
+
+def _ze2b_chord(a, dia):
+    """Task ZE2B: the ball's chord at axial depth a: c(a) = 2*sqrt(a*(dia-a))."""
+    return 2.0 * math.sqrt(max(a, 0.0) * max(dia - a, 0.0))
+
+
+def _ze2b_windows(moves, dia):
+    """Task ZE2B: merge consecutive ball cutting-feed moves (no rapid between,
+    direction change <= AE2_DIR_MAX_DEG on u, ANY Z change) into ZE2's minimal
+    windows of >= AE2_WINDOW_MM 3D travel (short tail dropped). vol = mm^3
+    removed (live-stock telescope), a = max stock_top - tip over engaged cells
+    (clipped [0,R]), ext/dext = extent perp to u / bbox diagonal."""
+    windows = []
+    cur = None
+
+    def close(w):
+        if w["length_3d"] >= AE2_WINDOW_MM:
+            w["ae_eq"] = round(w["vol"] / w["length_3d"] / w["a"], 4) if w["a"] > 0.0 else 0.0
+            w["w_plan"] = round(min(w["dext"] if w["descent"] else w["ext"], dia), 4)
+            w["c_a"] = round(_ze2b_chord(w["a"], dia), 4)
+            w["theta"] = round(math.degrees(math.acos(1.0 - w["a"] / (dia / 2.0))), 3)
+            windows.append(w)
+
+    for e in moves:
+        if not (cur is not None and e["idx"] == cur["idx"] + 1
+                and e["dx"] * cur["dx"] + e["dy"] * cur["dy"]
+                >= math.cos(math.radians(AE2_DIR_MAX_DEG))):
+            if cur is not None:
+                close(cur)
+            cur = dict(e, n_moves=1, end_line=e["line"])
+        else:
+            cur.update(idx=e["idx"], end_line=e["line"], x=e["x"], y=e["y"])
+            cur["length_3d"] += e["length_3d"]
+            cur["horiz"] += e["horiz"]
+            cur["vol"] += e["vol"]
+            cur["a"] = max(cur["a"], e["a"])
+            cur["ext"] = max(cur["ext"], e["ext"])
+            cur["dext"] = max(cur["dext"], e["dext"])
+            cur["n_moves"] += 1
+        cur["descent"] = cur["horiz"] < ZE2B_DESCENT_FRAC * cur["length_3d"]
+        if cur["length_3d"] >= AE2_WINDOW_MM:
+            close(cur)
+            cur = None
+    if cur is not None:
+        close(cur)
+    return windows
+
+
+def _ze2b_keys(wins, dia, engage_max):
+    """Task ZE2B (report-only): engagement.ze2b for ball programs, with ZE2F's
+    cutting/entry-feed split; full_width = not descent AND a >= 0.05 AND
+    w_plan >= FULL_WIDTH_FRAC x c(a); overload = ae_eq > engage_max."""
+    def brief(w):
+        return {"line": w["line"], "x": w["x"], "y": w["y"], "z": w["z"],
+                "a": round(w["a"], 4), "theta": w["theta"],
+                "w_plan": w["w_plan"], "c_a": w["c_a"], "ae_eq": w["ae_eq"],
+                "length_3d": round(w["length_3d"], 3), "feed": w["feed"],
+                "descent": w["descent"]}
+
+    fw = sorted([w for w in wins if not w["descent"] and w["a"] >= 0.05
+                 and w["w_plan"] >= FULL_WIDTH_FRAC * w["c_a"]],
+                key=lambda w: -(w["w_plan"] / max(w["c_a"], 1e-9)))
+    ov = sorted([w for w in wins if engage_max is not None
+                 and w["ae_eq"] > engage_max], key=lambda w: -w["ae_eq"])
+    by_feed = {}
+    for w in wins:
+        if w.get("feed"):
+            by_feed[w["feed"]] = by_feed.get(w["feed"], 0.0) + w["length_3d"]
+    cut_feed = max(by_feed, key=by_feed.get) if by_feed else None
+    fw_cut = [w for w in fw if cut_feed is None or (w.get("feed") is not None
+                and w["feed"] >= AE2_ENTRY_FEED_FRAC * cut_feed)]
+
+    def cls(ws):
+        return {"count": len(ws),
+                "length_mm": round(sum(w["length_3d"] for w in ws), 1)}
+    return {
+        "n_windows": len(wins),
+        "full_width": dict(cls(fw), worst=[brief(w) for w in fw[:10]]),
+        "overload": dict(cls(ov), worst=[brief(w) for w in ov[:10]]),
+        "ae_eq": _engage_stats([w["ae_eq"] for w in wins]),
+        "w_plan_over_chord": _engage_stats([w["w_plan"] / w["c_a"]
+                                            for w in wins if w["c_a"] > 0.0]),
+        "a": _engage_stats([w["a"] for w in wins]),
+        "descent": cls([w for w in wins if w["descent"]]),
+        "ae2b_cutting_feed": cut_feed,
+        "full_width_cutting_feed": cls(fw_cut),
+        "full_width_entry_feed": cls([w for w in fw if w not in fw_cut]),
     }
 
 
@@ -1261,12 +1380,19 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         stock[~window] = -np.inf
     R = dia / 2.0
     dz = tool_dz(tool, dia, corner)
+    # task SP2: for a ball, the exact dz(d) op chain is replayed in-place on
+    # one scratch buffer per sample (same ops, same order, same dtype) so the
+    # per-sample closure allocates nothing.
+    ball_surf = tool == "ball"
     # task ZA: bottom disk radius for the axial plunge check -- the flat part
     # of the tool's bottom: R for flat, R - corner for bull; a ball has no
     # flat bottom, so its full disk is judged against the spherical surface
     bottom_r = R - corner if tool == "bull" else R
     engage_track = engage_max is not None or engage_report
     k = int(math.ceil(R / cell)) + 1  # +1 so the padded engagement mask fits
+    surf_buf = np.empty((2 * k + 1, 2 * k + 1)) if ball_surf else None
+    zb_on = engage_track and tool == "ball"  # task ZE2B (ball only)
+    zb_moves = []
     # shank/over-flute check (only with flute): radius S/2, its own window
     shank_on = flute is not None
     Rs = (shank_dia if shank_dia else dia) / 2.0
@@ -1370,6 +1496,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     # footprint-outside-grid tracking (cells outside the grid are unjudged)
     outside_grid = 0
     first_outside_line = None
+    bsb_raw = []  # task ZG1: {line, x, y, depth} below the stock bottom
 
     for mi, mv in enumerate(resolved):
         if mv.get("comp"):
@@ -1402,6 +1529,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             if first_outside_line is None:
                 first_outside_line = mv["line"]
         cutting = mv["motion"] in ("G1", "G2", "G3")
+        if cutting and min(z1, cur[2]) < szmin - 1e-9:  # task ZG1
+            bz, bxy = ((z1, [x1, y1]) if z1 <= cur[2] else (cur[2], cur[:2]))
+            bsb_raw.append({"line": mv["line"], "x": bxy[0], "y": bxy[1],
+                            "depth": szmin - bz})
         move_collided = False
         move_over_flute = False
         move_shank = False
@@ -1415,6 +1546,17 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         # task ZE2: plan area of the cells this move removes material from
         # (cells counted once: stock update makes later samples cut 0 there)
         move_area = 0.0
+        # task ZE2B: engagement vs the stock BEFORE this move stamps it (copy)
+        zb_vol = zb_a = zb_ext = zb_dext = 0.0
+        zb_pre = None
+        if cutting and zb_on:
+            bx = np.asarray(samples)
+            zb_ilo = max(0, int(math.floor((bx[:, 0].min() - x0) / cell)) - k)
+            zb_ihi = min(nx, int(math.floor((bx[:, 0].max() - x0) / cell)) + k + 1)
+            zb_jlo = max(0, int(math.floor((bx[:, 1].min() - y0) / cell)) - k)
+            zb_jhi = min(ny, int(math.floor((bx[:, 1].max() - y0) / cell)) + k + 1)
+            if zb_ilo < zb_ihi and zb_jlo < zb_jhi:
+                zb_pre = stock[zb_jlo:zb_jhi, zb_ilo:zb_ihi].copy()
         # travel direction for engagement (perpendicular chord width)
         dx_t = x1 - cur[0]
         dy_t = y1 - cur[1]
@@ -1451,7 +1593,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             if ilo < ihi and jlo < jhi:
                 dxa = xs[ilo:ihi] - x1
                 dya = ys[jlo:jhi] - y1
-                da = np.hypot(*np.meshgrid(dxa, dya))
+                da = np.hypot(dxa, dya[:, None])
                 win_a = stock[jlo:jhi, ilo:ihi]
                 keep = (da <= bottom_r + 1e-9) & np.isfinite(win_a)
                 if keep.any():
@@ -1486,8 +1628,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 slo, shi = max(0, i0 - ks), min(nx, i0 + ks + 1)
                 tlo, thi = max(0, j0 - ks), min(ny, j0 + ks + 1)
                 if slo < shi and tlo < thi:
-                    dsg = np.meshgrid(xs[slo:shi] - sx, ys[tlo:thi] - sy)
-                    dd = np.hypot(dsg[0], dsg[1])
+                    dd = np.hypot(xs[slo:shi] - sx, (ys[tlo:thi] - sy)[:, None])
                     dsh = dd <= Rs + 0.75 * cell
                     vsh = np.where(dsh, np.maximum(stock[tlo:thi, slo:shi],
                                                    part[tlo:thi, slo:shi]),
@@ -1520,8 +1661,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     slo, shi = max(0, i0 - kH), min(nx, i0 + kH + 1)
                     tlo, thi = max(0, j0 - kH), min(ny, j0 + kH + 1)
                     if slo < shi and tlo < thi:
-                        dsg = np.meshgrid(xs[slo:shi] - sx, ys[tlo:thi] - sy)
-                        dd = np.hypot(dsg[0], dsg[1])
+                        dd = np.hypot(xs[slo:shi] - sx, (ys[tlo:thi] - sy)[:, None])
                         dH = dd <= Rh
                         mat = np.maximum(
                             np.where(np.isfinite(stock[tlo:thi, slo:shi]),
@@ -1556,16 +1696,28 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 if cutting:
                     air_length += seg_len
                 continue
-            dxg, dyg = np.meshgrid(gx, gy)
-            d = np.hypot(dxg, dyg)
+            d = np.hypot(gx[None, :], gy[:, None])
             msk = d <= R + 1e-9
             if window is not None:
                 msk &= window[jlo:jhi, ilo:ihi]
             if not msk.any():
                 continue
-            newv = np.where(msk, sz + dz(d), np.inf)
+            if ball_surf:
+                # exact dz(d) chain into scratch, then sz + dz (same ops)
+                t = surf_buf[:gy.size, :gx.size]
+                np.multiply(d, d, out=t)
+                np.subtract(R * R, t, out=t)
+                np.maximum(t, 0.0, out=t)
+                np.sqrt(t, out=t)
+                np.subtract(R, t, out=t)
+                np.add(sz, t, out=t)
+                newv = np.where(msk, t, np.inf)
+            else:
+                newv = np.where(msk, sz + dz(d), np.inf)
             cut = win - newv
-            removed = float(np.sum(np.clip(np.where(msk, cut, 0.0), 0.0, None)))
+            # task SP2: outside msk newv is +inf so cut is -inf and the clip
+            # to >= 0 yields the same 0.0 the masked where wrote there
+            removed = float(np.sum(np.clip(cut, 0.0, None)))
             if cutting and engage_track:
                 # task ZE2: cells this sample actually removes (finite positive
                 # cut height); each cell is counted at most once per move since
@@ -1577,6 +1729,22 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                                     .astype(np.int64), FWD_NBINS - 1)
                     hh = np.bincount(hb, minlength=FWD_NBINS).astype(np.uint32)
                     move_hist = hh if move_hist is None else move_hist + hh
+            if cutting and zb_on:
+                # task ZE2B: vol = live cut (telescopes, each cell once); a/ext
+                # vs the pre-move snapshot where r = stock - z_b > 0.01
+                cb = msk & np.isfinite(cut) & (cut > REMOVE_EPS)
+                if cb.any():
+                    zb_vol += float(cut[cb].sum()) * cell * cell
+                if zb_pre is not None:
+                    sub = zb_pre[jlo - zb_jlo:jhi - zb_jlo, ilo - zb_ilo:ihi - zb_ilo]
+                    eb = msk & np.isfinite(sub) & (sub - newv > 0.01)
+                    if eb.any():
+                        zb_a = max(zb_a, float(np.max(sub[eb] - sz)))
+                        pu = (dx_t * gx[None, :] + dy_t * gy[:, None])[eb]
+                        pv = (-dy_t * gx[None, :] + dx_t * gy[:, None])[eb]
+                        zb_ext = max(zb_ext, float(pv.max() - pv.min()))
+                        zb_dext = max(zb_dext, math.hypot(float(pu.max() - pu.min()),
+                                                        float(pv.max() - pv.min())))
             if cutting and engage_track:
                 # task ZE: axial depth at this sample = deepest column of
                 # stock removed above the tool surface under the footprint
@@ -1596,8 +1764,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 msk_e = d <= R + 0.75 * cell
                 if window is not None:
                     msk_e &= window[jlo:jhi, ilo:ihi]
-                engaged = (msk_e.any() and
-                         float(np.max(np.where(msk_e, win, -np.inf))) > sz + 1e-6)
+                # task SP2: msk_e.any() is implied -- with an empty msk_e the
+                # masked max is -inf and the comparison is False either way
+                engaged = (float(np.max(np.where(msk_e, win, -np.inf)))
+                           > sz + 1e-6)
                 # radial engagement: chord width of engaged arc perpendicular to
                 # travel (dx_t, dy_t); equivalent radial width = 2*R*sin(theta/2)
                 if engaged and engage_track:
@@ -1627,7 +1797,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 if not engaged:
                     air_length += seg_len
             else:  # rapid
-                if np.any(np.where(msk, cut > REMOVE_EPS, False)):
+                # task SP2: outside msk cut is -inf, never > REMOVE_EPS
+                if np.any(cut > REMOVE_EPS):
                     move_collided = True
         if cutting:
             cut_length += length
@@ -1725,6 +1896,15 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     "depth_mm": round(max(move_max_depth, 0.0), 4),
                     "width_mm": round(move_max_engage, 4),
                 })
+            if zb_on and length > 0.0:
+                zb_moves.append({
+                    "idx": mi + idx_offset, "line": mv["line"],
+                    "x": round(x1, 4), "y": round(y1, 4), "z": round(z1, 3),
+                    "dx": dx_t, "dy": dy_t, "length_3d": length,
+                    "horiz": horiz,
+                    "vol": zb_vol, "a": min(max(zb_a, 0.0), R),
+                    "ext": zb_ext, "dext": zb_dext, "feed": mv.get("f"),
+                })
             if engage_max is not None and move_max_engage > engage_max:
                 engage_count += 1
                 engage_spikes.append({
@@ -1779,12 +1959,15 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         cur = [x1, y1, z1]
 
     ae2_windows = _ae2_windows(ae2_moves) if engage_track else []
+    zb_windows = _ze2b_windows(zb_moves, dia) if zb_on else []
     result = {
         "stock": stock,
         "rapid_collisions": {"count": rapid_collisions,
                             "first_line": first_rapid_line},
         "outside_grid": {"count": outside_grid,
                          "first_line": first_outside_line},
+        "below_stock_bottom": _bsb_report(bsb_raw),
+        "_bsb_raw": bsb_raw,
         "plunge_over_flute": ({"count": over_flute, "flute_mm": flute,
                                "first_line": first_over_flute_line}
                               if flute is not None else None),
@@ -1827,6 +2010,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         # task ZE2: raw per-feed area records + built ae2 windows
         "_ae2_move_raw": ae2_moves,
         "_ae2_raw": ae2_windows,
+        "_zb_move_raw": zb_moves,
+        "_zb_raw": zb_windows,
         # raw per-bucket values for exact parallel merging (not reported)
         "_engage_raw": {"horizontal": engage_horiz, "entry": engage_entry},
         # task ZA: report-only for every tool; a FAILING gate for flat/bull
@@ -1841,6 +2026,9 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                            reverse=True)[:10],
         },
     }
+    if tool == "ball" and engage_track:
+        result["engagement"]["semantics"] = "flat-only, see ze2b"
+        result["engagement"]["ze2b"] = _ze2b_keys(zb_windows, dia, engage_max)
     result.update(analyze(stock, part, cell, x0, y0,
                           restrict=window if window is not None else in_box))
     return result
@@ -2005,6 +2193,8 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
         "axial_plunges": _axial_report(
             [e for r in results for e in r["_axial_raw"]]),
         "_axial_raw": [e for r in results for e in r["_axial_raw"]],
+        "below_stock_bottom": _bsb_report(
+            [e for r in results for e in r["_bsb_raw"]]),
     }
     zbands = {}
     for r in results:
@@ -2028,6 +2218,13 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
     ae2_windows = _ae2_windows(ae2_all)
     combined["_ae2_move_raw"] = ae2_all
     combined["_ae2_raw"] = ae2_windows
+    zb_all = [e for res in results for e in res["_zb_move_raw"]]
+    combined["_zb_move_raw"] = zb_all
+    combined["_zb_raw"] = _ze2b_windows(zb_all, dia) if zb_all else []
+    if tool == "ball" and combined["engagement"] is not None:
+        combined["engagement"]["semantics"] = "flat-only, see ze2b"
+        combined["engagement"]["ze2b"] = _ze2b_keys(combined["_zb_raw"], dia,
+                                                    engage_max)
     if combined["engagement"] is not None:
         combined["engagement"].update(
             _ze_engagement_keys(hw_all, engage_max, dia))
@@ -2051,16 +2248,25 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
 # Analysis / report
 # --------------------------------------------------------------------------
 
+def _bsb_report(raw):  # task ZG1: below_stock_bottom block from raw records
+    w = max(raw, key=lambda e: e["depth"], default=None)
+    return {"count": len(raw), "max_depth": w["depth"] if w else 0.0,
+            "worst_xy": [w["x"], w["y"]] if w else None,
+            "first_line": min((e["line"] for e in raw), default=None)}
+
+
 def analyze(stock, part, cell, x0, y0, restrict=None):
     ny, nx = part.shape
     valid = np.isfinite(stock)
+    hit = getattr(part, "hit", None)
     bottom = float(np.min(part))
     footprint = part > bottom + 1e-9
     mask = valid & footprint
     if restrict is not None:
         mask &= restrict
     depth = part - stock
-    gouge_mask = mask & (stock < part - GOUGE_TOL)
+    gouge_mask = (valid & hit if hit is not None else valid) \
+        & (stock < part - GOUGE_TOL)
     if gouge_mask.any():
         flat = np.argmax(np.where(gouge_mask, depth, -np.inf))
         gj, gi = np.unravel_index(flat, part.shape)
@@ -2083,6 +2289,7 @@ def analyze(stock, part, cell, x0, y0, restrict=None):
     return {
         "gouges": {"count": int(gouge_mask.sum()), "max_depth": max_depth,
                    "worst_xy": worst},
+        "part_mask": "present" if hit is not None else "missing",
         "leftover": lv,
         "within_0p5mm_fraction": within,
     }
@@ -2113,6 +2320,9 @@ def write_png(stock, part, cell, x0, y0, path):
 # CLI
 # --------------------------------------------------------------------------
 
+class PartField(np.ndarray): hit = None  # ndarray + .hit bool mask (task ZG1)
+
+
 def load_part(path):
     part = np.load(path)
     sidecar = re.sub(r"\.npy$", "", path) + ".json"
@@ -2125,6 +2335,9 @@ def load_part(path):
             "vertical walls carry unbounded chord error and the judgement "
             "would be silently optimistic. Regenerate the heightfield with "
             "TESS_TOL=0.01." % (sidecar, tess))
+    part = part.view(PartField)
+    if os.path.exists(hp := re.sub(r"\.npy$", "", path) + ".hit.npy"):
+        part.hit = np.load(hp)
     return part, float(meta["cell"]), float(meta["x0"]), float(meta["y0"])
 
 
@@ -2160,9 +2373,10 @@ def main(argv=None):
     p.add_argument("--out-json", default=None, help="write report JSON here")
     p.add_argument("--png", default=None, help="optional leftover heatmap PNG")
     p.add_argument("--window", action="store_true",
-                   help="only simulate/evaluate cells within 2 mm of steep "
-                        "walls (|dZ| > 1 mm between part heightfield "
-                        "neighbours); faster at fine cell sizes")
+                   help="speed option: only cells within 2 mm of steep walls "
+                        "are simulated and judged; gouges and every other "
+                        "check outside the window are NOT judged; never use "
+                        "for a gate or a verdict")
     p.add_argument("--rapid-feed", dest="rapid_feed", type=float,
                    default=RAPID_FEED,
                    help="assumed G0 feed mm/min for the cycle-time estimate")
@@ -2230,6 +2444,9 @@ def main(argv=None):
                    help="task ZE2 (report-only extra): write the raw ae2 "
                         "window records (res[_ae2_raw]) to this JSON path in "
                         "addition to the report; changes nothing else")
+    p.add_argument("--ae2b-dump", dest="ae2b_dump", default=None,
+                   help="task ZE2B (report-only extra, ball): write the raw "
+                        "ze2b window records to this JSON path")
     args = p.parse_args(argv)
 
     gtext = None
@@ -2284,7 +2501,18 @@ def main(argv=None):
     stock_init = None
     if args.stock_in:
         stock_init = np.load(args.stock_in)
+    # task ZG1b: the true stock bottom travels through chains via the stock
+    # sidecar's "stock_box" key (never nanmin of the remaining grid)
+    side_box = None
+    if args.stock_in and os.path.exists(si := os.path.splitext(args.stock_in)[0] + ".json"):
+        with open(si) as fh:
+            side_box = json.load(fh).get("stock_box")
+        side_box = tuple(map(float, side_box)) if side_box else None
     if args.stock is not None:
+        if side_box and any(abs(a - b) > 1e-6 for a, b in zip(args.stock, side_box)):
+            print("error: --stock box %s and --stock-in sidecar stock_box %s disagree"
+                  " by more than 1e-6 mm" % (list(args.stock), list(side_box)), file=sys.stderr)
+            return 1
         stock_box = tuple(args.stock)
     else:
         # Derive the box from the saved state's finite cells.
@@ -2293,8 +2521,11 @@ def main(argv=None):
             p.error("--stock-in file has no finite cells")
         stock_box = (x0 + ii.min() * cell, x0 + (ii.max() + 1) * cell,
                     y0 + jj.min() * cell, y0 + (jj.max() + 1) * cell,
-                    float(np.nanmin(stock_init)),
+                    # unknown bottom = -inf: the gate can never fire on a guess
+                    float(side_box[4]) if side_box else float("-inf"),
                     float(np.nanmax(stock_init)))
+    # --stock-out records this ORIGINAL box; --stock wins over the sidecar
+    orig_box = tuple(args.stock) if args.stock is not None else side_box
     # a judge must never silently judge less than the whole stock: the part
     # grid has to cover the stock box (within half a cell per side), or the
     # moves out there are unjudged. No option to skip this.
@@ -2344,8 +2575,17 @@ def main(argv=None):
         "stock_in": os.path.abspath(args.stock_in) if args.stock_in else None,
         "holder": _holder_report(args, holder_name, holder_stick),
         "cell": cell,
-        "window": ("steep walls |dZ|>1mm dilated 2mm" if args.window else None),
+        "window": ("speed option: only cells within 2 mm of steep walls are "
+                   "simulated and judged; gouges and every other check outside "
+                   "the window are NOT judged; never use for a gate or a "
+                   "verdict" if args.window else None),
         "gouges": res["gouges"],
+        "part_mask": res["part_mask"],
+        "below_stock_bottom": res["below_stock_bottom"] if orig_box else {
+            "status": "unknown", "count": 0, "max_depth": 0.0, "worst_xy": None,
+            "first_line": None, "reason": "stock bottom check NOT done: no "
+            "--stock and no stock_box in the --stock-in sidecar", "next_step":
+            "pass --stock or regenerate the stock file with this version"},
         "outside_grid": res["outside_grid"],
         "leftover": res["leftover"],
         "within_0p5mm_fraction": res["within_0p5mm_fraction"],
@@ -2385,8 +2625,20 @@ def main(argv=None):
         # ae_eff, a, old width, length) for post-hoc per-line analysis
         with open(args.ae2_dump, "w") as f:
             json.dump(_sanitize(res["_ae2_raw"]), f, indent=1)
+    if args.ae2b_dump:
+        with open(args.ae2b_dump, "w") as f:
+            json.dump(_sanitize(res.get("_zb_raw", [])), f, indent=1)
     if args.stock_out:
         np.save(args.stock_out, res["stock"])
+        if orig_box is not None:  # the ORIGINAL box; merge existing sidecar keys
+            sc = os.path.splitext(args.stock_out)[0] + ".json"
+            meta = {}
+            if os.path.exists(sc):
+                with open(sc) as f:
+                    meta = json.load(f)
+            meta["stock_box"] = [float(v) for v in orig_box]
+            with open(sc, "w") as f:
+                json.dump(meta, f)
     if args.png:
         ok = write_png(res["stock"], part, cell, x0, y0, args.png)
         if not ok:
@@ -2400,6 +2652,12 @@ def main(argv=None):
                   res["outside_grid"]["count"], args.dia / 2.0,
                   gxmin, gxmax, gymin, gymax,
                   res["outside_grid"]["first_line"]), file=sys.stderr)
+        return 1
+    if (bs := res["below_stock_bottom"])["count"] > 0:
+        print("error: %d cutting move(s) drive the tip below the stock "
+              "bottom Z %.3f (max %.3f mm below at XY %s, first line %s)"
+              % (bs["count"], stock_box[4], bs["max_depth"],
+                 bs["worst_xy"], bs["first_line"]), file=sys.stderr)
         return 1
     ap = res["axial_plunges"]
     if args.tool != "ball" and ap["count"] > 0:

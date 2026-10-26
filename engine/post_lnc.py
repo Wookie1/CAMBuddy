@@ -15,8 +15,10 @@ numbers).
   ``dwell_p_ms=False`` emits ``G04 X<s>.``) / work offset ``G54`` (P9) /
   ``M08`` (P10) / first XY rapid at the current Z / ``G43 Z<clear> H<n>``
   (P11) / motion. Cutter radius comp is off, paths are tool centre (P12); a
-  header comment states this. Arcs (``G02``/``G03`` with I/J in G17, N5) are
-  emitted only if the input path actually contains arcs.
+  header comment states this. Arcs (``G02``/``G03`` with incremental I/J in
+  G17, N5/A1-A8) are emitted only with ``arcs=True`` (fitted by
+  engine/arcfit.py, off by default); an arc move without centre data is
+  refused.
 * Number format (N1-N4): every axis/arc-centre/feed value carries a decimal
   point; maximum fraction digits with trailing zeros trimmed and the point
   forced (inch coords 4 dp, mm 3 dp; feeds inch up to 1 dp, mm integer).
@@ -32,7 +34,10 @@ numbers).
 Line endings: CRLF per N7 (``crlf=False`` switches to LF for diffing/tests).
 """
 import json
+import math
 import os
+
+from engine import arcfit
 
 # Motion G-codes that are "group 1" modal moves in this post.
 _MOTION = {0: "G00", 1: "G01", 2: "G02", 3: "G03"}
@@ -256,12 +261,21 @@ def post_moves(moves, metric=False, units_in=1.0, start=None):
     mode = None                                # last emitted motion mode word
     cur_feed = None
 
-    for mv in moves:
+    pending = list(reversed(moves))            # stack: arc fallback pushes its lines
+    while pending:
+        mv = pending.pop()
         g = mv.get("g", 1)
         newmode = _MOTION.get(g, "G01")
         tgt = {"x": coord(mv["x"]) if mv.get("x") is not None else cur["x"],
                "y": coord(mv["y"]) if mv.get("y") is not None else cur["y"],
                "z": coord(mv["z"]) if mv.get("z") is not None else cur["z"]}
+
+        ij = None
+        if g in (2, 3):
+            ij = _arc_centre(mv, cur, tgt, scale, dec, metric)
+            if ij is None:                    # misses A6 after rounding
+                pending.extend(reversed(mv["src"]))
+                continue
 
         words = []
         if newmode != mode:
@@ -269,9 +283,11 @@ def post_moves(moves, metric=False, units_in=1.0, start=None):
         for k in ("x", "y", "z"):
             if tgt[k] != cur[k]:
                 words.append("%s%s" % (k.upper(), fmt_num(tgt[k], dec)))
+        if ij is not None:
+            words.append("I%s J%s" % (fmt_num(ij[0], dec), fmt_num(ij[1], dec)))
 
         feed = mv.get("f")
-        if newmode == "G01" and feed:
+        if newmode != "G00" and feed:
             outf = round(feed * scale, fdec)
             if outf != cur_feed:
                 words.append("F%s" % fmt_num(outf, fdec))
@@ -281,10 +297,72 @@ def post_moves(moves, metric=False, units_in=1.0, start=None):
         lines.append(" ".join(words))
         cur = tgt
         mode = newmode
-        if newmode == "G01" and feed:
+        if newmode != "G00" and feed:
             cur_feed = round(feed * scale, fdec)
 
     return lines
+
+
+def _arc_centre(mv, cur, tgt, scale, dec, metric):
+    """Rounded incremental (I, J) for a G02/G03 move (spec A2, A5, A6), or None
+    when no rounded centre meets the end-point limit / ARC_TOL and the move
+    carries its original lines (``src``) to fall back on. Raises on an arc the
+    post cannot write: no centre, unknown start, helical, or no fallback."""
+    g = mv["g"]
+    if mv.get("cx") is None or mv.get("cy") is None:
+        raise ValueError("G0%d move to (%s, %s) has no centre data (cx/cy): "
+                         "the post refuses to write an arc without I/J"
+                         % (g, mv.get("x"), mv.get("y")))
+    if None in (cur["x"], cur["y"], cur["z"]):
+        raise ValueError("G0%d move with unknown start position" % g)
+    if tgt["z"] != cur["z"]:
+        raise ValueError("helical G0%d (Z %s -> %s): not supported, the LNC "
+                         "manual does not document helical arcs (spec A5)"
+                         % (g, cur["z"], tgt["z"]))
+    out_to_mm = 1.0 if metric else 25.4
+    lsb = 10.0 ** -dec
+    sx, sy, ex, ey = cur["x"], cur["y"], tgt["x"], tgt["y"]
+    i0 = round(mv["cx"] * scale - sx, dec)
+    j0 = round(mv["cy"] * scale - sy, dec)
+    src = mv.get("src")
+    pts = None
+    if src:
+        pts = [(sx, sy)] + [(m["x"] * scale, m["y"] * scale) for m in src]
+    for di, dj in sorted(((a, b) for a in (0, -1, 1) for b in (0, -1, 1)),
+                         key=lambda d: abs(d[0]) + abs(d[1])):
+        ii, jj = round(i0 + di * lsb, dec), round(j0 + dj * lsb, dec)
+        cx, cy = sx + ii, sy + jj
+        r1 = math.hypot(sx - cx, sy - cy)
+        if abs(r1 - math.hypot(ex - cx, ey - cy)) * out_to_mm > arcfit.ARC_END_MISMATCH:
+            continue
+        if pts is not None:
+            chk = arcfit.arc_check(pts, cx, cy, r1)
+            if (chk is None or chk[0] != (g == 3)
+                    or chk[2] * out_to_mm > arcfit.ARC_TOL):
+                continue
+        return ii, jj
+    if not src:
+        raise ValueError("G0%d end point is not on the arc within %.4f mm "
+                         "after rounding (spec A6)" % (g, arcfit.ARC_END_MISMATCH))
+    return None
+
+
+def _header_comment_lines(header_comments):
+    """Extra header comment lines (TL2 item 2) in the P3 form: upper case,
+    no parentheses inside; slashstar applies with the whole header.
+    None -> no lines (output byte-identical)."""
+    if header_comments is None:
+        return []
+    if isinstance(header_comments, str):
+        header_comments = [header_comments]
+    out = []
+    for line in header_comments:
+        s = str(line).strip()
+        if "(" in s or ")" in s:
+            raise ValueError("header comment must not nest parentheses "
+                             "(spec P3): %r" % (line,))
+        out.append("(%s)" % s.upper())
+    return out
 
 
 def post(moves, *, metric=False, units_in=1.0, program=1001,
@@ -292,7 +370,7 @@ def post(moves, *, metric=False, units_in=1.0, program=1001,
          dia_mm=12.7, corner_mm=0.127, tool_kind="bull",
          clear_mm=None, wcs=54, dwell_ms=3000, dwell_p_ms=True,
          tool_desc=None, comp_note=True, crlf=True,
-         comment_style="paren"):
+         comment_style="paren", arcs=False, header_comments=None):
     """Build a full LNC program (single string) from neutral ``moves``.
 
     Format follows docs/lnc5800_post_spec.md (rule ids P1..P13, N1..N7).
@@ -308,6 +386,9 @@ def post(moves, *, metric=False, units_in=1.0, program=1001,
     the X7 tool table (``tools/x7_tools.json``, matched on type + diameter +
     corner radius within 0.001 mm). A spec that is not in the table with no
     explicit number is refused -- never a silent T1.
+
+    ``arcs=True`` fits G17 arcs to G01 runs (engine/arcfit.py, spec A1-A8);
+    off by default, so the output is unchanged unless asked for.
     """
     if tool_number is None:
         entry = lookup_tool(tool_kind, dia_mm, corner_mm)
@@ -357,6 +438,7 @@ def post(moves, *, metric=False, units_in=1.0, program=1001,
     out.append("(T%d D=%s CR=%s - ZMIN=%s - %s)"
                % (tool_number, fmt_num(dia_out, cdec), fmt_num(cr_out, cdec),
                  fmt_num(zmin_out, cdec), type_str))
+    out.extend(_header_comment_lines(header_comments))   # e.g. (ORIGIN: ...)
     out.append("G90 G94 G17 G49 G40 G80")      # P4 safety line
     out.append("G21" if metric else "G20")      # P5 units, own line
     if comp_note:
@@ -393,7 +475,12 @@ def post(moves, *, metric=False, units_in=1.0, program=1001,
     out.append("G43 Z%s H%02d" % (fmt_num(clear_out, cdec), tool_number))
 
     # --- motion (X/Y already positioned at clear; start there for suppression) ---
-    out.extend(post_moves(moves, metric=metric, units_in=units_in,
+    path = moves
+    if arcs:
+        path = arcfit.fit_moves(moves, tol=arcfit.ARC_TOL / units_in,
+                                rmin=arcfit.R_MIN / units_in,
+                                rmax=arcfit.R_MAX / units_in)
+    out.extend(post_moves(path, metric=metric, units_in=units_in,
                          start=(start_x, start_y, clear_out)))
 
     # --- retract to clear if not already there ---

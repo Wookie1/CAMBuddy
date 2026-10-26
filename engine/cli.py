@@ -37,6 +37,25 @@ def stock_box(bbox, sx, sy, top, bottom):
             pzmin - bottom, pzmax + top]
 
 
+ORIGINS = ("stock_bottom_centre", "stock_top_centre", "model_origin")
+# below this (mm, under every post's output resolution) no translation is
+# applied: a model already in the chosen frame keeps today's exact STEP
+ORIGIN_EPS = 1e-4
+
+
+def origin_offset(stock, origin):
+    """Task (e): the translation (dx, dy, dz) mm that puts the chosen point
+    of the stock box at (0, 0, 0): its XY centre at the bottom or the top
+    face; model_origin keeps the model's own frame (0, 0, 0). Pure."""
+    if origin == "model_origin":
+        return (0.0, 0.0, 0.0)
+    if origin not in ORIGINS:
+        raise ValueError("unknown origin %r" % (origin,))
+    x0, x1, y0, y1, z0, z1 = stock
+    z = z0 if origin == "stock_bottom_centre" else z1
+    return (-(x0 + x1) / 2.0, -(y0 + y1) / 2.0, -z)
+
+
 def _run_post(a):
     """python -m engine.cli post --in <neutral/engine> --out F [options]"""
     from engine import post_lnc
@@ -45,7 +64,8 @@ def _run_post(a):
     kw = dict(metric=a.metric, program=a.program, op_name=a.op_name,
               wcs=a.wcs, dwell_ms=a.dwell_ms, dwell_p_ms=not getattr(a, "dwell_x_s", False),
               comment_style=getattr(a, "comment_style", "paren"),
-              tool_desc=a.tool_desc, crlf=not a.lf)
+              tool_desc=a.tool_desc, crlf=not a.lf, arcs=a.arcs,
+              header_comments=a.header_comments)
     if a.tool_number is not None:
         kw["tool_number"] = a.tool_number
     if a.rpm is not None:
@@ -104,6 +124,28 @@ def _run_prepare(a):
     except ValueError as e:
         raise SystemExit(str(e))
 
+    # task (e): work origin - move the oriented model so the chosen stock
+    # point is (0, 0, 0), then rebuild the stock box from the moved bbox
+    offset = origin_offset(stock, a.origin)
+    if max(abs(v) for v in offset) > ORIGIN_EPS:
+        moved = os.path.join(a.out_dir, "model_moved.step")
+        env = dict(os.environ, STEP_IN=step_out, STEP_OUT=moved,
+                   ORIENT="as_modeled", META_OUT=meta_out,
+                   TRANSLATE="%.9f %.9f %.9f" % offset)
+        os.remove(meta_out)
+        r = subprocess.run([model.freecadcmd(),
+                            os.path.join(here, "_orient.py")],
+                           env=env, capture_output=True, text=True)
+        if not os.path.exists(meta_out):
+            raise SystemExit("origin move failed: %s\n%s"
+                             % (r.stdout[-1500:], r.stderr[-1500:]))
+        os.replace(moved, step_out)
+        with open(meta_out) as fh:
+            bbox = json.load(fh)["bbox"]
+        stock = stock_box(bbox, sx, sy, a.stock_top, a.stock_bottom)
+    else:
+        offset = (0.0, 0.0, 0.0)
+
     prog(0.4, "rasterising part heightfield")
     # task HC: never accept a stale part_hf.npy from a reused out dir -
     # remove it (and its sidecar) first, then require both to exist and
@@ -125,7 +167,8 @@ def _run_prepare(a):
                                           r.stderr[-1500:]))
 
     out = {"step": step_out, "hf": hf_out, "bbox": bbox, "stock": stock,
-           "orient": a.orient}
+           "orient": a.orient, "origin": a.origin,
+           "origin_offset": list(offset)}
     with open(os.path.join(a.out_dir, "prepare.json"), "w") as fh:
         json.dump(out, fh, indent=2)
     prog(1.0, "prepared")
@@ -219,6 +262,71 @@ def finish_main(a):
     return 0
 
 
+def rest_rough_main(a):
+    """`engine.cli rest-rough`: z-level ball rest-rough from a live-stock
+    map (engine/rest_rough.py). Fails closed: any emitted feed point below
+    the exact ball CL (probe_clcheck rule, 0.005 mm) aborts with exit 1."""
+    from engine import model, rest_rough as rrmod
+    kind, dia, _corner = parse_tool(a.tool)
+    if kind != "ball":
+        raise SystemExit("rest-rough: tool kind %r refused (%s): the rest "
+                         "generator cuts a ball only" % (kind, a.tool))
+    stock = rrmod.fin.load_heightfield(a.stock_from)
+    t0 = time.time()
+    stl = model.step_to_stl(a.step)
+    surf = model.load_surf(stl)
+    print("STL %s: %d triangles" % (stl, surf.size()), flush=True)
+    workers = a.workers if a.workers is not None else \
+        int(os.environ.get("ENGINE_WORKERS", 4))
+
+    def prog(stats):
+        print("rest-rough: zones entered=%d no-entry=%d cut=%.0fmm "
+              "ramp=%.0fmm rapid=%.0fmm" % (len(stats["zones"]),
+                                            len(stats["no_entry"]),
+                                            stats["cut_len"],
+                                            stats["ramp_len"],
+                                            stats["rapid_len"]), flush=True)
+
+    moves, stats = rrmod.rest_rough(
+        surf, stock, (kind, dia), floor_z=a.floor, stepdown=a.stepdown,
+        ae=a.ae, rest_leave=a.rest_leave, min_excess=a.min_excess,
+        min_helix_r=a.min_helix_r, ramp_angle_deg=a.ramp_angle_deg,
+        cut_feed=a.cut_feed, ramp_feed=a.ramp_feed, clearance=a.clearance,
+        zb_floor=a.zb_floor, workers=workers, shallow=a.shallow,
+        progress=prog)
+
+    below_cl, worst = rrmod.validate_exact(surf, dia, moves, a.rest_leave,
+                                           workers=workers)
+    stats["exact_cl_below"] = below_cl
+    stats["exact_cl_worst_mm"] = round(worst, 4)
+    if below_cl:
+        raise SystemExit("rest-rough: %d emitted CL point(s) below the exact "
+                         "ball CL by >0.005 mm (worst %.3f) - refusing to "
+                         "post" % (below_cl, worst))
+    if a.post == "lnc":
+        from engine import post_lnc
+        text = post_lnc.post(moves, metric=a.metric, program=a.program,
+                             op_name=a.op_name, tool_number=a.tool_number,
+                             rpm=a.spindle, dia_mm=dia, corner_mm=dia / 2.0,
+                             tool_kind="ball")
+    else:
+        text = moves_to_gcode(
+            moves, spindle_rpm=a.spindle,
+            tool_comment="T %s D=%.3f CR=%.3f (rest-rough)"
+                       % (kind, dia, dia / 2.0))
+    with open(a.out, "w", newline="") as fh:
+        fh.write(text)
+    stats["out"] = a.out
+    stats["n_moves"] = len(moves)
+    stats["t_total_s"] = round(time.time() - t0, 1)
+    print("wrote %s (%d moves) in %.1f s" % (a.out, len(moves),
+                                             stats["t_total_s"]), flush=True)
+    if a.stats_json:
+        with open(a.stats_json, "w") as fh:
+            json.dump(stats, fh, indent=2)
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="engine.cli")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -229,7 +337,11 @@ def main(argv=None):
     pr.add_argument("--out-dir", dest="out_dir", required=True)
     pr.add_argument("--orient", default="as_modeled",
                     choices=("as_modeled", "flip_x_180", "flip_y_180",
-                           "flip_z_180"))
+                           "flip_z_180", "rot_x_90", "rot_x_270",
+                           "rot_y_90", "rot_y_270"))
+    pr.add_argument("--origin", default="model_origin", choices=ORIGINS,
+                    help="work origin: the stock point moved to (0,0,0) "
+                         "(default model_origin: the model's own frame)")
     pr.add_argument("--stock-xy", dest="stock_xy", type=float, default=1.0,
                    help="XY stock offset per side mm")
     pr.add_argument("--stock-x", dest="stock_x", type=float, default=None,
@@ -331,9 +443,14 @@ def main(argv=None):
     r.add_argument("--tool-number", dest="tool_number", type=int, default=None,
                    help="LNC tool number (T/H) with --post lnc; default: look "
                         "the tool up in tools/x7_tools.json")
+    r.add_argument("--header-comment", dest="header_comments",
+                   action="append", default=None,
+                   help="extra LNC header comment line (P3 form); repeatable")
     r.add_argument("--json-progress", dest="json_progress", action="store_true",
                    help='emit JSON progress lines '
                        '{"progress":0.4,"message":"level 3/7"} for callers')
+    r.add_argument("--tools-json", dest="tools_json", default=None,
+                   help="tool table JSON for every tool lookup of this call")
 
     pp = sub.add_parser("post", help="post neutral/engine moves to LNC G-code")
     pp.add_argument("--in", dest="inp", required=True,
@@ -351,6 +468,9 @@ def main(argv=None):
     pp.add_argument("--corner", type=float, default=None, help="corner radius mm")
     pp.add_argument("--tool-kind", dest="tool_kind", default=None,
                    choices=("bull", "flat", "ball", "endmill"))
+    pp.add_argument("--header-comment", dest="header_comments",
+                    action="append", default=None,
+                    help="extra LNC header comment line (P3 form); repeatable")
     pp.add_argument("--clear", type=float, default=None,
                    help="clearance/retract height mm (default: max Z of path)")
     pp.add_argument("--wcs", type=int, default=54, help="work offset G-code (54)")
@@ -362,6 +482,11 @@ def main(argv=None):
                         "the default G04 P<milliseconds> (James's X7)")
     pp.add_argument("--tool-desc", dest="tool_desc", default=None)
     pp.add_argument("--lf", action="store_true", help="use LF instead of CRLF")
+    pp.add_argument("--arcs", action="store_true",
+                   help="fit G17 G02/G03 arcs (I/J) to G01 runs within 0.002 mm "
+                        "(spec A1-A8); default off: lines only")
+    pp.add_argument("--tools-json", dest="tools_json", default=None,
+                   help="tool table JSON for every tool lookup of this call")
 
     f = sub.add_parser("finish",
                        help="slope-split finishing (action: slope_split_finish) "
@@ -453,11 +578,77 @@ def main(argv=None):
                    help="PQ: output grid mm the emitted points are snapped to "
                         "(0.001 for a metric post, 0.00254 for inch output; "
                         "the caller passes the grid matching its post units)")
+    f.add_argument("--tools-json", dest="tools_json", default=None,
+                   help="tool table JSON for every tool lookup of this call")
+
+    rr = sub.add_parser("rest-rough",
+                       help="z-level ball rest-rough restricted to zones where "
+                            "live stock (--stock-from) exceeds the tool CL by "
+                            "--min-excess mm")
+    rr.add_argument("--step", required=True, help="part STEP")
+    rr.add_argument("--stock-from", dest="stock_from", required=True,
+                   help="live stock heightfield .npy (+ x0/y0/cell .json): "
+                        "the previous op's stock (engine.cli rough --stock-out "
+                        "or zmap --stock-out); the rest-rough starts from it")
+    rr.add_argument("--out", required=True, help="output .ngc file")
+    rr.add_argument("--tool", required=True,
+                   help="ball:DIA (only a ball is accepted)")
+    rr.add_argument("--floor", type=float, required=True,
+                   help="setup floor Z; levels = floor + leave + k*stepdown")
+    rr.add_argument("--stepdown", type=float, required=True,
+                   help="max level stepdown mm")
+    rr.add_argument("--ae", type=float, required=True,
+                   help="max radial engagement / stepover mm")
+    rr.add_argument("--rest-leave", dest="rest_leave", type=float, required=True,
+                   help="stock to leave on the part mm")
+    rr.add_argument("--min-excess", dest="min_excess", type=float, required=True,
+                   help="zone threshold mm: stock above the tool CL surface")
+    rr.add_argument("--min-helix-r", dest="min_helix_r", type=float, required=True,
+                   help="smallest largest-CL-circle radius that earns a helix "
+                        "entry; pockets below it are reported, not entered")
+    rr.add_argument("--ramp-angle-deg", dest="ramp_angle_deg", type=float,
+                   default=2.0, help="helix ramp angle deg (default 2.0)")
+    rr.add_argument("--cut-feed", dest="cut_feed", type=float, required=True)
+    rr.add_argument("--ramp-feed", dest="ramp_feed", type=float, required=True)
+    rr.add_argument("--spindle", type=int, required=True)
+    rr.add_argument("--clearance", type=float, default=None,
+                   help="retract plane Z (default: stock/part top + 2)")
+    rr.add_argument("--zb-floor", dest="zb_floor", type=float, default=0.5,
+                   help="entry-depth floor mm (FE5/ZB): no descent after a G0 "
+                        "may exceed it against live stock (default 0.5)")
+    rr.add_argument("--shallow", type=float, default=0.25,
+                   help="RR1c step-1 live-depth limit mm: a pass start whose "
+                        "FE5 disk depth against live stock is at or below this "
+                        "is entered by a straight feed descent (no helix); it "
+                        "also sizes the in-pass-ramp top-clear rule and the "
+                        "SE2 descent column (default 0.25)")
+    rr.add_argument("--workers", type=int, default=None)
+    rr.add_argument("--stats-json", dest="stats_json", default=None)
+    rr.add_argument("--post", choices=("neutral", "lnc"), default="neutral")
+    rr.add_argument("--program", type=int, default=1003)
+    rr.add_argument("--op-name", dest="op_name", default="REST ROUGH")
+    rr.add_argument("--metric", action="store_true")
+    rr.add_argument("--tool-number", dest="tool_number", type=int, default=None)
 
     a = p.parse_args(argv)
 
+    # TLG1: --tools-json redirects BOTH table constants (finish.py
+    # geometry/holder, post_lnc lookup_tool; both read at call time), so no
+    # call can read two tables. Unset: nothing is changed (byte-identical).
+    if getattr(a, "tools_json", None):
+        from engine import post_lnc as _pl
+        _pl.TOOL_TABLE_PATH = a.tools_json
+        try:
+            from engine import finish as _fin
+            _fin.TOOL_TABLE_PATH = a.tools_json
+        except ImportError:   # no opencamlib: no finish lookup can run here
+            pass
+
     if a.cmd == "finish":
         return finish_main(a)
+
+    if a.cmd == "rest-rough":
+        return rest_rough_main(a)
 
 
     if a.cmd == "post":
@@ -541,7 +732,7 @@ def main(argv=None):
         text = post_lnc.post(moves, metric=a.metric, program=a.program,
                              op_name=a.op_name, tool_number=a.tool_number,
                              rpm=a.spindle, dia_mm=dia, corner_mm=corner,
-                             tool_kind=kind)
+                             tool_kind=kind, header_comments=a.header_comments)
     else:
         text = moves_to_gcode(moves, spindle_rpm=a.spindle,
                               tool_comment="T1 %s D=%.3f CR=%.3f" % (kind, dia, corner))

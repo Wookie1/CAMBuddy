@@ -1,126 +1,86 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>STEVE CAM roughing</title>
+<title>SteveCAM</title>
 <link rel="stylesheet" href="panel.css">
 </head>
 <body>
-<header>
-  <h1>Adaptive roughing</h1>
-  <span id="engine-state" class="pill idle">idle</span>
+<header class="top">
+  <div class="brand"><h1>SteveCAM</h1><span class="muted small">SYIL X7</span></div>
+  <span id="engine" class="pill" title="SteveCAM engine">Connecting…</span>
 </header>
+<p id="doc-line" class="muted small">Connecting to STEVE…</p>
+<p id="notice" class="notice" role="status" hidden></p>
 
-<main>
-  <section id="doc-line">No open document.</section>
-
-  <p>Roughing: constant-engagement roughing with a flat or bull end mill,
-    level by level, leaving stock for finishing. Nothing goes to the
-    machine - always graphics-check and dry-run above the part on the X7
-    first. Slope-split finishing (run from STEVE, after roughing): ball-end
-    passes split by slope - contour-style on steep walls, raster-style on
-    flatter areas, overlapping where they meet. You can set a different extra
-    stock on each side in X and Y (Stock X and Stock Y); whichever you leave
-    blank uses the Stock XY value.</p>
-
-  <p>Check a posted program: judges your posted G-code against the open
-    part and stock box with the independent zmap, using your tool table -
-    the program's T word picks the tool and the run checks gouges, rapid
-    collisions, shank/over-flute rub, holder clearance and the tool
-    footprint, plus an engagement report. Anything outside the supported
-    subset (XY moves and arcs only, one tool) fails with the code and line.
-    It does NOT check fixtures/vise, machine travel, multi-tool programs,
-    cutter comp, canned cycles, other planes or feeds/speeds suitability -
-    the dry run above the part on the X7 is still yours to do. Up to three
-    programs can be checked in one run, in order (e.g. rough, finish, rest):
-    each program is judged on the stock left by the previous one, and the
-    first failing program fails the run.</p>
-
-  <form id="rough-form" autocomplete="off">
-    <div class="grid">
-      <label>Orientation
-        <select name="orientation">
-          <option value="as_modeled" selected>As modeled</option>
-          <option value="flip_x_180">Flip X 180</option>
-          <option value="flip_y_180">Flip Y 180</option>
-          <option value="flip_z_180">Flip Z 180</option>
-        </select>
-      </label>
-      <label>Tool
-        <select name="tool_type">
-          <option value="bull" selected>Bull</option>
-          <option value="flat">Flat</option>
-        </select>
-      </label>
-      <label>Dia (mm)<input name="tool_diameter" type="number" step="0.1"
-        min="1" max="32" value="12.7"></label>
-      <label>Corner R (mm)<input name="corner_radius" type="number"
-        step="0.001" min="0" max="8" value="0.127"></label>
-      <label>Stock XY (mm)<input name="stock_xy" type="number" step="0.1"
-        min="0" max="25.4" value="1"></label>
-      <label>Stock top (mm)<input name="stock_top" type="number" step="0.1"
-        min="0" max="25.4" value="1"></label>
-      <label>Stock bottom (mm)<input name="stock_bottom" type="number"
-        step="0.1" min="0" max="25.4" value="1"></label>
-      <label>Floor Z (mm)<input name="floor_z" type="number" step="0.1"
-        min="0" max="200" value="0"></label>
-      <label>Stepdown (mm)<input name="stepdown" type="number" step="0.1"
-        min="0.1" max="25.4" value="19.05"></label>
-      <label>Optimal load (mm)<input name="optimal_load" type="number"
-        step="0.1" min="0.05" max="10" value="2.03"></label>
-      <label>Leave (mm)<input name="stock_to_leave" type="number"
-        step="0.01" min="0" max="5" value="0.381"></label>
-      <label>RPM<input name="rpm" type="number" step="100" min="100"
-        max="30000" value="7500"></label>
-      <label>Feed (mm/min)<input name="feed" type="number" step="10"
-        min="10" max="20000" value="3429"></label>
-      <label>Units
-        <select name="units">
-          <option value="inch" selected>Inch</option>
-          <option value="mm">mm</option>
-        </select>
-      </label>
+<section class="card" id="setup" aria-labelledby="setup-h">
+  <h2 id="setup-h">Setup <span class="muted small">for every operation</span></h2>
+  <div class="grid" id="setup-top"></div>
+  <p id="origin-fixed" class="muted small" hidden>Origin: the model's own origin (as drawn)</p>
+  <div class="grid" id="setup-stock"></div>
+  <div id="measure-box" hidden>
+    <div class="inline">
+      <button type="button" id="measure-btn" class="secondary">Measure model</button>
+      <span id="measure-state" class="muted small" role="status"></span>
     </div>
-    <button id="rough-open" type="submit" disabled>
-      Rough the open document
-    </button>
-  </form>
+    <p id="model-size" class="small" hidden></p>
+    <p id="blank-hint" class="muted small">Or type the blank size: the extras are worked out from it.</p>
+    <div class="grid" id="blank-fields"></div>
+    <p id="blank-partial" class="partial small" role="status" hidden>Fill all three to use the blank size.</p>
+  </div>
+  <p id="block-size" class="small" hidden></p>
+  <div class="inline" id="save-row" hidden>
+    <button type="button" id="save-setup" class="secondary">Save setup</button>
+    <span id="save-state" class="muted small" role="status"></span>
+  </div>
+</section>
 
-  <section id="run-card" class="hidden">
-    <div class="run-head">
-      <strong id="run-state">…</strong>
-      <button id="cancel-btn" type="button">Cancel</button>
-    </div>
-    <progress id="run-progress" max="1" value="0"></progress>
-    <div id="run-message"></div>
-    <pre id="run-summary" class="hidden"></pre>
-    <img id="run-preview" class="hidden" alt="leftover preview">
-  </section>
+<details class="card" id="job-tools" hidden open>
+  <summary><h2>Tools for this job</h2></summary>
+  <p class="muted small">Changing a T number here changes it in every program for this job.</p>
+  <div id="job-list"></div>
+</details>
 
-  <section id="gate-help">
-    <strong>What the run checks mean</strong>
-    <ul>
-      <li>gouges - the tool cuts into the part where the model says it
-        should not. Check orientation, tool size, stepdown; rerun.</li>
-      <li>rapid collisions - a G0 move hits stock or the part. Check floor Z
-        and stock sizes; rerun.</li>
-      <li>shank / over-flute - a wall deeper than the flutes makes the
-        shank rub. Use a longer-flute or reduced-neck tool.</li>
-      <li>holder - the collet nut or holder cannot keep 1.0 mm clearance; a
-        tool with no known holder outline is never run. More stick-out or a
-        different holder.</li>
-      <li>clcheck - exact check of the posted finish program (finishing
-        only): no point below the tool path by more than 0.005 mm.</li>
-      <li>engagement / plunge - warnings only: engagement fires above 1.2x
-        the optimal load (roughing, e.g. 2.438 mm for 2.032) and 1.5x the
-        stepover (finishing); plus steep entries into stock.</li>
-    </ul>
-  </section>
+<div class="tabs" role="tablist" id="tabs">
+  <button type="button" role="tab" id="tab-rough" data-tab="rough" aria-controls="pane-rough">Rough</button>
+  <button type="button" role="tab" id="tab-finish" data-tab="finish" aria-controls="pane-finish">Finish</button>
+  <button type="button" role="tab" id="tab-check" data-tab="check" aria-controls="pane-check">Check</button>
+</div>
+<p id="no-tabs" class="muted" hidden>SteveCAM offers no operations to this panel.</p>
 
-  <section id="events"></section>
-</main>
+<section class="pane" id="pane-rough" role="tabpanel" aria-labelledby="tab-rough">
+  <h2>Adaptive rough</h2>
+  <p class="lead">Clears the stock at a steady tool load and leaves stock for the finish.</p>
+  <div id="rough-form"></div>
+</section>
 
+<section class="pane" id="pane-finish" role="tabpanel" aria-labelledby="tab-finish" hidden>
+  <h2>Slope-split finish</h2>
+  <p class="lead">Roughs, then finishes with a ball: Z levels on steep walls, passes on flatter areas. Checked as one chain.</p>
+  <div id="finish-form"></div>
+</section>
+
+<section class="pane" id="pane-check" role="tabpanel" aria-labelledby="tab-check" hidden>
+  <h2>Check a program</h2>
+  <p class="lead">To check a posted program, run “Check program” from STEVE's connector menu and pick the program and its origin there.</p>
+  <div id="check-runs"><p class="muted small" id="check-empty">No check results in this panel yet.</p></div>
+</section>
+
+<details class="card help" id="help">
+  <summary>What the checks mean</summary>
+  <ul>
+    <li><b>Gouges</b>: the tool cuts into the finished part.</li>
+    <li><b>Rapid collisions</b>: a rapid (G0) move goes through stock or the part.</li>
+    <li><b>Over-flute / shank</b>: the tool cuts above its flutes, so the shank would rub.</li>
+    <li><b>Holder</b>: the holder comes closer than 1.0 mm (0.039 in) to the stock or part.</li>
+    <li><b>Probe clcheck</b>: the finish stays within 0.005 mm (0.0002 in) of the model at every probe point. 0 misses needed.</li>
+    <li><b>Engagement</b> (warning, not a failure): the tool takes more than 1.2× the optimal load (2.438 mm, 0.096 in, for the default) or more than 1.5× the stepover. The feed is slowed there.</li>
+  </ul>
+</details>
+
+<script src="fields.js"></script>
+<script src="report.js"></script>
 <script src="panel.js"></script>
 </body>
 </html>

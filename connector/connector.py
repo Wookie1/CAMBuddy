@@ -20,11 +20,35 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import catalog as catalog_mod  # noqa: E402
 import config as config_mod    # noqa: E402
 import crypto                  # noqa: E402
+import toollib                 # noqa: E402
+import envelope                # noqa: E402
+import errors                  # noqa: E402
 from client import SteveClient, SteveError  # noqa: E402
 from runner import EngineRun, EngineError, Cancelled  # noqa: E402
 
 VERSION = "1.0.0"
 PANEL_NAME = catalog_mod.ACTION
+
+
+def prepare_values(values_in, action):
+    """Run inputs -> (ok, code, mm values). Task UN: convert inch inputs to
+    mm FIRST (an omitted units input is the catalog default, inch: task
+    (a)), then validate the mm values against the catalog's mm ranges.
+    Track 2: job renumbering follows the STEVE document - an explicit
+    document_id, else the model's own document."""
+    raw = values_in
+    values_in = catalog_mod.to_mm(values_in, action)
+    spec = catalog_mod.get_action(action) or {}
+    takes_doc = "document_id" in spec.get("inputs", {}).get("properties", {})
+    if takes_doc and not values_in.get("document_id"):
+        doc = (values_in.get("model") or {}).get("document") \
+            if isinstance(values_in.get("model"), dict) else None
+        if isinstance(doc, dict) and doc.get("id"):
+            values_in = dict(values_in, document_id=str(doc["id"]))
+    ok, out = catalog_mod.validate(values_in, action, raw=raw)
+    if not ok:
+        return False, out["code"], out  # out = the agent error (task f)
+    return True, "", out
 
 
 class Connector:
@@ -202,17 +226,81 @@ class Connector:
             return  # never act twice
         self._remember_nonce(env.get("nonce"))
         action = env.get("action")
-        if action not in catalog_mod.ACTIONS:
+        if action not in catalog_mod.ENGINE_ACTIONS + catalog_mod.TOOL_ACTIONS:
             self._remember_run(run_id)
             self._safe_reject(run_id, "action_unknown")
             return
         self._remember_run(run_id)
+        if action in catalog_mod.TOOL_ACTIONS:
+            self._run_tool_action(run_id, env, action)
+            return
         self._run_job(run_id, env, action)
+
+    def tool_action(self, action, values):
+        """Track 2: tools.list / tools.update / job.get / job.renumber on
+        the library (<home>/tools.json) and the per-document jobs
+        (<home>/jobs/). Returns the result; ToolLibError -> {code,
+        message}."""
+        home, repo = self.home, self.cfg["repo_root"]
+        if action == catalog_mod.TOOLS_LIST:
+            return toollib.tools_list(home, repo)
+        if action == catalog_mod.TOOLS_UPDATE:
+            return toollib.update_tool(home, repo, values.get("tool_id"),
+                                       values.get("changes"),
+                                       values.get("pockets"))
+        if action == catalog_mod.JOB_GET:
+            return toollib.job_get(home, values["document_id"])
+        if action == catalog_mod.JOB_SETUP:
+            return toollib.set_setup(home, values["document_id"],
+                                     values["setup"])
+        return toollib.renumber(home, repo, values["document_id"],
+                                values["tool_id"], values["t"])
+
+    def _run_tool_action(self, run_id, env, action):
+        try:
+            self.client.report_run(run_id, "received")
+        except SteveError:
+            pass
+        ok, values = catalog_mod.validate(env.get("inputs", {}), action)
+        try:
+            if not ok:
+                self.client.report_run(run_id, "rejected", error=values)
+                return
+            self.client.report_run(run_id, "running", progress=0.5,
+                                   message=action)
+            try:
+                result = self.tool_action(action, values)
+            except toollib.ToolLibError as e:
+                err = e.as_dict()
+            except Exception as e:  # never a raw traceback to the caller
+                self._log_exception(run_id)
+                err = errors.make_error("library_error", type(e).__name__)
+            else:
+                result = dict(result, **envelope.for_tool_action(action,
+                                                                 result))
+                self.client.report_run(run_id, "succeeded", result=result,
+                                       message="done")
+                return
+            self.client.report_run(run_id, "failed", error=err,
+                                   result=envelope.for_failure(action, err))
+        except SteveError:
+            pass
+
+    def _log_exception(self, run_id):
+        """Full traceback server-side only: <home>/runs/<id>/connector_error.log."""
+        import traceback
+        try:
+            d = os.path.join(self.home, "runs", str(run_id))
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "connector_error.log"), "a") as fh:
+                fh.write(traceback.format_exc())
+        except OSError:
+            pass
 
     def _safe_reject(self, run_id, code):
         try:
             self.client.report_run(run_id, "rejected",
-                                  error={"code": code, "message": code})
+                                  error=errors.make_error(code, code))
         except SteveError:
             pass
 
@@ -262,8 +350,9 @@ class Connector:
                 if digest != inp.get("sha256") or len(data) != inp.get("bytes"):
                     self.client.report_run(
                         run_id, "rejected",
-                        error={"code": "input_digest_mismatch",
-                             "message": "download failed sha256/bytes check"})
+                        error=errors.make_error(
+                            "input_digest_mismatch",
+                            "download failed sha256/bytes check", field=name))
                     self.emit_state("idle")
                     return
                 os.makedirs(work, exist_ok=True)
@@ -280,21 +369,17 @@ class Connector:
                     step_path = dest
                 with open(dest, "wb") as fh:
                     fh.write(data)
-            values_in = env.get("inputs", {})
-            # task UN: convert inch inputs to mm FIRST, then validate the
-            # mm values against the catalog's mm ranges (unchanged) -- the
-            # ranges are mm-valued, so validating raw inch numbers would
-            # reject or misjudge sensible inch inputs
-            values_in = catalog_mod.to_mm(values_in)
-            ok, code, values = catalog_mod.validate_inputs(values_in, action)
+            ok, code, values = prepare_values(env.get("inputs", {}), action)
             if not ok:
-                self.client.report_run(run_id, "rejected",
-                                     error={"code": code, "message": values})
+                self.client.report_run(run_id, "rejected", error=values)
                 self.emit_state("idle")
                 return
 
             if action == catalog_mod.ACTION:
                 result, files = engine.run(step_path, values, on_progress)
+            elif action == catalog_mod.MEASURE_ACTION:
+                result, files = engine.run_measure(step_path, values,
+                                                   on_progress)
             elif action == catalog_mod.CHECK_ACTION:
                 # task CP: judge a posted program; no .nc is uploaded or
                 # copied (the program came FROM STEVE and goes nowhere else)
@@ -303,6 +388,18 @@ class Connector:
             else:
                 result, files = engine.run_slope_split_finish(
                     step_path, values, on_progress)
+            # task f: the envelope joins the result and check.json
+            check = None
+            if "check.json" in files:
+                with open(files["check.json"][0]) as fh:
+                    check = json.load(fh)
+            env_ = envelope.for_result(action, check)
+            result = dict(result, **env_)
+            if check is not None:
+                check.update(env_)
+                check["setup"] = {"origin": values.get("origin")}
+                with open(files["check.json"][0], "w") as fh:
+                    json.dump(check, fh, indent=2)
             for fname, (path, media) in files.items():
                 with open(path, "rb") as fh:
                     self.client.put_file(run_id, fname, fh.read(), media)
@@ -320,11 +417,18 @@ class Connector:
             except SteveError:
                 pass
             self.emit_state("idle")
-        except (EngineError, SteveError, OSError, KeyError) as e:
+        except Exception as e:  # noqa: BLE001 - every path reports
+            if isinstance(e, EngineError):
+                err = e.as_error()
+            else:  # never a raw traceback to the caller: logged here
+                self._log_exception(run_id)
+                err = errors.make_error(
+                    "internal_error", "%s: %s" % (type(e).__name__,
+                                                  str(e)[:200]))
             try:
                 self.client.report_run(
-                    run_id, "failed",
-                    error={"code": "engine_failed", "message": str(e)[:400]})
+                    run_id, "failed", error=err,
+                    result=envelope.for_failure(action, err))
             except SteveError:
                 pass
             self.emit_state("idle")
