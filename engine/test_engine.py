@@ -1470,6 +1470,235 @@ def test_bs1a4d8_arrival_gate_reads_judge_skin():
           % (max(w_new), judged, len(link_calls)))
 
 
+def test_bs1a4d8b_no_unsimulated_link_into_path():
+    """BS1a4d8b (c): a region ENTERED at a stored start that is NOT its
+    path's first point must never be linked into that path straight at
+    cutting feed (CF 64233: 25.2 mm G1 F3429 entry-end -> path[0], judged
+    ae_eff 9.319 / a 18.61, lnk_cut_ok never called). SYNTHETIC scene only
+    (no James-part fixture): a pocket block roughed at two levels 0.029 mm
+    apart, so at the final level Z = 4.381 the floor stands a hair
+    (0.029 <= 0.05 mm) above Z - inside the OLD link-clear eps band, the
+    CF skin signature. Two pieces at Z are injected honestly through the
+    engine's own emitter loop: one cuts in the LEFT bay; the other's stored
+    start is 1 mm from the previous piece's end (left bay) while its path's
+    FIRST point sits in the RIGHT bay, 22.4 mm straight across the skin
+    floor. Asserts, measured from the emitted moves: (i) the live engine
+    stock reads that link CLEAR at the old eps 0.05 and STANDING at the
+    judge's eps 0 (the backstop is not redundant with link_clear); (ii) NO
+    cutting-feed move at Z longer than one step (0.6 mm) leaves the left
+    side of the corridor and lands on its right side; (iii) the left-piece
+    -> right-piece transition IS a lift + rapid at Z + lift + entry descent
+    (the fallback the brief prescribes); (iv) the run-loop backstop fired
+    (stats["n_backstop_links"] >= 1 - the test measures the guard, and a
+    2 mm intra-run chord over the same skin is exactly what it caught);
+    (v) verify/zmap's raw ae2 windows show NO cutting-feed window over
+    2.44 mm anywhere along the link line. MUTATIONS (scratch copies):
+    backstop off AND (a) reverted -> this fails by the MEASURED overloaded
+    link (ae_eff and a printed); backstop off with (a) kept -> the link
+    assertions pass ((a) alone removes the CF site) and only the backstop
+    counter assert fails (the general net is off). NOTE: the injected
+    right-bay piece is a deliberate full-width slotting pass at x = 10 -
+    path INTERIORS are outside this brief's backstop (transitions only),
+    so the window assert is scoped to the link bbox, not the whole level.
+    """
+    import subprocess
+    import tempfile
+    import json as _json
+    import numpy as np
+    from opencamlib import ocl
+    import engine.rough as R
+    from engine.rough import rough, build_part_hf
+    from engine.gcode import moves_to_gcode
+    assert HAVE_AREA, "area module missing: run with VibeCAD python"
+    Z, LIFT, CUT_F, RAMP_F = 4.381, 1.9, 3429.0, 1270.0
+    box = (-25.0, 25.0, -20.0, 20.0, 0.0, 6.03)
+    link = [(-12.0, 2.0), (10.0, -6.0)]      # entry-end -> path[0]
+
+    def quad(a, b, c, d):
+        return [(a, b, c), (a, c, d)]
+
+    X0, X1, Y0, Y1, px, py, zf, zt = -25.0, 25.0, -20.0, 20.0, 20.0, 15.0, \
+        4.0, 6.03
+    t = []
+    t += quad((X0, Y0, 0), (X0, Y1, 0), (X1, Y1, 0), (X1, Y0, 0))
+    t += quad((X1, Y0, 0), (X1, Y1, 0), (X1, Y1, zt), (X1, Y0, zt))
+    t += quad((X0, Y0, 0), (X0, Y0, zt), (X0, Y1, zt), (X0, Y1, 0))
+    t += quad((X0, Y1, 0), (X0, Y1, zt), (X1, Y1, zt), (X1, Y1, 0))
+    t += quad((X0, Y0, 0), (X1, Y0, 0), (X1, Y0, zt), (X0, Y0, zt))
+    # top annulus (frame around the pocket mouth)
+    t += quad((X0, Y0, zt), (X0, -py, zt), (-px, -py, zt), (-px, Y0, zt))
+    t += quad((px, Y0, zt), (px, -py, zt), (X1, -py, zt), (X1, Y0, zt))
+    t += quad((X0, py, zt), (X0, Y1, zt), (-px, Y1, zt), (-px, py, zt))
+    t += quad((px, py, zt), (px, Y1, zt), (X1, Y1, zt), (X1, py, zt))
+    # pocket walls (material outside, air inside: normals face inward)
+    t += quad((-px, -py, zf), (-px, py, zf), (-px, py, zt), (-px, -py, zt))
+    t += quad((px, -py, zf), (px, -py, zt), (px, py, zt), (px, py, zf))
+    t += quad((-px, -py, zf), (-px, -py, zt), (px, -py, zt), (px, -py, zf))
+    t += quad((-px, py, zf), (-px, py, zt), (px, py, zt), (px, py, zf))
+    t += quad((-px, -py, zf), (-px, py, zf), (px, py, zf), (px, -py, zf))
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1a4d8b.stl")
+        _write_stl(stl, t)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        calls = {"n": 0}
+        skin = {}
+        _orig_a2d, _orig_hug = R._run_a2d, R.hug_regions
+
+        def a2d_spy(*a, **k):
+            regs = _orig_a2d(*a, **k)
+            calls["n"] += 1
+            if calls["n"] == 2:   # the Z 4.381 level (levels: 4.41, 4.381)
+                regs = ([{"start": [-13.0, 0.0], "helix": None,
+                          "paths": [["cutting", [[-13.0, 0.0],
+                                                  [-13.0, 2.0]]]]},
+                         {"start": [-12.0, 2.0], "helix": None,
+                          "paths": [["cutting", [[10.0, -6.0],
+                                                  [10.0, 6.0]]]]},
+                         # piece whose linkclear corridor LIFTS (its mid
+                         # point is island-illegal) and lands at (6, 8)
+                         # while its cutting path starts at (-4, -6): a
+                         # 14.4 mm piece-to-piece transition straight
+                         # across the uncut skin corridor that the run-loop
+                         # backstop must simulate (the (a) redirect cannot
+                         # pre-empt it: entry and path[0] already agree)
+                         {"start": [6.0, 8.0], "helix": None,
+                          "paths": [["linkclear",
+                                     [[2.0, 8.0], [4.0, 14.0],
+                                      [6.0, 8.0]]],
+                                    ["cutting", [[-4.0, -6.0],
+                                                 [-4.0, 6.0]]]]}]
+                        + regs)
+            return regs
+
+        def hug_spy(islands, grown, stock, isl_ok, **k):
+            if "lc" not in skin:
+                lc05 = stock.link_clear(link, Z)
+                if lc05:   # only the Z 4.381 level reads the skin as clear
+                    skin["lc"] = (lc05, stock.link_clear(link, Z, eps=0.0))
+            return _orig_hug(islands, grown, stock, isl_ok, **k)
+
+        R._run_a2d, R.hug_regions = a2d_spy, hug_spy
+        try:
+            moves, stats = rough(surf, box, 6.343, 4.0, leave=0.381,
+                                 axial_leave=0.381, stepdown=1.62,
+                                 stepup=1.905, stepover=0.16,
+                                 tolerance=0.05, threads=4,
+                                 stock_cell=0.5, min_rest=0.3, corner_r=0.0,
+                                 stl_path=stl)
+        finally:
+            R._run_a2d, R.hug_regions = _orig_a2d, _orig_hug
+    print("BS1a4d8b scene: levels %s, moves %d, backstop firings %s"
+          % (stats["levels_planned"], len(moves),
+             stats.get("n_backstop_links", 0)))
+    assert stats["levels_planned"] == [4.41, 4.381], stats["levels_planned"]
+    assert calls["n"] == 2, "expected 2 levels, _run_a2d ran %d time(s)" \
+        % calls["n"]
+    # (i) the CF eps signature on the LIVE engine model
+    assert skin.get("lc") == (True, False), \
+        "scenario broken: skin link must read clear at eps 0.05 and " \
+        "standing at eps 0 on the live model, got %r" % (skin.get("lc"),)
+    cuts = [i for i, m in enumerate(moves)
+            if m["g"] == 1 and m.get("f") == CUT_F and m.get("z") is not None
+            and abs(m["z"] - Z) < 1e-6]
+    assert cuts, "no cutting-feed move at Z emitted: vacuous"
+
+    def _span(i):
+        a, b = moves[i - 1], moves[i]
+        return math.dist((a["x"], a["y"]), (b["x"], b["y"]))
+
+    # (ii) no cutting-feed step > one step (0.6 mm) crosses the corridor
+    cross = [i for i in cuts if _span(i) > 0.6
+             and ((moves[i - 1]["x"] < -1.5 and moves[i]["x"] > 1.5)
+                  or (moves[i - 1]["x"] > 1.5
+                      and moves[i]["x"] < -1.5))]
+    # (v) judge the program: raw ae2 windows along the link line
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    with tempfile.TemporaryDirectory() as td2:
+        ngc = os.path.join(td2, "bs1a4d8b.ngc")
+        with open(ngc, "w") as fh:
+            fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+        hf = build_part_hf(surf, box[0], box[2], 0.5, 180, 140, threads=4,
+                           drop_z=box[4] - 1.0)
+        hf_p = os.path.join(td2, "part_hf.npy")
+        pad = int(math.ceil((6.343 + 5.0) / 0.5))
+        padded = np.full((hf.shape[0] + 2 * pad, hf.shape[1] + 2 * pad),
+                         np.nan, dtype=hf.dtype)
+        padded[pad:pad + hf.shape[0], pad:pad + hf.shape[1]] = hf
+        np.save(hf_p, padded)
+        with open(hf_p[:-4] + ".json", "w") as fh:
+            _json.dump({"x0": box[0] - pad * 0.5, "y0": box[2] - pad * 0.5,
+                        "cell": 0.5, "tess_tol": 0.01}, fh)
+        dj = os.path.join(td2, "ae2.json")
+        rr = subprocess.run(
+            [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+             "--part", hf_p, "--tool", "flat", "--dia", "12.686",
+             "--stock", *[str(v) for v in box], "--engage-max", "2.438",
+             "--ae2-dump", dj],
+            capture_output=True, text=True, cwd=repo)
+        assert rr.returncode == 0, "zmap failed: %s | %s" % (
+            rr.stdout[-300:], rr.stderr[-300:])
+        wj = _json.load(open(dj))
+    along = [w for w in wj if abs(w["z"] - Z) < 2e-3 and w.get("feed", 0)
+             > 3000.0 and -12.5 <= w["x"] <= 10.5 and -6.5 <= w["y"] <= 2.5]
+    over = [w for w in along if w["ae_eff"] > 2.44]
+    # (ii) failure FIRST with the judged load (the mutation's evidence):
+    # a cross-corridor cutting-feed step is legal ONLY if the backstop
+    # simulated it (bstd_chk counts those lnk_cut_ok calls).
+    if cross and not stats.get("bstd_chk", 0):
+        worst = max(along, key=lambda w: w["ae_eff"]) if along else None
+        raise AssertionError(
+            "run loop linked entry-end -> path[0] UNSIMULATED straight at "
+            "cutting feed: %d move(s), e.g. line %s (%.3f, %.3f) -> "
+            "(%.3f, %.3f) %.2f mm; zmap-judged link windows: ae_eff %.3f "
+            "mm, a %.3f mm"
+            % (len(cross), moves[cross[0]].get("line", "?"),
+               moves[cross[0] - 1]["x"], moves[cross[0] - 1]["y"],
+               moves[cross[0]]["x"], moves[cross[0]]["y"], _span(cross[0]),
+               worst["ae_eff"] if worst else -1,
+               worst["a"] if worst else -1))
+    assert not cross or stats.get("bstd_chk", 0) >= len(cross), \
+        "%d cross-corridor cutting-feed step(s) but only %d simulated " \
+        "link check(s) ran" % (len(cross), stats.get("bstd_chk", 0))
+    # (iii) the transition left piece -> right piece is lift + entry
+    i1 = next(i for i in cuts if moves[i]["x"] > 1.5)
+    j0 = max(i for i in cuts if i < i1 and moves[i]["x"] < -1.5)
+    mid = moves[j0 + 1:i1]
+    assert not [m for m in mid if m["g"] == 1 and m.get("f") == CUT_F
+                and m.get("z") is not None and abs(m["z"] - Z) < 1e-6], \
+        "cutting-feed move at Z inside the piece-to-piece transition"
+    assert any(m["g"] == 0 and m["z"] >= Z + LIFT - 0.01 for m in mid), \
+        "no rapid at Z + lift between the pieces: transition %s" % (
+            [(m["g"], round(m["z"], 3)) for m in mid][:12])
+    assert any(m["g"] == 1 and m["z"] <= Z + 1e-9 and
+               mid[k - 1]["z"] > m["z"] + 1e-9
+               for k, m in enumerate(mid) if k), \
+        "no entry descent to Z at the right-bay piece"
+    # (iv) the backstop is wired and measured in this scene: it ran its
+    # simulated-link check on the piece-to-piece transition(s) and/or
+    # converted one into a lift + entry.
+    assert stats.get("bstd_chk", 0) + stats.get("n_backstop_links", 0) \
+        >= 1, \
+        "run-loop backstop never engaged (bstd_chk/n_backstop_links both " \
+        "zero): the guard is off"
+    assert not over, \
+        "cutting-feed window(s) over 2.44 mm on the link: worst ae_eff " \
+        "%.3f mm, a %.3f mm (line %s)" % (
+            max(w["ae_eff"] for w in over),
+            max(over, key=lambda w: w["ae_eff"])["a"],
+            max(over, key=lambda w: w["ae_eff"]).get("line", "?"))
+    assert stats.get("clcheck_violations", 0) == 0, stats.get(
+        "clcheck_violations")
+    print("PASS bs1a4d8b: no UNSIMULATED cutting-feed link crosses the skin "
+          "corridor; transition = %d moves incl. rapid >= %.2f + entry "
+          "descent; backstop checks %d, conversions %d; %d judged link "
+          "windows, max ae_eff %.3f mm"
+          % (len(mid), Z + LIFT, stats.get("bstd_chk", 0),
+             stats.get("n_backstop_links", 0), len(along),
+             max((w["ae_eff"] for w in along), default=0.0)))
+
+
 def _main():
     fails = 0
     for fn in (test_adaptive2d_offset_convention, test_plan_levels,
@@ -1509,7 +1738,8 @@ def _main():
                test_bs1a4d6c_side_entry_no_under_read,
                test_bs1a4d6d_approach_simulated_in_window0,
                test_bs1a4d7_sub1mm_tail_merges_not_dropped,
-               test_bs1a4d8_arrival_gate_reads_judge_skin):
+               test_bs1a4d8_arrival_gate_reads_judge_skin,
+               test_bs1a4d8b_no_unsimulated_link_into_path):
         try:
             fn()
         except AssertionError as e:

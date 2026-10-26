@@ -852,3 +852,131 @@ crop fails to reproduce the 64232->64233 shape.
 
 - BS1a4d8 DONE.
 
+
+---
+
+# BS1a4d8b (brief TASK_BS1a4d8b @ 9834f12, fresh session)
+
+Start: Sun Oct 25 17:07:59 MST 2026 (`date`). Worktree
+/Users/James/ai-sandbox/stevecam-bs1a4d5, branch bs1a4d5 @ 9834f12
+(= BS1a4d8 63db90f + brief). Baseline for line budget: 63db90f.
+
+## CAUSE (confirmed by reading the named code at 9834f12)
+
+- The region run loop (engine/rough.py:2333-2357, emit at :2355) starts a
+  cutting run with `run += pts[i:j+1]; for (x, y) in run: emit({"g": 1, ...
+  "f": cut_feed})` - the FIRST emit goes straight from the CURRENT tool
+  position to pts[i] with NO distance or stock check: the gap branch
+  (bridge / d_chord > 0.6 re-entry, rough.py:2270-2330) is only entered when
+  `gap` is set (an island-invalid point was skipped) or the tool is up.
+  A region whose entry ended at a point OTHER than its path's first point
+  therefore gets an un-simulated straight cutting-feed link entry -> path[0].
+- The entry candidate rule admits BOTH points: `pts0 = [res["start"],
+  fc[0]]` (rough.py:2090 a2d regions, :2129 band regions) and the entry is
+  the NN-valid candidate (rough.py:2157-2160), with `if res.get("bore"):
+  entry = res["bore"][:2]` (rough.py:2162) pinning it to the stored start.
+  Nothing re-checks entry -> paths[0][1][0] afterwards; the d_chord > 0.6
+  re-entry test (rough.py:2332) lives inside the gap branch only.
+- Supervisor facts match: CF 64233 (Z 42.354) 25.2 mm G1 F3429
+  (26.7568,13.4273) -> (1.6689,10.7822), judged ae_eff 9.319 / a 18.61,
+  emitted by that run loop right after try_cand's helix + 1.5 mm feed-in
+  (rough.py:1291/:1396) landed at the stored start q4; lnk_cut_ok was never
+  called for the move (its only neighbour was enter_at route-1 "tolk"
+  lnk_clear_true for the DIFFERENT segment (23.709,13.047)->(1.669,10.782)).
+- Probe (scratch/d8b_probe_start.py, L-scene): reports every a2d region with
+  res["start"] != first cutting point - result appended below.
+
+## PROGRESS LOG
+
+## CHANGE (file:line, vs 63db90f)
+
+- engine/rough.py:1789-1812 `trans_guard(p_to, z, side)` (new closure after
+  descend_feed): the (b) backstop - a straight cutting-feed move from the
+  CURRENT position to p_to farther than one step (0.6 mm, the loop's own
+  re-entry bound) is written only if lnk_cut_ok simulates it against the
+  LIVE stock right then (link_clear eps 0, else band _simulate eps 0, key
+  "bstd"); otherwise enter_at plans the lift -> rapid -> proper entry at
+  p_to. Firings: stats["n_backstop_links"]; checks: bstd_chk/bstd_cvt.
+- engine/rough.py:2398-2399 run loop: `if run: trans_guard(run[0], z, ...)`
+  - the ASSERT-style guard: path[0] is never emitted at cutting feed > one
+  step from the tool unless simulated (the CAUSE site).
+- engine/rough.py:2178-2189 (a) PREFERRED fix at entry choice: the region's
+  entry target IS its emitted cutting path's first point - when the chosen
+  entry (stored start / pinned bore) differs from path[0] by > 0.6 mm and
+  path[0] is island-legal, the entry is re-planned THERE (enter_at /
+  helix_entry bore or ramp it on the live stock; the stale-start bore and
+  credit are cleared, so the stale-q4 helix is not emitted for that
+  region). FALLBACK for whatever entry/path mismatch survives = the (b)
+  guard's lift -> rapid -> enter_at above.
+- engine/rough.py:2447 (deep link), :2483 (feed link), :2555 (more_pcs
+  owncut): the same trans_guard on each corridor/piece's first point -
+  every piece-to-piece emitter goes through the one check.
+- engine/band.py: NOT changed. engine/test_engine.py: new test
+  test_bs1a4d8b_no_unsimulated_link_into_path (added to _main).
+
+## TESTS (all via slot_m4.sh + VibeCAD python, FOREGROUND; scratch/d8b_run_one.py standalone runner)
+
+- NEW test_bs1a4d8b_no_unsimulated_link_into_path EXIT=0. Measured:
+  levels [4.41, 4.381] (floor stands 0.029 mm - inside the old eps band -
+  above Z); live-model skin link reads clear at eps 0.05, standing at eps
+  0; NO unsimulated cutting-feed step crosses the corridor; the left->right
+  piece transition = 5 moves incl. rapid >= 6.28 (Z + lift) + entry
+  descent; backstop simulated-link checks 1 (bstd_chk), conversions 0;
+  zmap raw ae2 windows along the link: 1, max ae_eff 0.174 mm; clcheck 0.
+- AT-RISK 22/22 + new test, chunk exit codes:
+  CHUNK1_EXIT=0 (bs1a4b_failed_region_lightest, bs1a4b_windows_align_zmap,
+  bs1a4c_backed_credit, bs1a4c_fix_no_post_entry_helix,
+  bs1a4c2_band_chord_cl_checked, bs1a4d_credit0_lightest_option,
+  bs1a4d_credit_real_bore)
+  CHUNK2_EXIT=0 (bs1a4d2b_centred_entry_bore,
+  bs1a4d4_credit_entry_matches_prediction,
+  bs1a4d4_entry_pinned_to_stored_start,
+  bs1a4d5_splitbore_failed_recheck_not_emitted_at_load,
+  bs1a4d6b_q4_entry_bore_in_live_stock, bs1a4d6c_side_entry_no_under_read,
+  bs1a4d6d_approach_simulated_in_window0)
+  CHUNK3_EXIT=0 (bs1a4d7_sub1mm_tail_merges_not_dropped,
+  bs1a_straight_channel, bs1a_lshaped_channel, bs1a3_no_band_after_a2d,
+  bs1a4d8_arrival_gate_reads_judge_skin, bs1a4d8b NEW)
+  CHUNK4_EXIT=0 (bs1a4d3_links_measured_as_cuts, rough_synth_pocket_repro,
+  dt1_synthetic_rough_twice_identical)
+
+## MUTATIONS (scratch/mut1, scratch/mut2: copies of the fixed tree, engine/rough.py edited there only; the real tree untouched, cmp-checked flows: scratch copies were created AFTER the final engine edit and never copied back)
+
+- M1 backstop OFF + (a) REVERTED (scratch/mut1): test FAILS (runner
+  MUT-TEST-FAILED, exit 1) by the MEASURED overloaded link:
+  "run loop linked entry-end -> path[0] UNSIMULATED straight at cutting
+  feed: 2 move(s), e.g. (-12.000, 2.000) -> (10.000, -6.000) 23.41 mm;
+  zmap-judged link windows: ae_eff 8.362 mm, a 0.029 mm" - the CF 64233
+  shape (25.2 mm, judged 9.319) reproduced synthetically at 23.41 mm /
+  8.362 mm.
+- M2 backstop OFF, (a) KEPT (scratch/mut2): test FAILS (exit 1) but with
+  only 1 unsimulated cross move - the entry-end -> path[0] link of the CF
+  site is GONE (the surviving (6,8) -> (-4,-6) piece-to-piece link is the
+  third injected piece's, never checked: bstd_chk = 0). What it shows:
+  (a) alone removes THIS site's mismatch (entry always lands on path[0]),
+  but with the backstop off NO transition is ever simulated - the
+  surviving link judged clear here (ae_eff 0.174) only because the
+  corridor's own deep-link milling happened to pre-cut the skin, luck and
+  not a check; the general net (b) is what makes "no unsimulated
+  cutting-feed transition" a property instead of an accident.
+
+## LINE BUDGET / STATUS
+
+- git diff --numstat 63db90f: engine/rough.py 46 added / 0 removed
+  (46 changed non-test engine lines <= 50 budget); engine/band.py 0;
+  engine/test_engine.py 231/1 (tests exempt); BS1a4d6_RESULTS.md + this
+  section; TASK file +64 (brief, not mine); opencode.json 22/1 pre-existing
+  at session start (NOT edited here).
+- Limits untouched (ZE2B 2.286 / ZE2 2.44 / ZA 0.2 / ZB 0.5 / AE_SPIKE /
+  AE_SS); no margin/leave/feed change; no gate relaxed; verify/ and
+  opencode.json not edited; engine imports nothing from zmap/verify (only
+  the new test runs verify/zmap.py as a subprocess); no Core Front job was
+  run; no git stash/reset/checkout; NOT committed.
+- Session: start 17:07:59 MST, finished ~18:15 MST (inside the 2 h cap).
+  (d) CF lines 64233 / Z 40.289 are left to the supervisor's CF run.
+- Probes/scratch kept: scratch/d8b_probe_start.py (L-scene a2d start==path0
+  check: 0 mismatches, 0 long straight cut-feed G1s - the mismatch needs
+  the CF-scale scene the supervisor measured), scratch/d8b_run_one.py,
+  scratch/d8b_run_mut.py, scratch/mut1/, scratch/mut2/, scratch/d8b_dbg.py.
+
+- BS1a4d8b DONE.

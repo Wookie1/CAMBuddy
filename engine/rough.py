@@ -1785,6 +1785,32 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             a = b
         return tot
 
+    def trans_guard(p_to, z, side):
+        """BS1a4d8b (b): emission backstop - the run loop never writes a
+        straight cutting-feed move from the CURRENT position to p_to that is
+        farther than one step (0.6 mm, the loop's own re-entry bound) unless
+        that move is simulated against the LIVE stock right now (lnk_cut_ok:
+        link_clear eps 0, else the band window measure, eps 0). Over the
+        limits it becomes a gap: enter_at plans the lift -> rapid -> proper
+        entry at p_to (the tool lands ON p_to, the caller's emit of it is
+        then a zero-length move and drops). Firings count in
+        stats["n_backstop_links"]; the checks in bstd_chk/bstd_cvt."""
+        if prev[0] is None or prev[2] is None or abs(prev[2] - z) > 1e-6:
+            return                       # tool up: the entry path covers it
+        d0 = math.dist((prev[0], prev[1]), (p_to[0], p_to[1]))
+        if d0 <= 0.6 or lnk_cut_ok(stock, _dense_line((prev[0], prev[1]),
+                                                      (p_to[0], p_to[1])),
+                                   z, "bstd"):
+            return
+        stats["n_backstop_links"] = stats.get("n_backstop_links", 0) + 1
+        p0b = (prev[0], prev[1], prev[2])
+        i0b = len(moves)
+        enter_at(round(p_to[0], 4), round(p_to[1], 4), z, None, side=side)
+        der = descend_feed(p0b, i0b)
+        stats["reentry_feed_mm"] += der
+        if der > 1e-6:
+            stats["n_reentry_descends"] += 1
+
     zi = 0
     for z in order:
         del hf_pts[:]
@@ -2157,6 +2183,19 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     (prev[0], prev[1]), p), p[0], p[1]))
             if res.get("bore"):
                 entry = res["bore"][:2]   # BS1a4d4: enter at the stored start
+            # BS1a4d8b (a): the region's entry target IS the first point of
+            # its emitted cutting path - entering at a stored start that is
+            # not path[0] would make the run loop link entry-end -> path[0]
+            # straight at cutting feed (CF 64233). Re-plan the entry at
+            # path[0] (enter_at/helix_entry bore or ramp it on the live
+            # stock); the stale-start bore/credit no longer back anything.
+            fc0 = next((p[0] for (kk, p) in res["paths"]
+                        if kk == "cutting" and p), None)
+            if fc0 is not None and isl_ok([tuple(fc0)])[0] and \
+                    math.dist(entry, tuple(fc0)) > 0.6:
+                entry = tuple(fc0)
+                res["bore"] = None
+                res["credit"] = 0.0
             rp2_flag, rp2_cand = rp2_open(res)
             pxy0 = (prev[0], prev[1])
             pz0 = prev[2]
@@ -2351,6 +2390,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                         bridge = None
                         run += [(round(x, 4), round(y, 4)) for (x, y)
                                in pts[i:j + 1]]
+                        if run:   # BS1a4d8b (b): backstop on the run's first
+                            trans_guard(run[0], z, bool(rp2_flag))
                         for (x, y) in run:
                             emit({"g": 1, "x": x, "y": y, "z": z,
                                   "f": cut_feed})
@@ -2381,6 +2422,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                             stock.link_clear(corridor, z + lift) and \
                             not _strip_engage(stock, corridor, z, tool_r) > 2.438:
                         stats["n_deep_links"] += 1
+                        trans_guard(corridor[0], z,
+                                    bool(rp2_flag))  # BS1a4d8b (b)
                         for (x, y) in corridor:
                             if x == prev[0] and y == prev[1]:
                                 continue
@@ -2427,6 +2470,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                         # fails the `not wide` gate above and takes the lift.
                         if top > z + 0.05:
                             stats["n_feed_links"] += 1
+                            trans_guard(corridor[0], z,
+                                        bool(rp2_flag))  # BS1a4d8b (b)
                             for (x, y) in corridor:
                                 if x == prev[0] and y == prev[1]:
                                     continue
@@ -2500,6 +2545,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     continue
                 enter_at(round(pc[0][0], 4), round(pc[0][1], 4), z, None,
                          side=bool(rp2_flag))
+                trans_guard(pc[0], z, bool(rp2_flag))  # BS1a4d8b (b)
                 for (x, y) in pc:
                     emit({"g": 1, "x": x, "y": y, "z": z, "f": cut_feed})
                     level_pts.append((x, y, "owncut r%d" % nreg))
