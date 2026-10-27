@@ -2317,6 +2317,7 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     fe5_top_unresolved = []  # FE5e: entries with no clear ramp top
     fe5_chord_depths = []   # FE5e: max live depth along each ramp chord
     fe5_skip_pts = []       # FE5f: skipped pass vertices (x, y, live depth)
+    fe5h_log = []           # FE5h: entries whose decision the margin changed
     _fe5_track = None       # FE5 diag: env FE5_TRACK="x,y" probe cell
     _env_track = os.environ.get("FE5_TRACK")
     if _env_track:
@@ -2325,9 +2326,27 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     _fe5_track_last = [math.inf]
     fe5_track_log = []
     if tan_ramp > 0.0 and link_stock is not None:
-        live = entry_depth.LiveStock(link_stock[0], link_stock[1],
-                                      link_stock[2], link_stock[3],
-                                      0.5 * float(tool[1]))
+        # FE5h: coarse stock grids (cell > FINE) are read through a 2-cell
+        # max-pool: the plain resample hides the rim slivers the fine judge
+        # keeps and under-reads entries (red test fe5h)
+        live = entry_depth.LiveStock(
+            link_stock[0], link_stock[1], link_stock[2], link_stock[3],
+            0.5 * float(tool[1]),
+            margin=2.0 * link_stock[3] if link_stock[3] > entry_depth.FINE
+            else 0.0)
+        # FE5h diag: plain (margin 0) twin for the fe5h_changed stats
+        live_h0 = entry_depth.LiveStock(link_stock[0], link_stock[1],
+                                        link_stock[2], link_stock[3],
+                                        0.5 * float(tool[1]))
+
+        def _fe5h_note(x, y, z, kind):
+            d0p = live_h0.disk_depth(float(x), float(y), float(z))
+            before = "straight" if d0p <= RAMP_TRIGGER else "ramp"
+            if before != ("straight" if kind == "straight" else "ramp"):
+                fe5h_log.append({"x": round(float(x), 3),
+                                 "y": round(float(y), 3),
+                                 "z": round(float(z), 3),
+                                 "before": before, "after": kind})
         n_unchanged = 0
         for k in range(len(ordered)):
             pth = ordered[k]
@@ -2338,6 +2357,8 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                     dq = live.disk_depth(float(q[0]), float(q[1]), float(q[2]))
                     if dq > ZB_FLOOR_BALL:
                         n_skipped += 1
+                        _fe5h_note(float(q[0]), float(q[1]), float(q[2]),
+                                   "skipped")
                         fe5_skip_pts.append([round(float(q[0]), 3),
                                             round(float(q[1]), 3),
                                             round(dq, 3)])
@@ -2361,6 +2382,7 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
             if total < 1e-9 and d > ZB_FLOOR_BALL:
                 # FE5fc: zero-length pass deeper than the floor - never plunged
                 n_skipped += 1
+                _fe5h_note(float(P[0, 0]), float(P[0, 1]), z0, "skipped")
                 fe5_skip_pts.append([round(float(P[0, 0]), 3),
                                     round(float(P[0, 1]), 3),
                                     round(float(d), 3)])
@@ -2399,6 +2421,7 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                 if _unres and (d > ZB_FLOOR_BALL or live.disk_depth(
                         rv[0][0], rv[0][1], rv[0][2]) > ZB_FLOOR_BALL):
                     n_skipped += 1
+                    _fe5h_note(float(P[0, 0]), float(P[0, 1]), z0, "skipped")
                     # FE5f-b: trim ONLY the illegal fragment - keep the rest
                     # of the pass, re-entered at the next vertex where FE5e's
                     # rule makes a legal entry (own vertices, forward only:
@@ -2435,6 +2458,8 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                     n_short_run += 1
                 else:
                     n_ramped += 1
+                _fe5h_note(P[0, 0], P[0, 1], z0,
+                           "ramp" if len(rv) >= 2 else "straight")
                 if d > 0.5:  # FE5 diag
                     fe5_deep_ramped.append(
                         [round(P[0, 0], 3), round(P[0, 1], 3),
@@ -2450,6 +2475,7 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                          len(rv)])
             else:
                 n_unchanged += 1
+                _fe5h_note(P[0, 0], P[0, 1], z0, "straight")
                 if d > 0.5:  # FE5 diag: deep entry left unramped
                     fe5_deep_unramped.append(
                         [round(P[0, 0], 3), round(P[0, 1], 3),
@@ -2488,6 +2514,7 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
             F = np.asarray(ordered[k], dtype=float)
             for i in range(len(F) - 1):
                 live.stamp_chord(F[i], F[i + 1])
+                live_h0.stamp_chord(F[i], F[i + 1])  # FE5h plain twin
             if _fe5_track is not None:  # FE5 diag: who cuts the probe cell
                 tx, ty = _fe5_track
                 v = float(live.L[int(math.floor((ty - live.y0) / live.f))
@@ -2589,6 +2616,9 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     stats["fe5g_ramped_n"] = n_fe5g_ramped  # in-pass descents ramped
     stats["fe5g_trimmed_n"] = len(fe5g_trimmed)
     stats["fe5g_trimmed"] = fe5g_trimmed[:400]
+    # FE5h: entries whose straight/ramp decision the margin resample changed
+    stats["fe5h_changed_n"] = len(fe5h_log)
+    stats["fe5h_changed"] = fe5h_log[:400]
     if flute_mm is not None and shank_dia is not None:
         # S4: flute/shank-aware pass (tools/x7_tools.json or --flute/--shank)
         stats["flute_mm"] = round(float(flute_mm), 4)

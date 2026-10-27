@@ -2393,6 +2393,146 @@ def test_fe5g_net_ramps_and_trims_inpass_drop():
           "trimmed and reported")
 
 
+def test_fe5h_entry_estimate_not_below_true_depth():
+    """FE5h (supervisor): the live-stock entry estimate must never UNDER-read
+    the judge-model true live depth at an emitted entry. Scene: flat pocket
+    floor 28.2 (live stock 28.4) whose FIRST row starts at the pocket corner
+    (-8,-12); a post-roughing leftover ridge (coarse stock 29.55, cells
+    x<=-11.75, y<=-12.25 - the raw zone just OUTSIDE the pocket corner) sits
+    so its coarse-cell edge is 3.45 mm from the start: the 0.5 mm lattice and
+    the plain 0.5->0.1 overlap resample both hide it (contribution < 0, the
+    estimator reads 0.1985 -> straight plunge), yet the true 0.1 mm judge
+    stock keeps the rim sliver an optimistic coarse stamp leaves standing
+    past the footprint (the RT2 corner: the coarse kernel clears ~c/sqrt(2)+c
+    - exactly the TB chain's 1.1303 mm plunge mechanism). TRUTH is built
+    independently of the engine: dilate the coarse array by 2 source cells
+    (1.0 mm Chebyshev box-max, data-preserving) and overlap-resample to 0.1
+    mm, then stamp the emitted G1 prefix with the judge's own zmap.simulate
+    and read the exact ball formula. Assert at every emitted vertical entry
+    (plunge): true depth <= the ZB floor 0.5, and at every entry (plunge or
+    ramp vertex) below the floor: engine estimate >= true depth - 1e-6.
+    Must FAIL on the plain resample (est 0.1985 vs truth 0.6085 at the
+    plunge (-8,-12)) and PASS once resample_fine/LiveStock pool the source
+    with margin=2*cell (the entry is then read ~0.61 and ramped)."""
+    from engine.finish import finish
+    from engine.entry_depth import LiveStock
+    R = 9.525 / 2.0
+    cell = 0.5
+    gx0, gy0, gx1, gy1 = -13.0, -17.0, 13.0, 17.0
+    floor_z = 28.2
+    with tempfile.TemporaryDirectory() as td:
+        stl = write_stl(os.path.join(td, "fe5h_pocket.stl"),
+                        _box(-8.0, 8.0, -12.0, 12.0, 0.0, floor_z))
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        CX, CY = np.meshgrid(gx0 + (np.arange(52) + 0.5) * cell,
+                             gy0 + (np.arange(68) + 0.5) * cell)
+        A = np.full(CX.shape, 28.4)
+        A[(CX <= -11.75) & (CY >= -13.0) & (CY <= -12.25)] = 29.55
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, _stats = finish(surf, stl_path=stl, tool=("ball", 9.525, 0.0),
+                               stepover=3.0, floor_z=floor_z, threads=4,
+                               stock_from=stockp, ramp_angle_deg=2.0)
+    # truth stock: dilate the coarse array 2 cells (the sliver the judge's
+    # fine rough stamp keeps past the optimistic coarse footprint), then the
+    # same conservative overlap resample the estimator uses
+    D = np.where(np.isfinite(A), A, -np.inf)
+    for _ in range(2):
+        pad = np.full((D.shape[0] + 2, D.shape[1] + 2), -np.inf)
+        pad[1:-1, 1:-1] = D
+        o = pad[1:-1, 1:-1].copy()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                o = np.maximum(o, pad[1 + dy:D.shape[0] + 1 + dy,
+                                      1 + dx:D.shape[1] + 1 + dx])
+        D = np.where(np.isfinite(D), o, -np.inf)
+    nxf = int(round((gx1 - gx0) / 0.1))
+    nyf = int(round((gy1 - gy0) / 0.1))
+    cx = gx0 + (np.arange(nxf) + 0.5) * 0.1
+    cy = gy0 + (np.arange(nyf) + 0.5) * 0.1
+    ix = np.clip(np.floor((cx - 0.05 - gx0) / cell).astype(int),
+                 0, D.shape[1] - 1)
+    iy = np.clip(np.floor((cy - 0.05 - gy0) / cell).astype(int),
+                 0, D.shape[0] - 1)
+    kx = ((cx + 0.05 - gx0) / cell > ix) & (ix + 1 < D.shape[1])
+    ky = ((cy + 0.05 - gy0) / cell > iy) & (iy + 1 < D.shape[0])
+    b00 = D[np.ix_(iy, ix)]
+    b10 = np.where(kx[None, :],
+                   D[np.ix_(iy, np.minimum(ix + 1, D.shape[1] - 1))],
+                   -np.inf)
+    b01 = np.where(ky[:, None],
+                   D[np.ix_(np.minimum(iy + 1, D.shape[0] - 1), ix)],
+                   -np.inf)
+    b11 = np.where(kx[None, :] & ky[:, None],
+                   D[np.ix_(np.minimum(iy + 1, D.shape[0] - 1),
+                            np.minimum(ix + 1, D.shape[1] - 1))],
+                   -np.inf)
+    F = np.maximum(np.maximum(b00, b10), np.maximum(b01, b11))
+    part = np.where(np.isfinite(F), F, -1e9)
+
+    def truth_depth(gmv, x, y, z):
+        if gmv:
+            st = zmap.simulate(gmv, part, 0.1, gx0, gy0,
+                               stock_box=(gx0, gx1, gy0, gy1, 0.0, 31.5),
+                               tool="ball", dia=9.525,
+                               stock_init=F.copy())["stock"]
+        else:
+            st = F
+        ci = int(math.floor((x - gx0) / 0.1))
+        cj = int(math.floor((y - gy0) / 0.1))
+        kR = int(math.ceil(R / 0.1))
+        i0, i1 = max(0, ci - kR - 1), min(st.shape[1], ci + kR + 2)
+        j0, j1 = max(0, cj - kR - 1), min(st.shape[0], cj + kR + 2)
+        DX, DY = np.meshgrid(gx0 + (np.arange(i0, i1) + 0.5) * 0.1 - x,
+                             gy0 + (np.arange(j0, j1) + 0.5) * 0.1 - y)
+        d2 = DX * DX + DY * DY
+        w = st[j0:j1, i0:i1]
+        m = (d2 <= R * R + 1e-9) & np.isfinite(w)
+        assert m.any(), "no stock data at the entry"
+        v = w[m] - (R - np.sqrt(np.maximum(R * R - d2[m], 0.0)))
+        return float(np.max(v)) - z
+
+    try:
+        live = LiveStock(A, gx0, gy0, cell, R, margin=2.0 * cell)
+    except TypeError:                       # pre-fix estimator
+        live = LiveStock(A, gx0, gy0, cell, R)
+    gmv = []
+    entries = []                            # (x, y, z, est, is_plunge)
+    prev = None
+    for m in moves:
+        x, y, z = m["x"], m["y"], m["z"]
+        if prev is not None:
+            px, py, pz = prev
+            if m["g"] == 1 and z < floor_z + 0.05:
+                vert = abs(x - px) <= 1e-9 and abs(y - py) <= 1e-9
+                if (vert and z < pz - 1e-9) or \
+                        (abs(z - pz) > 1e-9 and not vert):
+                    entries.append((x, y, z, live.disk_depth(x, y, z),
+                                    vert and z < pz - 1e-9, len(gmv)))
+        gmv.append({"line": len(gmv) + 1,
+                    "motion": "G0" if m["g"] == 0 else "G1",
+                    "x": x, "y": y, "z": z})
+        if prev is not None and m["g"] == 1:
+            live.stamp_chord(prev, (x, y, z))
+        prev = (x, y, z)
+    assert entries, "no entries emitted - the scene no longer exercises FE5"
+    deep = []
+    under = []
+    for (x, y, z, est, is_plunge, npre) in entries:
+        tr = truth_depth(gmv[:npre], x, y, z)
+        rep = "(%.3f,%.3f) z=%.3f est=%.4f truth=%.4f" % (x, y, z, est, tr)
+        if is_plunge and tr > 0.5 + 1e-9:
+            deep.append(rep)
+        if est < tr - 1e-6:
+            under.append(rep)
+    print("fe5h: %d entries; deep %s; under-read %s"
+          % (len(entries), deep[:3], under[:3]))
+    assert not deep, "FE5h: vertical entries below the 0.5 floor: %s" % deep
+    assert not under, "FE5h: estimate under-reads truth: %s" % under
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -2426,7 +2566,8 @@ if __name__ == "__main__":
                test_floor_pad_rows_inside_stock_box,
                test_fe5g_no_lifted_vertex_in_constant_z_pass,
                test_fe5g_scene_vertices_never_below_cl,
-               test_fe5g_net_ramps_and_trims_inpass_drop):
+               test_fe5g_net_ramps_and_trims_inpass_drop,
+               test_fe5h_entry_estimate_not_below_true_depth):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))

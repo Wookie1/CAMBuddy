@@ -85,9 +85,13 @@ def load_heightfield(path):
     return A, float(meta["x0"]), float(meta["y0"]), float(meta["cell"])
 
 
-def resample_fine(A, x0, y0, cell, fine=FINE):
+def resample_fine(A, x0, y0, cell, fine=FINE, margin=0.0):
     """Conservative resample to `fine` mm: each fine cell = max of the
-    source cells overlapping it (nan = no data). Never lower than source."""
+    source cells overlapping it (nan = no data). Never lower than source.
+    FE5h: margin > 0 (coarse sources only) first box-dilates the source by
+    Chebyshev radius ceil(margin/cell) (data-preserving max pool): the
+    coarse lattice alone hides sub-cell high-stock rim slivers the fine
+    judge keeps, under-reading entries (TB chain: 1.1303 mm plunge)."""
     ny, nx = A.shape
     nxf = int(round(nx * cell / fine))
     nyf = int(round(ny * cell / fine))
@@ -100,6 +104,16 @@ def resample_fine(A, x0, y0, cell, fine=FINE):
     kx = ((cx + 0.5 * fine - x0) / cell > ix) & (ix + 1 < nx)
     ky = ((cy + 0.5 * fine - y0) / cell > iy) & (iy + 1 < ny)
     Af = np.where(np.isfinite(A), A, -np.inf)
+    if margin > 0.0 and cell > fine:
+        for _ in range(int(math.ceil(margin / cell))):
+            pad = np.full((ny + 2, nx + 2), -np.inf)
+            pad[1:-1, 1:-1] = Af
+            o = pad[1:-1, 1:-1].copy()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    o = np.maximum(o, pad[1 + dy:ny + 1 + dy,
+                                          1 + dx:nx + 1 + dx])
+            Af = np.where(np.isfinite(Af), o, -np.inf)
     b00 = Af[np.ix_(iy, ix)]
     b10 = np.where(kx[None, :], Af[np.ix_(iy, np.minimum(ix + 1, nx - 1))],
                    -np.inf)
@@ -115,8 +129,8 @@ class LiveStock:
     """Live material heightfield on the fine grid, milled by the ball's
     swept envelope in emit order. No-data cells are -inf."""
 
-    def __init__(self, A, x0, y0, cell, R, fine=FINE):
-        F = resample_fine(A, x0, y0, cell, fine)
+    def __init__(self, A, x0, y0, cell, R, fine=FINE, margin=0.0):
+        F = resample_fine(A, x0, y0, cell, fine, margin=margin)
         self.R = float(R)
         self.f = fine
         self.x0, self.y0 = x0, y0
