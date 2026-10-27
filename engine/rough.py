@@ -599,6 +599,16 @@ def island_clear_fn(islands, req):
     return f
 
 
+def _seg_clear(ok_fn, a, b, step=0.25):
+    """CL1: True iff ok_fn holds at a, b and at samples every <= step mm along
+    the straight a -> b (one batched ok_fn call per segment)."""
+    n = max(1, int(math.ceil(math.dist(a[:2], b[:2]) / step - 1e-9)))
+    pts = [tuple(a[:2]), tuple(b[:2])] + [
+        (a[0] + (b[0] - a[0]) * t / n, a[1] + (b[1] - a[1]) * t / n)
+        for t in range(1, n)]
+    return all(ok_fn(pts))
+
+
 def build_part_hf(surf, x0, y0, cell, nx, ny, threads=None, drop_z=0.0):
     """Rasterise the part heightfield on a grid (x0/y0 = lower-left corner,
     cell mm, row j = +Y) by dropping a small cylinder (r 0.05 mm) with ocl's
@@ -1179,6 +1189,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
              "n_clip_breaks": 0, "n_axial_plunge": 0, "n_clip_bridges": 0,
              "n_offset_descends": 0, "n_axial_suspect": 0,
              "n_feed_links": 0, "n_air_links": 0, "n_deep_links": 0,
+             "cl1_seg_breaks": 0, "cl1_seg_log": [],  # CL1: segment breaks
              "helix_dia_mm": round(helix_dia, 4),
              "ramp_angle_deg": round(ramp_angle_deg, 3),
              "n_tooldown_links": 0, "levels_planned": [round(z, 3) for z in order],
@@ -1568,8 +1579,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 path = [(round(sx + (x - sx) * t / n, 4),
                         round(sy + (y - sy) * t / n, 4))
                        for t in range(n + 1)]
-                if not all(isl_ok3(path)):
-                    continue
+                if not _seg_clear(isl_ok3, (sx, sy), (x, y)):
+                    continue     # CL1: <= 0.25 mm samples replace the 0.4 mm
                 if flank:
                     if hf_gouge_violation([(px, py, z) for (px, py) in path],
                                          stock, tool_r) is not None:
@@ -2417,6 +2428,20 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             for (kind, pts) in res["paths"]:
                 if kind == "cutting" and not drop_cut:  # BS1a4c: unbacked
                     good = isl_ok(pts)
+                    # CL1: a segment whose endpoints pass but which is not
+                    # _seg_clear breaks the run there - the next point is then
+                    # reached by the same bridge / clip-break re-entry a
+                    # failing point uses (the point itself is never dropped).
+                    brk = set()
+                    for k in range(1, len(pts)):
+                        if good[k - 1] and good[k] and not _seg_clear(
+                                isl_ok, pts[k - 1], pts[k]):
+                            brk.add(k)
+                            stats["cl1_seg_breaks"] += 1
+                            if len(stats["cl1_seg_log"]) < 200:
+                                stats["cl1_seg_log"].append({"z": z,
+                                    "x": (pts[k - 1][0] + pts[k][0]) / 2.0,
+                                    "y": (pts[k - 1][1] + pts[k][1]) / 2.0})
                     i = 0
                     gap = False
                     bridge = None
@@ -2451,7 +2476,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                 # unbroken path would have (isl_ok): no gouge,
                                 # and the chord removes MORE material than the
                                 # detour it replaces, never less.
-                                if all(isl_ok3(chord + [tuple(pts[i])])) and \
+                                if _seg_clear(isl_ok3, (prev[0], prev[1]),
+                                        tuple(pts[i])) and \
                                         lnk_cut_ok(stock, [(prev[0], prev[1])] +
                                                  chord + [tuple(pts[i])], z,
                                                  "brdg"):
@@ -2511,7 +2537,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                                     "reentry r%d" % nreg))
                                 gap = False
                         j = i
-                        while j + 1 < len(pts) and good[j + 1]:
+                        while j + 1 < len(pts) and good[j + 1] and \
+                                (j + 1) not in brk:
                             j += 1
                         nb = len(bridge) if bridge else 0
                         run = list(bridge) if bridge else []
@@ -2535,6 +2562,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                             level_pts.append((x, y, "cut r%d" % nreg))
                         stock.mill_path(run[k0:], z, tool_r, corner_r)
                         i = j + 1
+                        gap = i < len(pts) and i in brk  # CL1 segment break
                     q4b = False   # BS1a4d8e: the q4 head join is spent
                     if _RP and rp_g0 is not None:
                         _cat = rp_cat(pts[rp_g0:]) + " (tail dropped)"
