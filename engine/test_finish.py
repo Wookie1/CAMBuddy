@@ -2371,7 +2371,7 @@ def test_fe5g_net_ramps_and_trims_inpass_drop():
     P += [(x, 0.0, 5.0) for x in np.arange(5.5, 15.0, 0.5)]
     out, n_ramp, trimmed = _fe5g_inpass(live, P, tan)
     assert n_ramp >= 1 and not trimmed, \
-        "mid-pass drop not ramped: n_ramp=%d trimmed=%d" % (n_ramp, trimmed)
+        "mid-pass drop not ramped: n_ramp=%d trimmed=%s" % (n_ramp, trimmed)
     for (x, y, z), (xo, yo, zo) in zip(out, P):
         assert (x, y) == (xo, yo) and z >= zo - 1e-9, "point moved/lowered"
     for a, b in zip(out, out[1:]):
