@@ -3491,7 +3491,8 @@ def _main():
                test_rra3_straight_descent_scope,
                test_fi1_entry_feedin_within_limit,
                test_bs1d_overload_band_on_standing_strip,
-               test_bs1d_a2d_drop_counted):
+               test_bs1d_a2d_drop_counted,
+               test_cl1_pins_segment_clearance):
         try:
             fn()
         except AssertionError as e:
@@ -5797,6 +5798,59 @@ def test_bs1d_a2d_drop_counted():
             stats.get("n_band_regions"),)
     assert stats.get("clcheck_violations", 0) == 0
     print("PASS bs1d drop counted")
+
+
+def test_cl1_pins_segment_clearance():
+    """Task CL1 (red test): a 60 x 50 pocket (18 mm walls, floor Z0) with six
+    1 x 1 mm square pins, 18 mm tall, 14 mm pitch. Adaptive2d emits a 7.38 mm
+    straight cutting move at Z 0.381 - (-3.920, -16.750) -> (3.456, -16.748),
+    points 1497 -> 1498 of one a2d cutting path - whose two END POINTS are
+    clear but whose middle passes 6.25 mm from the pin at (0, -10), under the
+    tool radius: the emit checks points only, so on main 7923643 the final
+    CLCHECK refuses the whole program (RuntimeError, 32 samples below CL, 1
+    move). The emit must check every cutting segment sampled at <= 0.25 mm and
+    fall back (clip break + checked re-entry, as for a failing point) where a
+    segment is not clear, as a COUNTED event: stats["cl1_seg_breaks"] (int,
+    >= 1 here) and stats["cl1_seg_log"] (list of {"z", "x", "y"}). Program
+    produced, clcheck 0, no axial plunge."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    from opencamlib import ocl
+    from engine.rough import rough
+    bt = _box_tris
+    tris = (bt(-40, 40, -30, 30, -1, 0) + bt(-40, -30, -30, 30, 0, 18)
+            + bt(30, 40, -30, 30, 0, 18) + bt(-30, 30, -30, -25, 0, 18)
+            + bt(-30, 30, 25, 30, 0, 18))
+    for cx in (-14, 0, 14):
+        for cy in (-10, 4):
+            tris += bt(cx - 0.5, cx + 0.5, cy - 0.5, cy + 0.5, 0, 18)
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "cl1_pins.stl")
+        _write_stl(stl, tris)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        try:
+            moves, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0),
+                                 6.343, 0.0, leave=0.381, axial_leave=0.381,
+                                 stepdown=19.05, stepup=1.905, tolerance=0.05,
+                                 threads=4, stock_cell=0.5, min_rest=0.5,
+                                 corner_r=0.0, stl_path=stl)
+        except RuntimeError as e:
+            raise AssertionError("the program was refused: %s" % str(e)[:300])
+    print("cl1 pins: %d moves, clcheck %s, axial %s, cl1_seg_breaks %r, "
+          "cl1_seg_log %r" % (len(moves), stats.get("clcheck_violations"),
+                              stats.get("n_axial_plunge"),
+                              stats.get("cl1_seg_breaks"),
+                              (stats.get("cl1_seg_log") or [])[:4]))
+    assert stats.get("clcheck_violations", 0) == 0
+    assert stats.get("n_axial_plunge", 0) == 0
+    assert isinstance(stats.get("cl1_seg_breaks"), int) and \
+        stats["cl1_seg_breaks"] >= 1, \
+        "segment fallback not counted: cl1_seg_breaks = %r" % (
+            stats.get("cl1_seg_breaks"),)
+    assert isinstance(stats.get("cl1_seg_log"), list) and \
+        len(stats["cl1_seg_log"]) >= 1
+    print("PASS cl1: pins program produced, every segment clear")
 
 
 if __name__ == "__main__":
