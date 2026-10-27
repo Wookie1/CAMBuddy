@@ -153,3 +153,6 @@ test_fe5f_skip_bore_entries reports 21 skipped bore-wall entries instead of 16 (
 ACCEPTED: James chose to skip the bores (drill them); the dilated entry stock reads more bore stock, so 5 more bore-wall
 entries are skipped instead of plunged - conservative. The test asserts fe5_skipped_n >= 1 (it never pinned 16; 16 was the
 brief's expectation), so no test value changes.
+- Bore cluster AT BOUND, NO MARGIN (coordinator 2026-10-27): with FE5h the test_fe5f_skip_bore_entries cluster centre is
+  [0.0, 1.0], exactly at the test's 1.0 mm bound (passes, no margin left). The test stays as is; the next change that touches
+  the bores must be checked by hand here.
