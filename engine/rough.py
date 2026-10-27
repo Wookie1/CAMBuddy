@@ -991,8 +991,9 @@ def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
             if any(not getattr(r, "StartPointNotFound", False)
                    and r.AdaptivePaths and any(pth[0] == CT and pth[1]
                                                for pth in r.AdaptivePaths)
-                   for r in alone):
-                continue
+                   for r in alone) or not any(
+                    getattr(r, "StartPointNotFound", False) for r in alone):
+                continue    # runs alone, or nothing to clear (no SPNF)
             stats["a2d_dropped_outers"].append(
                 {"z": round(z, 3),
                  "polygon": [[round(float(x), 4), round(float(y), 4)]
