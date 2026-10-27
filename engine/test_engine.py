@@ -3489,7 +3489,9 @@ def _main():
                test_rr1c5d_live_grid_fine_for_coarse_stock,
                test_rra2_deep_top_scope,
                test_rra3_straight_descent_scope,
-               test_fi1_entry_feedin_within_limit):
+               test_fi1_entry_feedin_within_limit,
+               test_bs1d_overload_band_on_standing_strip,
+               test_bs1d_a2d_drop_counted):
         try:
             fn()
         except AssertionError as e:
@@ -5636,6 +5638,165 @@ def test_fi1_entry_feedin_within_limit():
     assert not bad, "entry feed-in over 2.44: line %d ae_eff %.3f mm, a %.2f mm" % (
         worst["line"], worst["ae_eff"], worst["a"])
     print("PASS fi1 T-feedin: every entry feed-in judged <= 2.44")
+
+
+def _bs1d_ledge_tris(w=3.7):
+    """BS1d scene: closed 60 x 50 pocket, 18 mm walls, floor Z0, and a W-wide
+    ledge (top Z4) along the -y wall. The floor level (0.381) cannot enter the
+    ledge, so at the ledge's plateau level (4.381) a strip ~W beyond leave and
+    ~13.6 mm high stands against the -y wall - Core Front Z 47.224's geometry
+    class (3.7 mm beyond leave, 13.74 high)."""
+    bt = _box_tris
+    return (bt(-40, 40, -30, 30, -1, 0) + bt(-40, -30, -30, 30, 0, 18)
+            + bt(30, 40, -30, 30, 0, 18) + bt(-30, 30, -30, -25, 0, 18)
+            + bt(-30, 30, 25, 30, 0, 18) + bt(-30, 30, -25, -25 + w, 0, 4))
+
+
+def test_bs1d_overload_band_on_standing_strip():
+    """Task BS1d (red test): the hug ring at the ledge level (Z 4.381) runs
+    beside a standing strip ~3.7 mm beyond leave, ~13.6 mm high. Its ZE2
+    windows overload (> 2.44) but stay under the full-width band trigger
+    (0.85 x D = 10.78), so on main 605fffa NO band is planned and zmap counts
+    43 over-2.44 windows at CUTTING feed on that ring stretch (max ae 7.86).
+    The band step must also trigger on such an overloaded stretch beside
+    standing stock: >= 1 band region planned at Z 4.381 and <= 8 over-2.44
+    windows at cutting feed on the stretch (Z 4.381 +- 0.05, -22 < y < -12,
+    |x| < 26). Gates: zmap gouges / rapid / axial / outside 0, clcheck 0."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import subprocess
+    import tempfile
+    import json as _json
+    from opencamlib import ocl
+    import engine.band as B
+    from engine.gcode import moves_to_gcode
+    from engine.rough import rough, build_part_hf
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    stock_box = (-40.0, 40.0, -30.0, 30.0, -1.0, 18.0)
+    tool_r = 6.343
+    dia = 2.0 * tool_r
+    Z = 4.381
+    nb = {}
+    orig = B.channel_regions
+
+    def cr_spy(rings, stock, isl_ok3, z, *a, **k):
+        out = orig(rings, stock, isl_ok3, z, *a, **k)
+        nb[round(z, 3)] = nb.get(round(z, 3), 0) + len(out)
+        return out
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1d_ledge.stl")
+        _write_stl(stl, _bs1d_ledge_tris())
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        B.channel_regions = cr_spy
+        try:
+            moves, stats = rough(surf, stock_box, tool_r, 0.0, leave=0.381,
+                                 axial_leave=0.381, stepdown=19.05,
+                                 stepup=1.905, tolerance=0.05, threads=4,
+                                 stock_cell=0.5, min_rest=0.5, corner_r=0.0,
+                                 stl_path=stl)
+        finally:
+            B.channel_regions = orig
+        ngc = os.path.join(td, "bs1d_ledge.ngc")
+        with open(ngc, "w") as fh:
+            fh.write(moves_to_gcode(moves, spindle_rpm=7500))
+        hf = build_part_hf(surf, -40.0, -30.0, 0.5, 160, 120, threads=4,
+                           drop_z=-1.0)
+        hf_p = os.path.join(td, "part_hf.npy")
+        pad = int(math.ceil((tool_r + 5.0) / 0.5))
+        padded = np.full((hf.shape[0] + 2 * pad, hf.shape[1] + 2 * pad),
+                         np.nan, dtype=hf.dtype)
+        padded[pad:pad + hf.shape[0], pad:pad + hf.shape[1]] = hf
+        np.save(hf_p, padded)
+        with open(hf_p[:-4] + ".json", "w") as fh:
+            _json.dump({"x0": -40.0 - pad * 0.5, "y0": -30.0 - pad * 0.5,
+                        "cell": 0.5, "tess_tol": 0.01}, fh)
+        rj = os.path.join(td, "zmap.json")
+        dj = os.path.join(td, "ae2.json")
+        rr = subprocess.run(
+            [sys.executable, os.path.join(repo, "verify", "zmap.py"), ngc,
+             "--part", hf_p, "--tool", "flat", "--dia", "%.3f" % dia,
+             "--stock", *[str(v) for v in stock_box],
+             "--engage-max", "2.438", "--ae2-dump", dj, "--out-json", rj],
+            capture_output=True, text=True, cwd=repo)
+        assert rr.returncode == 0, "zmap failed: %s | %s" % (
+            rr.stdout[-800:], rr.stderr[-600:])
+        rep = _json.load(open(rj))
+        wins = _json.load(open(dj))
+    cut_feed = rep["engagement"]["ae2_cutting_feed"]
+    strip = [w for w in wins
+             if w["ae_eff"] > 2.44 and abs(w["z"] - Z) < 0.05
+             and -22.0 < w["y"] < -12.0 and abs(w["x"]) < 26.0
+             and w.get("feed") is not None
+             and abs(w["feed"] - cut_feed) < 1e-6]
+    print("bs1d strip: Z %.3f band regions %d, over-2.44 windows at cutting "
+          "feed on the ring stretch %d (max ae %.2f); gates g%d r%d a%d o%d "
+          "clcheck %s" % (Z, nb.get(Z, 0), len(strip),
+                          max([w["ae_eff"] for w in strip] or [0.0]),
+                          rep["gouges"]["count"],
+                          rep["rapid_collisions"]["count"],
+                          rep["axial_plunges"]["count"],
+                          rep["outside_grid"]["count"],
+                          stats.get("clcheck_violations")))
+    assert rep["gouges"]["count"] == 0, rep["gouges"]
+    assert rep["rapid_collisions"]["count"] == 0
+    assert rep["axial_plunges"]["count"] == 0, rep["axial_plunges"]
+    assert rep["outside_grid"]["count"] == 0
+    assert stats.get("clcheck_violations", 0) == 0
+    assert nb.get(Z, 0) >= 1, \
+        "no band planned beside the standing strip at Z %.3f (%d over-2.44 " \
+        "windows at cutting feed on the ring stretch)" % (Z, len(strip))
+    assert len(strip) <= 8, \
+        "%d over-2.44 windows at cutting feed on the ring stretch (bar 8): %s" \
+        % (len(strip), [(w["line"], round(w["x"], 1), round(w["y"], 1),
+                         round(w["ae_eff"], 2)) for w in strip[:6]])
+    print("PASS bs1d: overloaded ring stretch beside standing stock banded")
+
+
+def test_bs1d_a2d_drop_counted():
+    """Task BS1d: Adaptive2d's StartPointNotFound is a counted exit, not a
+    silent skip. Closed 60 x 50 pocket with a 22 x 12 island (19 mm channel,
+    14 mm walls, one level Z 0.381): the only outer comes back fully
+    StartPointNotFound. stats["a2d_spnf"] must be an int >= 1 and
+    stats["a2d_dropped_outers"] must list that outer ({"z", "polygon"}). No
+    fallback: the channel stays the band step's (n_band_regions >= 1). FAILS
+    on main 605fffa: neither key exists."""
+    assert HAVE_AREA, "area module missing: run the engine suite with VibeCAD python"
+    import tempfile
+    from opencamlib import ocl
+    from engine.rough import rough
+    bt = _box_tris
+    tris = (bt(-40, 40, -30, 30, -1, 0) + bt(-40, -30, -30, 30, 0, 14)
+            + bt(30, 40, -30, 30, 0, 14) + bt(-30, 30, -30, -25, 0, 14)
+            + bt(-30, 30, 25, 30, 0, 14) + bt(-11, 11, -6, 6, 0, 14))
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "bs1d_drop.stl")
+        _write_stl(stl, tris)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        moves, stats = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 14.0),
+                             6.343, 0.0, leave=0.381, axial_leave=0.381,
+                             stepdown=19.05, stepup=1.905, tolerance=0.05,
+                             threads=4, stock_cell=0.5, min_rest=0.5,
+                             corner_r=0.0, stl_path=stl)
+    dropped = stats.get("a2d_dropped_outers")
+    print("bs1d drop: a2d_spnf %r, a2d_dropped_outers %r, n_band_regions %r"
+          % (stats.get("a2d_spnf"),
+             None if dropped is None else [(d.get("z"), len(d.get("polygon")
+                                                         or []))
+                                           for d in dropped],
+             stats.get("n_band_regions")))
+    assert isinstance(stats.get("a2d_spnf"), int) and \
+        stats["a2d_spnf"] >= 1, "a2d_spnf = %r" % (stats.get("a2d_spnf"),)
+    assert isinstance(dropped, list) and len(dropped) == 1, \
+        "a2d_dropped_outers = %r" % (dropped,)
+    assert abs(dropped[0]["z"] - 0.381) < 1e-3 and \
+        len(dropped[0]["polygon"]) >= 3, dropped[0]
+    assert stats.get("n_band_regions", 0) >= 1, \
+        "the channel lost its band: n_band_regions %r" % (
+            stats.get("n_band_regions"),)
+    assert stats.get("clcheck_violations", 0) == 0
+    print("PASS bs1d drop counted")
 
 
 if __name__ == "__main__":
