@@ -2268,6 +2268,49 @@ def test_fe5fc_buried_ends_keep_middle():
                                            len(skip_pts)))
 
 
+def test_fe5g_no_lifted_vertex_in_constant_z_pass():
+    """FE5g (red test): a constant-Z finish pass must not carry an interior
+    vertex lifted above BOTH of its neighbours by more than the ball axial
+    floor (0.5 mm) unless the pass is split there (a G0 next to it). Such a
+    vertex (an inserted point whose CL comes from the drop-cutter where the
+    ball rides a wall top edge) makes the pass climb and drop back steeply;
+    on the test block the drop drove the T20 ball 0.815 mm into live stock
+    (ZB, connector E2E test_tb_rest_chain_checks_stock_bottom). Scene: a
+    20 x 20 mm boss 14 mm tall on a plate, stock 0.3 over the part,
+    stock_from. FAILS on fe5-trial 74582f3: 98 lifted vertices around the
+    boss corners, max lift 4.607 mm."""
+    from engine.finish import finish
+    cell = 0.5
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "boss.stl")
+        write_stl(stl, _box(-25, 25, -25, 25, -2, 0)
+                  + _box(-10, 10, -10, 10, 0, 14.0))
+        surf = model.load_surf(stl)
+        gx0, gy0, nx, ny = -25.0, -25.0, 100, 100
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                             gy0 + (np.arange(ny) + 0.5) * cell)
+        boss = (np.abs(CX) <= 10) & (np.abs(CY) <= 10)
+        stockp = os.path.join(td, "stock.npy")
+        np.save(stockp, np.where(boss, 14.3, 0.3))
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 9.525, 0.0),
+                              stepover=1.5, floor_z=1.0, threads=4,
+                              stock_from=stockp, ramp_angle_deg=2.0)
+    P = [(m["x"], m["y"], m["z"], m["g"]) for m in moves]
+    lifted = [(round(b[0], 3), round(b[1], 3), round(a[2], 3),
+               round(b[2] - a[2], 3))
+              for a, b, c in zip(P[:-2], P[1:-1], P[2:])
+              if a[3] == b[3] == c[3] == 1 and abs(a[2] - c[2]) < 1e-6
+              and b[2] > a[2] + 0.5]
+    print("fe5g lifted vertices in constant-Z passes: %d (max lift %.3f)"
+          % (len(lifted), max([e[3] for e in lifted] or [0.0])))
+    assert not lifted, \
+        "FE5g: %d constant-Z pass vertices lifted > 0.5 mm above both " \
+        "neighbours (max %.3f): %s" % (len(lifted), max(e[3] for e in lifted),
+                                       lifted[:4])
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -2298,7 +2341,8 @@ if __name__ == "__main__":
                test_fe5fc_buried_ends_keep_middle,
                test_fe5fc_degenerate_pass_never_plunged,
                test_floor_dip_split_finish_and_rest,
-               test_floor_pad_rows_inside_stock_box):
+               test_floor_pad_rows_inside_stock_box,
+               test_fe5g_no_lifted_vertex_in_constant_z_pass):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))
