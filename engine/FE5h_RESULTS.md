@@ -147,3 +147,9 @@ the fix. All frozen estimator + finish + rr + zmap + tlg1 gates green; one
 documented behavioral deviation (fe5f skip count 16->21, assertions still
 green). Red (a) E2E still red - remaining cause is the rough-stage
 coarse-vs-fine divergence at deep-level entries (above). NOT committed.
+
+## Reviewed deviation (coordinator, 2026-10-27)
+test_fe5f_skip_bore_entries reports 21 skipped bore-wall entries instead of 16 (cluster still centred on the bore axis).
+ACCEPTED: James chose to skip the bores (drill them); the dilated entry stock reads more bore stock, so 5 more bore-wall
+entries are skipped instead of plunged - conservative. The test asserts fe5_skipped_n >= 1 (it never pinned 16; 16 was the
+brief's expectation), so no test value changes.
