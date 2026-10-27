@@ -108,6 +108,7 @@ RAMP_TRIGGER = 0.25   # mm, FE5: ramp an entry only where the estimator's
                       # live stock depth at the pass start exceeds this
 ZB_FLOOR_BALL = 0.5   # mm, FE5f: mirror of zmap BALL_AXIAL_FLOOR - an
                       # unresolved entry deeper than this is SKIPPED (drill)
+FE5G_MAX_DESCENT_DEG = 15.0  # deg, FE5g: mirror of zmap MAX_RAMP_DEG
 GRID_SPIKE = 0.01     # mm, PQ: drop an emitted point whose closest
                       # output-grid CL still differs from its Z by more than
                       # this (no one-point spikes)
@@ -1228,8 +1229,8 @@ def grid_snap(surf, cutter, paths, grid=POST_GRID, threads=None):
     dip exceeds BOTH NET_TOL and the pre-snap dip of the same chord (what
     upstream already verified); repair = DENSIFY the chord with its own
     on-grid samples at CL rounded up to the grid. Points are never lowered
-    and no path is split (a densified sub-chord ~GRID_SS long has
-    negligible sag; all-air chords cannot gouge).
+    and no path is split, EXCEPT at an FE5g gouge vertex (a repair sample
+    whose CL is > the ZB floor above the pass line splits the pass there).
 
     Returns (paths, src, n_dropped, n_splits) with src[i] the index in
     `paths` that output path i came from (splits keep input order)."""
@@ -1287,7 +1288,10 @@ def grid_snap(surf, cutter, paths, grid=POST_GRID, threads=None):
                           math.ceil(z / grid - 1e-9) * grid))
             continue
         d, ci, c = best
-        if d > GRID_SPIKE and not own_ok:
+        # FE5g: CL > ZB floor above pass Z at the EMITTED XY - the drop back
+        # could drive the ball past the floor: split (drop the vertex), never
+        # lift it
+        if d > GRID_SPIKE and (not own_ok or c > z + ZB_FLOOR_BALL):
             snapped.append(None)
             n_dropped += 1
         else:
@@ -1386,15 +1390,27 @@ def grid_snap(surf, cutter, paths, grid=POST_GRID, threads=None):
                        / ((s1 - s0) + 1.0))[fin]
                     lz = a[2] + (b[2] - a[2]) * t
                     if float(np.max(cz[fin] - lz)) > max(NET_TOL, dp[k]):
-                        # densify: insert the (on-grid) samples at CL rounded
-                        # up - never below CL at their own XY, and sub-chords
-                        # ~GRID_SS long have negligible sag
+                        # FE5g: insert at max(pass line, ceil CL); a sample
+                        # whose CL is > the ZB floor above the pass line: the
+                        # drop back could plunge - SPLIT, links rejoin pieces
                         n_repair += 1
-                        for (px, py), pz in zip(xy[s0:s1], cz):
-                            if np.isfinite(pz):
-                                pts.append((px, py,
-                                          math.ceil(float(pz) / grid - 1e-9)
-                                          * grid))
+                        split = False
+                        for m, (px, py) in enumerate(xy[s0:s1]):
+                            pz = float(cz[m])
+                            if not np.isfinite(pz):
+                                continue
+                            lzz = a[2] + (b[2] - a[2]) * ((m + 1) / (len(cz) + 1.0))
+                            if pz > lzz + ZB_FLOOR_BALL:
+                                if len(pts) >= 2:
+                                    out.append(pts)
+                                    src.append(src_i)
+                                pts = [b]
+                                split = True
+                                break
+                            pts.append((px, py, max(lzz, math.ceil(
+                                pz / grid - 1e-9) * grid)))
+                        if split:
+                            continue
             pts.append(b)
         if len(pts) >= 2:
             out.append(pts)
@@ -1853,6 +1869,49 @@ def _fe5_pick_ramp(live, P, s, tan):
     return None, False
 
 
+def _fe5g_inpass(live, pth, tan):
+    """FE5g: an in-pass descent steeper than FE5G_MAX_DESCENT_DEG that cuts
+    deeper than the ball ZB floor of live stock is ramped along the pass's
+    OWN FOLLOWING vertices (_ramp_entry-style raise: XY fixed, Z only rises).
+    A descent into the last vertex has no followers, so its illegal fragment
+    is trimmed and reported (never the whole pass). -> (path, n_ramped,
+    trimmed)."""
+    P = [tuple(float(v) for v in q) for q in pth]
+    s = np.cumsum([0.0] + [math.hypot(b[0] - a[0], b[1] - a[1])
+                           for a, b in zip(P, P[1:])])
+    n_ramp, trimmed, i = 0, [], 0
+    while i + 1 < len(P):
+        a, b = P[i], P[i + 1]
+        dz = a[2] - b[2]
+        h = math.hypot(b[0] - a[0], b[1] - a[1])
+        dd = -math.inf
+        if dz > 1e-9 and math.degrees(math.atan2(dz, h)) \
+                > FE5G_MAX_DESCENT_DEG:
+            for t in (0.0, 0.5, 1.0):   # segments are ~GRID_SS long
+                v = live.disk_depth(*[a[k] + (b[k] - a[k]) * t
+                                      for k in range(3)])
+                if math.isfinite(v):    # inf = no stock data = cannot gouge
+                    dd = max(dd, v)
+        if dd <= ZB_FLOOR_BALL:
+            i += 1
+            continue
+        if i + 2 >= len(P):             # no followers: trim the fragment
+            for q in P[i + 1:]:
+                v = live.disk_depth(q[0], q[1], q[2])
+                trimmed.append({"x": round(q[0], 3), "y": round(q[1], 3),
+                                "z": round(q[2], 3), "depth":
+                                round(v, 3) if math.isfinite(v) else None})
+            P = P[:i + 1]
+            break
+        za, sa, j = a[2], float(s[i]), i + 1
+        while j < len(P) and P[j][2] < za - (float(s[j]) - sa) * tan:
+            P[j] = (P[j][0], P[j][1], za - (float(s[j]) - sa) * tan)
+            j += 1
+        n_ramp += 1
+        i += 1
+    return P, n_ramp, trimmed
+
+
 def _fe5_cluster_skips(pts, merge_r):
     """FE5f: merge skipped points into clusters (greedy, nearest centre
     within merge_r = 2 x tool D): centre, bbox, max live depth, area."""
@@ -2251,6 +2310,7 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     n_ramped = n_short_run = 0
     n_unchanged = len(ordered)
     n_skipped = 0                  # FE5f: entries skipped (never plunged)
+    n_fe5g_ramped, fe5g_trimmed = 0, []   # FE5g: in-pass ramped / trimmed
     ramp_cnt = {}
     fe5_deep_unramped = []  # FE5 diag: entries with live depth > 0.5 left
     fe5_deep_ramped = []    # FE5 diag: deep entries that WERE ramped
@@ -2417,6 +2477,12 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
                         if math.isfinite(dd) and dd > cd:
                             cd = dd
                 fe5_chord_depths.append(round(cd, 3))
+            # FE5g: ramp illegal in-pass descents (finish and rest), else trim
+            if ordered[k] is not None and len(ordered[k]) > 1:
+                _p2, _nr, _tr = _fe5g_inpass(live, ordered[k], tan_ramp)
+                n_fe5g_ramped += _nr
+                fe5g_trimmed.extend(_tr)
+                ordered[k] = _p2
             # stamp this pass's PHYSICAL path (ramp first if prepended) so
             # later entries see the stock this program already cleared
             F = np.asarray(ordered[k], dtype=float)
@@ -2520,6 +2586,9 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
         fe5_skip_pts, 2.0 * float(tool[1]))
     stats["fe5_skip_pts"] = [p for p in fe5_skip_pts  # FE5f-b/c: fragment
                             if math.isfinite(p[2])][:400]  # verts, on-grid only
+    stats["fe5g_ramped_n"] = n_fe5g_ramped  # in-pass descents ramped
+    stats["fe5g_trimmed_n"] = len(fe5g_trimmed)
+    stats["fe5g_trimmed"] = fe5g_trimmed[:400]
     if flute_mm is not None and shank_dia is not None:
         # S4: flute/shank-aware pass (tools/x7_tools.json or --flute/--shank)
         stats["flute_mm"] = round(float(flute_mm), 4)

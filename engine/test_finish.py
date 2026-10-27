@@ -2311,6 +2311,88 @@ def test_fe5g_no_lifted_vertex_in_constant_z_pass():
                                        lifted[:4])
 
 
+def test_fe5g_scene_vertices_never_below_cl():
+    """FE5g: gouge gate on the red-test scene (20 x 20 boss 14 tall, stock
+    from): every emitted G1 vertex must sit AT OR ABOVE its own drop-cutter
+    CL (ball 9.525). A root fix that simply forced inserted vertices to the
+    pass Z without the CL check would cut into the part at the wall-top
+    edges and fail here by a measured value."""
+    import math
+    from engine.finish import finish, make_cutter, batch_drop
+    cell = 0.5
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "boss.stl")
+        write_stl(stl, _box(-25, 25, -25, 25, -2, 0)
+                  + _box(-10, 10, -10, 10, 0, 14.0))
+        surf = model.load_surf(stl)
+        gx0, gy0, nx, ny = -25.0, -25.0, 100, 100
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                             gy0 + (np.arange(ny) + 0.5) * cell)
+        boss = (np.abs(CX) <= 10) & (np.abs(CY) <= 10)
+        stockp = os.path.join(td, "stock.npy")
+        np.save(stockp, np.where(boss, 14.3, 0.3))
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 9.525, 0.0),
+                              stepover=1.5, floor_z=1.0, threads=4,
+                              stock_from=stockp, ramp_angle_deg=2.0)
+        cutter = make_cutter("ball", 9.525, 0.0)
+        pts = [(m["x"], m["y"]) for m in moves if m["g"] == 1]
+        cl = batch_drop(surf, cutter, pts, threads=4)
+        bad = []
+        for m, c in zip([m for m in moves if m["g"] == 1], cl):
+            if math.isfinite(c) and m["z"] < c - 0.004:   # NET_TOL margin
+                bad.append((round(m["x"], 3), round(m["y"], 3),
+                            round(m["z"], 3), round(float(c), 3)))
+        print("fe5g gouge gate: %d G1 vertices, %d below CL by >0.004 mm"
+              % (len(pts), len(bad)))
+        assert not bad, \
+            "FE5g: %d emitted vertices below their drop-cutter CL " \
+            "(max %.3f): %s" % (len(bad),
+                                max(p[3] - p[2] for p in bad), bad[:4])
+
+
+def test_fe5g_net_ramps_and_trims_inpass_drop():
+    """FE5g safety net unit test on _fe5g_inpass: a near-vertical descent
+    mid-pass is ramped along the pass's own following vertices (XY fixed, Z
+    only rises, resulting slopes <= the ramp angle); a descent into the LAST
+    vertex has no followers and is trimmed (head kept, vertices reported).
+    Disabling the net (no-op _fe5g_inpass) fails this test."""
+    from engine.finish import _fe5g_inpass
+    from engine.entry_depth import LiveStock
+
+    A = np.full((40, 40), 10.0)          # flat stock at Z10, cell 0.5
+    live = LiveStock(A, -10.0, -10.0, 0.5, 0.5 * 9.525)
+    tan = math.tan(math.radians(2.0))
+    # mid-pass drop: 20 mm of flat at Z8, near-vertical drop to Z5 at x=5,
+    # then 20 mm more at Z5 (followers exist to ramp over)
+    P = [(x, 0.0, 8.0) for x in np.arange(-5.0, 5.0, 0.5)]
+    P += [(5.0, 0.0, 5.0)]
+    P += [(x, 0.0, 5.0) for x in np.arange(5.5, 15.0, 0.5)]
+    out, n_ramp, trimmed = _fe5g_inpass(live, P, tan)
+    assert n_ramp >= 1 and not trimmed, \
+        "mid-pass drop not ramped: n_ramp=%d trimmed=%d" % (n_ramp, trimmed)
+    for (x, y, z), (xo, yo, zo) in zip(out, P):
+        assert (x, y) == (xo, yo) and z >= zo - 1e-9, "point moved/lowered"
+    for a, b in zip(out, out[1:]):
+        dz = a[2] - b[2]
+        h = math.hypot(b[0] - a[0], b[1] - a[1])
+        assert dz <= 1e-9 or math.degrees(math.atan2(dz, h)) <= 2.0 + 1e-6, \
+            "ramped pass still descends at %.1f deg" % \
+            math.degrees(math.atan2(dz, h))
+    # tail drop: descent into the LAST vertex -> trim, head kept
+    Q = [(x, 0.0, 8.0) for x in np.arange(-5.0, 5.0, 0.5)]
+    Q += [(5.0, 0.0, 5.0)]
+    out2, n_ramp2, trimmed2 = _fe5g_inpass(live, Q, tan)
+    assert n_ramp2 == 0 and len(trimmed2) == 1 and len(out2) == len(Q) - 1, \
+        "tail drop not trimmed: n_ramp=%d trimmed=%s len=%d/%d" % \
+        (n_ramp2, trimmed2, len(out2), len(Q))
+    assert trimmed2[0]["x"] == 5.0 and trimmed2[0]["depth"] > 0.5, \
+        "trimmed vertex not reported with depth: %s" % trimmed2
+    print("fe5g net: mid-pass drop ramped (slopes <= 2 deg), tail drop "
+          "trimmed and reported")
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -2342,7 +2424,9 @@ if __name__ == "__main__":
                test_fe5fc_degenerate_pass_never_plunged,
                test_floor_dip_split_finish_and_rest,
                test_floor_pad_rows_inside_stock_box,
-               test_fe5g_no_lifted_vertex_in_constant_z_pass):
+               test_fe5g_no_lifted_vertex_in_constant_z_pass,
+               test_fe5g_scene_vertices_never_below_cl,
+               test_fe5g_net_ramps_and_trims_inpass_drop):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))
