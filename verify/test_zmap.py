@@ -3007,7 +3007,10 @@ def test_ze2b_cli_ball_block_and_dump(tmp_path):
         json.dump({"cell": CELL_B, "x0": X0_B, "y0": Y0_B, "tess_tol": 0.01},
                   f)
     ngc = tmp_path / "slot.ngc"
-    ngc.write_text(_zb_pass_gcode(0.0, 8.0))
+    ngc.write_text("G21 G90 F500\nG0 X-5.0000 Y0.0000 Z12.\n"
+                   "G1 X-5.0000 Y0.0000 Z10.5 F100.\n"
+                   + _zb_entry(-5.0, 0.0, 10.5, 8.0)
+                   + "G1 X5.0000 Y0.0000 F500.\n")
     out = tmp_path / "rep.json"
     dump = tmp_path / "wins.json"
     rc = zmap.main([str(ngc), "--part", str(npf), "--tool", "ball",
@@ -3080,6 +3083,22 @@ def _zg1_cli(tmp_path, npy, body, tool=None):
     return rc, json.loads(out.read_text())
 
 
+def _zb_entry(x, y, z0, z1, feed=100.0, r=1.0, deg=10.0):
+    """FE5M (fe5 merge, ZB): a helical feed descent from (x, y, z0) to (x, y,
+    z1) on a radius-r circle about (x + r, y), no steeper than deg - the
+    ZB-legal replacement for a straight ball plunge into stock in a
+    hand-written test program. It ends exactly where the plunge ended, so the
+    pass after it is unchanged."""
+    drop = z0 - z1
+    k = max(1, int(math.ceil(drop / (2 * math.pi * r
+                                     * math.tan(math.radians(deg))))))
+    n = 36 * k
+    return "".join("G1 X%.4f Y%.4f Z%.4f F%.1f\n" % (
+        x + r + r * math.cos(math.pi + 2 * math.pi * i / 36),
+        y + r * math.sin(math.pi + 2 * math.pi * i / 36),
+        z0 - drop * i / n, feed) for i in range(1, n + 1))
+
+
 def test_zg1_plate_minimum_face_gouge_with_hit_mask(tmp_path):
     """Cut 0.1 mm into a plate face sitting at the part's global minimum:
     with a .hit.npy mask it is a gouge (fails under the old footprint rule)."""
@@ -3142,7 +3161,7 @@ def test_zg1_at_stock_bottom_not_flagged(tmp_path):
     """Cutting exactly TO the stock bottom is not below it: gate stays 0."""
     npy = _zg1_plate(tmp_path)
     rc, rep = _zg1_cli(tmp_path, npy,
-                       "G0 X-20. Y0. Z20.\nG1 Z0. F100.\nG1 X20. F500.\n",
+                       "G0 X-20. Y0. Z20.\n" + "G1 Z10.5 F100.\n" + _zb_entry(-20.0, 0.0, 10.5, 0.0) + "G1 X20. F500.\n",
                        tool=["--tool", "ball"])
     assert rep["below_stock_bottom"]["count"] == 0
     assert rep["below_stock_bottom"]["max_depth"] == 0.0
@@ -3202,7 +3221,8 @@ def _zg1b_prog1_out(tmp_path, stem="st1"):
     npy = _zg1_plate(tmp_path, stem="zg1b")
     g1 = tmp_path / "p1.ngc"
     g1.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
-                  "G1 Z6. F100.\nG1 X20. F500.\n")
+                  "G1 Z10.5 F100.\n" + _zb_entry(-20.0, 0.0, 10.5, 6.0)
+                  + "G1 X20. F500.\n")
     st = tmp_path / (stem + ".npy")
     rc = zmap.main([str(g1), "--part", str(npy), "--tool", "ball", "--stock"]
                    + [str(v) for v in STOCK]
@@ -3222,7 +3242,7 @@ def test_zg1b_chain_below_true_bottom_fails_by_value(tmp_path):
     assert box == _ZG1B_BOX, "sidecar must carry the ORIGINAL box: %r" % box
     g2 = tmp_path / "p2.ngc"
     g2.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
-                  "G1 Z-0.25 F100.\nG1 X20. F500.\n")
+                  "G1 Z10.5 F100.\n" + _zb_entry(-20.0, 0.0, 10.5, -0.25) + "G1 X20. F500.\n")
     j2 = tmp_path / "j2.json"
     st2 = tmp_path / "st2.npy"
     rc = zmap.main([str(g2), "--part", str(npy), "--tool", "ball",
@@ -3247,7 +3267,7 @@ def test_zg1b_stock_without_sidecar_box_is_unknown(tmp_path):
     (tmp_path / "st1.json").unlink()  # simulate a pre-ZG1b stock file
     g2 = tmp_path / "p2.ngc"
     g2.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
-                  "G1 Z4.5 F100.\nG1 X20. F500.\n")
+                  "G1 Z10.5 F100.\n" + _zb_entry(-20.0, 0.0, 10.5, 4.5) + "G1 X20. F500.\n")
     j2 = tmp_path / "j2.json"
     rc = zmap.main([str(g2), "--part", str(npy), "--tool", "ball",
                     "--stock-in", str(st1), "--out-json", str(j2)])
@@ -3271,7 +3291,7 @@ def test_zg1b_stock_vs_sidecar_box_disagreement_fails(tmp_path, capsys):
     sc.write_text(json.dumps(meta))
     g2 = tmp_path / "p2.ngc"
     g2.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
-                  "G1 Z4.5 F100.\nG1 X20. F500.\n")
+                  "G1 Z10.5 F100.\n" + _zb_entry(-20.0, 0.0, 10.5, 4.5) + "G1 X20. F500.\n")
     rc = zmap.main([str(g2), "--part", str(npy), "--tool", "ball", "--stock"]
                    + [str(v) for v in STOCK]
                    + ["--stock-in", str(st1),
@@ -3287,7 +3307,7 @@ def test_zg1b_stock_out_merges_existing_sidecar(tmp_path):
     npy = _zg1_plate(tmp_path, stem="zg1bm")
     g1 = tmp_path / "p1.ngc"
     g1.write_text("G21 G90 F500\nG0 X-20. Y0. Z20.\n"
-                  "G1 Z6. F100.\nG1 X20. F500.\n")
+                  "G1 Z10.5 F100.\n" + _zb_entry(-20.0, 0.0, 10.5, 6.0) + "G1 X20. F500.\n")
     st = tmp_path / "stm.npy"
     (tmp_path / "stm.json").write_text(json.dumps(
         {"x0": X0, "y0": Y0, "cell": CELL}))
