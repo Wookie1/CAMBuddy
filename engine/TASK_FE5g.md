@@ -37,9 +37,12 @@ test_rra3_straight_descent_scope, test_rr1c5c_closed_pocket_bore_entry_no_deep_a
   neighbours, around the boss corners (e.g. (-14.762, -10.007) at Z 8.6 lifted 0.707; max 4.607).
 ## Items (coordinator spec)
 1. ROOT FIRST: find where a constant-Z pass gets an inserted vertex whose CL is sampled (drop-cutter) far above the pass Z
-   (pass split / fragment-trim / gap-split / corner insertion boundary - name it with file:line in CAUSE) and fix it THERE:
-   an inserted vertex of a constant-Z pass carries the pass Z (or the pass is split at it), never a drop-cutter CL above it.
-   Do not move existing points.
+   (pass split / fragment-trim / gap-split / corner insertion boundary - name it with file:line in CAUSE) and fix it THERE,
+   with THIS rule for that inserted vertex (coordinator correction 2026-10-27):
+   - if its drop-cutter CL at that XY is <= pass Z + 0.01: keep the vertex at pass Z;
+   - otherwise (the tool at pass Z would cut into the PART - a gouge): SPLIT the pass at that vertex and join the two
+     pieces with the normal safe link or retract, which goes through clcheck like every other link;
+   - NEVER set any vertex below its drop-cutter CL. Every other vertex keeps its point (no point moved).
 2. SAFETY NET (finish AND rest passes): any in-pass G1 descent steeper than 15 deg whose live-stock disk depth (the FE5
    estimator) exceeds 0.5 mm is ramped along the pass's own FOLLOWING vertices at the ramp angle (as FE5e's vertex-raise
    does for entries), else the illegal fragment is trimmed to its legal part; never skip whole passes; every trim listed in
@@ -47,4 +50,6 @@ test_rra3_straight_descent_scope, test_rr1c5c_closed_pocket_bore_entry_no_deep_a
 3. Programs where neither applies stay byte-identical.
 ## engine/FE5g_RESULTS.md: CAUSE (file:line), the change with file:line, line count vs 74582f3, both red tests' printed numbers,
 PASTED exit codes of the red tests and all at-risk tests, git diff --numstat. Then stop. (Supervisor verifies from committed code,
-runs mutations (root fix reverted; safety net disabled), the full suites, and the CF chain judge (chain8).)
+runs mutations (root fix reverted; safety net disabled; root fix FORCED to pass Z with no CL check - must fail on zmap
+gouges or clcheck by a measured value), checks the zmap gouge gate stays 0 on the red scene and the TB E2E, the full suites,
+and the CF chain judge (chain8).) Add your own gouge check to test 1's scene in a NEW test if you need one.
