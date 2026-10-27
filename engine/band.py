@@ -45,6 +45,8 @@ FW_FRAC = 0.9
 # (one 1.06 mm ring window at ae_eff 11.91 >= 11.42 slipped through on Core
 # Front, Z 42.926); the judge's own threshold stays 0.9 x D
 FW_TRIGGER = 0.85
+OVL_BAND_MM = 1.0       # BS1d: probe tool_r + leave + this on the channel side
+OVL_STAND_MM = 2.032    # BS1d: stock top above z there = standing stock
 AE_SS = 1.85            # steady target per 1 mm window
 AE_SPIKE = 2.25         # spike target per 1 mm window
 SPIKE_MM = 2.44         # judge overload bar (zmap OVERLOAD_WIDTH_MM)
@@ -147,6 +149,27 @@ def _centreline(pts, isl_ok3, tool_r, leave):
         out.append((pts[i][0] + sgn * nx * off, pts[i][1] + sgn * ny * off,
                    tx, ty, hw))
     return out
+
+
+def _stands(stock, p, c, z, dist):
+    """BS1d: stock stands beside the ring at ring point p - on the island
+    side (direction c -> p, away from the sliver centre c) the live top at
+    dist exceeds z + OVL_STAND_MM, while the channel side (where the CL room
+    is) holds no such stock: an overloaded stretch chewing a standing strip
+    beside the wall, over a channel this level's a2d already cleared."""
+    dx, dy = c[0] - p[0], c[1] - p[1]
+    L = math.hypot(dx, dy)
+    if L < 0.5:
+        return False
+    t = dist / L
+
+    def top(s):
+        i, j = stock._ci(p[0] + dx * t * s), stock._cj(p[1] + dy * t * s)
+        if not (0 <= i < stock.nx and 0 <= j < stock.ny):
+            return None                       # off grid: no evidence
+        return stock.top[j, i] > z + OVL_STAND_MM
+    wall, chan = top(-1.0), top(1.0)
+    return bool(wall) and chan is not None and not bool(chan)
 
 
 def _advance(r, tool_r):
@@ -414,6 +437,7 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
             for a, b in zip(dense[:-1], dense[1:]):
                 arc.append(arc[-1] + math.dist(a[:2], b[:2]))
             mark = [False] * len(dense)
+            ovl = [False] * len(dense)     # BS1d overload candidates
             w = 0
             for i, s in enumerate(arc):
                 while w < len(wb) and wb[w] < s:
@@ -421,12 +445,13 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                 if w >= len(wins):
                     break                       # trailing < 1 mm: judge drops it
                 if wins[w] < fw_min:
+                    ovl[i] = wins[w] > SPIKE_MM   # BS1d: over 2.44, not full FW
                     continue
                 lo = max(0, i - FW_LEAD_PTS)
                 hi = min(len(dense), i + FW_LEAD_PTS + 1)
                 for k in range(lo, hi):
                     mark[k] = True
-            if not any(mark):
+            if not (any(mark) or any(ovl)):
                 continue
             cl = _centreline(dense, isl_ok3, tool_r, leave)
             prev_bad = None
@@ -437,6 +462,13 @@ def channel_regions(rings, stock, isl_ok3, z, tool_r, leave, cell,
                         blocked.append((round(dense[i][0], 2),
                                       round(dense[i][1], 2)))
                 prev_bad = (dense[i][:2] if mark[i] and s is None else None)
+            for i, s in enumerate(cl):      # BS1d: overloaded stretch beside
+                if ovl[i] and s is not None and _stands(
+                        stock, dense[i], s, z, tool_r + leave + OVL_BAND_MM):
+                    lo = max(0, i - FW_LEAD_PTS)      # standing stock -> same
+                    hi = min(len(dense), i + FW_LEAD_PTS + 1)
+                    for k in range(lo, hi):
+                        mark[k] = True        # trochoid planning as full FW
             segs = []
             cur = []
             for i, s in enumerate(cl):

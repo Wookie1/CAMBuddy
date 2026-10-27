@@ -949,9 +949,8 @@ def _nn_order(phase, cand, pos):
     return out, pos
 
 
-def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
-             keep_tool_down, helix_dia):
-    """One level's Adaptive2d run; returns plain picklable region dicts."""
+def _a2d_new(tool_r, leave, stepover, tolerance, keep_tool_down, helix_dia):
+    """A freshly configured Adaptive2d (BS1d: every Execute gets its own)."""
     a2d = area.Adaptive2d()
     a2d.stepOverFactor = stepover
     a2d.toolDiameter = 2 * tool_r
@@ -965,9 +964,39 @@ def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
     a2d.forceInsideOut = False
     a2d.finishingProfile = False
     a2d.opType = area.AdaptiveOperationType.ClearingInside
+    return a2d
+
+
+def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
+             keep_tool_down, helix_dia, z, stats):
+    """One level's Adaptive2d run; returns plain picklable region dicts.
+    BS1d: every StartPointNotFound of the primary call is counted into
+    stats["a2d_spnf"]; an outer that yields no region when run ALONE at the
+    primary helix (fresh instance) is fully dropped and listed in
+    stats["a2d_dropped_outers"]. The returned regions are exactly as before;
+    levels without SPNF make no extra Execute."""
+    a2d = _a2d_new(tool_r, leave, stepover, tolerance, keep_tool_down,
+                   helix_dia)
     results = a2d.Execute(list(outers), list(outers) + holes + islands, [],
                           lambda tp: False)
+    n_spnf = sum(1 for res in results
+                 if getattr(res, "StartPointNotFound", False))
+    stats["a2d_spnf"] += n_spnf
     CT = area.AdaptiveMotionType.Cutting
+    if n_spnf:
+        for o in outers:
+            alone = _a2d_new(tool_r, leave, stepover, tolerance,
+                             keep_tool_down, helix_dia).Execute(
+                [o], [o] + holes + islands, [], lambda tp: False)
+            if any(not getattr(r, "StartPointNotFound", False)
+                   and r.AdaptivePaths and any(pth[0] == CT and pth[1]
+                                               for pth in r.AdaptivePaths)
+                   for r in alone):
+                continue
+            stats["a2d_dropped_outers"].append(
+                {"z": round(z, 3),
+                 "polygon": [[round(float(x), 4), round(float(y), 4)]
+                             for (x, y) in o]})
     LC = area.AdaptiveMotionType.LinkClear
     regions = []
     for res in results:
@@ -1157,6 +1186,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
              "n_side_entries": 0, "side_entry_feed_mm": 0.0,
              "credit_fallback": [],  # BS1a4c: every credit fallback at emit
              "b2_rej": 0, "b2_exhausted": 0,  # FI1: helix-entry B2 refusals
+             "a2d_spnf": 0, "a2d_dropped_outers": [],  # BS1d: counted drops
              "mandatory_levels": sorted(round(z, 3) for z in mand)}
     helix_n = [0]   # BS1a4c: successful entry helices emitted (f3f2165)
     # RP0 diagnosis (engine/TASK_RP0.md): env-gated instrumentation only, no
@@ -2128,7 +2158,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             continue
         t0 = time.time()
         regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
-                           tolerance, keep_tool_down, helix_dia)
+                           tolerance, keep_tool_down, helix_dia, z, stats)
         n_a2d = len(regions)  # HR1: everything from here on is hug rings
         if _RP:
             rp["a2d_cut_len_mm"] = round(sum(
