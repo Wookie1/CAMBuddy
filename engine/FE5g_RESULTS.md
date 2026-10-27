@@ -149,3 +149,10 @@ git diff --numstat 74582f3 -- engine/finish.py engine/entry_depth.py
 (entry_depth.py: no changes)
 git status: M engine/finish.py, M engine/test_finish.py (new FE5g tests),
 ?? engine/FE5g_RESULTS.md, ?? scratch/. NOT committed, per brief.
+
+## Reviewed deviation (coordinator, 2026-10-27)
+The coordinator's rule kept an inserted constant-Z vertex at pass Z only when its drop-cutter CL is <= pass Z + 0.01, else
+split. FE5g uses 0.5 (ZB_FLOOR_BALL) instead: at 0.01 the densify split fired on 0.011-0.101 mm violations in the FE5f bore
+scene and broke test_fe5f_skip_bore_entries (23 skips vs 16, cluster off the bore axis). ACCEPTED: no vertex is ever set below
+its CL (max(pass line, ceil CL)), so no gouge; a lift <= 0.5 followed by its drop is at most the 0.5 ZB axial floor, and the
+in-pass safety net (_fe5g_inpass) catches anything deeper.
