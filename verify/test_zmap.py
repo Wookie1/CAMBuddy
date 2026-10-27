@@ -2529,12 +2529,13 @@ G1 Z0.2 F100.
 
 def test_axial_real_core_front_rough_fails():
     """Task ZA/ZA2 real case: zmap on out/core_front_roughRT_before.ngc (the
-    current Core Front T13 flat rough, D=12.686) FAILS with 489 axial
+    current Core Front T13 flat rough, D=12.686) FAILS with 492 axial
     plunges (worst 25.654 mm at XY -2.593, -52.230, first line 63675).
     The measured removed-depth distribution is bimodal: 14 stepdown
     re-entries of 1.12-1.62 mm and 475 solid-stock plunges of 10.16-25.65
     mm; both are axial removal under the flat bottom and both exceed
-    AXIAL_FLOOR=0.2, so the 1.1-1.6 mm re-entries count too (489 total;
+    AXIAL_FLOOR=0.2, so the 1.1-1.6 mm re-entries count too (489 on the lost
+    original, 492 on the 2026-10-27 regeneration from 5326ad5;
     see zmap.py)."""
     import json
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2549,7 +2550,7 @@ def test_axial_real_core_front_rough_fails():
         assert rc == 1, "flat rough plunging into solid stock must FAIL"
         rep = json.load(open(out))
         ap = rep["axial_plunges"]
-        assert ap["count"] == 489, "exact axial plunge count: %r" % (ap,)
+        assert ap["count"] == 492, "exact axial plunge count: %r" % (ap,)
         assert abs(ap["max_depth_mm"] - 25.654) < 1e-3, ap
         assert ap["first_line"] == 63675, ap
     finally:

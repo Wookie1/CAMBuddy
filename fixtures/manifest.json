@@ -43,7 +43,7 @@
   },
   {
    "path": "out/core_front_roughRT_before.ngc",
-   "sha256": "e1096fe5c55249466c3300daaf4fe9fd47942c70e3906e8bbed7e8e5dfea53f4",
+   "sha256": "905fb737c26c4950d25b29bd5ca66818758cfcbe93d5eaadda8a53b58c49b2a9", "note": "original e1096fe5c55249466c3300daaf4fe9fd47942c70e3906e8bbed7e8e5dfea53f4 lost in the 2026-10-26 18:40 deletion; regenerated 2026-10-27 from 5326ad5 by the regenerate recipe: max_depth 25.654, first_line 63675 and worst XY identical, axial plunges 489 -> 492 (a2d timing)",
    "regenerate": "frozen pre-RT rough (main 5326ad5): engine.cli rough --step samples/core_front_setup.step --stock -128.651 128.651 -82.55 82.55 0.0 60.96 --tool flat:12.686:0.0 --floor 24.765 --leave 0.381 --stepdown 19.05 --optimal-load-mm 2.032 --stepup 1.905 --hf out/core_front_setup_hf.npy --min-rest 0.5 at commit 5326ad5 (engine/RT_BEFORE.md)."
   },
   {
