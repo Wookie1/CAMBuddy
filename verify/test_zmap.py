@@ -2626,6 +2626,42 @@ def test_ze2f_fw_split_by_feed_and_helix_bottom_exception():
     assert zmap._ae2_engagement_keys(clean, 12.686)["roughing_target_ae2"]["met"]
 
 
+def test_ze2l_floor_circle_judged_by_load():
+    """ZE2L (James 2026-10-27, judge by load): a helix-bottom window (pitch
+    carried) leaves overload_feeds_ae2_load only with a <= pitch + 0.05 AND
+    load = ae_eff x a x feed / (2.032 x 19.05 x cutting feed) <= 1.2; the raw
+    overload_feeds_ae2 count is unchanged; every other window keeps the ae2
+    rule. Same windows drive the full-width entry-feed class."""
+    def w(feed, a, pitch, length=1.0, ae=12.6):
+        return {"line": 1, "x": 0.0, "y": 0.0, "z": 0.0, "ae_eff": ae, "a": a,
+                "width_mm": 12.686, "length_mm": length, "feed": feed,
+                "helix_pitch": pitch}
+    bulk = w(3429.0, 0.0, None, length=50.0, ae=1.0)   # sets the cutting feed
+    ok = w(1270.0, 1.04, 1.0)          # floor turn: within pitch, load ~0.125
+    heavy = w(3000.0, 10.0, 10.0)      # within its pitch but load ~2.85
+    deep = w(1270.0, 1.2, 1.0)         # deeper than pitch + 0.05, load ~0.14
+    slot = w(3429.0, 7.0, None)        # non-entry full-width at cutting feed
+    k = zmap._ae2_engagement_keys([bulk, ok, heavy, deep, slot], 12.686,
+                                  load_rule=True)
+    assert abs(ok["load"] - 0.1250) < 0.002 and heavy["load"] > 2.8, \
+        (ok["load"], heavy["load"])
+    assert k["overload_feeds_ae2"]["count"] == 4          # raw rule unchanged
+    L = k["overload_feeds_ae2_load"]
+    assert L["raw_count"] == 4 and L["floor_circles_allowed"] == 1 \
+        and L["count"] == 3, L
+    ent = k["full_width_slots_ae2_entry_feed"]
+    assert ent["allowed_helix_bottom"] == 1 and ent["not_allowed"]["count"] == 2
+    assert k["full_width_slots_ae2_cutting_feed"]["count"] == 1   # slot fails
+    # the design stepdown is honoured: at 1 mm the same floor turn is 19x the
+    # load (~2.38 > 1.2) and stops being allowed
+    k1 = zmap._ae2_engagement_keys([bulk, ok], 12.686, design_stepdown=1.0,
+                                   load_rule=True)
+    assert k1["overload_feeds_ae2_load"]["floor_circles_allowed"] == 0
+    # opt-in: without --load-rule the report has no new key (JSON unchanged)
+    assert "overload_feeds_ae2_load" not in zmap._ae2_engagement_keys(
+        [bulk, ok], 12.686)
+
+
 def test_ze2f2_pitch_carries_along_the_helix_bottom_run():
     """ZE2F2: after a helix, every window of the contiguous run at its bottom
     Z and entry feed (a floor circle) carries the helix pitch; the first move

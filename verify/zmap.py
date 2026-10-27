@@ -69,6 +69,16 @@ AE2_PITCH_TOL = 0.05
 # Task ZE2F2: the helix pitch carries along the contiguous entry-feed run at
 # the helix-bottom Z for at most one circumference of the helix path plus this
 AE2_CARRY_EXTRA_MM = 1.0
+# Task ZE2L (James 2026-10-27, "judge by load"): load of an ae2 window =
+# ae_eff x a x feed / (design ae x design stepdown x cutting feed). A helix-bottom
+# window (ZE2F2 carry) is allowed only when a <= pitch + AE2_PITCH_TOL AND load
+# <= AE2_FLOOR_LOAD_MAX; overload_feeds_ae2_load drops allowed ones (the raw
+# overload_feeds_ae2 stays as it was; the new key only with --load-rule). --design-ae /
+# --design-stepdown set the design cut.
+AE2_FLOOR_LOAD_MAX = 1.2
+DESIGN_AE = 2.032
+DESIGN_STEPDOWN = 19.05
+LOAD_RULE = False   # --load-rule: emit overload_feeds_ae2_load (opt-in, keeps default JSON)
 # Task ZE2D (report-only): full_width_depth of an ae2 window = the largest h for
 # which (plan area of cells removed at least h deep) / travel >= 0.9 x dia.
 # Separates a genuinely deep full-width slot from a wide shallow cut joined to
@@ -1079,7 +1089,8 @@ def _helix_pitch(run):
     return round(dz / (arc / (2.0 * math.pi * r)), 4)
 
 
-def _ae2_engagement_keys(win_recs, dia):
+def _ae2_engagement_keys(win_recs, dia, design_ae=None, design_stepdown=None,
+                         load_rule=None):
     """Task ZE2 (report-only): engagement keys from the ae2 windows. Old keys
     stay untouched.
     - ae2: {n, p50, p95, p99, max} over ae_eff of every window.
@@ -1106,9 +1117,16 @@ def _ae2_engagement_keys(win_recs, dia):
         return (cut_feed is not None and w.get("feed") is not None
                 and w["feed"] < AE2_ENTRY_FEED_FRAC * cut_feed)
 
+    ref = ((design_ae or DESIGN_AE) * (design_stepdown or DESIGN_STEPDOWN)
+           * (cut_feed or 1.0))
+    for w in win_recs:   # task ZE2L: additive per-window key
+        w["load"] = round(w["ae_eff"] * w["a"] * (w.get("feed") or cut_feed
+                                                  or 0.0) / ref, 4)
+
     def allowed(w):
         hp = w.get("helix_pitch")
-        return hp is not None and w["a"] <= hp + AE2_PITCH_TOL
+        return (hp is not None and w["a"] <= hp + AE2_PITCH_TOL
+                and w["load"] <= AE2_FLOOR_LOAD_MAX)
 
     # task ZE2D: full_width_depth per window (then drop the histograms)
     for w in win_recs:
@@ -1177,6 +1195,17 @@ def _ae2_engagement_keys(win_recs, dia):
             "total_length_mm": round(sum(w["length_mm"] for w in ovl), 1),
             "worst": [brief(w) for w in ovl[:10]],
         },
+        # task ZE2L: the same windows minus allowed helix-bottom floor turns
+        **({"overload_feeds_ae2_load": {
+            "ae_eff_above_mm": round(OVERLOAD_WIDTH_MM, 4),
+            "load_max": AE2_FLOOR_LOAD_MAX, "raw_count": len(ovl),
+            "floor_circles_allowed": sum(1 for w in ovl if allowed(w)),
+            "count": sum(1 for w in ovl if not allowed(w)),
+            "total_length_mm": round(sum(w["length_mm"] for w in ovl
+                                         if not allowed(w)), 1),
+            "worst": [dict(brief(w), load=w["load"])
+                      for w in ovl if not allowed(w)][:10],
+        }} if (LOAD_RULE if load_rule is None else load_rule) else {}),
     }
 
 
@@ -2353,6 +2382,7 @@ def _sanitize(obj):
 
 
 def main(argv=None):
+    global DESIGN_AE, DESIGN_STEPDOWN, LOAD_RULE   # task ZE2L: read by _ae2_engagement_keys
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("gcode", help="input G-code file")
     p.add_argument("--part", required=True, help="part heightfield .npy "
@@ -2440,6 +2470,18 @@ def main(argv=None):
                    help="report engagement stats (max/percentiles) without a "
                         "threshold: nothing is flagged (report-only). "
                         "Default off")
+    p.add_argument("--load-rule", dest="load_rule", action="store_true",
+                   help="task ZE2L: also report overload_feeds_ae2_load "
+                        "(helix-bottom floor turns allowed by load <= 1.2 and "
+                        "a <= pitch + 0.05); off keeps the JSON unchanged")
+    p.add_argument("--design-ae", dest="design_ae", type=float,
+                   default=DESIGN_AE,
+                   help="task ZE2L: design radial engagement mm for the "
+                        "window load ratio (default 2.032)")
+    p.add_argument("--design-stepdown", dest="design_stepdown", type=float,
+                   default=DESIGN_STEPDOWN,
+                   help="task ZE2L: design stepdown mm for the window load "
+                        "ratio (default 19.05)")
     p.add_argument("--ae2-dump", dest="ae2_dump", default=None,
                    help="task ZE2 (report-only extra): write the raw ae2 "
                         "window records (res[_ae2_raw]) to this JSON path in "
@@ -2473,6 +2515,8 @@ def main(argv=None):
     # Derive engage_max from optimal_load when not explicitly given
     # (roughing: warn above 1.2 x optimal load; finishing passes an explicit
     # --engage-max of 1.5 x stepover)
+    DESIGN_AE, DESIGN_STEPDOWN = args.design_ae, args.design_stepdown
+    LOAD_RULE = args.load_rule
     engage_max = args.engage_max
     if engage_max is None and args.optimal_load is not None:
         engage_max = 1.2 * args.optimal_load
