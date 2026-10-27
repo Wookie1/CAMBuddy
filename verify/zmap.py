@@ -19,9 +19,10 @@ REMOVE_EPS = 1e-9  # mm^3 of removal below which a sample counts as air
 RAPID_FEED = 15000.0  # mm/min assumed for G0 when estimating cycle time
 HOLDER_CLEAR = 1.0  # mm, S5: min clearance of the holder stack to material
 # Task ZA: an AXIAL PLUNGE is a descending feed move (G1) steeper than
-# MAX_RAMP_DEG whose flat tool bottom (radius R, bull: R - corner) removes
-# stock deeper than AXIAL_FLOOR under its end-point disk (deepest removed
-# column, read before the move cuts). Flat/bull: failing gate; ball: report.
+# MAX_RAMP_DEG whose tool removes stock deeper than its floor under its
+# end-point disk (deepest removed column, read before the move cuts).
+# Flat/bull: floor AXIAL_FLOOR; ball (task ZB): floor BALL_AXIAL_FLOOR.
+# Every tool type: failing gate at its own floor.
 # MAX_RAMP_DEG = 15 = the engine's maximum ramp/helix angle: helixes and ramps
 # at or below it are legitimate entries; anything steeper into stock - a true
 # vertical (90 deg) or a disguised steep diagonal - is a plunge.
@@ -34,6 +35,17 @@ HOLDER_CLEAR = 1.0  # mm, S5: min clearance of the holder stack to material
 # Constants: never raise either later; fix the measurement instead.
 MAX_RAMP_DEG = 15.0
 AXIAL_FLOOR = 0.2  # mm: noise floor, constant, never raise it later
+# Task ZB: BALL_AXIAL_FLOOR = 0.5 mm - a FIXED constant for ball tools, NOT
+# tied to any per-program finish-leave parameter: James's 0.381 mm finish
+# leave plus measurement noise. A ball axial plunge (same rule: descending
+# feed steeper than MAX_RAMP_DEG, angle from arc length for helical arcs)
+# that removes stock deeper than this under the ball FAILS exactly like a
+# flat/bull plunge (CLI exit 1 + connector gate). Ball contact disk at the
+# end point = the tool's full radius R around the end XY; removed depth is
+# the deepest column stock - (z_end + dz(d)) over that disk against the
+# spherical surface (see simulate). Never raise this floor later; fix the
+# measurement or the toolpath instead.
+BALL_AXIAL_FLOOR = 0.5  # mm: fixed ball floor, constant, never raise it
 # Task ZE (report-only): axial depth classification of engaging horizontal
 # feed moves. Axial depth = deepest column of stock removed above the tool
 # tip under the footprint during the move (max over removed cells of
@@ -1298,18 +1310,21 @@ def _ze2b_keys(wins, dia, engage_max):
     }
 
 
-def _axial_report(raw):
-    """Task ZA: summarize axial plunges (descents steeper than MAX_RAMP_DEG) that removed
-    more than AXIAL_FLOOR mm under the tool's flat bottom:
-    {count, max_depth_mm, first_line, worst_xy, floor_mm}."""
-    ax = [e for e in raw if e["depth_mm"] > AXIAL_FLOOR]
+def _axial_report(raw, tool="flat"):
+    """Task ZA/ZB: summarize axial plunges (descents steeper than
+    MAX_RAMP_DEG) that removed more than the tool's floor under its bottom
+    (flat/bull: AXIAL_FLOOR; ball: BALL_AXIAL_FLOOR):
+    {count, max_depth_mm, first_line, worst_xy, floor_mm} - floor_mm is per
+    tool type."""
+    floor = BALL_AXIAL_FLOOR if tool == "ball" else AXIAL_FLOOR
+    ax = [e for e in raw if e["depth_mm"] > floor]
     if not ax:
         return {"count": 0, "max_depth_mm": 0.0, "first_line": None,
-                "worst_xy": None, "floor_mm": AXIAL_FLOOR}
+                "worst_xy": None, "floor_mm": floor}
     worst = max(ax, key=lambda e: e["depth_mm"])
     return {"count": len(ax), "max_depth_mm": worst["depth_mm"],
             "first_line": min(e["line"] for e in ax),
-            "worst_xy": [worst["x"], worst["y"]], "floor_mm": AXIAL_FLOOR}
+            "worst_xy": [worst["x"], worst["y"]], "floor_mm": floor}
 
 
 def _box_max_np(A, k):
@@ -1413,9 +1428,11 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     # one scratch buffer per sample (same ops, same order, same dtype) so the
     # per-sample closure allocates nothing.
     ball_surf = tool == "ball"
-    # task ZA: bottom disk radius for the axial plunge check -- the flat part
-    # of the tool's bottom: R for flat, R - corner for bull; a ball has no
-    # flat bottom, so its full disk is judged against the spherical surface
+    # task ZA/ZB: bottom disk radius for the axial plunge check -- the flat
+    # part of the tool's bottom: R for flat, R - corner for bull; a ball has
+    # no flat bottom: its contact disk at the end point is the tool's FULL
+    # radius R around the end XY, and the removed depth there is measured
+    # against the spherical surface z1 + dz(d) (deepest removed column)
     bottom_r = R - corner if tool == "bull" else R
     engage_track = engage_max is not None or engage_report
     k = int(math.ceil(R / cell)) + 1  # +1 so the padded engagement mask fits
@@ -1518,9 +1535,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     # plunge tracking
     plunge_flags = []  # list of dicts: {line, x, y, z, angle_deg, depth_mm}
     plunge_count = 0
-    # axial plunge tracking (task ZA): every straight vertical feed descent
-    # that removed >0 stock under the bottom disk, with its deepest removed
-    # column (raw; the report filters by AXIAL_FLOOR)
+    # axial plunge tracking (task ZA/ZB): every descending feed move steeper
+    # than MAX_RAMP_DEG that removed >0 stock under the tool's bottom disk
+    # (flat/bull: flat bottom, ball: full disk vs sphere), with its deepest
+    # removed column (raw; the report filters by the tool's floor)
     axial_raw = []  # list of dicts: {line, x, y, depth_mm}
     # footprint-outside-grid tracking (cells outside the grid are unjudged)
     outside_grid = 0
@@ -2043,9 +2061,10 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         "_zb_raw": zb_windows,
         # raw per-bucket values for exact parallel merging (not reported)
         "_engage_raw": {"horizontal": engage_horiz, "entry": engage_entry},
-        # task ZA: report-only for every tool; a FAILING gate for flat/bull
-        # (CLI exit code + connector _check_zmap_gates)
-        "axial_plunges": _axial_report(axial_raw),
+        # task ZA/ZB: failing gate for EVERY tool type at its own floor
+        # (flat/bull: AXIAL_FLOOR, ball: BALL_AXIAL_FLOOR) - CLI exit code +
+        # connector _check_zmap_gates; floor_mm in the report is per tool
+        "axial_plunges": _axial_report(axial_raw, tool),
         "_axial_raw": axial_raw,
         "plunge": {
             "ramp_angle_deg": ramp_angle,
@@ -2220,7 +2239,7 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                            key=lambda f: f["depth_mm"], reverse=True)[:10],
         },
         "axial_plunges": _axial_report(
-            [e for r in results for e in r["_axial_raw"]]),
+            [e for r in results for e in r["_axial_raw"]], tool),
         "_axial_raw": [e for r in results for e in r["_axial_raw"]],
         "below_stock_bottom": _bsb_report(
             [e for r in results for e in r["_bsb_raw"]]),
@@ -2704,12 +2723,15 @@ def main(argv=None):
                  bs["worst_xy"], bs["first_line"]), file=sys.stderr)
         return 1
     ap = res["axial_plunges"]
-    if args.tool != "ball" and ap["count"] > 0:
+    if ap["count"] > 0:
+        # task ZA/ZB: axial plunges FAIL for EVERY tool type at its own
+        # floor (flat/bull: AXIAL_FLOOR, ball: BALL_AXIAL_FLOOR)
         wx = ap["worst_xy"] or [float("nan"), float("nan")]
-        print("error: %d axial plunge(s): straight feed descents driving the "
-              "%s bottom deeper than %.3f mm into stock under the flat bottom "
-              "(max %.3f mm at XY %.3f, %.3f, first line %s)" % (
-                  ap["count"], args.tool, AXIAL_FLOOR,
+        print("error: %d axial plunge(s): descending feed steeper than %.0f "
+              "deg driving the %s tool deeper than its %.3f mm floor into "
+              "stock under its bottom (max %.3f mm at XY %.3f, %.3f, first "
+              "line %s)" % (
+                  ap["count"], MAX_RAMP_DEG, args.tool, ap["floor_mm"],
                   ap["max_depth_mm"], wx[0], wx[1],
                   ap["first_line"]), file=sys.stderr)
         return 1
