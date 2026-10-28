@@ -114,6 +114,17 @@ def test_rrstock2_restrough_handoff_not_below_judge():
         assert n_v == 0, (
             "engine rest-rough handoff is BELOW the judge replay at %d "
             "standing cells (max %.3f mm)" % (n_v, worst))
+        # two-sided (coordinator): a handoff that wrote its INPUT stock back
+        # unchanged passes the one-sided check; it must also not stand
+        # above what the program really left anywhere
+        fin = np.isfinite(judge) & np.isfinite(E)
+        over = float(np.max(np.where(fin, E - judge, -np.inf)))
+        under = float(np.max(np.where(fin, judge - E, -np.inf)))
+        print("rrstock2(a) two-sided: max over %.3f mm, max under %.3f mm "
+              "(TOL %.2f)" % (over, under, RR_TOL))
+        assert over <= RR_TOL, (
+            "engine rest-rough handoff stands ABOVE the judge replay by "
+            "%.3f mm - the handoff must be the program's own replay" % over)
 
 
 def test_rrstock2_skip_clusters_have_reason():

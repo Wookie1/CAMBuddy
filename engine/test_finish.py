@@ -2630,6 +2630,23 @@ def test_rrstock_rough_handoff_not_below_judge():
             "engine handoff is BELOW the judge replay at %d standing cells "
             "(max %.3f mm) - the handoff must replay the emitted program"
             % (n_v, worst))
+        # two-sided (coordinator): also never above what the program left.
+        # Compared CELL FOR CELL (centre read): the conservative overlap-max
+        # above can pick up an uncut neighbour beside a wall and read up to a
+        # full wall height over (measured 13.3 mm), which says nothing about
+        # the replay; centre to centre the replay must match both ways.
+        Ef = np.where(np.isfinite(E), E, -np.inf)
+        ic = np.clip(np.floor((Xc - ex0) / ec).astype(np.int64), 0, Ef.shape[1] - 1)
+        jc_ = np.clip(np.floor((Yc - ey0) / ec).astype(np.int64), 0, Ef.shape[0] - 1)
+        eng_c = Ef[jc_, ic]
+        fin = np.isfinite(judge) & np.isfinite(eng_c)
+        over = float(np.max(np.where(fin, eng_c - judge, -np.inf)))
+        under = float(np.max(np.where(fin, judge - eng_c, -np.inf)))
+        print("rrstock(a) two-sided: max over %.3f mm, max under %.3f mm "
+              "(TOL %.2f)" % (over, under, RR_TOL))
+        assert over <= RR_TOL and under <= RR_TOL, (
+            "engine handoff differs from the judge replay cell for cell: "
+            "over %.3f, under %.3f mm" % (over, under))
 
 
 def test_rrstock_finish_handoff_matches_judge():
@@ -2693,6 +2710,17 @@ def test_rrstock_finish_handoff_matches_judge():
         assert n_b == 0, (
             "engine after-finish replay differs from the judge by > %.2f "
             "mm at %d standing cells (max %.4f)" % (RR_TOL, n_b, worst))
+        # every cell (coordinator): an unchanged input stock would read far
+        # above the judge exactly where the program cut to the part, which
+        # the standing-only check above excludes
+        fin = np.isfinite(judge) & np.isfinite(E)
+        over = float(np.max(np.where(fin, E - judge, -np.inf)))
+        under = float(np.max(np.where(fin, judge - E, -np.inf)))
+        print("rrstock(b) every cell: max over %.4f mm, max under %.4f mm"
+              % (over, under))
+        assert over <= RR_TOL and under <= RR_TOL, (
+            "engine after-finish replay differs from the judge: over %.4f, "
+            "under %.4f mm" % (over, under))
 
 
 def test_rrstock_replay_matches_analytic_stamp():
