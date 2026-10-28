@@ -166,6 +166,16 @@ ROUGHING_ACTION = {
             **_STOCK_INPUTS,
             **{k: v for k, v in _ROUGHING_INPUTS.items()},
             **_CUTTING_INPUTS,
+            # FL-LOAD: optional rough feed limiter (default OFF); only the
+            # roughing action offers it (the slope-split action is at its
+            # 30-input cap and its rough pass runs without the flag)
+            "load_limit": {"type": "boolean", "default": False,
+                           "title": "Rough load limiter",
+                           "description": "slow the roughing feed only where "
+                                          "the rough tool is overloaded "
+                                          "(window load ae*a*F above 1.2x "
+                                          "the design chip); the path is "
+                                          "unchanged (off by default)"},
             "tool_number": {"type": "integer", "minimum": 1,
                             "maximum": 999,
                             "description": "machine tool number; if blank, "

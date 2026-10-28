@@ -538,6 +538,8 @@ class EngineRun:
         argv_r += _origin_flags(values)
         if metric:
             argv_r += ["--metric"]
+        if values.get("load_limit"):
+            argv_r += ["--load-limit"]
         self._spawn(argv_r, 0.2, 0.85, on_progress)
         posted = {"rough.nc": posted_units(nc, values["units"])}
         with open(stats_path) as fh:
@@ -1040,6 +1042,8 @@ class EngineRun:
         argv += _origin_flags(values)
         if metric:
             argv += ["--metric"]
+        if values.get("load_limit"):
+            argv += ["--load-limit"]
         self._spawn(argv, *P["rough"], on_progress)
         posted["rough.nc"] = posted_units(nc, values["units"])
 
