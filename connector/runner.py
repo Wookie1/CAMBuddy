@@ -359,6 +359,15 @@ class EngineRun:
         return self.tools_path or toollib.repo_table_path(
             self.cfg["repo_root"])
 
+    def _load_limit_args(self, values):
+        """FL-LOAD: the explicit load_limit input wins, else the document's
+        job.setup load_limit, else ON."""
+        on = values.get("load_limit")
+        if on is None:
+            on = toollib.setup_load_limit(self.cfg.get("home"),
+                                          values.get("document_id"))
+        return ["--no-load-limit"] if on is False else ["--load-limit"]
+
     def _tools_json_args(self):
         return ["--tools-json", self.tools_path] if self.tools_path else []
 
@@ -538,6 +547,7 @@ class EngineRun:
         argv_r += _origin_flags(values)
         if metric:
             argv_r += ["--metric"]
+        argv_r += self._load_limit_args(values)
         self._spawn(argv_r, 0.2, 0.85, on_progress)
         posted = {"rough.nc": posted_units(nc, values["units"])}
         with open(stats_path) as fh:
@@ -1040,6 +1050,7 @@ class EngineRun:
         argv += _origin_flags(values)
         if metric:
             argv += ["--metric"]
+        argv += self._load_limit_args(values)
         self._spawn(argv, *P["rough"], on_progress)
         posted["rough.nc"] = posted_units(nc, values["units"])
 

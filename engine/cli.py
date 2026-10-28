@@ -449,6 +449,14 @@ def main(argv=None):
                    help="write the engine's final stock heightfield to this "
                         ".npy (+ x0/y0/cell .json sidecar) for finish "
                         "--stock-from rapid verification (S3b)")
+    r.add_argument("--load-limit", dest="load_limit", default=True,
+                   action=argparse.BooleanOptionalAction,
+                   help="FL-LOAD: replay the emitted moves into the engine's "
+                        "own 0.1 mm stock and slow the feed (never raise it, "
+                        "floor 25%% of --cut-feed) on ZE2 windows whose load "
+                        "ae*a*F/(2.032*19.05*Fcut) exceeds 1.2; the XYZ path "
+                        "is unchanged (default on; --no-load-limit turns "
+                        "it off)")
     r.add_argument("--post", choices=("neutral", "lnc"), default="neutral",
                    help="writer: neutral G21 (default) or SyilCNC LNCv2")
     r.add_argument("--program", type=int, default=1001,
@@ -759,6 +767,16 @@ def main(argv=None):
                                   keep_tool_down=a.keep_tool_down,
                                    progress=prog, stock_out=a.stock_out,
                                     ramp_angle_deg=a.ramp_angle_deg)
+    if a.load_limit:
+        # FL-LOAD: slow the feed on over-loaded windows ONLY (flag OFF: this
+        # post-pass never runs and the emitted program is untouched)
+        from engine import load_limit
+        moves, lst = load_limit.limit_feeds(moves, dia, corner, a.stock,
+                                            a.stock[5], a.cut_feed)
+        print("load_limit: windows_slowed=%d mm_slowed=%.1f min_feed=%.0f "
+              "floor_bound=%d" % (lst["windows_slowed"], lst["mm_slowed"],
+                                  lst["min_feed"] or 0.0,
+                                  lst["floor_bound"]), flush=True)
     if a.stock_out:
         # RR-STOCK: hand downstream the replay of the EMITTED moves (never
         # lower than what they remove); overwrites rough's coarse file
