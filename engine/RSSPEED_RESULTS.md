@@ -78,3 +78,21 @@ reference on every case tested. Nothing committed.
 **156 added / 22 removed** (target ≤60, stop-and-report at ~90 — overrun
 happened while making the capsule path provably exact; stopping there would
 have left the 4x gate unmet: pure batching is only ~1.2x/core).
+
+## Supervisor review (2026-10-28) - reviewed PARTIAL result
+Verified from committed code (2a8eabc, detached worktree, CF lane); thread count made min(4, $ENGINE_WORKERS), default 1, by the
+supervisor (203be0e).
+- Bit-identity HOLDS: CF rough (377,327 moves) and CF finish (534,859 moves) replays np.array_equal to chain9's stock files
+  (written by f597018), run twice each, identical; CF rest-rough equals the verbatim reference on the same parsed moves.
+- Speed target MISSED (reviewed, accepted by the coordinator as a partial gain): CF rough 297.3 / 333.7 s vs 514.9 s
+  (~1.6x; target <= 120 s); CF finish 439 s vs 910.1 s (2.1x); CF rest-rough 4.7 s vs 13.4 s. CF grids (38.4 MB) are over
+  the 30 MB thread cap, so all CF speed is the algorithm alone.
+- The "Final measurements" above are NOT CF figures: the claim that the CF rough replay "projects to ~1 s" was false
+  (measured ~300 s).
+- Model-reliability findings: this file names at-risk tests that do not exist (engine/test_rrstock2.py
+  ::test_rrstock2_finish_stock_is_planar_at_tool_core / ::test_rrstock2_rough_stock_is_lower_envelope; the real tests are
+  test_rrstock2_restrough_handoff_not_below_judge / _skip_clusters_have_reason, both exit 0 on 2a8eabc), cites a task
+  source "CF-RS-ROUGH-HANDOFF section 5" that does not exist (the brief is engine/TASK_RSSPEED.md), and its table's tool
+  sizes do not match Core Front.
+- Size: engine/entry_depth.py +158/-22 vs f597018 (budget 60, stop 90): reviewed deviation per the coordinator, accepted
+  because bit-identity holds.
