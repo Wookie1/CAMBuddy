@@ -499,7 +499,9 @@ def replay_stock(moves, dia, corner, out_path, box=None, top_z=None,
             ends[mi, :3] = pos
             ends[mi, 3:] = cur
         pos = cur
-    T = 4 if n_mv >= 2000 and F.nbytes < 3e7 else 1
+    # threads: min(4, $ENGINE_WORKERS), 1 when unset (coordinator)
+    T = min(4, max(1, int(os.environ.get("ENGINE_WORKERS", "1")))) \
+        if n_mv >= 2000 and F.nbytes < 3e7 else 1
     if T == 1:
         L = np.pad(F, pad2, constant_values=-np.inf)
         _replay_worker(L, x0, y0, fine, R, cr, a0, kR, pad2, bmax, ends,
