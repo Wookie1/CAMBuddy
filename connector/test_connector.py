@@ -2203,7 +2203,8 @@ class TestCheckProgramE2E:
         assert result["engagement"]["threshold_mm"] is None
         # check.json + preview.png only: NO .nc upload, nothing new in the
         # programs folder (nothing is sent anywhere near the machine)
-        assert mock.file_names(910) == ["check.json", "preview.png"]
+        assert mock.file_names(910) == ["check.json", "preview.png",
+                                          "view.bin", "view.json"]
         assert not list(programs.glob("O4501*"))
 
     def test_stale_program_2_in_reused_run_dir_is_not_judged(self, live):
@@ -2372,7 +2373,8 @@ class TestCheckProgramSequenceE2E:
                    ["mean"]) > 0.01
 
         # no .nc upload, nothing to the programs folder
-        assert mock.file_names(913) == ["check.json", "preview.png"]
+        assert mock.file_names(913) == ["check.json", "preview.png",
+                                          "view.bin", "view.json"]
         assert not list(programs.glob("O4510*"))
         assert not list(programs.glob("O4511*"))
 

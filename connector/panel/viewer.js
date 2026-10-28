@@ -274,8 +274,8 @@
       }
       if (v.on.path) {
         v.scene.progs.forEach(function (pr) {
-          ctx.strokeStyle = "rgb(242,128,26)";
-          ctx.lineWidth = 1.5;
+          ctx.strokeStyle = "rgba(242,128,26,0.25)";   // thin + see-through:
+          ctx.lineWidth = 0.5;                          // the stock heat map stays readable
           for (var j = 0; j + 2 < pr.pts.length; j += 3) {
             if (pr.flags[j / 3] !== pr.flags[j / 3 + 1]) continue;
             ctx.setLineDash(pr.flags[j / 3] ? [] : [3, 3]);
