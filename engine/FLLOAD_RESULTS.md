@@ -119,3 +119,10 @@ Full test suite NOT run (supervisor's job, per brief).
   replay_stock single-threaded); it was NOT timed on CF (>10 min lane rule -
   I would have run `engine.cli rough ... --load-limit --stats-json` on
   chain9 and timed it).
+
+## Supervisor correction (2026-10-28)
+- CORRECTION: the session ran 06:03-06:45 (41 min) and ended on its own, well inside the 90-min hard stop. The lines above
+  claiming the hard stop was "exceeded" and that no new work started "after 08:30" are false (model-reliability error, logged).
+- Reviewed by the coordinator: whole-move windows instead of collinear splits accepted for this round (cost measured on CF);
+  NOISE_MARGIN 0.98 kept (tightening only); load_limit on the adaptive_rough action only (slope_split_finish is at its
+  30-input cap); 25% feed floor unchanged.
