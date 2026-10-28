@@ -196,15 +196,15 @@ def test_library_geometry_mismatch_still_refused(home, tmp_path,
 
 # ------------------------------------------------- one REAL post + zmap --
 
-NEUTRAL = """\
-(BALL NOSE END MILL)
-G21
-G90
-G0 Z12.0
-G1 Z9.0 F1270
-G1 X5.0 Y0.0 F3429
-G0 Z12.0
-"""
+# FE5M (fe5 merge, ZB): the ball enters on a 10-deg helix (radius 1 about
+# X1 Y0, 2 turns, 10.5 -> 9.0) instead of a straight feed plunge into the
+# stock top Z10, and ends where the plunge ended (X0 Y0 Z9.0).
+NEUTRAL = ("(BALL NOSE END MILL)\nG21\nG90\nG0 Z12.0\nG1 Z10.5 F1270\n"
+           + "".join("G1 X%.4f Y%.4f Z%.4f F1270\n" % (
+               1.0 + np.cos(np.pi + 2 * np.pi * i / 36),
+               np.sin(np.pi + 2 * np.pi * i / 36), 10.5 - 1.5 * i / 72)
+               for i in range(1, 73))
+           + "G1 X5.0 Y0.0 F3429\nG0 Z12.0\n")
 
 
 def _lib_only_ball(home):

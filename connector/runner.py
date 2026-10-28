@@ -129,10 +129,11 @@ def _engine_error(rc, stderr):
 
 def _check_zmap_gates(check):
     """Raise EngineError if any zmap gate fails: gouges, rapid collisions,
-    shank/over-flute hits > 0, holder hits > 0 (S5), or - task ZA - axial
-    plunges > 0 for a flat/bull roughing tool (a straight feed descent
-    driving the flat bottom into solid stock). Ball programs: axial plunges
-    are report-only."""
+    shank/over-flute hits > 0, holder hits > 0 (S5), or axial plunges > 0
+    for ANY tool type (task ZA/ZB): a flat/bull descent driving its flat
+    bottom into solid stock fails at AXIAL_FLOOR=0.2; a ball axial plunge
+    (finish/rest programs) fails at its own fixed BALL_AXIAL_FLOOR=0.5 mm
+    floor - zmap applies the floor and reports floor_mm per tool type."""
     gouges = check.get("gouges", {})
     if isinstance(gouges, dict) and gouges.get("count", 0) > 0:
         raise EngineError(
@@ -165,17 +166,22 @@ def _check_zmap_gates(check):
             % (hh["count"], hh.get("max_intrusion", 0.0),
                hh.get("first_line", "?")),
             code="holder_hits", where=_xy_where(hh))
-    # task ZA: axial plunges fail flat/bull roughing programs; for a ball
-    # they stay report-only (count + depths in check.json)
+    # task ZA/ZB: axial plunges fail EVERY tool type at its own floor
+    # (flat/bull: AXIAL_FLOOR=0.2, ball: BALL_AXIAL_FLOOR=0.5 - zmap
+    # applies the floor per tool type and reports floor_mm in check.json)
     ap = check.get("axial_plunges")
     ttype = (check.get("tool") or {}).get("type")
-    if ttype in ("flat", "bull") and isinstance(ap, dict) \
-            and ap.get("count", 0) > 0:
+    if isinstance(ap, dict) and ap.get("count", 0) > 0:
+        floor = ap.get("floor_mm")
+        if floor is None:
+            floor = 0.5 if ttype == "ball" else 0.2
         raise EngineError(
             "zmap gate: %d axial plunges (max %.3f mm, first line %s) - a "
-            "%s program must not drive its flat bottom straight into solid "
-            "stock" % (ap["count"], ap.get("max_depth_mm", 0.0),
-                       ap.get("first_line", "?"), ttype),
+            "%s program must not drive its bottom deeper than the %.3f mm "
+            "axial floor into solid stock" % (ap["count"],
+                                               ap.get("max_depth_mm", 0.0),
+                                               ap.get("first_line", "?"),
+                                               ttype, floor),
             code="axial_plunges", where=_xy_where(ap))
 
 
@@ -1056,6 +1062,11 @@ class EngineRun:
         #    snap stays a no-op on posting)
         fin_neutral = os.path.join(self.work, "finish_neutral.ngc")
         fin_stats = os.path.join(self.work, "finish_stats.json")
+        # RR-STOCK: the engine replays its own emitted finish moves into a
+        # 0.1 mm stock; the rest pass plans on THAT (never on a judge stock)
+        stock_fin_engine = os.path.join(
+            self.work, "stock_after_finish_engine.npy")
+        fr.remove_stale(stock_fin_engine)
         self._spawn([py, "-m", "engine.cli", "finish",
                     "--stl", stl,
                     "--tool", "ball:%.4f" % values["tool_diameter"],
@@ -1066,9 +1077,12 @@ class EngineRun:
                     "--floor", "%.4f" % floor,
                     "--cut-feed", "%.1f" % values["feed"],
                     "--ramp-feed", "%.1f" % values["ramp_feed"],
+                    "--ramp-angle-deg",
+                    "%.2f" % (values.get("ramp_angle_deg") or 2.0),
                     "--spindle", str(int(values["rpm"])),
                     "--post-grid-mm", post_grid,
                     "--stock-from", rough_stock_out,
+                    "--stock-out", stock_fin_engine,
                     *self._tools_json_args(),
                     "--stats-json", fin_stats], 0.50, 0.72, on_progress)
 
@@ -1197,7 +1211,7 @@ class EngineRun:
                         "--stl", stl,
                         "--out", rest_neutral,
                         "--tool", "ball:%.4f" % values["tool_diameter"],
-                        "--rest-from", stock_finish,
+                        "--rest-from", stock_fin_engine,
                         "--rest-tool", "ball:%.4f" % rest["diameter_mm"],
                         "--min-rest", "%.4f" % (values.get("min_rest") or 0.5),
                         "--stock-from", rough_stock_out,
@@ -1208,6 +1222,8 @@ class EngineRun:
                         "--floor", "%.4f" % floor,
                         "--cut-feed", "%.1f" % values["feed"],
                         "--ramp-feed", "%.1f" % values["ramp_feed"],
+                        "--ramp-angle-deg",
+                        "%.2f" % (values.get("ramp_angle_deg") or 2.0),
                         "--spindle", str(int(values["rpm"])),
                         "--post-grid-mm", post_grid,
                         *self._tools_json_args(),
@@ -1324,6 +1340,19 @@ class EngineRun:
             check["warnings"]["engagement"]["rest"] = \
                 check_s.get("engagement")
             check["warnings"]["plunge"]["rest"] = check_s.get("plunge")
+        # FE5f: pass entries with no legal entry (deeper than the ball ZB
+        # floor) were SKIPPED by finish/rest, never plunged - the areas stay
+        # for a hole op or another setup, so James sees them in the summary
+        def _skips(p):
+            try:
+                with open(p) as fh:
+                    return json.load(fh).get("fe5_skipped_clusters", [])
+            except (OSError, ValueError):
+                return []
+        check["left_for_hole_op_or_another_setup"] = {
+            "finish": _skips(fin_stats),
+            "rest": _skips(rest_stats) if rest else [],
+        }
         with open(os.path.join(self.work, "check.json"), "w") as fh:
             json.dump(check, fh, indent=2)
 

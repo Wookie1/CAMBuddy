@@ -85,9 +85,13 @@ def load_heightfield(path):
     return A, float(meta["x0"]), float(meta["y0"]), float(meta["cell"])
 
 
-def resample_fine(A, x0, y0, cell, fine=FINE):
+def resample_fine(A, x0, y0, cell, fine=FINE, margin=0.0):
     """Conservative resample to `fine` mm: each fine cell = max of the
-    source cells overlapping it (nan = no data). Never lower than source."""
+    source cells overlapping it (nan = no data). Never lower than source.
+    FE5h: margin > 0 (coarse sources only) first box-dilates the source by
+    Chebyshev radius ceil(margin/cell) (data-preserving max pool): the
+    coarse lattice alone hides sub-cell high-stock rim slivers the fine
+    judge keeps, under-reading entries (TB chain: 1.1303 mm plunge)."""
     ny, nx = A.shape
     nxf = int(round(nx * cell / fine))
     nyf = int(round(ny * cell / fine))
@@ -100,6 +104,16 @@ def resample_fine(A, x0, y0, cell, fine=FINE):
     kx = ((cx + 0.5 * fine - x0) / cell > ix) & (ix + 1 < nx)
     ky = ((cy + 0.5 * fine - y0) / cell > iy) & (iy + 1 < ny)
     Af = np.where(np.isfinite(A), A, -np.inf)
+    if margin > 0.0 and cell > fine:
+        for _ in range(int(math.ceil(margin / cell))):
+            pad = np.full((ny + 2, nx + 2), -np.inf)
+            pad[1:-1, 1:-1] = Af
+            o = pad[1:-1, 1:-1].copy()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    o = np.maximum(o, pad[1 + dy:ny + 1 + dy,
+                                          1 + dx:nx + 1 + dx])
+            Af = np.where(np.isfinite(Af), o, -np.inf)
     b00 = Af[np.ix_(iy, ix)]
     b10 = np.where(kx[None, :], Af[np.ix_(iy, np.minimum(ix + 1, nx - 1))],
                    -np.inf)
@@ -115,8 +129,8 @@ class LiveStock:
     """Live material heightfield on the fine grid, milled by the ball's
     swept envelope in emit order. No-data cells are -inf."""
 
-    def __init__(self, A, x0, y0, cell, R, fine=FINE):
-        F = resample_fine(A, x0, y0, cell, fine)
+    def __init__(self, A, x0, y0, cell, R, fine=FINE, margin=0.0):
+        F = resample_fine(A, x0, y0, cell, fine, margin=margin)
         self.R = float(R)
         self.f = fine
         self.x0, self.y0 = x0, y0
@@ -315,6 +329,70 @@ def build_rough_stock(nc_path, dia, box, top_z, fine=FINE):
             live.stamp_flat_chord(prev, cur)
         prev = cur
     return live
+
+
+def replay_stock(moves, dia, corner, out_path, box=None, top_z=None,
+                 init=None, fine=FINE):
+    """RR-STOCK: replay an EMITTED move list (modal x/y/z, g 0|1, mm) with
+    its tool into the engine's own `fine` mm stock, written as .npy +
+    x0/y0/cell .json sidecar. Start from `init` (A, x0, y0, cell), resampled
+    conservatively, or a full `box` (xmin xmax ymin ymax) raised to top_z;
+    every G1 is sampled at <= fine/4 (the judge's resolution) and stamps the
+    tool profile disk (dz = 0 inside R-cr, cr - sqrt(cr^2-(d-R+cr)^2) beyond;
+    cr = dia/2 the ball, cr = 0 the flat); G0 never cuts - never lower than
+    what the program removes. Returns (A, x0, y0, fine)."""
+    import json, os, time
+    t0 = time.time()
+    R = float(dia) / 2.0
+    cr = min(float(corner), R) if corner else 0.0
+    if init is not None:
+        A0, x0, y0, cell = init
+        # same pitch: resample_fine would max-pool the touching neighbour
+        F = A0 if abs(float(cell) - fine) < 1e-12 \
+            else resample_fine(A0, x0, y0, cell, fine)
+    else:
+        xmn, xmx, ymn, ymx = (float(v) for v in box[:4])
+        x0, y0 = xmn - R, ymn - R
+        cx = x0 + (np.arange(int(math.ceil((xmx - xmn + 2 * R) / fine))) + .5) * fine
+        cy = y0 + (np.arange(int(math.ceil((ymx - ymn + 2 * R) / fine))) + .5) * fine
+        F = np.where(((cx >= xmn - 1e-9) & (cx <= xmx + 1e-9))[None, :]
+                     & ((cy >= ymn - 1e-9) & (cy <= ymx + 1e-9))[:, None],
+                     float(top_z), -np.inf)
+    kR = int(math.ceil(R / fine))
+    pad, a0 = kR + 1, R - cr
+    L = np.pad(F, pad, constant_values=-np.inf)
+    pos = None
+    for mv in moves:
+        cur = tuple(p if mv.get(k) is None else mv[k]
+                    for k, p in zip("xyz", pos or (0.0, 0.0, 0.0)))
+        if pos is not None and mv["g"] == 1:
+            d = np.subtract(cur, pos)
+            n = 1 if abs(d[0]) <= 1e-9 and abs(d[1]) <= 1e-9 else max(
+                2, int(math.ceil(float(np.linalg.norm(d)) / (fine / 4.0))))
+            for t in np.linspace(0.0, 1.0, n + 1):
+                sx, sy = pos[0] + d[0] * t, pos[1] + d[1] * t
+                sz = min(pos[2], cur[2]) if n == 1 else pos[2] + d[2] * t
+                j = int(math.floor((sy - y0) / fine)) + pad
+                i = int(math.floor((sx - x0) / fine)) + pad
+                j0, j1 = max(0, j - kR), min(L.shape[0], j + kR + 1)
+                i0, i1 = max(0, i - kR), min(L.shape[1], i + kR + 1)
+                if j0 >= j1 or i0 >= i1: continue
+                gx = x0 + (np.arange(i0, i1) - pad + 0.5) * fine - sx
+                gy = y0 + (np.arange(j0, j1) - pad + 0.5) * fine - sy
+                dd = np.hypot(gx[None, :], gy[:, None])
+                dz = (cr - np.sqrt(np.maximum(
+                    cr * cr - np.maximum(dd - a0, 0.0) ** 2, 0.0))
+                    if cr else 0.0)
+                w = L[j0:j1, i0:i1]
+                np.minimum(w, np.where(dd <= R + 1e-9, sz + dz, np.inf), out=w)
+        pos = cur
+    A = L[pad:-pad, pad:-pad]
+    np.save(out_path, A)
+    with open(os.path.splitext(out_path)[0] + ".json", "w") as fh:
+        json.dump({"x0": x0, "y0": y0, "cell": fine}, fh)
+    print("replay_stock: %d moves -> %s in %.1f s"
+          % (len(moves), out_path, time.time() - t0), flush=True)
+    return A, x0, y0, fine
 
 
 def estimate_entries(moves, live):

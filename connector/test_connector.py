@@ -2600,9 +2600,10 @@ def test_token_refresh_near_expiry_does_not_recurse():
 
 
 class TestAxialPlungeGate:
-    """Task ZA: a straight flat/bull descent driving its bottom into solid
-    stock (axial_plunges.count > 0) FAILS the connector gate; a ball is
-    report-only (count + depths, never fails)."""
+    """Task ZA/ZB: a descent driving the tool's bottom into solid stock
+    (axial_plunges.count > 0) FAILS the connector gate for EVERY tool type:
+    flat/bull at AXIAL_FLOOR=0.2, ball at its own BALL_AXIAL_FLOOR=0.5
+    (zmap applies the floor and reports floor_mm)."""
 
     def _passing_check(self, tool="flat"):
         return {
@@ -2635,13 +2636,24 @@ class TestAxialPlungeGate:
             _check_zmap_gates(c)
         assert "axial plunges" in str(ei.value)
 
-    def test_ball_axial_plunge_report_only(self):
-        from runner import _check_zmap_gates
+    def test_ball_axial_plunge_fails_gate(self):
+        """Task ZB: a ball axial plunge deeper than BALL_AXIAL_FLOOR=0.5
+        (zmap applied the floor, count > 0) now FAILS the gate too."""
+        from runner import _check_zmap_gates, EngineError
         c = self._passing_check("ball")
-        c["axial_plunges"] = {"count": 475, "max_depth_mm": 25.654,
-                               "first_line": 63675,
-                               "worst_xy": [-2.593, -52.230]}
-        _check_zmap_gates(c)  # must NOT raise for a ball
+        c["tool"]["dia"] = 9.525
+        c["tool"]["corner"] = 4.7625
+        c["axial_plunges"] = {"count": 199, "max_depth_mm": 4.0,
+                               "first_line": 2708, "worst_xy": [1.0, 2.0],
+                               "floor_mm": 0.5}
+        with pytest.raises(EngineError) as ei:
+            _check_zmap_gates(c)
+        assert "axial plunges" in str(ei.value)
+
+    def test_ball_zero_axial_passes(self):
+        from runner import _check_zmap_gates
+        c = self._passing_check("ball")  # count 0 -> passes (task ZB)
+        _check_zmap_gates(c)
 
     def test_flat_zero_axial_passes(self):
         from runner import _check_zmap_gates

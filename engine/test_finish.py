@@ -1476,6 +1476,170 @@ def test_shank_t31_wall_13mm():
                                          max(zl)))
 
 
+def test_ramp_vertices_never_below_verified_path():
+    """FE5: every emitted ramp vertex z must be >= the verified path CL z at
+    its own arc position (max(vertex z, z0 + s*tan)); a ramp vertex below
+    the verified path would be an unverified, gouge-risk CL point."""
+    from engine.finish import _ramp_entry
+    n = 40
+    xs = np.arange(n) * 0.7
+    ys = np.sin(np.arange(n) * 0.55) * 3.0
+    zs = 5.0 - 0.08 * xs + 0.4 * np.cos(np.arange(n) * 1.3)
+    P = np.stack([xs, ys, zs], axis=1)
+    s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(xs),
+                                                   np.diff(ys)))])
+    tan = math.tan(math.radians(2.0))
+    for depth in (0.3, 1.7, 60.0):        # full ramp and short-run cases
+        u = min(depth / tan, float(s[-1]))
+        rv = _ramp_entry(P, s, tan, u)
+        assert rv, "empty ramp"
+        z0 = float(P[0, 2])
+        # last ramp vertex is the pass start itself
+        assert math.dist(rv[-1], (float(P[0, 0]), float(P[0, 1]), z0)) \
+            < 1e-9, rv[-1]
+        for (x, y, z) in rv:
+            # arc position of this point on the verified pass: own vertex
+            # (exact XY match) or the interpolated vertex at s = u
+            d = np.hypot(P[:, 0] - x, P[:, 1] - y)
+            i = int(np.argmin(d))
+            sp = float(s[i]) if d[i] < 1e-6 else u
+            verified_z = float(np.interp(sp, s, P[:, 2]))
+            assert z >= verified_z - 1e-9, \
+                "ramp vertex z %.4f below verified path z %.4f at s %.2f" \
+                % (z, verified_z, sp)
+            assert z >= min(z0 + sp * tan, verified_z) - 1e-9
+
+
+def test_fe5e_ramp_top_clear_of_ridge():
+    """FE5e: a shallow entry (live depth 0.3 at P0) whose FE5 ramp top
+    (s = d/tan ~ 8.6 mm along) lands UNDER a standing ridge (stock 2.0 mm
+    above the top - the line-52593 case). _fe5_pick_ramp must return the
+    SMALLEST longer L whose ramp top is clear (live disk_depth <= 0.25,
+    which also clears the link's vertical descent column onto rv[0]: depth
+    only grows downward), and (None, False) - reported unresolved - when no
+    L on the run clears. Fails on e40f664's code: there L = d/tan only and
+    the top stays buried (and the helper does not exist)."""
+    from engine.finish import _fe5_pick_ramp, _ramp_entry, RAMP_TRIGGER
+    from engine.entry_depth import LiveStock
+    cell, x0, y0 = 0.5, -15.0, -5.0
+    xs = x0 + (np.arange(100) + 0.5) * cell   # to x = 34.75
+    ys = y0 + (np.arange(20) + 0.5) * cell
+    X, Y = np.meshgrid(xs, ys)
+    A = np.full(X.shape, 10.0)
+    A[(X >= -4.0) & (X <= 2.0) & (np.abs(Y) <= 1.5)] = 12.0
+    tan = math.tan(math.radians(2.0))
+    n = 9                                     # x -10..30, 5 mm chords, flat z
+    P = np.stack([-10.0 + np.arange(n) * 5.0, np.zeros(n),
+                  np.full(n, 9.7)], axis=1)
+    s = np.arange(n) * 5.0
+    live = LiveStock(A, x0, y0, cell, 3.0)
+    d = live.disk_depth(P[0, 0], P[0, 1], 9.7)
+    assert RAMP_TRIGGER < d <= 0.5, "P0 must be shallow, got %.3f" % d
+    L0 = d / tan
+    # today's top (s = L0) is buried under the ridge: the FE5d defect
+    ox = float(np.interp(L0, s, P[:, 0]))
+    oz = max(float(np.interp(L0, s, P[:, 2])), 9.7 + L0 * tan)
+    assert live.disk_depth(ox, 0.0, oz) > RAMP_TRIGGER, \
+        "test shape must bury the FE5 top"
+    L, flip = _fe5_pick_ramp(live, P, s, tan)
+    assert L is not None and not flip and L0 < L <= float(s[-1]), (L, flip)
+    top = _ramp_entry(P, s, tan, L)[0]
+    assert live.disk_depth(top[0], top[1], top[2]) <= RAMP_TRIGGER, \
+        "FE5e ramp top/descent column not clear: %s" % (top,)
+    # ridge over the whole run (+ ball margin): no L clears -> unresolved
+    A2 = np.full(X.shape, 10.0)
+    A2[X >= -13.5] = 12.0
+    live2 = LiveStock(A2, x0, y0, cell, 3.0)
+    L2, flip2 = _fe5_pick_ramp(live2, P, s, tan)
+    assert L2 is None and not flip2, (L2, flip2)
+    print("fe5e ridge: d=%.3f L0=%.1f -> L=%.1f clear; all-ridge unresolved"
+          % (d, L0, L))
+
+
+def test_fe5t_public_ramp_top_clear_of_ridge():
+    """FE5e-t: BEHAVIOURAL test through the PUBLIC finish() path. Small
+    synthetic flat block (floor_z 6.0) with --stock-from live stock: a
+    shallow entry shelf (leave 0.3 -> live depth ~0.3 at the first row's
+    P0, over the RAMP_TRIGGER) whose FE5 ramp sized from P0 only
+    (L = d/tan ~ 8.6 mm) lands its TOP (first ramp vertex) UNDER the
+    standing leftover ridge (stock 7.0 -> ~0.7 deep > 0.25) - the
+    line-52593 defect at program level. e40f664 emits exactly that buried
+    top and has no fe5_top_unresolved stat; FE5e (44e0a61) must pick the
+    SMALLEST longer L whose top is clear (or enter from the other end, or
+    report the entry). Assert on the EMITTED moves: replay the estimator's
+    LiveStock in emit order and require every entry landing strictly above
+    the floor - the bottom of a vertical descent (plunge onto a ramp top)
+    or a horizontal arrival at ramp height - to have live depth <= 0.25 or
+    appear in stats fe5_top_unresolved. Ramp chord vertices below their top
+    are sloped moves and stay excluded (allowed, FE5e rule 4). Must FAIL
+    BY ASSERTION on e40f664's engine and PASS on 44e0a61."""
+    from engine.finish import finish, RAMP_TRIGGER
+    from engine.entry_depth import LiveStock, load_heightfield
+    cell = 0.5
+    bx0, bx1, by0, by1 = -15.0, 15.0, -12.0, 12.0
+    floor_z, base, shelf, ridge = 6.0, 6.2, 6.3, 7.0
+    with tempfile.TemporaryDirectory() as td:
+        stl = write_stl(os.path.join(td, "fe5t_block.stl"),
+                        _box(bx0, bx1, by0, by1, 0.0, floor_z))
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        # grid extends 4 mm past the block: a disk centered exactly on the
+        # block edge must read finite stock (an off-grid window is inf and
+        # would flag safe-height traversals as buried)
+        gx0, gx1, gy0, gy1 = bx0 - 4.0, bx1 + 4.0, by0 - 4.0, by1 + 4.0
+        nx = int(round((gx1 - gx0) / cell))
+        ny = int(round((gy1 - gy0) / cell))
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                              gy0 + (np.arange(ny) + 0.5) * cell)
+        A = np.full(CX.shape, base)
+        A[CX <= -9.0] = shelf                  # shallow entry: d(P0) ~ 0.3
+        A[(CX >= -8.0) & (CX <= -4.0)] = ridge  # standing leftover ridge
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 6.0, 0.0),
+                              stepover=1.5, floor_z=floor_z, threads=4,
+                              stock_from=stockp, ramp_angle_deg=2.0)
+        assert moves and stats.get("stock_from"), "stock_from not recorded"
+        n_ramp = stats.get("n_entries_ramped", 0) + \
+            stats.get("n_entries_short_run", 0)
+        assert n_ramp >= 1, "no ramped entry - the ridge scenario is gone"
+        unresolved = [tuple(r[:3]) for r in
+                     stats.get("fe5_top_unresolved", [])]
+        A0, sx0, sy0, c0 = load_heightfield(stockp)
+        live = LiveStock(A0, sx0, sy0, c0, 3.0)
+
+        def listed(x, y):
+            return any(math.hypot(x - ux, y - uy) <= 1.5
+                       for ux, uy, _ in unresolved)
+
+        buried = []
+        prev = None
+        for m in moves:
+            x, y, z = m["x"], m["y"], m["z"]
+            if prev is not None:
+                px, py, pz = prev
+                if m["g"] == 1:
+                    if z > floor_z + 0.05:
+                        vert = abs(x - px) <= 1e-9 and abs(y - py) <= 1e-9
+                        horiz = abs(z - pz) <= 1e-9 and (abs(x - px) > 1e-9
+                                                        or abs(y - py) > 1e-9)
+                        if (vert and z < pz - 1e-9) or horiz:
+                            dd = live.disk_depth(x, y, z)
+                            if dd > RAMP_TRIGGER + 1e-9 and not listed(x, y):
+                                buried.append((round(x, 2), round(y, 2),
+                                             round(z, 3), round(dd, 3)))
+                    live.stamp_chord(prev, (x, y, z))
+            prev = (x, y, z)
+        assert not buried, \
+            "FE5e-t: %d buried ramp top/entry landing (max depth %.3f): %s" \
+            % (len(buried), max(b[3] for b in buried), buried[:4])
+        print("fe5t public: %d entries ramped, %d unresolved, tops clear "
+              "(chord max depth %.3f)"
+              % (n_ramp, len(unresolved),
+                 stats.get("fe5_chord_max_depth_max", float("nan"))))
+
+
 def floor_dip_stl(path, half_x=15.0, half_y=10.0, top=10.0, slot_half=6.0,
                   deep_z=2.0, shelf_z=7.0, step_y=4.0):
     """Block with a slot along Y (walls at x=+-slot_half, mouth at z=top):
@@ -1489,6 +1653,85 @@ def floor_dip_stl(path, half_x=15.0, half_y=10.0, top=10.0, slot_half=6.0,
     tris += _box(-slot_half, slot_half, -half_y, -step_y, 0.0, shelf_z)
     tris += _box(-slot_half, slot_half, -step_y, step_y, 0.0, deep_z)
     return write_stl(path, tris)
+
+
+def test_fe5fc_degenerate_pass_never_plunged():
+    """FE5fc (supervisor): a ONE-POINT pass and a ZERO-LENGTH pass whose live
+    depth exceeds the ball floor 0.5 must be SKIPPED and reported, never
+    linked-to and plunged (the T33 chain's 1.06 mm straight plunge at
+    (-23.64, 1.68)). The two passes are injected into finish()'s own steep
+    pass list (floor_net wrapper, steep call) over the hill scene's +2.0 mm
+    buried stock, away from every real pass. Asserts: fe5_skipped_n grows by
+    exactly 2 vs the same run without injection, each point is in a skip
+    cluster with max depth > 0.5, and no move reaches either injected XY at
+    or below its z. Must FAIL BY ASSERTION with the old plunge path (1f499f5:
+    degenerate passes bypass every FE5e/FE5f check)."""
+    from engine import finish as _fmod
+    from engine.finish import finish
+    cell = 0.5
+    INJ = [[(-11.13, 2.37, 10.0)], [(11.27, -2.41, 10.0), (11.27, -2.41, 10.0)]]
+
+    def surfz(x):
+        if x <= -8 or x >= 8:
+            return 10.0
+        if x < -2:
+            return 10.0 + 3.0 * (x + 8) / 6.0
+        if x > 2:
+            return 13.0 - 3.0 * (x - 2) / 6.0
+        return 13.0
+
+    with tempfile.TemporaryDirectory() as td:
+        prof = [(-14, 0), (14, 0), (14, 10), (8, 10), (2, 13), (-2, 13),
+                (-8, 10), (-14, 10)]
+        stl = _prism_stl(os.path.join(td, "hill.stl"), prof, -6.0, 6.0)
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        gx0, gy0 = -20.0, -10.0
+        CX, _CY = np.meshgrid(gx0 + (np.arange(80) + 0.5) * cell,
+                              gy0 + (np.arange(40) + 0.5) * cell)
+        A = np.vectorize(lambda x: surfz(x) + (2.0 if abs(x) >= 8 else 0.3))(CX)
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        kw = dict(stl_path=stl, tool=("ball", 6.0, 0.0), stepover=1.5,
+                  floor_z=5.0, threads=4, stock_from=stockp,
+                  ramp_angle_deg=2.0)
+        _m0, st0 = finish(surf, **kw)
+        orig = _fmod.floor_net
+        calls = []
+
+        def inject(paths, src, *a, **k):
+            out = orig(paths, src, *a, **k)
+            calls.append(1)
+            if len(calls) == 1:            # the steep call (first in finish)
+                out = (list(out[0]) + [list(p) for p in INJ],
+                       list(out[1]) + [0] * len(INJ), out[2])
+            return out
+
+        _fmod.floor_net = inject
+        try:
+            moves, st = finish(surf, **kw)
+        finally:
+            _fmod.floor_net = orig
+        assert len(calls) >= 1, "floor_net wrapper never called"
+        dn = st.get("fe5_skipped_n", 0) - st0.get("fe5_skipped_n", 0)
+        assert dn == 2, "degenerate deep passes not skipped: skipped %d -> " \
+            "%d (expected +2)" % (st0.get("fe5_skipped_n", 0),
+                                  st.get("fe5_skipped_n", 0))
+        cls = st.get("fe5_skipped_clusters") or []
+        for p in INJ:
+            x, y, z = p[0]
+            near = [c for c in cls if c["bbox"][0] - 1e-3 <= x <= c["bbox"][1]
+                    + 1e-3 and c["bbox"][2] - 1e-3 <= y <= c["bbox"][3] + 1e-3]
+            assert near and any((c["max_depth_mm"] or 0) > 0.5 for c in near), \
+                "injected (%.1f, %.1f) not reported deeper than 0.5: %s" % (
+                    x, y, near)
+            hit = [m for m in moves if abs(m["x"] - x) < 1e-3
+                   and abs(m["y"] - y) < 1e-3 and m["z"] <= z + 1e-6]
+            assert not hit, "injected pass at (%.1f, %.1f) was emitted " \
+                "(plunged to z %.3f)" % (x, y, hit[0]["z"])
+    print("PASS fe5fc degenerate passes: one-point + zero-length deep passes "
+          "skipped and clustered (+%d), none emitted" % dn)
 
 
 def test_floor_dip_split_finish_and_rest():
@@ -1596,6 +1839,926 @@ def test_floor_pad_rows_inside_stock_box():
                      len(kept)))
 
 
+def bored_cyl_stl(path, ro=8.0, ri=4.8, h=14.0, n=96):
+    """FE5f: vertical cylinder (radius ro, z 0..h) with a THROUGH bore
+    (radius ri): the bore wall is steep and, with stock filled in, every
+    entry into it plunges - the through-bore trap (James drills those)."""
+    ang = np.linspace(0.0, 2.0 * math.pi, n + 1)[:-1]
+    xo, yo = ro * np.cos(ang), ro * np.sin(ang)
+    xi, yi = ri * np.cos(ang), ri * np.sin(ang)
+    tris = []
+    for i in range(n):
+        j = (i + 1) % n
+        mo = (math.cos(ang[i] + ang[j] - math.pi),
+              math.sin(ang[i] + ang[j] - math.pi), 0.0)   # outer +radial
+        mi = (-mo[0], -mo[1], 0.0)                        # bore wall -radial
+        up = (0.0, 0.0, 1.0)
+        dn = (0.0, 0.0, -1.0)
+        tris += [((xo[i], yo[i], 0.0), (xo[j], yo[j], 0.0),
+                  (xo[j], yo[j], h), mo),
+                 ((xo[i], yo[i], 0.0), (xo[j], yo[j], h),
+                  (xo[i], yo[i], h), mo),
+                 ((xi[i], yi[i], 0.0), (xi[i], yi[i], h),
+                  (xi[j], yi[j], h), mi),
+                 ((xi[i], yi[i], 0.0), (xi[j], yi[j], h),
+                  (xi[j], yi[j], 0.0), mi),
+                 ((xo[i], yo[i], h), (xo[j], yo[j], h),
+                  (xi[j], yi[j], h), up),
+                 ((xo[i], yo[i], h), (xi[j], yi[j], h),
+                  (xi[i], yi[i], h), up),
+                 ((xo[i], yo[i], 0.0), (xi[i], yi[i], 0.0),
+                  (xi[j], yi[j], 0.0), dn),
+                 ((xo[i], yo[i], 0.0), (xi[j], yi[j], 0.0),
+                  (xo[j], yo[j], 0.0), dn)]
+    return write_stl(path, tris)
+
+
+def plain_cyl_stl(path, ro=18.0, h=20.0, n=96):
+    """FE5f-b: plain vertical cylinder (radius ro, z 0..h) - the dome/boss
+    surface. The bores are NOT in the part: they stand as tall stock columns
+    (to be drilled), so a raster row crossing them has BOTH ends buried while
+    the middle is clear - the whole-pass-drop trap."""
+    ang = np.linspace(0.0, 2.0 * math.pi, n + 1)[:-1]
+    xo, yo = ro * np.cos(ang), ro * np.sin(ang)
+    tris = []
+    for i in range(n):
+        j = (i + 1) % n
+        mo = (math.cos(ang[i] + ang[j] - math.pi),
+              math.sin(ang[i] + ang[j] - math.pi), 0.0)
+        tris += [((xo[i], yo[i], 0.0), (xo[j], yo[j], 0.0),
+                  (xo[j], yo[j], h), mo),
+                 ((xo[i], yo[i], 0.0), (xo[j], yo[j], h),
+                  (xo[i], yo[i], h), mo),
+                 ((xo[i], yo[i], h), (xo[j], yo[j], h), (0.0, 0.0, h),
+                  (0.0, 0.0, 1.0)),
+                 ((xo[i], yo[i], 0.0), (0.0, 0.0, 0.0),
+                  (xo[j], yo[j], 0.0), (0.0, 0.0, -1.0))]
+    return write_stl(path, tris)
+
+
+def test_fe5f_skip_bore_entries():
+    """FE5f: a boss with a 10 mm-ish THROUGH bore full of stock (stock top
+    above the boss top; the 9.525 ball has ~0.038 mm radial room per side).
+    No ramp top on a bore-wall entry can be clear, and neither end is -
+    FE5e left those unramped (ZB violations). FE5f must SKIP them: replay
+    the estimator's LiveStock in emit order (as test_fe5t does) and require
+    every ENTRY - the bottom of a vertical G1 descent (link plunge onto the
+    pass / ramp top) - to land at live depth <= the ball floor 0.5 mm
+    (mid-pass CL descents along verified paths are FE5e traversal behaviour,
+    out of scope here), AND the skip report to list a cluster centred within
+    1 mm of the bore axis. Must FAIL BY ASSERTION on e773afa (entries
+    plunged up to 5.6 mm deep; no fe5_skipped_* stats at all)."""
+    from engine import finish as _fmod
+    from engine.finish import finish
+    ZB_FLOOR_BALL = getattr(_fmod, "ZB_FLOOR_BALL", 0.5)
+    from engine.entry_depth import LiveStock, load_heightfield
+    cell, top, boss_r, bore_r = 0.5, 14.0, 8.0, 4.8
+    stock_bore = top + 2.0            # bore FULL of stock, top above boss
+    with tempfile.TemporaryDirectory() as td:
+        stl = bored_cyl_stl(os.path.join(td, "bore.stl"), ro=boss_r,
+                            ri=bore_r, h=top)
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        gx0, gx1, gy0, gy1 = -16.0, 16.0, -16.0, 16.0
+        nx = int(round((gx1 - gx0) / cell))
+        ny = int(round((gy1 - gy0) / cell))
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                             gy0 + (np.arange(ny) + 0.5) * cell)
+        R = np.hypot(CX, CY)
+        A = np.full(CX.shape, top + 0.3)   # normal 0.3 finish allowance
+        A[R <= bore_r] = stock_bore        # the bore stands full of stock
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 9.525, 0.0),
+                              stepover=1.5, floor_z=6.0, threads=4,
+                              stock_from=stockp, ramp_angle_deg=2.0)
+        assert moves and stats.get("stock_from"), "stock_from not recorded"
+        # the trap must be real: something tries to enter the bore
+        A0, sx0, sy0, c0 = load_heightfield(stockp)
+        live = LiveStock(A0, sx0, sy0, c0, 0.5 * 9.525)
+        deep = []
+        prev = None
+        for m in moves:
+            x, y, z = m["x"], m["y"], m["z"]
+            if prev is not None:
+                px, py, pz = prev
+                if m["g"] == 1 and z < pz - 1e-9 \
+                        and abs(x - px) <= 1e-9 and abs(y - py) <= 1e-9:
+                    dd = live.disk_depth(x, y, z)
+                    if math.isfinite(dd) and dd > ZB_FLOOR_BALL:
+                        deep.append((round(x, 2), round(y, 2),
+                                     round(z, 3), round(dd, 3)))
+                live.stamp_chord(prev, (x, y, z))
+            prev = (x, y, z)
+        assert not deep, \
+            "FE5f: %d bore entries plunged > %.1f mm into live stock " \
+            "(max %.3f): %s" % (len(deep), ZB_FLOOR_BALL,
+                                 max(e[3] for e in deep), deep[:4])
+        clusters = stats.get("fe5_skipped_clusters", [])
+        assert stats.get("fe5_skipped_n", 0) >= 1, "nothing was skipped"
+        assert clusters, "no skip clusters reported"
+        d0 = min(math.hypot(c["center"][0], c["center"][1]) for c in clusters)
+        assert d0 <= 1.0, \
+            "no skip cluster centred on the bore axis: %s" % (clusters,)
+        print("fe5f skip-bore: skipped %d passes in %d cluster(s) at %s "
+              "(max live depth %.2f mm)"
+              % (stats["fe5_skipped_n"], len(clusters),
+                 clusters[0]["center"], clusters[0]["max_depth_mm"]))
+
+
+def _g1_samples(moves, step=0.25):
+    """XY samples every <= step mm along every emitted G1 segment (coverage
+    checks must not read sparse move ENDPOINTS as gaps)."""
+    out = []
+    prev = None
+    for m in moves:
+        cur = (m["x"], m["y"])
+        if prev is not None and m["g"] == 1:
+            n = max(1, int(math.ceil(math.dist(prev, cur) / step)))
+            out.extend((prev[0] + (cur[0] - prev[0]) * t / n,
+                        prev[1] + (cur[1] - prev[1]) * t / n)
+                       for t in range(1, n + 1))
+        prev = cur
+    return np.asarray(out, dtype=float)
+
+
+def test_fe5fb_real_bore_surface_kept():
+    """FE5f-b on the REAL bore geometry (bored_cyl_stl, boss r 18 with one
+    4.8 mm through-bore full of stock, 0.3 finish allowance elsewhere): the
+    boss surface beyond bore + tool + 0.5 mm stays finished (emitted cut
+    points within 1 mm of every such cell) and no skip vertex lies beyond
+    bore + tool + 1 mm of the bore axis. Coordinator: must fail on 1f499f5
+    (whole-pass drop) by assertion where that geometry exposes it."""
+    from engine.finish import finish
+    cell, top, ro, bore_r = 0.5, 14.0, 18.0, 4.8
+    with tempfile.TemporaryDirectory() as td:
+        stl = bored_cyl_stl(os.path.join(td, "bore.stl"), ro=ro, ri=bore_r,
+                            h=top)
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        gx0, gx1, gy0, gy1 = -22.0, 22.0, -22.0, 22.0
+        nx = int(round((gx1 - gx0) / cell))
+        ny = int(round((gy1 - gy0) / cell))
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                             gy0 + (np.arange(ny) + 0.5) * cell)
+        A = np.full(CX.shape, top + 0.3)
+        A[np.hypot(CX, CY) <= bore_r] = top + 2.0   # bore full of stock
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 9.525, 0.0),
+                              stepover=1.5, floor_z=6.0, threads=4,
+                              stock_from=stockp, ramp_angle_deg=2.0)
+        assert moves, "no moves"
+        pts = _g1_samples(moves)
+        keep_r = bore_r + 0.5 * 9.525 + 0.5
+        miss = []
+        for cy in np.arange(-ro + 1.0, ro, 0.5):
+            for cx in np.arange(-ro + 1.0, ro, 0.5):
+                r = math.hypot(cx, cy)
+                if r <= keep_r or r > ro - 1.0:
+                    continue
+                dd = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy).min()
+                if dd > 1.0:
+                    miss.append((round(cx, 2), round(cy, 2), round(dd, 2)))
+        assert not miss, "real bore: %d boss cells beyond bore+tool+0.5 " \
+            "uncovered: %s" % (len(miss), miss[:4])
+        far = [p for p in (stats.get("fe5_skip_pts") or [])
+               if math.hypot(p[0], p[1]) > bore_r + 0.5 * 9.525 + 1.0]
+        assert not far, "real bore: %d skip vertices beyond bore+tool+1: %s" \
+            % (len(far), far[:4])
+        print("fe5fb real bore: surface beyond the bore covered, skips %d"
+              % stats.get("fe5_skipped_n", 0))
+
+
+def test_fe5fb_fragment_trim_keeps_surface():
+    """FE5f/FE5f-b: boss (plain cyl r 18, h 20) with two through-bores'
+    worth of standing stock: columns r 4.8 at (+-12.5, 0) filled to h + 2
+    above the 0.3-mm finish allowance (the 9.525 ball has ~0.038 mm radial
+    room per side; James drills those). A shallow row crossing a column has
+    its entry buried (disk sees the 2-mm-tall column) and no ramp top on
+    that run clears, and neither end does - FE5f must SKIP the entry (never
+    plunge: replay the estimator's LiveStock in emit order, as test_fe5t
+    does, and require every ENTRY - the bottom of a vertical G1 descent -
+    to land at live depth <= the ball floor 0.5 mm) and report it clustered
+    on the column axes. FE5f-b: only the ILLEGAL FRAGMENT may be dropped -
+    every finish-relevant cell of the boss surface beyond bore radius + tool
+    radius + 0.5 mm must still be finished: no skipped vertex there (raw
+    fe5_skip_pts, and the report must expose them whenever passes were
+    dropped), and emitted cut points within one stepover of every such
+    cell. Must FAIL BY ASSERTION on 1f499f5 (whole-pass drop: rows crossing
+    a column lose their whole stripe across the boss - cells beyond both
+    columns unfinished - and raw skip vertices reach past bore + tool +
+    0.5 mm)."""
+    from engine import finish as _fmod
+    from engine.finish import finish
+    ZB_FLOOR_BALL = getattr(_fmod, "ZB_FLOOR_BALL", 0.5)
+    from engine.entry_depth import LiveStock, load_heightfield
+    cell, h, ro, bore_r, axis = 0.5, 20.0, 18.0, 4.8, 12.5
+    col_top = h + 2.0               # columns stand 2 mm above the allowance
+    with tempfile.TemporaryDirectory() as td:
+        stl = plain_cyl_stl(os.path.join(td, "boss.stl"), ro=ro, h=h)
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        gx0, gx1, gy0, gy1 = -22.0, 22.0, -22.0, 22.0
+        nx = int(round((gx1 - gx0) / cell))
+        ny = int(round((gy1 - gy0) / cell))
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                             gy0 + (np.arange(ny) + 0.5) * cell)
+        RA = np.hypot(CX - axis, CY)     # distance to either bore column
+        RB = np.hypot(CX + axis, CY)
+        A = np.full(CX.shape, h + 0.3)   # normal 0.3 finish allowance
+        A[np.minimum(RA, RB) <= bore_r] = col_top
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 9.525, 0.0),
+                              stepover=1.5, floor_z=12.0, threads=4,
+                              stock_from=stockp, ramp_angle_deg=2.0)
+        assert moves and stats.get("stock_from"), "stock_from not recorded"
+        # the trap must be real: something tries to enter a column
+        A0, sx0, sy0, c0 = load_heightfield(stockp)
+        live = LiveStock(A0, sx0, sy0, c0, 0.5 * 9.525)
+        deep = []
+        prev = None
+        cut_pts = []                   # emitted feed (G1) cut points
+        for m in moves:
+            x, y, z = m["x"], m["y"], m["z"]
+            if m["g"] == 1:
+                cut_pts.append((x, y))
+            if prev is not None:
+                px, py, pz = prev
+                if m["g"] == 1 and z < pz - 1e-9 \
+                        and abs(x - px) <= 1e-9 and abs(y - py) <= 1e-9:
+                    dd = live.disk_depth(x, y, z)
+                    if math.isfinite(dd) and dd > ZB_FLOOR_BALL:
+                        deep.append((round(x, 2), round(y, 2),
+                                     round(z, 3), round(dd, 3)))
+                live.stamp_chord(prev, (x, y, z))
+            prev = (x, y, z)
+        assert not deep, \
+            "FE5f: %d bore entries plunged > %.1f mm into live stock " \
+            "(max %.3f): %s" % (len(deep), ZB_FLOOR_BALL,
+                                 max(e[3] for e in deep), deep[:4])
+        clusters = stats.get("fe5_skipped_clusters", [])
+        n_skip = stats.get("fe5_skipped_n", 0)
+        assert n_skip >= 1, "nothing was skipped"
+        assert clusters, "no skip clusters reported"
+        # FE5f-b 1: the boss surface beyond bore + tool + 0.5 mm from both
+        # columns is still finished - emitted cut points within one stepover
+        # of every such cell
+        tol = 1.0   # rows are stepover=1.5 apart; worst in-band gap 0.75
+        pts = _g1_samples(moves)
+        miss = []
+        yy = np.arange(-ro + 1.0, ro, 0.5)
+        xx = np.arange(-ro + 1.0, ro, 0.5)
+        for cy in yy:
+            inside = xx[xx ** 2 + cy ** 2 <= (ro - 1.0) ** 2]
+            for cx in inside:
+                if min(math.hypot(cx - axis, cy), math.hypot(cx + axis, cy)) \
+                        <= bore_r + 0.5 * 9.525 + 0.5:
+                    continue          # may be left with the bores
+                dd = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy).min()
+                if dd > tol:
+                    miss.append((round(cx, 2), round(cy, 2), round(dd, 2)))
+        assert not miss, \
+            "FE5f-b: %d finish-relevant cells beyond bore+tool+0.5 mm are " \
+            "uncovered (nearest cut point > %.1f mm; whole stripes lost): %s" \
+            % (len(miss), tol, miss[:4])
+        # FE5f-b 2: only the fragment near a column may be skipped - every
+        # recorded skip vertex within bore + tool + 1 mm of a column axis
+        skip_pts = stats.get("fe5_skip_pts")
+        assert skip_pts is not None, \
+            "FE5f-b: %d passes skipped but raw skip vertices not reported" \
+            % n_skip
+        far = [(x, y, dep) for x, y, dep in skip_pts
+               if min(math.hypot(x - axis, y), math.hypot(x + axis, y))
+               > bore_r + 0.5 * 9.525 + 1.0]
+        assert not far, \
+            "FE5f-b: %d skipped vertices beyond bore+tool+1 mm off the " \
+            "column axes (unfinished outside the bores): %s" % (len(far),
+                                                                far[:4])
+        print("fe5f skip-bore: skipped %d passes/fragments in %d cluster(s) "
+              "at %s (max live depth %.2f mm); surface beyond the bores "
+              "fully covered" % (n_skip, len(clusters), clusters[0]["center"],
+                                clusters[0]["max_depth_mm"]))
+
+
+def _prism_stl(path, prof, y0, y1):
+    """FE5fc: extrude an XZ profile polygon along Y (both windings, so the
+    drop-cutter sees every face)."""
+    n = len(prof)
+    tris = []
+    for i in range(n):
+        j = (i + 1) % n
+        x0, z0 = prof[i]
+        x1, z1 = prof[j]
+        ref = (z1 - z0, 0.0, -(x1 - x0))
+        tris.append(((x0, y0, z0), (x1, y1, z1), (x1, y0, z1), ref))
+        tris.append(((x0, y0, z0), (x0, y1, z0), (x1, y1, z1), ref))
+    for yy, sgn in ((y0, -1.0), (y1, 1.0)):
+        for i in range(1, n - 1):
+            tris.append(((prof[0][0], yy, prof[0][1]),
+                        (prof[i][0], yy, prof[i][1]),
+                        (prof[i + 1][0], yy, prof[i + 1][1]), (0, sgn, 0)))
+    return write_stl(path, tris)
+
+
+def test_fe5fc_buried_ends_keep_middle():
+    """FE5fc: a long raster pass whose FIRST part is buried > 0.5 mm with no
+    legal ramp at either end - deep stock (+2.0) at both ends of a hill
+    prism, only +0.3 over the hill - must lose only the illegal fragment.
+    The whole-pass sizing (both ends, FE5e) fails: every vertex sits 0.3
+    under the allowance and the 2 deg ramp from the buried end cannot beat
+    the hill. But a suffix based ON THE HILL clears within ~1.5 mm, so
+    FE5f-b's fragment trim keeps the middle: assert every hill cell in
+    |x| <= 4, |y| <= 5 is cut (G1 samples within 1 mm); no vertical G1
+    descent may land deeper than the ball floor 0.5 mm (replay as in
+    test_fe5f); passes were skipped and clustered; and every recorded raw
+    skip vertex has a FINITE live depth (FE5fc: off-grid vertices are not
+    recorded, no invented depth). Must FAIL BY ASSERTION on 1f499f5
+    (whole-pass drop: hill cells uncovered, no fe5_skip_pts stat)."""
+    from engine import finish as _fmod
+    from engine.finish import finish
+    ZB_FLOOR_BALL = getattr(_fmod, "ZB_FLOOR_BALL", 0.5)
+    from engine.entry_depth import LiveStock, load_heightfield
+    cell = 0.5
+
+    def surfz(x):
+        if x <= -8 or x >= 8:
+            return 10.0
+        if x < -2:
+            return 10.0 + 3.0 * (x + 8) / 6.0
+        if x > 2:
+            return 13.0 - 3.0 * (x - 2) / 6.0
+        return 13.0
+
+    with tempfile.TemporaryDirectory() as td:
+        prof = [(-14, 0), (14, 0), (14, 10), (8, 10), (2, 13), (-2, 13),
+                (-8, 10), (-14, 10)]
+        stl = _prism_stl(os.path.join(td, "hill.stl"), prof, -6.0, 6.0)
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        gx0, gx1, gy0, gy1 = -20.0, 20.0, -10.0, 10.0
+        nx = int(round((gx1 - gx0) / cell))
+        ny = int(round((gy1 - gy0) / cell))
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                             gy0 + (np.arange(ny) + 0.5) * cell)
+        A = np.empty(CX.shape)
+        for j in range(ny):
+            for i in range(nx):
+                x = CX[j, i]
+                A[j, i] = surfz(x) + (2.0 if x <= -8 or x >= 8 else 0.3)
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 6.0, 0.0),
+                             stepover=1.5, floor_z=5.0, threads=4,
+                             stock_from=stockp, ramp_angle_deg=2.0)
+        assert moves and stats.get("stock_from"), "stock_from not recorded"
+        # the middle of the hill must still be cut (fails on 1f499f5:
+        # every crossing pass is dropped whole)
+        pts = _g1_samples(moves)
+        assert len(pts), "no G1 cut points at all"
+        miss = []
+        for cy in np.arange(-5.0, 5.1, 1.0):
+            for cx in np.arange(-2.0, 4.1, 1.0):
+                dd = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy).min()
+                if dd > 1.0:
+                    miss.append((round(cx, 1), round(cy, 1), round(float(dd),
+                                                              2)))
+        assert not miss, \
+            "FE5fc: %d hill cells uncovered (whole passes dropped): %s" \
+            % (len(miss), miss[:4])
+        # no entry may plunge deeper than the ball floor (replay, test_fe5f
+        # convention: mid-pass descents along verified paths are traversal)
+        live = LiveStock(*load_heightfield(stockp), 3.0)
+        deep = []
+        prev = None
+        for m in moves:
+            x, y, z = m["x"], m["y"], m["z"]
+            if prev is not None:
+                px, py, pz = prev
+                if m["g"] == 1 and z < pz - 1e-9 \
+                        and abs(x - px) <= 1e-9 and abs(y - py) <= 1e-9:
+                    dd = live.disk_depth(x, y, z)
+                    if math.isfinite(dd) and dd > ZB_FLOOR_BALL:
+                        deep.append((round(x, 2), round(y, 2), round(z, 3),
+                                   round(dd, 3)))
+                live.stamp_chord(prev, (x, y, z))
+            prev = (x, y, z)
+        assert not deep, \
+            "FE5fc: %d entries plunged > %.1f mm into live stock (max " \
+            "%.3f): %s" % (len(deep), ZB_FLOOR_BALL,
+                           max(e[3] for e in deep), deep[:4])
+        n_skip = stats.get("fe5_skipped_n", 0)
+        assert n_skip >= 1, "nothing was skipped"
+        assert stats.get("fe5_skipped_clusters"), "no skip clusters reported"
+        skip_pts = stats.get("fe5_skip_pts")
+        assert skip_pts is not None, \
+            "FE5fc: %d passes skipped but raw skip vertices not reported" \
+            % n_skip
+        bad = [p for p in skip_pts if not math.isfinite(p[2])]
+        assert not bad, \
+            "FE5fc: %d skip vertices with non-finite (invented) depth: %s" \
+            % (len(bad), bad[:4])
+        print("fe5fc buried-ends: skipped %d, hill kept (%.0f mm cut, "
+              "%d finite skip vertices)" % (n_skip, stats.get("cut_len", 0.0),
+                                           len(skip_pts)))
+
+
+def test_fe5g_no_lifted_vertex_in_constant_z_pass():
+    """FE5g (red test): a constant-Z finish pass must not carry an interior
+    vertex lifted above BOTH of its neighbours by more than the ball axial
+    floor (0.5 mm) unless the pass is split there (a G0 next to it). Such a
+    vertex (an inserted point whose CL comes from the drop-cutter where the
+    ball rides a wall top edge) makes the pass climb and drop back steeply;
+    on the test block the drop drove the T20 ball 0.815 mm into live stock
+    (ZB, connector E2E test_tb_rest_chain_checks_stock_bottom). Scene: a
+    20 x 20 mm boss 14 mm tall on a plate, stock 0.3 over the part,
+    stock_from. FAILS on fe5-trial 74582f3: 98 lifted vertices around the
+    boss corners, max lift 4.607 mm."""
+    from engine.finish import finish
+    cell = 0.5
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "boss.stl")
+        write_stl(stl, _box(-25, 25, -25, 25, -2, 0)
+                  + _box(-10, 10, -10, 10, 0, 14.0))
+        surf = model.load_surf(stl)
+        gx0, gy0, nx, ny = -25.0, -25.0, 100, 100
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                             gy0 + (np.arange(ny) + 0.5) * cell)
+        boss = (np.abs(CX) <= 10) & (np.abs(CY) <= 10)
+        stockp = os.path.join(td, "stock.npy")
+        np.save(stockp, np.where(boss, 14.3, 0.3))
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 9.525, 0.0),
+                              stepover=1.5, floor_z=1.0, threads=4,
+                              stock_from=stockp, ramp_angle_deg=2.0)
+    P = [(m["x"], m["y"], m["z"], m["g"]) for m in moves]
+    lifted = [(round(b[0], 3), round(b[1], 3), round(a[2], 3),
+               round(b[2] - a[2], 3))
+              for a, b, c in zip(P[:-2], P[1:-1], P[2:])
+              if a[3] == b[3] == c[3] == 1 and abs(a[2] - c[2]) < 1e-6
+              and b[2] > a[2] + 0.5]
+    print("fe5g lifted vertices in constant-Z passes: %d (max lift %.3f)"
+          % (len(lifted), max([e[3] for e in lifted] or [0.0])))
+    assert not lifted, \
+        "FE5g: %d constant-Z pass vertices lifted > 0.5 mm above both " \
+        "neighbours (max %.3f): %s" % (len(lifted), max(e[3] for e in lifted),
+                                       lifted[:4])
+
+
+def test_fe5g_scene_vertices_never_below_cl():
+    """FE5g: gouge gate on the red-test scene (20 x 20 boss 14 tall, stock
+    from): every emitted G1 vertex must sit AT OR ABOVE its own drop-cutter
+    CL (ball 9.525). A root fix that simply forced inserted vertices to the
+    pass Z without the CL check would cut into the part at the wall-top
+    edges and fail here by a measured value."""
+    import math
+    from engine.finish import finish, make_cutter, batch_drop
+    cell = 0.5
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "boss.stl")
+        write_stl(stl, _box(-25, 25, -25, 25, -2, 0)
+                  + _box(-10, 10, -10, 10, 0, 14.0))
+        surf = model.load_surf(stl)
+        gx0, gy0, nx, ny = -25.0, -25.0, 100, 100
+        CX, CY = np.meshgrid(gx0 + (np.arange(nx) + 0.5) * cell,
+                             gy0 + (np.arange(ny) + 0.5) * cell)
+        boss = (np.abs(CX) <= 10) & (np.abs(CY) <= 10)
+        stockp = os.path.join(td, "stock.npy")
+        np.save(stockp, np.where(boss, 14.3, 0.3))
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, stats = finish(surf, stl_path=stl, tool=("ball", 9.525, 0.0),
+                              stepover=1.5, floor_z=1.0, threads=4,
+                              stock_from=stockp, ramp_angle_deg=2.0)
+        cutter = make_cutter("ball", 9.525, 0.0)
+        pts = [(m["x"], m["y"]) for m in moves if m["g"] == 1]
+        cl = batch_drop(surf, cutter, pts, threads=4)
+        bad = []
+        for m, c in zip([m for m in moves if m["g"] == 1], cl):
+            if math.isfinite(c) and m["z"] < c - 0.004:   # NET_TOL margin
+                bad.append((round(m["x"], 3), round(m["y"], 3),
+                            round(m["z"], 3), round(float(c), 3)))
+        print("fe5g gouge gate: %d G1 vertices, %d below CL by >0.004 mm"
+              % (len(pts), len(bad)))
+        assert not bad, \
+            "FE5g: %d emitted vertices below their drop-cutter CL " \
+            "(max %.3f): %s" % (len(bad),
+                                max(p[3] - p[2] for p in bad), bad[:4])
+
+
+def test_fe5g_net_ramps_and_trims_inpass_drop():
+    """FE5g safety net unit test on _fe5g_inpass: a near-vertical descent
+    mid-pass is ramped along the pass's own following vertices (XY fixed, Z
+    only rises, resulting slopes <= the ramp angle); a descent into the LAST
+    vertex has no followers and is trimmed (head kept, vertices reported).
+    Disabling the net (no-op _fe5g_inpass) fails this test."""
+    from engine.finish import _fe5g_inpass
+    from engine.entry_depth import LiveStock
+
+    A = np.full((40, 40), 10.0)          # flat stock at Z10, cell 0.5
+    live = LiveStock(A, -10.0, -10.0, 0.5, 0.5 * 9.525)
+    tan = math.tan(math.radians(2.0))
+    # mid-pass drop: 20 mm of flat at Z8, near-vertical drop to Z5 at x=5,
+    # then 20 mm more at Z5 (followers exist to ramp over)
+    P = [(x, 0.0, 8.0) for x in np.arange(-5.0, 5.0, 0.5)]
+    P += [(5.0, 0.0, 5.0)]
+    P += [(x, 0.0, 5.0) for x in np.arange(5.5, 15.0, 0.5)]
+    out, n_ramp, trimmed = _fe5g_inpass(live, P, tan)
+    assert n_ramp >= 1 and not trimmed, \
+        "mid-pass drop not ramped: n_ramp=%d trimmed=%s" % (n_ramp, trimmed)
+    for (x, y, z), (xo, yo, zo) in zip(out, P):
+        assert (x, y) == (xo, yo) and z >= zo - 1e-9, "point moved/lowered"
+    for a, b in zip(out, out[1:]):
+        dz = a[2] - b[2]
+        h = math.hypot(b[0] - a[0], b[1] - a[1])
+        assert dz <= 1e-9 or math.degrees(math.atan2(dz, h)) <= 2.0 + 1e-6, \
+            "ramped pass still descends at %.1f deg" % \
+            math.degrees(math.atan2(dz, h))
+    # tail drop: descent into the LAST vertex -> trim, head kept
+    Q = [(x, 0.0, 8.0) for x in np.arange(-5.0, 5.0, 0.5)]
+    Q += [(5.0, 0.0, 5.0)]
+    out2, n_ramp2, trimmed2 = _fe5g_inpass(live, Q, tan)
+    assert n_ramp2 == 0 and len(trimmed2) == 1 and len(out2) == len(Q) - 1, \
+        "tail drop not trimmed: n_ramp=%d trimmed=%s len=%d/%d" % \
+        (n_ramp2, trimmed2, len(out2), len(Q))
+    assert trimmed2[0]["x"] == 5.0 and trimmed2[0]["depth"] > 0.5, \
+        "trimmed vertex not reported with depth: %s" % trimmed2
+    print("fe5g net: mid-pass drop ramped (slopes <= 2 deg), tail drop "
+          "trimmed and reported")
+
+
+def test_fe5h_entry_estimate_not_below_true_depth():
+    """FE5h (supervisor): the live-stock entry estimate must never UNDER-read
+    the judge-model true live depth at an emitted entry. Scene: flat pocket
+    floor 28.2 (live stock 28.4) whose FIRST row starts at the pocket corner
+    (-8,-12); a post-roughing leftover ridge (coarse stock 29.55, cells
+    x<=-11.75, y<=-12.25 - the raw zone just OUTSIDE the pocket corner) sits
+    so its coarse-cell edge is 3.45 mm from the start: the 0.5 mm lattice and
+    the plain 0.5->0.1 overlap resample both hide it (contribution < 0, the
+    estimator reads 0.1985 -> straight plunge), yet the true 0.1 mm judge
+    stock keeps the rim sliver an optimistic coarse stamp leaves standing
+    past the footprint (the RT2 corner: the coarse kernel clears ~c/sqrt(2)+c
+    - exactly the TB chain's 1.1303 mm plunge mechanism). TRUTH is built
+    independently of the engine: dilate the coarse array by 2 source cells
+    (1.0 mm Chebyshev box-max, data-preserving) and overlap-resample to 0.1
+    mm, then stamp the emitted G1 prefix with the judge's own zmap.simulate
+    and read the exact ball formula. Assert at every emitted vertical entry
+    (plunge): true depth <= the ZB floor 0.5, and at every entry (plunge or
+    ramp vertex) below the floor: engine estimate >= true depth - 1e-6.
+    Must FAIL on the plain resample (est 0.1985 vs truth 0.6085 at the
+    plunge (-8,-12)) and PASS once resample_fine/LiveStock pool the source
+    with margin=2*cell (the entry is then read ~0.61 and ramped)."""
+    from engine.finish import finish
+    from engine.entry_depth import LiveStock
+    R = 9.525 / 2.0
+    cell = 0.5
+    gx0, gy0, gx1, gy1 = -13.0, -17.0, 13.0, 17.0
+    floor_z = 28.2
+    with tempfile.TemporaryDirectory() as td:
+        stl = write_stl(os.path.join(td, "fe5h_pocket.stl"),
+                        _box(-8.0, 8.0, -12.0, 12.0, 0.0, floor_z))
+        surf = model.load_surf(stl)
+        stockp = os.path.join(td, "stock.npy")
+        CX, CY = np.meshgrid(gx0 + (np.arange(52) + 0.5) * cell,
+                             gy0 + (np.arange(68) + 0.5) * cell)
+        A = np.full(CX.shape, 28.4)
+        A[(CX <= -11.75) & (CY >= -13.0) & (CY <= -12.25)] = 29.55
+        np.save(stockp, A)
+        with open(stockp[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": cell}, fh)
+        moves, _stats = finish(surf, stl_path=stl, tool=("ball", 9.525, 0.0),
+                               stepover=3.0, floor_z=floor_z, threads=4,
+                               stock_from=stockp, ramp_angle_deg=2.0)
+    # truth stock: dilate the coarse array 2 cells (the sliver the judge's
+    # fine rough stamp keeps past the optimistic coarse footprint), then the
+    # same conservative overlap resample the estimator uses
+    D = np.where(np.isfinite(A), A, -np.inf)
+    for _ in range(2):
+        pad = np.full((D.shape[0] + 2, D.shape[1] + 2), -np.inf)
+        pad[1:-1, 1:-1] = D
+        o = pad[1:-1, 1:-1].copy()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                o = np.maximum(o, pad[1 + dy:D.shape[0] + 1 + dy,
+                                      1 + dx:D.shape[1] + 1 + dx])
+        D = np.where(np.isfinite(D), o, -np.inf)
+    nxf = int(round((gx1 - gx0) / 0.1))
+    nyf = int(round((gy1 - gy0) / 0.1))
+    cx = gx0 + (np.arange(nxf) + 0.5) * 0.1
+    cy = gy0 + (np.arange(nyf) + 0.5) * 0.1
+    ix = np.clip(np.floor((cx - 0.05 - gx0) / cell).astype(int),
+                 0, D.shape[1] - 1)
+    iy = np.clip(np.floor((cy - 0.05 - gy0) / cell).astype(int),
+                 0, D.shape[0] - 1)
+    kx = ((cx + 0.05 - gx0) / cell > ix) & (ix + 1 < D.shape[1])
+    ky = ((cy + 0.05 - gy0) / cell > iy) & (iy + 1 < D.shape[0])
+    b00 = D[np.ix_(iy, ix)]
+    b10 = np.where(kx[None, :],
+                   D[np.ix_(iy, np.minimum(ix + 1, D.shape[1] - 1))],
+                   -np.inf)
+    b01 = np.where(ky[:, None],
+                   D[np.ix_(np.minimum(iy + 1, D.shape[0] - 1), ix)],
+                   -np.inf)
+    b11 = np.where(kx[None, :] & ky[:, None],
+                   D[np.ix_(np.minimum(iy + 1, D.shape[0] - 1),
+                            np.minimum(ix + 1, D.shape[1] - 1))],
+                   -np.inf)
+    F = np.maximum(np.maximum(b00, b10), np.maximum(b01, b11))
+    part = np.where(np.isfinite(F), F, -1e9)
+
+    def truth_depth(gmv, x, y, z):
+        if gmv:
+            st = zmap.simulate(gmv, part, 0.1, gx0, gy0,
+                               stock_box=(gx0, gx1, gy0, gy1, 0.0, 31.5),
+                               tool="ball", dia=9.525,
+                               stock_init=F.copy())["stock"]
+        else:
+            st = F
+        ci = int(math.floor((x - gx0) / 0.1))
+        cj = int(math.floor((y - gy0) / 0.1))
+        kR = int(math.ceil(R / 0.1))
+        i0, i1 = max(0, ci - kR - 1), min(st.shape[1], ci + kR + 2)
+        j0, j1 = max(0, cj - kR - 1), min(st.shape[0], cj + kR + 2)
+        DX, DY = np.meshgrid(gx0 + (np.arange(i0, i1) + 0.5) * 0.1 - x,
+                             gy0 + (np.arange(j0, j1) + 0.5) * 0.1 - y)
+        d2 = DX * DX + DY * DY
+        w = st[j0:j1, i0:i1]
+        m = (d2 <= R * R + 1e-9) & np.isfinite(w)
+        assert m.any(), "no stock data at the entry"
+        v = w[m] - (R - np.sqrt(np.maximum(R * R - d2[m], 0.0)))
+        return float(np.max(v)) - z
+
+    try:
+        live = LiveStock(A, gx0, gy0, cell, R, margin=2.0 * cell)
+    except TypeError:                       # pre-fix estimator
+        live = LiveStock(A, gx0, gy0, cell, R)
+    gmv = []
+    entries = []                            # (x, y, z, est, is_plunge)
+    prev = None
+    for m in moves:
+        x, y, z = m["x"], m["y"], m["z"]
+        if prev is not None:
+            px, py, pz = prev
+            if m["g"] == 1 and z < floor_z + 0.05:
+                vert = abs(x - px) <= 1e-9 and abs(y - py) <= 1e-9
+                if (vert and z < pz - 1e-9) or \
+                        (abs(z - pz) > 1e-9 and not vert):
+                    entries.append((x, y, z, live.disk_depth(x, y, z),
+                                    vert and z < pz - 1e-9, len(gmv)))
+        gmv.append({"line": len(gmv) + 1,
+                    "motion": "G0" if m["g"] == 0 else "G1",
+                    "x": x, "y": y, "z": z})
+        if prev is not None and m["g"] == 1:
+            live.stamp_chord(prev, (x, y, z))
+        prev = (x, y, z)
+    assert entries, "no entries emitted - the scene no longer exercises FE5"
+    deep = []
+    under = []
+    for (x, y, z, est, is_plunge, npre) in entries:
+        tr = truth_depth(gmv[:npre], x, y, z)
+        rep = "(%.3f,%.3f) z=%.3f est=%.4f truth=%.4f" % (x, y, z, est, tr)
+        if is_plunge and tr > 0.5 + 1e-9:
+            deep.append(rep)
+        if est < tr - 1e-6:
+            under.append(rep)
+    print("fe5h: %d entries; deep %s; under-read %s"
+          % (len(entries), deep[:3], under[:3]))
+    assert not deep, "FE5h: vertical entries below the 0.5 floor: %s" % deep
+    assert not under, "FE5h: estimate under-reads truth: %s" % under
+
+
+# ---------------------------------------------------------------------------
+# RR-STOCK: the stock handed downstream is a replay of the EMITTED program,
+# never lower than what it removes.
+# ---------------------------------------------------------------------------
+
+RR_TOL = 0.1  # mm, brief's TOL
+
+
+def _handoff_read(A, x0, y0, cell, Xc, Yc, w):
+    """Read a handed-down stock grid at the judge's cells: the max of every
+    source cell overlapping the judge cell [c-w/2, c+w/2] (exactly the
+    conservative resample_fine read the finish performs); non-finite source
+    cells are no-data (-inf)."""
+    Af = np.where(np.isfinite(A), A, -np.inf)
+    ny_, nx_ = Af.shape
+    i_lo = np.floor((Xc - w / 2.0 - x0) / cell).astype(np.int64)
+    i_hi = np.floor((Xc + w / 2.0 - x0 - 1e-9) / cell).astype(np.int64)
+    j_lo = np.floor((Yc - w / 2.0 - y0) / cell).astype(np.int64)
+    j_hi = np.floor((Yc + w / 2.0 - y0 - 1e-9) / cell).astype(np.int64)
+    out = np.full(Xc.shape, -np.inf)
+    for dj in range(int((j_hi - j_lo).max()) + 1):
+        for di in range(int((i_hi - i_lo).max()) + 1):
+            ii, jj = i_lo + di, j_lo + dj
+            ok = ((ii >= 0) & (ii < nx_) & (jj >= 0) & (jj < ny_)
+                  & (ii <= i_hi) & (jj <= j_hi))
+            v = Af[np.clip(jj, 0, ny_ - 1), np.clip(ii, 0, nx_ - 1)]
+            out = np.maximum(out, np.where(ok, v, -np.inf))
+    return out
+
+
+def test_rrstock_rough_handoff_not_below_judge():
+    """RR-STOCK red (a): rough the test block (manifest-pinned fixtures)
+    through engine.cli with --stock-out, then judge the SAME emitted rough
+    program with verify.zmap (0.1 mm part grid, full stock box). At every
+    judge cell with standing stock (above the part) the engine handoff, read
+    with the conservative overlap-max, must be >= judge - TOL (TOL=0.1):
+    the handoff is a replay of the emitted program, never lower than what
+    it removes. The coarse 0.5 mm planning stock over-clears thin slivers
+    beside cuts and FAILS this (TB chain: 1190 cells, max 15.019 mm)."""
+    import subprocess
+    tb_stl = os.path.join(ROOT, "out", "test_block.stl")
+    tb_hf05 = os.path.join(ROOT, "out", "test_block_hf_0.5.npy")
+    tb_hf01 = os.path.join(ROOT, "out", "test_block_hf_0.1.npy")
+    for p in (tb_stl, tb_hf05, tb_hf01):
+        assert os.path.exists(p), "missing fixture %s" % p
+    stock_box = (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0)
+    dia = 12.686
+    with tempfile.TemporaryDirectory() as td:
+        ngc = os.path.join(td, "rough.ngc")
+        eng_stock = os.path.join(td, "stock_after_rough_engine.npy")
+        cmd = [sys.executable, "-m", "engine.cli", "rough",
+               "--step", os.path.join(ROOT, "samples", "test_block.step"),
+               "--stock", *[("%.4f" % v) for v in stock_box],
+               "--tool", "flat:%.4f" % dia,
+               "--out", ngc, "--floor", "20.0",
+               "--final-zmin", "20.381", "--leave", "0.381",
+               "--stepdown", "19.05", "--optimal-load-mm", "2.03",
+               "--hf", tb_hf05, "--min-rest", "0.5",
+               "--stock-out", eng_stock]
+        r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
+                           env=dict(os.environ, ENGINE_WORKERS="4"))
+        assert r.returncode == 0, "cli rough failed rc=%d: %s" % (
+            r.returncode, r.stderr[-800:])
+        assert os.path.exists(eng_stock), "no engine handoff stock written"
+        # judge: zmap replay of the SAME emitted rough program, 0.1 mm grid
+        part = np.load(tb_hf01)
+        with open(tb_hf01[:-4] + ".json") as fh:
+            meta = json.load(fh)
+        jx0, jy0, jc = float(meta["x0"]), float(meta["y0"]), float(meta["cell"])
+        with open(ngc) as fh:
+            gmv = zmap.parse_gcode(fh.read())
+        res = zmap.simulate(gmv, part, jc, jx0, jy0, stock_box,
+                            tool="flat", dia=dia)
+        judge = res["stock"]
+        E = np.load(eng_stock)
+        with open(eng_stock[:-4] + ".json") as fh:
+            emeta = json.load(fh)
+        ex0, ey0, ec = (float(emeta["x0"]), float(emeta["y0"]),
+                        float(emeta["cell"]))
+        xs = jx0 + (np.arange(judge.shape[1]) + 0.5) * jc
+        ys = jy0 + (np.arange(judge.shape[0]) + 0.5) * jc
+        Xc, Yc = np.meshgrid(xs, ys)
+        eng = _handoff_read(E, ex0, ey0, ec, Xc, Yc, jc)
+        standing = np.isfinite(judge) & (judge > part + 0.01)
+        deficit = np.where(standing, judge - eng, -np.inf)
+        viol = standing & (deficit > RR_TOL)
+        n_v = int(viol.sum())
+        n_half = int((deficit > 0.5).sum())
+        worst = float(np.max(deficit)) if standing.any() else 0.0
+        print("rrstock(a): standing=%d cells, violations(>%.2f)=%d "
+              "(%.1f mm2), cells >0.5mm low=%d, max deficit %.3f mm"
+              % (int(standing.sum()), RR_TOL, n_v, n_v * jc * jc,
+                 n_half, worst))
+        assert n_v == 0, (
+            "engine handoff is BELOW the judge replay at %d standing cells "
+            "(max %.3f mm) - the handoff must replay the emitted program"
+            % (n_v, worst))
+        # two-sided (coordinator): also never above what the program left.
+        # Compared CELL FOR CELL (centre read): the conservative overlap-max
+        # above can pick up an uncut neighbour beside a wall and read up to a
+        # full wall height over (measured 13.3 mm), which says nothing about
+        # the replay; centre to centre the replay must match both ways.
+        Ef = np.where(np.isfinite(E), E, -np.inf)
+        ic = np.clip(np.floor((Xc - ex0) / ec).astype(np.int64), 0, Ef.shape[1] - 1)
+        jc_ = np.clip(np.floor((Yc - ey0) / ec).astype(np.int64), 0, Ef.shape[0] - 1)
+        eng_c = Ef[jc_, ic]
+        fin = np.isfinite(judge) & np.isfinite(eng_c)
+        over = float(np.max(np.where(fin, eng_c - judge, -np.inf)))
+        under = float(np.max(np.where(fin, judge - eng_c, -np.inf)))
+        print("rrstock(a) two-sided: max over %.3f mm, max under %.3f mm "
+              "(TOL %.2f)" % (over, under, RR_TOL))
+        assert over <= RR_TOL and under <= RR_TOL, (
+            "engine handoff differs from the judge replay cell for cell: "
+            "over %.3f, under %.3f mm" % (over, under))
+
+
+def test_rrstock_finish_handoff_matches_judge():
+    """RR-STOCK red (b): engine.cli finish --stock-out replays its OWN
+    emitted moves with its ball into the engine's 0.1 mm stock; on a small
+    two-boss scene that replay and zmap's --stock-out of the same finish
+    program must agree: |engine - judge| <= TOL (0.1) at every cell with
+    standing stock (above the part)."""
+    import subprocess
+    q, hy, top, bx, cx, bh = 15.0, 10.0, 10.0, 2.5, 5.0, 20.0
+    gx0, gy0 = -18.0, -13.0                    # part grid beyond the stock
+    gnx, gny = int(2 * 18.0 / CELL), int(2 * 13.0 / CELL)
+    xs = gx0 + (np.arange(gnx) + 0.5) * CELL
+    ys = gy0 + (np.arange(gny) + 0.5) * CELL
+    Xc, Yc = np.meshgrid(xs, ys)
+    part = hf_two_boss(Xc, Yc, top=top, bx=bx, cx=cx, bh=bh)
+    stock_box = (-q, q, -hy, hy, 0.0, bh)
+    stock0 = np.where((np.abs(Xc) <= q) & (np.abs(Yc) <= hy),
+                      np.minimum(bh, part + 0.381), -np.inf)
+    with tempfile.TemporaryDirectory() as td:
+        stl = two_boss_stl(os.path.join(td, "2boss.stl"), q=q, top=top,
+                           bx=bx, cx=cx, bh=bh)
+        init_p = os.path.join(td, "stock_init.npy")
+        np.save(init_p, stock0)
+        with open(init_p[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": CELL}, fh)
+        ngc = os.path.join(td, "finish.ngc")
+        eng_stock = os.path.join(td, "stock_after_finish_engine.npy")
+        cmd = [sys.executable, "-m", "engine.cli", "finish",
+               "--stl", stl, "--tool", "ball:%.4f" % BALL_DIA,
+               "--out", ngc, "--floor", "0.0",
+               "--stock-from", init_p, "--stock-out", eng_stock]
+        r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
+                           env=dict(os.environ, ENGINE_WORKERS="4"))
+        assert r.returncode == 0, "cli finish failed rc=%d: %s" % (
+            r.returncode, r.stderr[-800:])
+        assert os.path.exists(eng_stock), "no engine after-finish stock"
+        with open(ngc) as fh:
+            gmv = zmap.parse_gcode(fh.read())
+        res = zmap.simulate(gmv, part, CELL, gx0, gy0, stock_box,
+                            tool="ball", dia=BALL_DIA, stock_init=stock0)
+        judge = res["stock"]
+        E = np.load(eng_stock)
+        with open(eng_stock[:-4] + ".json") as fh:
+            emeta = json.load(fh)
+        assert abs(float(emeta["x0"]) - gx0) < 1e-9 \
+            and abs(float(emeta["y0"]) - gy0) < 1e-9 \
+            and abs(float(emeta["cell"]) - CELL) < 1e-9, \
+            "engine replay grid %s != judge grid" % emeta
+        assert E.shape == judge.shape, "grid shape mismatch"
+        standing = np.isfinite(judge) & (judge > part + 0.01)
+        diff = np.where(np.isfinite(E) & np.isfinite(judge),
+                        np.abs(E - judge), np.inf)
+        bad = standing & (diff > RR_TOL)
+        n_b = int(bad.sum())
+        worst = float(np.max(np.where(standing, diff, -np.inf))) \
+            if standing.any() else 0.0
+        print("rrstock(b): standing=%d cells, |engine-judge|>%.2f at %d "
+              "cells, max diff %.4f mm"
+              % (int(standing.sum()), RR_TOL, n_b, worst))
+        assert n_b == 0, (
+            "engine after-finish replay differs from the judge by > %.2f "
+            "mm at %d standing cells (max %.4f)" % (RR_TOL, n_b, worst))
+        # every cell (coordinator): an unchanged input stock would read far
+        # above the judge exactly where the program cut to the part, which
+        # the standing-only check above excludes
+        fin = np.isfinite(judge) & np.isfinite(E)
+        over = float(np.max(np.where(fin, E - judge, -np.inf)))
+        under = float(np.max(np.where(fin, judge - E, -np.inf)))
+        print("rrstock(b) every cell: max over %.4f mm, max under %.4f mm"
+              % (over, under))
+        assert over <= RR_TOL and under <= RR_TOL, (
+            "engine after-finish replay differs from the judge: over %.4f, "
+            "under %.4f mm" % (over, under))
+
+
+def test_rrstock_replay_matches_analytic_stamp():
+    """RR-STOCK independence check (coordinator): replay_stock is a port of
+    the judge's stamping, so a shared bug would blind both - compare it with
+    heights computed HERE, analytically. Flat stock top Z10 on a 0.1 mm grid;
+    one straight G1 at Z8 along X (-5 -> 5, Y0) with (1) a 6 mm ball: away
+    from the ends every cell |y| < 3 must read 8 + 3 - sqrt(9 - y^2), cells
+    |y| > 3 stay 10; (2) a 6 mm flat: cells |y| <= 3 read 8, the rest 10.
+    Checked on |x| <= 3.5 (the end caps are not straight-line analytic)."""
+    from engine.entry_depth import replay_stock
+    moves = [{"g": 0, "x": -5.0, "y": 0.0, "z": 20.0},
+             {"g": 0, "z": 8.0}, {"g": 1, "x": 5.0, "y": 0.0, "z": 8.0},
+             {"g": 0, "z": 20.0}]
+    with tempfile.TemporaryDirectory() as td:
+        for kind, corner in (("ball", 3.0), ("flat", 0.0)):
+            A, x0, y0, c = replay_stock(moves, 6.0, corner,
+                                        os.path.join(td, kind + ".npy"),
+                                        box=(-10.0, 10.0, -10.0, 10.0),
+                                        top_z=10.0)
+            ny, nx = A.shape
+            xs = x0 + (np.arange(nx) + 0.5) * c
+            ys = y0 + (np.arange(ny) + 0.5) * c
+            X, Y = np.meshgrid(xs, ys)
+            m = (np.abs(X) <= 3.5) & (np.abs(Y) <= 5.0)
+            if kind == "ball":
+                exp = np.where(np.abs(Y) < 3.0,
+                               np.minimum(10.0, 8.0 + 3.0 - np.sqrt(
+                                   np.maximum(9.0 - Y * Y, 0.0))), 10.0)
+            else:
+                exp = np.where(np.abs(Y) <= 3.0, 8.0, 10.0)
+            err = float(np.max(np.abs(A[m] - exp[m])))
+            print("rrstock analytic %s: max |replay - analytic| %.2e mm "
+                  "over %d cells" % (kind, err, int(m.sum())))
+            assert err <= 1e-6, "%s replay differs from the analytic " \
+                "stamp by %.4f mm" % (kind, err)
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -1617,8 +2780,23 @@ if __name__ == "__main__":
                test_holder_drop_tall_boss,
                test_holder_stock_ridge_along_path,
                test_shank_t31_wall_13mm,
+               test_ramp_vertices_never_below_verified_path,
+               test_fe5e_ramp_top_clear_of_ridge,
+               test_fe5t_public_ramp_top_clear_of_ridge,
+               test_fe5f_skip_bore_entries,
+               test_fe5fb_fragment_trim_keeps_surface,
+               test_fe5fb_real_bore_surface_kept,
+               test_fe5fc_buried_ends_keep_middle,
+               test_fe5fc_degenerate_pass_never_plunged,
                test_floor_dip_split_finish_and_rest,
-               test_floor_pad_rows_inside_stock_box):
+               test_floor_pad_rows_inside_stock_box,
+               test_fe5g_no_lifted_vertex_in_constant_z_pass,
+               test_fe5g_scene_vertices_never_below_cl,
+               test_fe5g_net_ramps_and_trims_inpass_drop,
+               test_fe5h_entry_estimate_not_below_true_depth,
+               test_rrstock_rough_handoff_not_below_judge,
+               test_rrstock_finish_handoff_matches_judge,
+               test_rrstock_replay_matches_analytic_stamp):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))

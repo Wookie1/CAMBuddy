@@ -228,6 +228,7 @@ def finish_main(a):
         stickout_mm=getattr(a, "stickout", None),
         holder=getattr(a, "holder", None),
         post_grid_mm=a.post_grid_mm,
+        ramp_angle_deg=a.ramp_angle_deg,
         **rest_kw)
     # PQ: header corner radius = D/2 for a ball, the table corner radius for
     # a bull, 0 for a flat (the CLI spec carries only kind:dia for balls)
@@ -256,6 +257,15 @@ def finish_main(a):
     stats["t_total_s"] = round(time.time() - t0, 1)
     print("wrote %s (%d moves) in %.1f s" % (a.out, len(moves),
                                                stats.get("t_total_s", 0.0)), flush=True)
+    if a.stock_out:
+        # RR-STOCK: after-finish stock = this program's own replay from
+        # --stock-from (the rest pass plans on it, never on a judge stock)
+        from engine import entry_depth
+        if not a.stock_from:
+            raise SystemExit("finish --stock-out needs --stock-from")
+        entry_depth.replay_stock(
+            moves, dia, dia / 2.0 if kind == "ball" else corner,
+            a.stock_out, init=finishmod.load_heightfield(a.stock_from))
     if a.stats_json:
         with open(a.stats_json, "w") as fh:
             json.dump(stats, fh, indent=2)
@@ -321,6 +331,13 @@ def rest_rough_main(a):
     stats["t_total_s"] = round(time.time() - t0, 1)
     print("wrote %s (%d moves) in %.1f s" % (a.out, len(moves),
                                              stats["t_total_s"]), flush=True)
+    if a.stock_out:
+        # RR-STOCK2: after-rest-rough stock = this program's own replay from
+        # --stock-from (the finish after it plans on it, never on a judge map)
+        from engine import entry_depth
+        entry_depth.replay_stock(
+            moves, dia, dia / 2.0, a.stock_out,
+            init=rrmod.fin.load_heightfield(a.stock_from))
     if a.stats_json:
         with open(a.stats_json, "w") as fh:
             json.dump(stats, fh, indent=2)
@@ -541,6 +558,9 @@ def main(argv=None):
                         ".json sidecar, engine.cli rough --stock-out): "
                         "rapid/lift heights must clear max(CL, stock within "
                         "the tool radius) + margin along the swept path (S3b)")
+    f.add_argument("--stock-out", dest="stock_out", default=None,
+                   help="RR-STOCK: write this program's own 0.1 mm replay "
+                        "(moves x tool) from --stock-from (+ sidecar)")
     f.add_argument("--stock-allow", dest="stock_allow", type=float,
                    default=None,
                    help="stock allowance mm added on top of max CL + margin "
@@ -580,6 +600,12 @@ def main(argv=None):
                         "the caller passes the grid matching its post units)")
     f.add_argument("--tools-json", dest="tools_json", default=None,
                    help="tool table JSON for every tool lookup of this call")
+    f.add_argument("--ramp-angle-deg", dest="ramp_angle_deg", type=float,
+                   default=2.0,
+                   help="FE5: entry ramp angle deg - entries where the live "
+                        "stock depth exceeds 0.25 mm enter on a vertex-raise "
+                        "ramp along the pass's own vertices; default 2.0, "
+                        "clamped [0.5, 15], <= 0 rejected")
 
     rr = sub.add_parser("rest-rough",
                        help="z-level ball rest-rough restricted to zones where "
@@ -624,6 +650,12 @@ def main(argv=None):
                         "SE2 descent column (default 0.25)")
     rr.add_argument("--workers", type=int, default=None)
     rr.add_argument("--stats-json", dest="stats_json", default=None)
+    rr.add_argument("--stock-out", dest="stock_out", default=None,
+                    help="RR-STOCK2: replay this rest-rough's own emitted "
+                         "ball moves into its --stock-from stock and write "
+                         "the .npy (+ x0/y0/cell .json sidecar): the finish "
+                         "after a rest-rough plans on THIS, never on a zmap "
+                         "rest stock")
     rr.add_argument("--post", choices=("neutral", "lnc"), default="neutral")
     rr.add_argument("--program", type=int, default=1003)
     rr.add_argument("--op-name", dest="op_name", default="REST ROUGH")
@@ -727,6 +759,12 @@ def main(argv=None):
                                   keep_tool_down=a.keep_tool_down,
                                    progress=prog, stock_out=a.stock_out,
                                     ramp_angle_deg=a.ramp_angle_deg)
+    if a.stock_out:
+        # RR-STOCK: hand downstream the replay of the EMITTED moves (never
+        # lower than what they remove); overwrites rough's coarse file
+        from engine import entry_depth
+        entry_depth.replay_stock(moves, dia, corner, a.stock_out,
+                                 box=a.stock, top_z=a.stock[5])
     if a.post == "lnc":
         from engine import post_lnc
         text = post_lnc.post(moves, metric=a.metric, program=a.program,
