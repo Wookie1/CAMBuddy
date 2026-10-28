@@ -257,6 +257,15 @@ def finish_main(a):
     stats["t_total_s"] = round(time.time() - t0, 1)
     print("wrote %s (%d moves) in %.1f s" % (a.out, len(moves),
                                                stats.get("t_total_s", 0.0)), flush=True)
+    if a.stock_out:
+        # RR-STOCK: after-finish stock = this program's own replay from
+        # --stock-from (the rest pass plans on it, never on a judge stock)
+        from engine import entry_depth
+        if not a.stock_from:
+            raise SystemExit("finish --stock-out needs --stock-from")
+        entry_depth.replay_stock(
+            moves, dia, dia / 2.0 if kind == "ball" else corner,
+            a.stock_out, init=finishmod.load_heightfield(a.stock_from))
     if a.stats_json:
         with open(a.stats_json, "w") as fh:
             json.dump(stats, fh, indent=2)
@@ -542,6 +551,9 @@ def main(argv=None):
                         ".json sidecar, engine.cli rough --stock-out): "
                         "rapid/lift heights must clear max(CL, stock within "
                         "the tool radius) + margin along the swept path (S3b)")
+    f.add_argument("--stock-out", dest="stock_out", default=None,
+                   help="RR-STOCK: write this program's own 0.1 mm replay "
+                        "(moves x tool) from --stock-from (+ sidecar)")
     f.add_argument("--stock-allow", dest="stock_allow", type=float,
                    default=None,
                    help="stock allowance mm added on top of max CL + margin "
@@ -734,6 +746,12 @@ def main(argv=None):
                                   keep_tool_down=a.keep_tool_down,
                                    progress=prog, stock_out=a.stock_out,
                                     ramp_angle_deg=a.ramp_angle_deg)
+    if a.stock_out:
+        # RR-STOCK: hand downstream the replay of the EMITTED moves (never
+        # lower than what they remove); overwrites rough's coarse file
+        from engine import entry_depth
+        entry_depth.replay_stock(moves, dia, corner, a.stock_out,
+                                 box=a.stock, top_z=a.stock[5])
     if a.post == "lnc":
         from engine import post_lnc
         text = post_lnc.post(moves, metric=a.metric, program=a.program,

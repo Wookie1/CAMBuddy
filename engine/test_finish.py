@@ -2533,6 +2533,168 @@ def test_fe5h_entry_estimate_not_below_true_depth():
     assert not under, "FE5h: estimate under-reads truth: %s" % under
 
 
+# ---------------------------------------------------------------------------
+# RR-STOCK: the stock handed downstream is a replay of the EMITTED program,
+# never lower than what it removes.
+# ---------------------------------------------------------------------------
+
+RR_TOL = 0.1  # mm, brief's TOL
+
+
+def _handoff_read(A, x0, y0, cell, Xc, Yc, w):
+    """Read a handed-down stock grid at the judge's cells: the max of every
+    source cell overlapping the judge cell [c-w/2, c+w/2] (exactly the
+    conservative resample_fine read the finish performs); non-finite source
+    cells are no-data (-inf)."""
+    Af = np.where(np.isfinite(A), A, -np.inf)
+    ny_, nx_ = Af.shape
+    i_lo = np.floor((Xc - w / 2.0 - x0) / cell).astype(np.int64)
+    i_hi = np.floor((Xc + w / 2.0 - x0 - 1e-9) / cell).astype(np.int64)
+    j_lo = np.floor((Yc - w / 2.0 - y0) / cell).astype(np.int64)
+    j_hi = np.floor((Yc + w / 2.0 - y0 - 1e-9) / cell).astype(np.int64)
+    out = np.full(Xc.shape, -np.inf)
+    for dj in range(int((j_hi - j_lo).max()) + 1):
+        for di in range(int((i_hi - i_lo).max()) + 1):
+            ii, jj = i_lo + di, j_lo + dj
+            ok = ((ii >= 0) & (ii < nx_) & (jj >= 0) & (jj < ny_)
+                  & (ii <= i_hi) & (jj <= j_hi))
+            v = Af[np.clip(jj, 0, ny_ - 1), np.clip(ii, 0, nx_ - 1)]
+            out = np.maximum(out, np.where(ok, v, -np.inf))
+    return out
+
+
+def test_rrstock_rough_handoff_not_below_judge():
+    """RR-STOCK red (a): rough the test block (manifest-pinned fixtures)
+    through engine.cli with --stock-out, then judge the SAME emitted rough
+    program with verify.zmap (0.1 mm part grid, full stock box). At every
+    judge cell with standing stock (above the part) the engine handoff, read
+    with the conservative overlap-max, must be >= judge - TOL (TOL=0.1):
+    the handoff is a replay of the emitted program, never lower than what
+    it removes. The coarse 0.5 mm planning stock over-clears thin slivers
+    beside cuts and FAILS this (TB chain: 1190 cells, max 15.019 mm)."""
+    import subprocess
+    tb_stl = os.path.join(ROOT, "out", "test_block.stl")
+    tb_hf05 = os.path.join(ROOT, "out", "test_block_hf_0.5.npy")
+    tb_hf01 = os.path.join(ROOT, "out", "test_block_hf_0.1.npy")
+    for p in (tb_stl, tb_hf05, tb_hf01):
+        assert os.path.exists(p), "missing fixture %s" % p
+    stock_box = (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0)
+    dia = 12.686
+    with tempfile.TemporaryDirectory() as td:
+        ngc = os.path.join(td, "rough.ngc")
+        eng_stock = os.path.join(td, "stock_after_rough_engine.npy")
+        cmd = [sys.executable, "-m", "engine.cli", "rough",
+               "--step", os.path.join(ROOT, "samples", "test_block.step"),
+               "--stock", *[("%.4f" % v) for v in stock_box],
+               "--tool", "flat:%.4f" % dia,
+               "--out", ngc, "--floor", "20.0",
+               "--final-zmin", "20.381", "--leave", "0.381",
+               "--stepdown", "19.05", "--optimal-load-mm", "2.03",
+               "--hf", tb_hf05, "--min-rest", "0.5",
+               "--stock-out", eng_stock]
+        r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
+                           env=dict(os.environ, ENGINE_WORKERS="4"))
+        assert r.returncode == 0, "cli rough failed rc=%d: %s" % (
+            r.returncode, r.stderr[-800:])
+        assert os.path.exists(eng_stock), "no engine handoff stock written"
+        # judge: zmap replay of the SAME emitted rough program, 0.1 mm grid
+        part = np.load(tb_hf01)
+        with open(tb_hf01[:-4] + ".json") as fh:
+            meta = json.load(fh)
+        jx0, jy0, jc = float(meta["x0"]), float(meta["y0"]), float(meta["cell"])
+        with open(ngc) as fh:
+            gmv = zmap.parse_gcode(fh.read())
+        res = zmap.simulate(gmv, part, jc, jx0, jy0, stock_box,
+                            tool="flat", dia=dia)
+        judge = res["stock"]
+        E = np.load(eng_stock)
+        with open(eng_stock[:-4] + ".json") as fh:
+            emeta = json.load(fh)
+        ex0, ey0, ec = (float(emeta["x0"]), float(emeta["y0"]),
+                        float(emeta["cell"]))
+        xs = jx0 + (np.arange(judge.shape[1]) + 0.5) * jc
+        ys = jy0 + (np.arange(judge.shape[0]) + 0.5) * jc
+        Xc, Yc = np.meshgrid(xs, ys)
+        eng = _handoff_read(E, ex0, ey0, ec, Xc, Yc, jc)
+        standing = np.isfinite(judge) & (judge > part + 0.01)
+        deficit = np.where(standing, judge - eng, -np.inf)
+        viol = standing & (deficit > RR_TOL)
+        n_v = int(viol.sum())
+        n_half = int((deficit > 0.5).sum())
+        worst = float(np.max(deficit)) if standing.any() else 0.0
+        print("rrstock(a): standing=%d cells, violations(>%.2f)=%d "
+              "(%.1f mm2), cells >0.5mm low=%d, max deficit %.3f mm"
+              % (int(standing.sum()), RR_TOL, n_v, n_v * jc * jc,
+                 n_half, worst))
+        assert n_v == 0, (
+            "engine handoff is BELOW the judge replay at %d standing cells "
+            "(max %.3f mm) - the handoff must replay the emitted program"
+            % (n_v, worst))
+
+
+def test_rrstock_finish_handoff_matches_judge():
+    """RR-STOCK red (b): engine.cli finish --stock-out replays its OWN
+    emitted moves with its ball into the engine's 0.1 mm stock; on a small
+    two-boss scene that replay and zmap's --stock-out of the same finish
+    program must agree: |engine - judge| <= TOL (0.1) at every cell with
+    standing stock (above the part)."""
+    import subprocess
+    q, hy, top, bx, cx, bh = 15.0, 10.0, 10.0, 2.5, 5.0, 20.0
+    gx0, gy0 = -18.0, -13.0                    # part grid beyond the stock
+    gnx, gny = int(2 * 18.0 / CELL), int(2 * 13.0 / CELL)
+    xs = gx0 + (np.arange(gnx) + 0.5) * CELL
+    ys = gy0 + (np.arange(gny) + 0.5) * CELL
+    Xc, Yc = np.meshgrid(xs, ys)
+    part = hf_two_boss(Xc, Yc, top=top, bx=bx, cx=cx, bh=bh)
+    stock_box = (-q, q, -hy, hy, 0.0, bh)
+    stock0 = np.where((np.abs(Xc) <= q) & (np.abs(Yc) <= hy),
+                      np.minimum(bh, part + 0.381), -np.inf)
+    with tempfile.TemporaryDirectory() as td:
+        stl = two_boss_stl(os.path.join(td, "2boss.stl"), q=q, top=top,
+                           bx=bx, cx=cx, bh=bh)
+        init_p = os.path.join(td, "stock_init.npy")
+        np.save(init_p, stock0)
+        with open(init_p[:-4] + ".json", "w") as fh:
+            json.dump({"x0": gx0, "y0": gy0, "cell": CELL}, fh)
+        ngc = os.path.join(td, "finish.ngc")
+        eng_stock = os.path.join(td, "stock_after_finish_engine.npy")
+        cmd = [sys.executable, "-m", "engine.cli", "finish",
+               "--stl", stl, "--tool", "ball:%.4f" % BALL_DIA,
+               "--out", ngc, "--floor", "0.0",
+               "--stock-from", init_p, "--stock-out", eng_stock]
+        r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
+                           env=dict(os.environ, ENGINE_WORKERS="4"))
+        assert r.returncode == 0, "cli finish failed rc=%d: %s" % (
+            r.returncode, r.stderr[-800:])
+        assert os.path.exists(eng_stock), "no engine after-finish stock"
+        with open(ngc) as fh:
+            gmv = zmap.parse_gcode(fh.read())
+        res = zmap.simulate(gmv, part, CELL, gx0, gy0, stock_box,
+                            tool="ball", dia=BALL_DIA, stock_init=stock0)
+        judge = res["stock"]
+        E = np.load(eng_stock)
+        with open(eng_stock[:-4] + ".json") as fh:
+            emeta = json.load(fh)
+        assert abs(float(emeta["x0"]) - gx0) < 1e-9 \
+            and abs(float(emeta["y0"]) - gy0) < 1e-9 \
+            and abs(float(emeta["cell"]) - CELL) < 1e-9, \
+            "engine replay grid %s != judge grid" % emeta
+        assert E.shape == judge.shape, "grid shape mismatch"
+        standing = np.isfinite(judge) & (judge > part + 0.01)
+        diff = np.where(np.isfinite(E) & np.isfinite(judge),
+                        np.abs(E - judge), np.inf)
+        bad = standing & (diff > RR_TOL)
+        n_b = int(bad.sum())
+        worst = float(np.max(np.where(standing, diff, -np.inf))) \
+            if standing.any() else 0.0
+        print("rrstock(b): standing=%d cells, |engine-judge|>%.2f at %d "
+              "cells, max diff %.4f mm"
+              % (int(standing.sum()), RR_TOL, n_b, worst))
+        assert n_b == 0, (
+            "engine after-finish replay differs from the judge by > %.2f "
+            "mm at %d standing cells (max %.4f)" % (RR_TOL, n_b, worst))
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -2567,7 +2729,9 @@ if __name__ == "__main__":
                test_fe5g_no_lifted_vertex_in_constant_z_pass,
                test_fe5g_scene_vertices_never_below_cl,
                test_fe5g_net_ramps_and_trims_inpass_drop,
-               test_fe5h_entry_estimate_not_below_true_depth):
+               test_fe5h_entry_estimate_not_below_true_depth,
+               test_rrstock_rough_handoff_not_below_judge,
+               test_rrstock_finish_handoff_matches_judge):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))

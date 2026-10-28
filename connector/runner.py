@@ -1062,6 +1062,11 @@ class EngineRun:
         #    snap stays a no-op on posting)
         fin_neutral = os.path.join(self.work, "finish_neutral.ngc")
         fin_stats = os.path.join(self.work, "finish_stats.json")
+        # RR-STOCK: the engine replays its own emitted finish moves into a
+        # 0.1 mm stock; the rest pass plans on THAT (never on a judge stock)
+        stock_fin_engine = os.path.join(
+            self.work, "stock_after_finish_engine.npy")
+        fr.remove_stale(stock_fin_engine)
         self._spawn([py, "-m", "engine.cli", "finish",
                     "--stl", stl,
                     "--tool", "ball:%.4f" % values["tool_diameter"],
@@ -1077,6 +1082,7 @@ class EngineRun:
                     "--spindle", str(int(values["rpm"])),
                     "--post-grid-mm", post_grid,
                     "--stock-from", rough_stock_out,
+                    "--stock-out", stock_fin_engine,
                     *self._tools_json_args(),
                     "--stats-json", fin_stats], 0.50, 0.72, on_progress)
 
@@ -1205,7 +1211,7 @@ class EngineRun:
                         "--stl", stl,
                         "--out", rest_neutral,
                         "--tool", "ball:%.4f" % values["tool_diameter"],
-                        "--rest-from", stock_finish,
+                        "--rest-from", stock_fin_engine,
                         "--rest-tool", "ball:%.4f" % rest["diameter_mm"],
                         "--min-rest", "%.4f" % (values.get("min_rest") or 0.5),
                         "--stock-from", rough_stock_out,
