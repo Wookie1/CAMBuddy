@@ -316,7 +316,7 @@ class TestEndToEnd:
 
         # files uploaded before the final state, correct digests recorded
         assert mock.file_names(501) == ["check.json", "preview.png",
-                                       "rough.nc"]
+                                       "rough.nc", "view.bin", "view.json"]
         files = {n: mock.file_info(501, n) for n in mock.file_names(501)}
         assert files["preview.png"]["bytes"] > 1000
         assert files["preview.png"]["media"] == "image/png"
