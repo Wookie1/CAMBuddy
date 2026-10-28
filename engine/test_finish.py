@@ -2695,6 +2695,42 @@ def test_rrstock_finish_handoff_matches_judge():
             "mm at %d standing cells (max %.4f)" % (RR_TOL, n_b, worst))
 
 
+def test_rrstock_replay_matches_analytic_stamp():
+    """RR-STOCK independence check (coordinator): replay_stock is a port of
+    the judge's stamping, so a shared bug would blind both - compare it with
+    heights computed HERE, analytically. Flat stock top Z10 on a 0.1 mm grid;
+    one straight G1 at Z8 along X (-5 -> 5, Y0) with (1) a 6 mm ball: away
+    from the ends every cell |y| < 3 must read 8 + 3 - sqrt(9 - y^2), cells
+    |y| > 3 stay 10; (2) a 6 mm flat: cells |y| <= 3 read 8, the rest 10.
+    Checked on |x| <= 3.5 (the end caps are not straight-line analytic)."""
+    from engine.entry_depth import replay_stock
+    moves = [{"g": 0, "x": -5.0, "y": 0.0, "z": 20.0},
+             {"g": 0, "z": 8.0}, {"g": 1, "x": 5.0, "y": 0.0, "z": 8.0},
+             {"g": 0, "z": 20.0}]
+    with tempfile.TemporaryDirectory() as td:
+        for kind, corner in (("ball", 3.0), ("flat", 0.0)):
+            A, x0, y0, c = replay_stock(moves, 6.0, corner,
+                                        os.path.join(td, kind + ".npy"),
+                                        box=(-10.0, 10.0, -10.0, 10.0),
+                                        top_z=10.0)
+            ny, nx = A.shape
+            xs = x0 + (np.arange(nx) + 0.5) * c
+            ys = y0 + (np.arange(ny) + 0.5) * c
+            X, Y = np.meshgrid(xs, ys)
+            m = (np.abs(X) <= 3.5) & (np.abs(Y) <= 5.0)
+            if kind == "ball":
+                exp = np.where(np.abs(Y) < 3.0,
+                               np.minimum(10.0, 8.0 + 3.0 - np.sqrt(
+                                   np.maximum(9.0 - Y * Y, 0.0))), 10.0)
+            else:
+                exp = np.where(np.abs(Y) <= 3.0, 8.0, 10.0)
+            err = float(np.max(np.abs(A[m] - exp[m])))
+            print("rrstock analytic %s: max |replay - analytic| %.2e mm "
+                  "over %d cells" % (kind, err, int(m.sum())))
+            assert err <= 1e-6, "%s replay differs from the analytic " \
+                "stamp by %.4f mm" % (kind, err)
+
+
 if __name__ == "__main__":
     for fn in (test_hemisphere_on_plate, test_cone_60deg,
                test_slot_narrower_than_ball, test_plate_at_floor,
@@ -2731,7 +2767,8 @@ if __name__ == "__main__":
                test_fe5g_net_ramps_and_trims_inpass_drop,
                test_fe5h_entry_estimate_not_below_true_depth,
                test_rrstock_rough_handoff_not_below_judge,
-               test_rrstock_finish_handoff_matches_judge):
+               test_rrstock_finish_handoff_matches_judge,
+               test_rrstock_replay_matches_analytic_stamp):
         t = __import__("time").time()
         fn()
         print("%s OK in %.1fs" % (fn.__name__, __import__("time").time() - t))
