@@ -56,75 +56,81 @@ def test_rrstock2_restrough_handoff_not_below_judge():
     surf, stock, _, _ = _rr1b_pocket_scene((lo, hi))
     # the CLI's STEP tessellation is FreeCAD-bound; the scene IS a synthetic
     # part, so hand the CLI this exact surf instead of a tessellated STEP
+    # restore the patched model functions afterwards (coordinator: test (b)
+    # in the same process must load the real part)
+    saved = (emod.step_to_stl, emod.load_surf)
     emod.step_to_stl = lambda step, *a, **k: step
     emod.load_surf = lambda stl: surf
-    dia = 9.525
-    with tempfile.TemporaryDirectory() as td:
-        stockp = os.path.join(td, "stock_in.npy")
-        np.save(stockp, stock[0])
-        with open(stockp[:-4] + ".json", "w") as fh:
-            json.dump({"x0": stock[1], "y0": stock[2], "cell": stock[3]},
-                      fh)
-        ngc = os.path.join(td, "rest_rough.ngc")
-        eng_stock = os.path.join(td, "stock_after_restrough_engine.npy")
-        ns = argparse.Namespace(
-            step="synth.step", stock_from=stockp, out=ngc,
-            tool="ball:%.3f" % dia, floor=24.0, stepdown=2.0, ae=1.905,
-            rest_leave=0.2, min_excess=0.5, min_helix_r=1.903,
-            ramp_angle_deg=2.0, cut_feed=2280.0, ramp_feed=850.0,
-            spindle=8000, clearance=None, zb_floor=0.5, shallow=0.25,
-            workers=4, stats_json=None, post="neutral", program=1003,
-            op_name="REST ROUGH", metric=False, tool_number=None,
-            stock_out=eng_stock)
-        rc = climod.rest_rough_main(ns)
-        assert rc == 0 and os.path.exists(ngc)
-        assert os.path.exists(eng_stock), \
-            "rest-rough --stock-out wrote no handoff stock"
+    try:
+        dia = 9.525
+        with tempfile.TemporaryDirectory() as td:
+            stockp = os.path.join(td, "stock_in.npy")
+            np.save(stockp, stock[0])
+            with open(stockp[:-4] + ".json", "w") as fh:
+                json.dump({"x0": stock[1], "y0": stock[2], "cell": stock[3]},
+                          fh)
+            ngc = os.path.join(td, "rest_rough.ngc")
+            eng_stock = os.path.join(td, "stock_after_restrough_engine.npy")
+            ns = argparse.Namespace(
+                step="synth.step", stock_from=stockp, out=ngc,
+                tool="ball:%.3f" % dia, floor=24.0, stepdown=2.0, ae=1.905,
+                rest_leave=0.2, min_excess=0.5, min_helix_r=1.903,
+                ramp_angle_deg=2.0, cut_feed=2280.0, ramp_feed=850.0,
+                spindle=8000, clearance=None, zb_floor=0.5, shallow=0.25,
+                workers=4, stats_json=None, post="neutral", program=1003,
+                op_name="REST ROUGH", metric=False, tool_number=None,
+                stock_out=eng_stock)
+            rc = climod.rest_rough_main(ns)
+            assert rc == 0 and os.path.exists(ngc)
+            assert os.path.exists(eng_stock), \
+                "rest-rough --stock-out wrote no handoff stock"
 
-        # judge: zmap replay of the SAME emitted program, 0.1 mm grid,
-        # stock-in = the same (uniform 30.0) input stock
-        n = int(round(40.0 / CELL))
-        xs = (np.arange(n) + 0.5) * CELL
-        Xc, Yc = np.meshgrid(xs, xs)
-        part = np.where((Xc >= lo) & (Xc <= hi) & (Yc >= lo) & (Yc <= hi),
-                        24.0, 30.0)
-        stock0 = np.full((n, n), 30.0)
-        with open(ngc) as fh:
-            gmv = zmap.parse_gcode(fh.read())
-        res = zmap.simulate(gmv, part, CELL, 0.0, 0.0,
-                            (0.0, 40.0, 0.0, 40.0, 20.0, 30.0),
-                            tool="ball", dia=dia, stock_init=stock0)
-        judge = res["stock"]
-        E = np.load(eng_stock)
-        with open(eng_stock[:-4] + ".json") as fh:
-            emeta = json.load(fh)
-        assert abs(float(emeta["x0"])) < 1e-9 \
-            and abs(float(emeta["y0"])) < 1e-9 \
-            and abs(float(emeta["cell"]) - CELL) < 1e-9, \
-            "engine replay grid %s != judge grid" % emeta
-        assert E.shape == judge.shape, "grid shape mismatch"
-        standing = np.isfinite(judge) & (judge > part + 0.01)
-        deficit = np.where(standing, judge - E, -np.inf)
-        viol = standing & (deficit > RR_TOL)
-        n_v = int(viol.sum())
-        worst = float(np.max(deficit)) if standing.any() else 0.0
-        print("rrstock2(a): standing=%d cells, handoff below judge by "
-              ">%.2f at %d cells, max deficit %.3f mm"
-              % (int(standing.sum()), RR_TOL, n_v, worst))
-        assert n_v == 0, (
-            "engine rest-rough handoff is BELOW the judge replay at %d "
-            "standing cells (max %.3f mm)" % (n_v, worst))
-        # two-sided (coordinator): a handoff that wrote its INPUT stock back
-        # unchanged passes the one-sided check; it must also not stand
-        # above what the program really left anywhere
-        fin = np.isfinite(judge) & np.isfinite(E)
-        over = float(np.max(np.where(fin, E - judge, -np.inf)))
-        under = float(np.max(np.where(fin, judge - E, -np.inf)))
-        print("rrstock2(a) two-sided: max over %.3f mm, max under %.3f mm "
-              "(TOL %.2f)" % (over, under, RR_TOL))
-        assert over <= RR_TOL, (
-            "engine rest-rough handoff stands ABOVE the judge replay by "
-            "%.3f mm - the handoff must be the program's own replay" % over)
+            # judge: zmap replay of the SAME emitted program, 0.1 mm grid,
+            # stock-in = the same (uniform 30.0) input stock
+            n = int(round(40.0 / CELL))
+            xs = (np.arange(n) + 0.5) * CELL
+            Xc, Yc = np.meshgrid(xs, xs)
+            part = np.where((Xc >= lo) & (Xc <= hi) & (Yc >= lo) & (Yc <= hi),
+                            24.0, 30.0)
+            stock0 = np.full((n, n), 30.0)
+            with open(ngc) as fh:
+                gmv = zmap.parse_gcode(fh.read())
+            res = zmap.simulate(gmv, part, CELL, 0.0, 0.0,
+                                (0.0, 40.0, 0.0, 40.0, 20.0, 30.0),
+                                tool="ball", dia=dia, stock_init=stock0)
+            judge = res["stock"]
+            E = np.load(eng_stock)
+            with open(eng_stock[:-4] + ".json") as fh:
+                emeta = json.load(fh)
+            assert abs(float(emeta["x0"])) < 1e-9 \
+                and abs(float(emeta["y0"])) < 1e-9 \
+                and abs(float(emeta["cell"]) - CELL) < 1e-9, \
+                "engine replay grid %s != judge grid" % emeta
+            assert E.shape == judge.shape, "grid shape mismatch"
+            standing = np.isfinite(judge) & (judge > part + 0.01)
+            deficit = np.where(standing, judge - E, -np.inf)
+            viol = standing & (deficit > RR_TOL)
+            n_v = int(viol.sum())
+            worst = float(np.max(deficit)) if standing.any() else 0.0
+            print("rrstock2(a): standing=%d cells, handoff below judge by "
+                  ">%.2f at %d cells, max deficit %.3f mm"
+                  % (int(standing.sum()), RR_TOL, n_v, worst))
+            assert n_v == 0, (
+                "engine rest-rough handoff is BELOW the judge replay at %d "
+                "standing cells (max %.3f mm)" % (n_v, worst))
+            # two-sided (coordinator): a handoff that wrote its INPUT stock back
+            # unchanged passes the one-sided check; it must also not stand
+            # above what the program really left anywhere
+            fin = np.isfinite(judge) & np.isfinite(E)
+            over = float(np.max(np.where(fin, E - judge, -np.inf)))
+            under = float(np.max(np.where(fin, judge - E, -np.inf)))
+            print("rrstock2(a) two-sided: max over %.3f mm, max under %.3f mm "
+                  "(TOL %.2f)" % (over, under, RR_TOL))
+            assert over <= RR_TOL, (
+                "engine rest-rough handoff stands ABOVE the judge replay by "
+                "%.3f mm - the handoff must be the program's own replay" % over)
+    finally:
+        emod.step_to_stl, emod.load_surf = saved
 
 
 def test_rrstock2_skip_clusters_have_reason():
