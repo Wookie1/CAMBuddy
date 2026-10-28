@@ -152,6 +152,7 @@ ul.plain, ul.warn { margin: 2px 0; padding-left: 18px; }
 .v3d { margin-top: 10px; }
 .v3d-canvas { display: block; width: 420px; max-width: 100%; border: 1px solid var(--line); border-radius: 6px; }
 .v3d-tools { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; font-size: 12px; color: var(--fg); }
-.v3d-tools label { display: inline-flex; align-items: center; gap: 3px; }
+.v3d-tools label { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
+.v3d-tools input[type="checkbox"] { width: auto; margin: 0; padding: 0; }
 .v3d-status { font-size: 12px; color: var(--muted); margin-top: 4px; }
 .v3d-note { font-size: 12px; color: var(--muted); margin: 8px 0 0; }

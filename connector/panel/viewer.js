@@ -34,9 +34,11 @@
     var dv = new DataView(buf);
     var g = hdr.grid, z = hdr.z, o = hdr.offsets, n = g.nx * g.ny;
     var part = new Float32Array(n), stock = new Float32Array(n);
+    var ND = z.nodata === undefined ? -1 : z.nodata;
     for (var i = 0; i < n; i++) {
-      part[i] = z.offset + dv.getUint16(o.part + i * 2, true) * z.scale;
-      stock[i] = z.offset + dv.getUint16(o.stock + i * 2, true) * z.scale;
+      var qp = dv.getUint16(o.part + i * 2, true), qs = dv.getUint16(o.stock + i * 2, true);
+      part[i] = z.offset + (qp === ND ? 0 : qp) * z.scale;          // no data: grid floor
+      stock[i] = qs === ND ? part[i] : z.offset + qs * z.scale;     // no stock: nothing left
     }
     var progs = (hdr.programs || []).map(function (p) {
       var pts = new Float32Array(p.points * 3), fl = new Uint8Array(p.points);

@@ -1053,7 +1053,8 @@ class TestRestPass:
         assert result["programs"]["rest"]["cut_length_mm"] == 100.0
         assert result["zmap"]["gouges"]["rest"] == 0
         assert result["files"] == ["rough.nc", "finish.nc", "rest.nc",
-                                  "check.json", "preview.png"]
+                                  "check.json", "preview.png",
+                                  "view.bin", "view.json"]
         assert "rest.nc" in files
         # combined = rough + finish + rest (each fake reports 1.0 s / 100 mm)
         assert result["estimated_time_min"] == pytest.approx(3.0 / 60.0,

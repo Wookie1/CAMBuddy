@@ -317,3 +317,66 @@ def test_view3d_programs_byte_identical(tmp_path, base_tree):
     assert h_cur == h_base, ("posted programs differ:\ncur %s\nbase %s"
                              % (h_cur, h_base))
     assert len(h_cur) >= 2, "probe posted no programs: %s" % h_cur
+
+
+# --------------------------------------------- supervisor fix (coordinator) ----
+def test_view3d_real_shaped_stock_nodata(tmp_path):
+    """A real judged stock carries -inf outside the stock box (zmap's padded
+    grid). build_view must not crash on it: non-finite cells are stored as the
+    header's nodata code, finite cells decode within scale/2 of the cell
+    extremum, and the offset comes from finite cells only. (Crashed on
+    edead3b: OverflowError from math.floor(-inf).)"""
+    import view
+
+    cell = 0.1
+    part = np.full((40, 60), 1.0)
+    stock = np.full((40, 60), -np.inf)
+    stock[10:30, 10:50] = 6.0                  # the stock box interior
+    part[0, 0] = np.nan                        # and one non-finite part cell
+    pn, sn = tmp_path / "part.npy", tmp_path / "stock.npy"
+    np.save(pn, part)
+    np.save(sn, stock)
+    meta = {"x0": 0.0, "y0": 0.0, "cell": cell, "tess_tol": 0.01}
+    for p in (pn, sn):
+        with open(os.path.splitext(str(p))[0] + ".json", "w") as fh:
+            json.dump(meta, fh)
+    hdr = view.build_view(str(tmp_path / "v.bin"), str(tmp_path / "v.json"),
+                          str(pn), str(sn), [], {})
+    g, z = hdr["grid"], hdr["z"]
+    nd = z["nodata"]
+    raw = open(tmp_path / "v.bin", "rb").read()
+    n = g["nx"] * g["ny"]
+    pq = np.frombuffer(raw[:2 * n], dtype="<u2").reshape(g["ny"], g["nx"])
+    sq = np.frombuffer(raw[2 * n:4 * n], dtype="<u2").reshape(g["ny"], g["nx"])
+    assert np.isfinite(z["offset"]) and z["offset"] <= 1.0
+    assert sq[0, 0] == nd and sq[-1, -1] == nd, "border stock must be nodata"
+    inner = sq[3:5, 3:9]                       # 0.5 mm cells fully inside the box
+    assert (inner != nd).all()
+    assert np.allclose(inner * z["scale"] + z["offset"], 6.0, atol=z["scale"] / 2)
+    assert pq[0, 0] == nd and (pq[1:, 1:] != nd).all()
+
+
+def test_view3d_failure_never_fails_the_run(tmp_path, monkeypatch):
+    """A view failure (forced) must not fail the run: the run returns, the
+    result's files list and the uploaded files omit view.*, check.json and
+    the gates are byte-for-byte what a run with a working view writes, and a
+    one-line note is in the run log (run dir run.log)."""
+    import view
+
+    ok_dir, bad_dir = tmp_path / "ok", tmp_path / "bad"
+    r_ok, f_ok, _ = _run_chain(ok_dir, monkeypatch)
+    assert "view.bin" in r_ok["files"] and "view.bin" in f_ok
+
+    def boom(*a, **k):
+        raise RuntimeError("forced view failure")
+    monkeypatch.setattr(view, "build_view", boom)
+    r_bad, f_bad, _ = _run_chain(bad_dir, monkeypatch)
+    assert "view.bin" not in r_bad["files"] and "view.json" not in r_bad["files"]
+    assert "view.bin" not in f_bad and "view.json" not in f_bad
+    assert r_bad["files"] == [f for f in r_ok["files"]
+                              if f not in ("view.bin", "view.json")]
+    assert _sha(f_bad["check.json"][0]) == _sha(f_ok["check.json"][0]), \
+        "check.json changed when the view failed"
+    assert r_bad["zmap"] == r_ok["zmap"], "gates changed when the view failed"
+    log = open(os.path.join(str(bad_dir), "run.log")).read()
+    assert "view: skipped (RuntimeError: forced view failure)" in log

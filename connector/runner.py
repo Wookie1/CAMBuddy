@@ -369,6 +369,29 @@ class EngineRun:
                                           values.get("document_id"))
         return ["--no-load-limit"] if on is False else ["--load-limit"]
 
+    def _build_view(self, *args):
+        """TASK_VIEW3D: display-only view.bin/view.json. A failure never
+        fails the run: view.* are dropped from the run's files and a one-line
+        note goes to the run log (run dir run.log); gates/check.json untouched."""
+        self._view_failed = False
+        try:
+            view.build_view(*args)
+        except Exception as e:  # noqa: BLE001 - display only, never fatal
+            self._view_failed = True
+            try:
+                with open(os.path.join(self.work, "run.log"), "a") as fh:
+                    fh.write("view: skipped (%s: %s)\n"
+                             % (type(e).__name__, e))
+            except OSError:
+                pass
+
+    def _drop_view_if_failed(self, result, files):
+        if getattr(self, "_view_failed", False):
+            result["files"] = [f for f in result["files"]
+                               if f not in ("view.bin", "view.json")]
+            files.pop("view.bin", None)
+            files.pop("view.json", None)
+
     def _tools_json_args(self):
         return ["--tools-json", self.tools_path] if self.tools_path else []
 
@@ -614,7 +637,7 @@ class EngineRun:
         with open(check_path, "w") as fh:
             json.dump(check, fh, indent=2)
 
-        view.build_view(os.path.join(self.work, "view.bin"),
+        self._build_view(os.path.join(self.work, "view.bin"),
                         os.path.join(self.work, "view.json"),
                         hf_zmap, stock_after, [("rough.nc", nc)],
                         {"rough": check})
@@ -657,6 +680,7 @@ class EngineRun:
                  "view.json": (os.path.join(self.work, "view.json"),
                                "application/json")}
         self._record_used(values, [number])
+        self._drop_view_if_failed(result, files)
         return result, files
 
     # -------------------------------------------------- model.measure ----
@@ -850,7 +874,7 @@ class EngineRun:
         check["tools_table"] = self._table_record()
         with open(os.path.join(self.work, "check.json"), "w") as fh:
             json.dump(check, fh, indent=2)
-        view.build_view(os.path.join(self.work, "view.bin"),
+        self._build_view(os.path.join(self.work, "view.bin"),
                         os.path.join(self.work, "view.json"),
                         hf_zmap, stock_out_i,
                         [(pname + ".nc", ppath)
@@ -897,6 +921,7 @@ class EngineRun:
                  "view.json": (os.path.join(self.work, "view.json"),
                                "application/json")}
         self._record_used(values, [e["tool"]["number"] for e in entries])
+        self._drop_view_if_failed(result, files)
         return result, files
 
     # ------------------------------------------------- slope_split_finish --
@@ -1409,7 +1434,7 @@ class EngineRun:
         if rest:
             view_progs.append(("rest.nc", rest_nc))
             view_checks["rest"] = check_s
-        view.build_view(os.path.join(self.work, "view.bin"),
+        self._build_view(os.path.join(self.work, "view.bin"),
                         os.path.join(self.work, "view.json"),
                         hf01, final_stock, view_progs, view_checks)
 
@@ -1500,4 +1525,5 @@ class EngineRun:
             files["rest.nc"] = (rest_nc, "application/octet-stream")
         self._record_used(values, [rough_number, finish_number]
                           + ([rest_number] if rest else []))
+        self._drop_view_if_failed(result, files)
         return result, files

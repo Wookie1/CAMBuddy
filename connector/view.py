@@ -58,8 +58,13 @@ def downsample(a, k, mode):
     return b.max(axis=(1, 3)) if mode == "max" else b.min(axis=(1, 3))
 
 
+NODATA = 65535             # uint16 code for a non-finite cell (no stock / outside the grid)
+
+
 def quantize(a, zoff, scale):
-    return np.clip(np.rint((a - zoff) / scale), 0, 65535).astype("<u2")
+    fin = np.isfinite(a)
+    q = np.clip(np.rint((np.where(fin, a, zoff) - zoff) / scale), 0, NODATA - 1)
+    return np.where(fin, q, NODATA).astype("<u2")
 
 
 def program_path(nc_path, cell=TARGET_CELL):
@@ -182,11 +187,12 @@ def build_view(out_bin, out_json, part_npy, stock_npy, programs, checks,
     pgrid = downsample(part, k, "max")
     sgrid = downsample(stock, k, "min")
     ny, nx = pgrid.shape
-    zmin = min(float(pgrid.min()), float(sgrid.min()))
-    zmax = max(float(pgrid.max()), float(sgrid.max()))
+    fin = np.concatenate([pgrid[np.isfinite(pgrid)], sgrid[np.isfinite(sgrid)]])
+    zmin = float(fin.min()) if fin.size else 0.0     # real stocks carry -inf
+    zmax = float(fin.max()) if fin.size else 0.0     # cells outside the box
     zoff = math.floor(zmin * 1000.0) / 1000.0
     scale = SCALE
-    if zmax - zoff > 65535.0 * scale:      # > 655 mm tall: stay representable
+    if zmax - zoff > (NODATA - 1) * scale:   # > 655 mm tall: stay representable
         scale = (zmax - zoff) / 65534.0
     body = quantize(pgrid, zoff, scale).tobytes()
     offsets = {"part": 0, "stock": len(body)}
@@ -224,7 +230,8 @@ def build_view(out_bin, out_json, part_npy, stock_npy, programs, checks,
     hdr = {"format": "stevecam-view", "version": 1, "units": "mm",
            "grid": {"x0": float(x0), "y0": float(y0),
                     "cell": float(cell * k), "nx": int(nx), "ny": int(ny)},
-           "z": {"offset": float(zoff), "scale": float(scale)},
+           "z": {"offset": float(zoff), "scale": float(scale),
+                 "nodata": NODATA},
            "programs": progs, "markers": markers,
            "offsets": offsets, "bytes": len(body)}
     with open(out_json, "w") as fh:
