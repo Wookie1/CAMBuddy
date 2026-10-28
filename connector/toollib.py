@@ -302,12 +302,14 @@ def _validate_setup(setup):
     if not isinstance(setup, dict):
         raise ToolLibError("invalid_field", "setup must be an object",
                            field="setup")
-    bad = sorted(k for k in setup if k not in SETUP_FIELDS + ("blank",))
+    bad = sorted(k for k in setup
+                 if k not in SETUP_FIELDS + ("blank", "load_limit"))
     if bad:
         raise ToolLibError("invalid_field",
                            "not a setup field: %s" % ", ".join(bad),
                            field="setup." + bad[0],
-                           allowed=list(SETUP_FIELDS) + ["blank"])
+                           allowed=list(SETUP_FIELDS) + ["blank",
+                                                         "load_limit"])
     props = catalog_mod.get_action(catalog_mod.ACTION)["inputs"]["properties"]
     out = {}
     for k in SETUP_FIELDS:
@@ -343,7 +345,25 @@ def _validate_setup(setup):
                                field="setup.blank", got=blank)
         blank = {a: blank[a] for a in "xyz"}
     out["blank"] = blank
+    ll = setup.get("load_limit")   # FL-LOAD: per-document limiter switch
+    if ll is not None and not isinstance(ll, bool):
+        raise ToolLibError("invalid_field", "load_limit must be true, false "
+                           "or null", field="setup.load_limit", got=ll)
+    if ll is not None:             # stored only when given (old setups
+        out["load_limit"] = ll     # keep their exact shape)
     return out
+
+
+def setup_load_limit(home, doc_id):
+    """The document's saved job.setup load_limit (True/False), or None when
+    there is no document, no saved setup or no such field."""
+    if not (home and doc_id):
+        return None
+    try:
+        return (_load_job_file(home, doc_id).get("setup") or {}).get(
+            "load_limit")
+    except (ToolLibError, OSError, ValueError):
+        return None
 
 
 def set_setup(home, doc_id, setup):

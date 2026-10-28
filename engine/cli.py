@@ -449,12 +449,14 @@ def main(argv=None):
                    help="write the engine's final stock heightfield to this "
                         ".npy (+ x0/y0/cell .json sidecar) for finish "
                         "--stock-from rapid verification (S3b)")
-    r.add_argument("--load-limit", dest="load_limit", action="store_true",
+    r.add_argument("--load-limit", dest="load_limit", default=True,
+                   action=argparse.BooleanOptionalAction,
                    help="FL-LOAD: replay the emitted moves into the engine's "
                         "own 0.1 mm stock and slow the feed (never raise it, "
                         "floor 25%% of --cut-feed) on ZE2 windows whose load "
                         "ae*a*F/(2.032*19.05*Fcut) exceeds 1.2; the XYZ path "
-                        "is unchanged (default off)")
+                        "is unchanged (default on; --no-load-limit turns "
+                        "it off)")
     r.add_argument("--post", choices=("neutral", "lnc"), default="neutral",
                    help="writer: neutral G21 (default) or SyilCNC LNCv2")
     r.add_argument("--program", type=int, default=1001,

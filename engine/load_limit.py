@@ -35,9 +35,10 @@ REMOVE_EPS = 1e-9                  # zmap's air threshold (mm removed)
 CARRY_EXTRA_MM = 1.0               # ZE2F2: helix-pitch carry margin
 FEED_FLOOR_FRAC = 0.25             # feed floor: 25% of the cutting feed
 # The judge (zmap --load-rule) re-measures the slowed program independently;
-# its window areas differ from this engine-side replay by ~1%. Slow to
-# 1.2 x this margin so the judge's load lands at or below 1.2.
-NOISE_MARGIN = 0.98
+# its window areas run ~1% above this engine-side replay. One fixed margin
+# for trigger and target (coordinator): slow when load > 1.2 x MARGIN, to
+# 1.2 x MARGIN, so the judge's load lands at or below 1.2.
+MARGIN = 0.97
 
 
 def _helix_radius(run):
@@ -239,14 +240,14 @@ def limit_feeds(moves, dia, corner, box, top_z, cut_feed, fine=FINE):
         allowed = (w["helix_pitch"] is not None
                    and w["a"] <= w["helix_pitch"] + PITCH_TOL
                    and load <= LOAD_MAX)
-        if load <= LOAD_MAX or allowed:
+        if load <= LOAD_MAX * MARGIN or allowed:
             continue
         slowed += 1
         mm += w["length_mm"]
         hit_floor = False
         for mi in w["move_idxs"]:
             f0 = out[mi].get("f") or cut_feed
-            f_new = f0 * LOAD_MAX * NOISE_MARGIN / load
+            f_new = f0 * LOAD_MAX * MARGIN / load
             if f_new < floor:
                 f_new = floor
                 hit_floor = True

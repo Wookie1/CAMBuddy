@@ -128,7 +128,9 @@ def test_flload_corner_scene_load():
     assert n_after == stats["floor_bound"], \
         "%d windows still load > 1.2 after limiting, only %d are " \
         "floor_bound" % (n_after, stats["floor_bound"])
-    assert stats["windows_slowed"] == n_base, \
+    # one margin for trigger and target (coordinator): windows the engine
+    # reads in (1.2*MARGIN, 1.2] are slowed as well, so >= the judge's count
+    assert stats["windows_slowed"] >= n_base, \
         "limiter slowed %d windows but the base had %d over-limit ones" % (
             stats["windows_slowed"], n_base)
     assert stats["windows_slowed"] > 0 and stats["mm_slowed"] > 0.0
@@ -246,12 +248,13 @@ def test_flload_off_byte_identical():
         "engine.cli rough has no --load-limit flag (rc=%d)" % r.returncode
     for pocket in ((10.0, 30.0), (12.0, 28.0)):
         cache = {}
-        text_off, expect = _run_cli_rough(pocket, [], cache)
+        text_off, expect = _run_cli_rough(pocket, ["--no-load-limit"], cache)
         assert text_off == expect, \
             "rough without the option: posted bytes differ from main's " \
             "emitter output (scene %s)" % (pocket,)
         cache2 = {}
-        text_false, expect2 = _run_cli_rough(pocket, [], cache2)
+        text_false, expect2 = _run_cli_rough(pocket, ["--no-load-limit"],
+                                             cache2)
         assert text_false == expect2 == expect, \
             "flag-off output differs between runs (scene %s)" % (pocket,)
         n_moves = len(cache["moves"])
@@ -259,3 +262,36 @@ def test_flload_off_byte_identical():
         print("flload(c) PASS scene %s: %d moves (%d feed), flag-off bytes "
               "identical to main's emitter output (%d bytes)"
               % (pocket, n_moves, n_f, len(text_off)))
+
+
+def test_flload_trigger_margin():
+    """FL-LOAD margin (coordinator): a window the engine reads at load 1.19
+    (under 1.2, over 1.2 x MARGIN) is slowed to 1.2 x MARGIN; one at 1.10
+    is left alone. The window is injected (engine windowing stubbed)."""
+    from engine import load_limit as ll
+    cut = 3429.0
+    ref = ll.DESIGN_AE * ll.DESIGN_STEPDOWN * cut
+    moves = [{"g": 0, "x": 0.0, "y": 0.0, "z": 50.0},
+             {"g": 1, "x": 10.0, "y": 0.0, "z": 50.0, "f": cut},
+             {"g": 1, "x": 20.0, "y": 0.0, "z": 50.0, "f": cut}]
+
+    def win(idx, load):
+        a = ll.DESIGN_STEPDOWN
+        return {"area_mm2": load * ref / (a * cut), "length_mm": 1.0, "a": a,
+                "feed": cut, "helix_pitch": None, "move_idxs": [idx]}
+    real = ll._windows
+    ll._windows = lambda recs: [win(1, 1.19), win(2, 1.10)]
+    try:
+        out, stats = ll.limit_feeds(moves, 12.686, 0.0, (0.0, 20.0, -5.0, 5.0),
+                                    50.0, cut)
+    finally:
+        ll._windows = real
+    want = cut * ll.LOAD_MAX * ll.MARGIN / 1.19
+    print("flload(m): load 1.19 -> F %.1f (want %.1f), load 1.10 -> F %.1f, "
+          "stats %s" % (out[1]["f"], want, out[2]["f"], stats))
+    assert abs(out[1]["f"] - want) < 1e-6, \
+        "load 1.19 window feed %.1f, want %.1f (slowed to 1.2 x MARGIN)" % (
+            out[1]["f"], want)
+    assert out[2]["f"] == cut, "load 1.10 window was slowed to %.1f" % (
+        out[2]["f"])
+    assert stats["windows_slowed"] == 1
