@@ -1940,6 +1940,26 @@ def _fe5_cluster_skips(pts, merge_r):
     return cl
 
 
+def _fe5_skip_reason(clusters, surf, floor_z, threads=None):
+    """RR-STOCK2: give every FE5f skip cluster its reason. A cluster whose
+    centre lies over a THROUGH OPENING of the part the finish already has -
+    the drop at the centre finds NO part, or the part surface there sits at
+    the stock bottom (the setup floor) - is left for a hole op / another
+    setup; every other cluster was skipped because its entry is deeper than
+    the floor with no legal ramp (its max_depth_mm is already reported)."""
+    if not clusters:
+        return clusters
+    z = batch_drop(surf, make_cutter("flat", 0.2),
+                   [(c["center"][0], c["center"][1]) for c in clusters],
+                   threads=threads)
+    for c, v in zip(clusters, z):
+        through = not math.isfinite(float(v)) or (
+            floor_z is not None and float(v) <= float(floor_z) + 1e-6)
+        c["reason"] = ("left_for_hole_op_or_another_setup" if through else
+                       "entry_deeper_than_floor_no_legal_ramp")
+    return clusters
+
+
 def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
            sampling=0.1, slope_threshold=40.0, overlap_mm=1.0,
            stepdown=0.3, overlap_deg=5.0, floor_z=None, wl_sampling=0.2,
@@ -2609,8 +2629,9 @@ def finish(surf, stl_path=None, tool=("ball", 6.0, 0.0), stepover=0.3,
     stats["fe5_chord_max_depth_max"] = max(fe5_chord_depths, default=0.0)
     # FE5f: skipped unenterable areas, left for a hole op / another setup
     stats["fe5_skipped_n"] = n_skipped
-    stats["fe5_skipped_clusters"] = _fe5_cluster_skips(
-        fe5_skip_pts, 2.0 * float(tool[1]))
+    stats["fe5_skipped_clusters"] = _fe5_skip_reason(
+        _fe5_cluster_skips(fe5_skip_pts, 2.0 * float(tool[1])),
+        surf, floor_z, threads=threads)
     stats["fe5_skip_pts"] = [p for p in fe5_skip_pts  # FE5f-b/c: fragment
                             if math.isfinite(p[2])][:400]  # verts, on-grid only
     stats["fe5g_ramped_n"] = n_fe5g_ramped  # in-pass descents ramped

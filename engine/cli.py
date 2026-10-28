@@ -331,6 +331,13 @@ def rest_rough_main(a):
     stats["t_total_s"] = round(time.time() - t0, 1)
     print("wrote %s (%d moves) in %.1f s" % (a.out, len(moves),
                                              stats["t_total_s"]), flush=True)
+    if a.stock_out:
+        # RR-STOCK2: after-rest-rough stock = this program's own replay from
+        # --stock-from (the finish after it plans on it, never on a judge map)
+        from engine import entry_depth
+        entry_depth.replay_stock(
+            moves, dia, dia / 2.0, a.stock_out,
+            init=rrmod.fin.load_heightfield(a.stock_from))
     if a.stats_json:
         with open(a.stats_json, "w") as fh:
             json.dump(stats, fh, indent=2)
@@ -643,6 +650,12 @@ def main(argv=None):
                         "SE2 descent column (default 0.25)")
     rr.add_argument("--workers", type=int, default=None)
     rr.add_argument("--stats-json", dest="stats_json", default=None)
+    rr.add_argument("--stock-out", dest="stock_out", default=None,
+                    help="RR-STOCK2: replay this rest-rough's own emitted "
+                         "ball moves into its --stock-from stock and write "
+                         "the .npy (+ x0/y0/cell .json sidecar): the finish "
+                         "after a rest-rough plans on THIS, never on a zmap "
+                         "rest stock")
     rr.add_argument("--post", choices=("neutral", "lnc"), default="neutral")
     rr.add_argument("--program", type=int, default=1003)
     rr.add_argument("--op-name", dest="op_name", default="REST ROUGH")
