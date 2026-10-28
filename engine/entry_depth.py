@@ -331,6 +331,129 @@ def build_rough_stock(nc_path, dia, box, top_z, fine=FINE):
     return live
 
 
+def _replay_stamp_batch(L, x0, y0, fine, R, cr, a0, kR, pad2, bmax,
+                        sx, sy, sz):
+    """RR-STOCK speed helper: stamp the tool disks of a batch of samples
+    into L, padded by pad2 = pad + 2*kR + 2 so windows never clip (the
+    extra margin is -inf and min keeps it). Bit-identical to the old
+    per-sample loop: same floating-point expressions per element, and
+    np.minimum into L is associative, commutative and idempotent, so
+    only the SET of (window, value) pairs matters; samples dropped by
+    `keep` would only have stamped -inf cells (or were clipped away)."""
+    H, W = L.shape
+    for c in range(0, sx.shape[0], bmax):
+        bx, by, bz = sx[c:c + bmax], sy[c:c + bmax], sz[c:c + bmax]
+        jj = np.floor((by - y0) / fine).astype(np.int64) + pad2
+        ii = np.floor((bx - x0) / fine).astype(np.int64) + pad2
+        keep = ((jj >= kR) & (jj < H - kR) & (ii >= kR) & (ii < W - kR))
+        if not keep.all():
+            jj, ii, bx, by, bz = (a[keep] for a in (jj, ii, bx, by, bz))
+            if not jj.size:
+                continue
+        o = np.arange(-kR, kR + 1)
+        gx = x0 + ((ii[:, None] + o - pad2) + 0.5) * fine - bx[:, None]
+        gy = y0 + ((jj[:, None] + o - pad2) + 0.5) * fine - by[:, None]
+        dd = np.hypot(gx[:, None, :], gy[:, :, None])
+        m = dd <= R + 1e-9
+        if cr:
+            np.subtract(dd, a0, out=dd)
+            np.maximum(dd, 0.0, out=dd)
+            dd *= dd
+            np.subtract(cr * cr, dd, out=dd)
+            np.maximum(dd, 0.0, out=dd)
+            np.sqrt(dd, out=dd)
+            np.subtract(cr, dd, out=dd)
+            np.add(dd, bz[:, None, None], out=dd)
+            dd[...] = np.where(m, dd, np.inf)
+        else:
+            dd[...] = np.where(m, bz[:, None, None] + 0.0, np.inf)
+        for b, (j, i) in enumerate(zip(jj.tolist(), ii.tolist())):
+            w = L[j - kR:j + kR + 1, i - kR:i + kR + 1]
+            np.minimum(w, dd[b], out=w)
+
+
+def _replay_move_flat(L, x0, y0, fine, R, pad2, p, cur, d, n):
+    """RR-STOCK speed path for a FLAT tool on one G1 move: z is linear
+    along the move, so every cell's winning stamp (the minimum over the
+    samples covering it) is taken from the LAST sample covering it
+    (descending/flat z) or the FIRST one (ascending) - the covering
+    samples of a cell form one contiguous run because the disk centre
+    moves along a straight line. The winner index per cell is computed
+    from the continuous capsule entry/exit time +-3 candidate samples,
+    then the EXACT old predicate hypot(cell - s_i) <= R + 1e-9 is
+    evaluated on those candidates (the float error of the capsule math
+    is ~1e-3 of one sample step even at the worst n and grazing angle,
+    so the true boundary index is always inside the candidate window);
+    cells outside stay inf and stamp nothing."""
+    T = R + 1e-9
+    t = np.linspace(0.0, 1.0, n + 1)
+    sx = p[0] + d[0] * t
+    sy = p[1] + d[1] * t
+    sz = p[2] + d[2] * t
+    lxy2 = d[0] * d[0] + d[1] * d[1]
+    H, W = L.shape
+    i0 = max(0, int(math.floor((min(p[0], cur[0]) - T - 2 * fine - x0)
+                               / fine)) + pad2)
+    i1 = min(W, int(math.ceil((max(p[0], cur[0]) + T + 2 * fine - x0)
+                              / fine)) + pad2 + 1)
+    j0 = max(0, int(math.floor((min(p[1], cur[1]) - T - 2 * fine - y0)
+                               / fine)) + pad2)
+    j1 = min(H, int(math.ceil((max(p[1], cur[1]) + T + 2 * fine - y0)
+                              / fine)) + pad2 + 1)
+    if i0 >= i1 or j0 >= j1:
+        return
+    Xc = x0 + (np.arange(i0, i1) - pad2 + 0.5) * fine
+    Yc = y0 + (np.arange(j0, j1) - pad2 + 0.5) * fine
+    vx = (Xc - p[0])[None, :]
+    vy = (Yc - p[1])[:, None]
+    proj = vx * d[0] + vy * d[1]
+    tau = proj / lxy2
+    perp2 = np.maximum(vx * vx + vy * vy - tau * proj, 0.0)
+    half = np.sqrt(np.maximum(T * T - perp2, 0.0)) / math.sqrt(lxy2)
+    end = (tau + half if d[2] <= 0.0 else tau - half) * n
+    c0 = np.rint(np.clip(end, 0.0, float(n))).astype(np.int64)
+    win = np.zeros(c0.shape, np.int64)
+    found = np.zeros(c0.shape, dtype=bool)
+    for o in ((3, 2, 1, 0, -1, -2, -3) if d[2] > 0.0
+              else (-3, -2, -1, 0, 1, 2, 3)):
+        idx = np.clip(c0 + o, 0, n)
+        P = np.hypot(Xc[None, :] - sx[idx], Yc[:, None] - sy[idx]) <= T
+        found |= P
+        np.copyto(win, idx, where=P)
+    wL = L[j0:j1, i0:i1]
+    np.minimum(wL, np.where(found, sz[win] + 0.0, np.inf), out=wL)
+
+
+def _replay_worker(L, x0, y0, fine, R, cr, a0, kR, pad2, bmax, ends, cut,
+                   lo, stride):
+    """One RR-STOCK worker: replays move indices lo::stride into its own
+    padded copy; workers fold later by np.minimum, exact and
+    order-independent, so each sample is bit-identical to the old loop."""
+    buf, nbuf = [], 0
+    for mi in range(lo, ends.shape[0], stride):
+        if not cut[mi]:
+            continue
+        p, cur = ends[mi, :3], ends[mi, 3:]
+        d = cur - p
+        n = 1 if abs(d[0]) <= 1e-9 and abs(d[1]) <= 1e-9 else max(
+            2, int(math.ceil(float(np.linalg.norm(d)) / (fine / 4.0))))
+        if cr == 0.0 and n >= 12 and d[0] * d[0] + d[1] * d[1] >= 2.5e-3:
+            _replay_move_flat(L, x0, y0, fine, R, pad2, p, cur, d, n)
+            continue
+        t = np.linspace(0.0, 1.0, n + 1)
+        buf.append((p[0] + d[0] * t, p[1] + d[1] * t,
+                    np.full(n + 1, min(p[2], cur[2])) if n == 1
+                    else p[2] + d[2] * t))
+        nbuf += n + 1
+        if nbuf >= bmax:
+            _replay_stamp_batch(L, x0, y0, fine, R, cr, a0, kR, pad2, bmax,
+                                *(np.concatenate(a) for a in zip(*buf)))
+            buf, nbuf = [], 0
+    if buf:
+        _replay_stamp_batch(L, x0, y0, fine, R, cr, a0, kR, pad2, bmax,
+                            *(np.concatenate(a) for a in zip(*buf)))
+
+
 def replay_stock(moves, dia, corner, out_path, box=None, top_z=None,
                  init=None, fine=FINE):
     """RR-STOCK: replay an EMITTED move list (modal x/y/z, g 0|1, mm) with
@@ -360,33 +483,44 @@ def replay_stock(moves, dia, corner, out_path, box=None, top_z=None,
                      float(top_z), -np.inf)
     kR = int(math.ceil(R / fine))
     pad, a0 = kR + 1, R - cr
-    L = np.pad(F, pad, constant_values=-np.inf)
+    pad2 = pad + 2 * kR + 2
+    # batch samples so the 3D stamp arrays stay cache-sized
+    bmax = max(4, min(64, 200000 // ((2 * kR + 1) ** 2)))
+    # modal start/end of every G1 cut - the only serial pass over moves
+    n_mv = len(moves)
+    ends = np.empty((n_mv, 6))
+    cut = np.zeros(n_mv, dtype=bool)
     pos = None
-    for mv in moves:
+    for mi, mv in enumerate(moves):
         cur = tuple(p if mv.get(k) is None else mv[k]
                     for k, p in zip("xyz", pos or (0.0, 0.0, 0.0)))
         if pos is not None and mv["g"] == 1:
-            d = np.subtract(cur, pos)
-            n = 1 if abs(d[0]) <= 1e-9 and abs(d[1]) <= 1e-9 else max(
-                2, int(math.ceil(float(np.linalg.norm(d)) / (fine / 4.0))))
-            for t in np.linspace(0.0, 1.0, n + 1):
-                sx, sy = pos[0] + d[0] * t, pos[1] + d[1] * t
-                sz = min(pos[2], cur[2]) if n == 1 else pos[2] + d[2] * t
-                j = int(math.floor((sy - y0) / fine)) + pad
-                i = int(math.floor((sx - x0) / fine)) + pad
-                j0, j1 = max(0, j - kR), min(L.shape[0], j + kR + 1)
-                i0, i1 = max(0, i - kR), min(L.shape[1], i + kR + 1)
-                if j0 >= j1 or i0 >= i1: continue
-                gx = x0 + (np.arange(i0, i1) - pad + 0.5) * fine - sx
-                gy = y0 + (np.arange(j0, j1) - pad + 0.5) * fine - sy
-                dd = np.hypot(gx[None, :], gy[:, None])
-                dz = (cr - np.sqrt(np.maximum(
-                    cr * cr - np.maximum(dd - a0, 0.0) ** 2, 0.0))
-                    if cr else 0.0)
-                w = L[j0:j1, i0:i1]
-                np.minimum(w, np.where(dd <= R + 1e-9, sz + dz, np.inf), out=w)
+            cut[mi] = True
+            ends[mi, :3] = pos
+            ends[mi, 3:] = cur
         pos = cur
-    A = L[pad:-pad, pad:-pad]
+    T = 4 if n_mv >= 2000 and F.nbytes < 3e7 else 1
+    if T == 1:
+        L = np.pad(F, pad2, constant_values=-np.inf)
+        _replay_worker(L, x0, y0, fine, R, cr, a0, kR, pad2, bmax, ends,
+                       cut, 0, 1)
+    else:
+        # independent per-worker padded copies; the np.minimum fold is
+        # exact and order-independent
+        import threading
+        ls = [np.pad(F, pad2, constant_values=-np.inf) for _ in range(T)]
+        th = [threading.Thread(target=_replay_worker,
+                               args=(ls[k], x0, y0, fine, R, cr, a0, kR,
+                                     pad2, bmax, ends, cut, k, T))
+              for k in range(T)]
+        for h in th:
+            h.start()
+        for h in th:
+            h.join()
+        L = ls[0]
+        for k in range(1, T):
+            np.minimum(L, ls[k], out=L)
+    A = L[pad2:-pad2, pad2:-pad2]
     np.save(out_path, A)
     with open(os.path.splitext(out_path)[0] + ".json", "w") as fh:
         json.dump({"x0": x0, "y0": y0, "cell": fine}, fh)
