@@ -128,6 +128,8 @@
     let blob;
     if (p.name === "preview.png") blob = await pngBlob();
     else if (p.name === "check.json") blob = new Blob([JSON.stringify(CFG.checkJson || {})], { type: "application/json" });
+    else if (p.name === "view.bin" && CFG.viewBinBase64) blob = new Blob([Uint8Array.from(atob(CFG.viewBinBase64), (ch) => ch.charCodeAt(0))], { type: "application/octet-stream" });
+    else if (p.name === "view.json" && CFG.viewJson) blob = new Blob([JSON.stringify(CFG.viewJson)], { type: "application/json" });
     else blob = new Blob(["%\nO1001\nM30\n%\n"], { type: "text/plain" });
     send({ steve: 1, id, result: { name: p.name, media_type: blob.type, bytes: blob.size, blob } });
   }

@@ -15,6 +15,7 @@ import sys
 import threading
 
 import toollib
+import view  # TASK_VIEW3D: display-only view.bin/view.json builder
 
 # Engagement warning factors (report-only warnings, never gates):
 # roughing warns above ROUGH_ENGAGE_FACTOR x optimal load, finishing above
@@ -588,6 +589,9 @@ class EngineRun:
             raise EngineError(str(e), code="stale_artifact")
         check_path = os.path.join(self.work, "check.json")
         png_path = os.path.join(self.work, "preview.png")
+        # TASK_VIEW3D: the final judged stock, exported by this same zmap
+        # call (no extra judge pass) for the panel's display-only view.bin
+        stock_after = os.path.join(self.work, "stock_after_rough.npy")
         self._spawn([py, "-m", "verify.zmap", nc,
                     "--part", hf_zmap,
                     "--tool", values["tool_type"],
@@ -600,7 +604,8 @@ class EngineRun:
                     % (ROUGH_ENGAGE_FACTOR * values["optimal_load"]),
                     "--tool-number", str(number),
                     *self._tools_json_args(),
-                    "--out-json", check_path, "--png", png_path],
+                    "--out-json", check_path, "--png", png_path,
+                    "--stock-out", stock_after],
                    0.88, 0.95, on_progress)
         with open(check_path) as fh:
             check = json.load(fh)
@@ -609,6 +614,10 @@ class EngineRun:
         with open(check_path, "w") as fh:
             json.dump(check, fh, indent=2)
 
+        view.build_view(os.path.join(self.work, "view.bin"),
+                        os.path.join(self.work, "view.json"),
+                        hf_zmap, stock_after, [("rough.nc", nc)],
+                        {"rough": check})
         result = {
             "units": values["units"],
             "posted_units": posted,
@@ -637,11 +646,16 @@ class EngineRun:
             "origin": prep.get("origin", "model_origin"),
             "origin_offset_mm": prep.get("origin_offset", [0.0, 0.0, 0.0]),
             "tools_table": self._table_record(),
-            "files": ["rough.nc", "check.json", "preview.png"],
+            "files": ["rough.nc", "check.json", "preview.png",
+                      "view.bin", "view.json"],
         }
         files = {"rough.nc": (nc, "application/octet-stream"),
                  "check.json": (check_path, "application/json"),
-                 "preview.png": (png_path, "image/png")}
+                 "preview.png": (png_path, "image/png"),
+                 "view.bin": (os.path.join(self.work, "view.bin"),
+                              "application/octet-stream"),
+                 "view.json": (os.path.join(self.work, "view.json"),
+                               "application/json")}
         self._record_used(values, [number])
         return result, files
 
@@ -794,11 +808,14 @@ class EngineRun:
                 argv += ["--stock", *[("%.4f" % v) for v in stock]]
             else:
                 argv += ["--stock-in", stock_in]
-            if i < nprog - 1:
-                stock_in = os.path.join(self.work,
-                                        "stock_after_%s.npy" % pname)
-                fr.remove_stale(stock_in)
-                argv += ["--stock-out", stock_in]
+            # TASK_VIEW3D: EVERY program exports the stock it leaves (same
+            # zmap call, no extra judge pass); the last one's is the final
+            # judged stock shown in the panel's 3D view
+            stock_out_i = os.path.join(self.work,
+                                       "stock_after_%s.npy" % pname)
+            fr.remove_stale(stock_out_i)
+            argv += ["--stock-out", stock_out_i]
+            stock_in = stock_out_i
             if i == nprog - 1:
                 argv += ["--png", png_path]
             if tool["flute_mm"] is not None:
@@ -833,6 +850,12 @@ class EngineRun:
         check["tools_table"] = self._table_record()
         with open(os.path.join(self.work, "check.json"), "w") as fh:
             json.dump(check, fh, indent=2)
+        view.build_view(os.path.join(self.work, "view.bin"),
+                        os.path.join(self.work, "view.json"),
+                        hf_zmap, stock_out_i,
+                        [(pname + ".nc", ppath)
+                         for pname, ppath, _, _ in resolved],
+                        {e["name"]: e["check"] for e in entries})
 
         result = {
             "units": "mm",
@@ -864,11 +887,15 @@ class EngineRun:
             "cut_length_mm": first["check"]["cutting_length_mm"],
             "rapid_length_mm": first["check"]["rapid_length_mm"],
             "tools_table": self._table_record(),
-            "files": ["check.json", "preview.png"],
+            "files": ["check.json", "preview.png", "view.bin", "view.json"],
         }
         files = {"check.json": (os.path.join(self.work, "check.json"),
                                  "application/json"),
-                 "preview.png": (png_path, "image/png")}
+                 "preview.png": (png_path, "image/png"),
+                 "view.bin": (os.path.join(self.work, "view.bin"),
+                              "application/octet-stream"),
+                 "view.json": (os.path.join(self.work, "view.json"),
+                               "application/json")}
         self._record_used(values, [e["tool"]["number"] for e in entries])
         return result, files
 
@@ -1155,6 +1182,7 @@ class EngineRun:
         # (--stock-in). zmap writes only the .npy, so the runner carries the
         # grid geometry in the heightfield sidecar convention.
         stock_finish = os.path.join(self.work, "stock_after_finish.npy")
+        stock_rest = os.path.join(self.work, "stock_after_rest.npy")
         argv_f = [py, "-m", "verify.zmap", fin,
                   "--part", hf01,
                   "--tool", "ball",
@@ -1175,8 +1203,10 @@ class EngineRun:
             argv_f += ["--shank-dia", "%.4f" % fin_tool["shank_diameter_mm"]]
         if rest:
             fr.remove_stale(stock_finish)
-            argv_f += ["--stock-out", stock_finish]
-        else:
+        # TASK_VIEW3D: always export the finish's judged stock (the final
+        # one when there is no rest pass) - same zmap call, no extra pass
+        argv_f += ["--stock-out", stock_finish]
+        if not rest:
             argv_f += ["--png", png_path]
         self._spawn(argv_f, *P["zmap_finish"], on_progress)
         with open(check_rough) as fh:
@@ -1286,6 +1316,8 @@ class EngineRun:
             # 9d) chained zmap of the rest program on the stock the finish
             #     left, with the rest tool's geometry + holder; preview.png is
             #     the leftover after the last program of the chain
+            stock_rest = os.path.join(self.work, "stock_after_rest.npy")
+            fr.remove_stale(stock_rest)
             argv_zr = [py, "-m", "verify.zmap", rest_nc,
                        "--part", hf01,
                        "--tool", "ball",
@@ -1296,7 +1328,8 @@ class EngineRun:
                        % (FINISH_ENGAGE_FACTOR * values["stepover"]),
                        "--tool-number", str(rest_number),
                        *self._tools_json_args(),
-                       "--out-json", check_rest_path, "--png", png_path]
+                       "--out-json", check_rest_path, "--png", png_path,
+                       "--stock-out", stock_rest]
             if rest["flute_mm"] is not None:
                 argv_zr += ["--flute", "%.4f" % rest["flute_mm"]]
             if rest["shank_diameter_mm"] is not None:
@@ -1367,6 +1400,19 @@ class EngineRun:
         with open(os.path.join(self.work, "check.json"), "w") as fh:
             json.dump(check, fh, indent=2)
 
+        # TASK_VIEW3D: display-only view data: part hf, the FINAL judged
+        # stock (rest's when there is a rest pass, the finish's otherwise),
+        # the posted programs' paths and the attention markers
+        final_stock = stock_rest if rest else stock_finish
+        view_progs = [("rough.nc", nc), ("finish.nc", fin)]
+        view_checks = {"rough": check_r, "finish": check_f}
+        if rest:
+            view_progs.append(("rest.nc", rest_nc))
+            view_checks["rest"] = check_s
+        view.build_view(os.path.join(self.work, "view.bin"),
+                        os.path.join(self.work, "view.json"),
+                        hf01, final_stock, view_progs, view_checks)
+
         cycle_s = check_r["cycle_time_s"] + check_f["cycle_time_s"]
         cut_mm = check_r["cutting_length_mm"] + check_f["cutting_length_mm"]
         if rest:
@@ -1432,13 +1478,17 @@ class EngineRun:
             "origin_offset_mm": prep.get("origin_offset", [0.0, 0.0, 0.0]),
             "tools_table": self._table_record(),
             "files": ["rough.nc", "finish.nc", "check.json",
-                     "preview.png"],
+                      "preview.png", "view.bin", "view.json"],
         }
         files = {"rough.nc": (nc, "application/octet-stream"),
                  "finish.nc": (fin, "application/octet-stream"),
                  "check.json": (os.path.join(self.work, "check.json"),
                                "application/json"),
-                 "preview.png": (png_path, "image/png")}
+                 "preview.png": (png_path, "image/png"),
+                 "view.bin": (os.path.join(self.work, "view.bin"),
+                              "application/octet-stream"),
+                 "view.json": (os.path.join(self.work, "view.json"),
+                               "application/json")}
         if rest:
             result["zmap"]["gouges"]["rest"] = check_s["gouges"]["count"]
             result["zmap"]["rapid_collisions"]["rest"] = \
