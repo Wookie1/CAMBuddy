@@ -160,7 +160,12 @@
     const p = ACTION[form] ? schemaProps(ACTION[form]) : null;
     const f = p && p[spec.name];
     return {
-      min: f && typeof f.minimum === "number" ? f.minimum : spec.min,
+      // STEVE gets length/feed minimums as INCH numbers (catalog.published_catalog:
+      // it checks raw values before units are known); the field's own mm minimum
+      // stays exact, so take the stricter of the two
+      min: f && typeof f.minimum === "number"
+        ? (FX.isLen(spec) && typeof spec.min === "number" ? Math.max(f.minimum, spec.min) : f.minimum)
+        : spec.min,
       max: f && typeof f.maximum === "number" ? f.maximum : spec.max,
     };
   }

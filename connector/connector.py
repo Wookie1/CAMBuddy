@@ -112,7 +112,7 @@ class Connector:
         pub = crypto.b64(crypto.public_raw(self.sk))
         out = self.client.enroll(self.cfg["pairing_code"], pub,
                                 self.cfg["connector_name"], VERSION,
-                                catalog_mod.CATALOG)
+                                catalog_mod.published_catalog())
         signed = out.get("steve_keys") or {}
         keys = {}
         try:
@@ -162,7 +162,7 @@ class Connector:
                 time.sleep(float(self.cfg["token_retry"]))
 
     def publish_catalog_and_panel(self):
-        self.client.put_catalog(catalog_mod.CATALOG)
+        self.client.put_catalog(catalog_mod.published_catalog())
         panel_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "panel")
         files = {}
