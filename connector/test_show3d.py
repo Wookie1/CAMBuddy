@@ -215,3 +215,50 @@ def test_last_runs_declared_in_catalog(conn):
     c, mock, _home = conn
     assert LAST_RUNS in [e["name"] for e in mock.catalog["events"]], \
         mock.catalog["events"]
+
+
+# ------------------------- run-id by exact directory match (coordinator) ----
+def test_view_load_accepts_any_existing_run_dir_name(conn):
+    """STEVE's run-id format is not assumed: an id with ':' and '.' that is
+    the exact name of a run dir loads."""
+    c, mock, home = conn
+    rid = "run:2026-10-28.v1"
+    _, data = make_view_run(home, rid)
+    assert dispatch(mock, c, VIEW_LOAD, {"run_id": rid}, 9301) == "succeeded", \
+        final_report(mock, 9301)
+    assert sorted(mock.file_names(9301)) == sorted(data)
+
+
+@pytest.mark.parametrize("bad", ["..", "../x", "/private/tmp", ".hidden",
+                                 "a/b", "a\\b", "a\x00b", "x" * 129,
+                                 "run:2026-10-28.v1x"])
+def test_view_load_refuses_non_child_ids(conn, bad):
+    """Only an exact existing child name loads: '..', '../x', absolute
+    paths, dot-names, separators, NUL, over-long ids and near-misses of a
+    real name are refused, and nothing is uploaded."""
+    c, mock, home = conn
+    make_view_run(home, "run:2026-10-28.v1")
+    hid = home / "runs" / ".hidden"
+    hid.mkdir()
+    (hid / "view.bin").write_bytes(b"HIDDEN")
+    (hid / "view.json").write_bytes(b"{}")
+    rid = 9400 + abs(hash(bad)) % 500
+    final = dispatch(mock, c, VIEW_LOAD, {"run_id": bad}, rid)
+    assert final in ("rejected", "failed"), (bad, final)
+    assert mock.file_names(rid) == [], "a refusal uploaded files for %r" % bad
+
+
+def test_view_load_refuses_symlinked_dir_with_listed_name(conn):
+    """A symlink in runs/ whose name is listed by os.listdir but which points
+    outside <home>/runs is refused by the realpath containment check."""
+    c, mock, home = conn
+    (home / "runs").mkdir(parents=True)
+    outside = home / "outside"
+    outside.mkdir()
+    (outside / "view.bin").write_bytes(b"OUTSIDE-BIN")
+    (outside / "view.json").write_bytes(b"{}")
+    os.symlink(str(outside), str(home / "runs" / "run:linked.out"))
+    assert "run:linked.out" in os.listdir(str(home / "runs"))
+    final = dispatch(mock, c, VIEW_LOAD, {"run_id": "run:linked.out"}, 9901)
+    assert final in ("rejected", "failed"), final
+    assert mock.file_names(9901) == []

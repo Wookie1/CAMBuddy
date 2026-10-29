@@ -32,7 +32,7 @@ VERSION = "1.0.0"
 PANEL_NAME = catalog_mod.ACTION
 # SHOW3D: this connector's own run-id shape (the ids STEVE sends: digits or
 # uuid-like). No separators, no dots: anything else is refused unread.
-RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+RUN_ID_MAX = 128             # view.load run_id length cap (STEVE's id format is not assumed)
 LAST_RUNS_MAX = 10           # the last_runs event lists at most this many
 LAST_RUNS_MAX_BYTES = 8 * 1024   # event data stays under 8 kB
 
@@ -271,14 +271,23 @@ class Connector:
 
     def _view_load_files(self, run_id):
         """SHOW3D: [(name, path, media)] for view.load, or None to refuse.
-        run_id must match this connector's own run-id shape; the directory
-        <home>/runs/<run_id> must exist and resolve INSIDE <home>/runs (no
-        traversal, no symlink escape); view.bin + view.json must be plain
+        STEVE's run-id format is not assumed: run_id must EXACTLY equal the
+        name of an existing direct child of <home>/runs (os.listdir, string
+        equality), never contain '/', '\\' or NUL, never start with '.',
+        and be <= RUN_ID_MAX long; the directory must resolve INSIDE
+        <home>/runs (no symlink escape); view.bin + view.json must be plain
         files in it (the pictures are optional). Nothing is ever read
         outside <home>/runs."""
-        if not isinstance(run_id, str) or not RUN_ID_RE.match(run_id):
+        if (not isinstance(run_id, str) or not 0 < len(run_id) <= RUN_ID_MAX
+                or run_id.startswith(".")
+                or any(ch in run_id for ch in ("/", "\\", "\0"))):
             return None
         root = os.path.realpath(os.path.join(self.home, "runs"))
+        try:
+            if run_id not in os.listdir(root):
+                return None
+        except OSError:
+            return None
         d = os.path.join(root, run_id)
         if os.path.realpath(d) != d or not os.path.isdir(d):
             return None

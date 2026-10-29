@@ -384,7 +384,7 @@ _VIEW_LOAD_ACTION_SPEC = {
                     "posted."),
     "confirm": False,
     "inputs": {"type": "object", "properties": {
-        "run_id": {"type": "string", "maxLength": 64, "title": "Run id",
+        "run_id": {"type": "string", "maxLength": 128, "title": "Run id",
                    "description": "the connector run id whose 3D view to "
                                   "show; REQUIRED: one of the last_runs "
                                   "event's run ids with has_view true"}},
