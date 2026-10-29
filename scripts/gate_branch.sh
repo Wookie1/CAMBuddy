@@ -1,7 +1,7 @@
 #!/bin/bash
 # Merge gate for the checkout this script lives in (run it from a DETACHED worktree at the sha under test, inside a lane:
-# slot2.sh or slot_m4.sh). (a) fixtures, (b) every engine test file standalone + verify/test_zmap.py with VibeCAD
-# python, (c) connector suite with homebrew pytest, (d) each failure is re-run on a detached worktree of main and
+# slot2.sh or slot_m4.sh). (a) fixtures, (b) every engine test file standalone with VibeCAD python, (c) connector
+# suite + verify/test_zmap.py (a pytest suite) with homebrew pytest, (d) each failure is re-run on a detached worktree of main and
 # labelled NEW or PRE-EXISTING, (e) prints GATE_GREEN (all rc 0 or every failure PRE-EXISTING) else GATE_RED.
 # No destructive git: the main worktree is only added (detached) and is left in place for inspection.
 VPY=/Applications/VibeCAD.app/Contents/Resources/bin/python
@@ -22,12 +22,12 @@ FAILS=()
 (cd "$ROOT" && "$HPY" scripts/check_fixtures.py) > "$LOG/fixtures.log" 2>&1 || {
   echo "fixtures rc=1 (see $LOG/fixtures.log)"; echo GATE_RED fixtures; exit 1; }
 echo "fixtures rc=0"
-for t in $(cd "$ROOT" && ls engine/test_*.py) verify/test_zmap.py; do
+for t in $(cd "$ROOT" && ls engine/test_*.py); do
   s=$(date +%s); run_engine "$ROOT" "$t" "$LOG/$(basename "$t" .py).log"; rc=$?
   echo "$t rc=$rc $(( $(date +%s) - s ))s"; [ $rc = 0 ] || FAILS+=("engine:$t")
 done
-s=$(date +%s); run_conn "$ROOT" "$LOG/connector.log"; rc=$?
-echo "connector(pytest) rc=$rc $(( $(date +%s) - s ))s"
+s=$(date +%s); run_conn "$ROOT" "$LOG/connector.log" "connector verify/test_zmap.py"; rc=$?
+echo "connector+verify/test_zmap(pytest) rc=$rc $(( $(date +%s) - s ))s"
 if [ $rc != 0 ]; then
   ids=$(grep -E '^FAILED ' "$LOG/connector.log" | awk '{print $2}')
   [ -n "$ids" ] || ids=connector   # collection error etc.: compare the whole suite
