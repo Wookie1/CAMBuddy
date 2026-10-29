@@ -518,6 +518,24 @@ for _a in CATALOG["actions"]:
     _annotate(_a)
 
 
+def published_catalog():
+    """The catalog as sent to STEVE (enroll and PUT /catalog). STEVE checks
+    each number input's minimum/maximum on the RAW value, before units are
+    known, while CATALOG's bounds for MM_FIELDS are millimetres and a run may
+    send inches. So the published minimum of a length/feed input is the INCH
+    number (mm minimum / 25.4, rounded down) and the maximum stays the mm
+    number: every value valid in either unit clears STEVE, and validate()
+    (CATALOG, after to_mm) still enforces the exact mm range."""
+    import copy
+    cat = copy.deepcopy(CATALOG)
+    for a in cat["actions"]:
+        for k, v in (a.get("inputs") or {}).get("properties", {}).items():
+            m = v.get("minimum")
+            if k in MM_FIELDS and isinstance(m, (int, float)) and m > 0:
+                v["minimum"] = int(m / 25.4 * 1e6) / 1e6
+    return cat
+
+
 def get_action(name):
     """The catalog action dict for `name`, or None."""
     for a in CATALOG["actions"]:
