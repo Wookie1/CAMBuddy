@@ -454,6 +454,14 @@ def _replay_worker(L, x0, y0, fine, R, cr, a0, kR, pad2, bmax, ends, cut,
                             *(np.concatenate(a) for a in zip(*buf)))
 
 
+def save_stock(out_path, A, x0, y0, fine):
+    """The stock file pair replay_stock writes: .npy + x0/y0/cell sidecar."""
+    import json, os
+    np.save(out_path, A)
+    with open(os.path.splitext(out_path)[0] + ".json", "w") as fh:
+        json.dump({"x0": x0, "y0": y0, "cell": fine}, fh)
+
+
 def replay_stock(moves, dia, corner, out_path, box=None, top_z=None,
                  init=None, fine=FINE):
     """RR-STOCK: replay an EMITTED move list (modal x/y/z, g 0|1, mm) with
@@ -525,9 +533,7 @@ def replay_stock(moves, dia, corner, out_path, box=None, top_z=None,
         for k in range(1, T):
             np.minimum(L, ls[k], out=L)
     A = L[pad2:-pad2, pad2:-pad2]
-    np.save(out_path, A)
-    with open(os.path.splitext(out_path)[0] + ".json", "w") as fh:
-        json.dump({"x0": x0, "y0": y0, "cell": fine}, fh)
+    save_stock(out_path, A, x0, y0, fine)
     print("replay_stock: %d moves -> %s in %.1f s"
           % (len(moves), out_path, time.time() - t0), flush=True)
     return A, x0, y0, fine

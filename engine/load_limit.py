@@ -156,10 +156,13 @@ def _windows(recs):
     return windows
 
 
-def limit_feeds(moves, dia, corner, box, top_z, cut_feed, fine=FINE):
+def limit_feeds(moves, dia, corner, box, top_z, cut_feed, fine=FINE,
+                return_stock=False):
     """Slow the feed on over-loaded ZE2 windows of an emitted rough move
     list (see module docstring). Returns (new_moves, stats); only F words
-    change."""
+    change. SP-P1A: return_stock=True also returns (A, x0, y0, fine), the
+    final replayed stock - identical to entry_depth.replay_stock of the same
+    moves (only F words differ), so the CLI skips that second replay."""
     R = float(dia) / 2.0
     cr = min(float(corner), R) if corner else 0.0
     a0 = R - cr
@@ -259,4 +262,6 @@ def limit_feeds(moves, dia, corner, box, top_z, cut_feed, fine=FINE):
              "mm_slowed": round(mm, 3),
              "min_feed": min(feeds) if feeds else None,
              "floor_bound": floor_bound}
+    if return_stock:
+        return out, stats, (L[pad2:-pad2, pad2:-pad2].copy(), x0, y0, fine)
     return out, stats

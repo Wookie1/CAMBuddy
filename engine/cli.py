@@ -771,13 +771,23 @@ def main(argv=None):
         # FL-LOAD: slow the feed on over-loaded windows ONLY (flag OFF: this
         # post-pass never runs and the emitted program is untouched)
         from engine import load_limit
-        moves, lst = load_limit.limit_feeds(moves, dia, corner, a.stock,
-                                            a.stock[5], a.cut_feed)
+        # SP-P1A: limit_feeds already replays the final stock; reuse it
+        # (STEVECAM_FORCE_REPLAY=1 keeps the separate replay, for proofs)
+        one = bool(a.stock_out) and \
+            os.environ.get("STEVECAM_FORCE_REPLAY") != "1"
+        moves, lst, *ll_stock = load_limit.limit_feeds(
+            moves, dia, corner, a.stock, a.stock[5], a.cut_feed,
+            return_stock=one)
         print("load_limit: windows_slowed=%d mm_slowed=%.1f min_feed=%.0f "
               "floor_bound=%d" % (lst["windows_slowed"], lst["mm_slowed"],
                                   lst["min_feed"] or 0.0,
                                   lst["floor_bound"]), flush=True)
-    if a.stock_out:
+    if a.stock_out and a.load_limit and ll_stock:
+        from engine import entry_depth
+        entry_depth.save_stock(a.stock_out, *ll_stock[0])
+        print("stock_out: %s from load_limit's replay (no second replay)"
+              % a.stock_out, flush=True)
+    elif a.stock_out:
         # RR-STOCK: hand downstream the replay of the EMITTED moves (never
         # lower than what they remove); overwrites rough's coarse file
         from engine import entry_depth

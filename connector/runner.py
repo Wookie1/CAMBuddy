@@ -23,6 +23,9 @@ import viewimg  # TASK VIEW3D-IMG: display-only view_iso/view_top.png render
 # FINISH_ENGAGE_FACTOR x stepover.
 ROUGH_ENGAGE_FACTOR = 1.2
 FINISH_ENGAGE_FACTOR = 1.5
+# zmap judge worker processes on this machine (results equal --jobs 1 except
+# chunk-order float sums in report-only keys; ~3-4 GB peak per CF judge)
+ZMAP_JOBS = 12
 
 # ---------------------------------------------------------------------------
 # Task RR1b: T20 ball rest-rough defaults (parameters + defaults only).
@@ -643,7 +646,7 @@ class EngineRun:
         # TASK_VIEW3D: the final judged stock, exported by this same zmap
         # call (no extra judge pass) for the panel's display-only view.bin
         stock_after = os.path.join(self.work, "stock_after_rough.npy")
-        self._spawn([py, "-m", "verify.zmap", nc,
+        self._spawn([py, "-m", "verify.zmap", nc, "--jobs", str(ZMAP_JOBS),
                     "--part", hf_zmap,
                     "--tool", values["tool_type"],
                     "--dia", "%.4f" % values["tool_diameter"],
@@ -859,7 +862,7 @@ class EngineRun:
             if on_progress:
                 on_progress(lo, "checking %s" % pname)
             out_json = os.path.join(self.work, "check_%d.json" % (i + 1))
-            argv = [py, "-m", "verify.zmap", ppath,
+            argv = [py, "-m", "verify.zmap", ppath, "--jobs", str(ZMAP_JOBS),
                     "--part", hf_zmap,
                     "--tool", tool["type"],
                     "--dia", "%.4f" % tool["diameter_mm"],
@@ -1235,7 +1238,7 @@ class EngineRun:
         #    finish with the roughed stock as --stock-in
         check_rough = os.path.join(self.work, "check_rough.json")
         stock_out = os.path.join(self.work, "stock_after_rough.npy")
-        self._spawn([py, "-m", "verify.zmap", nc,
+        self._spawn([py, "-m", "verify.zmap", nc, "--jobs", str(ZMAP_JOBS),
                     "--part", hf01,
                     "--tool", values["rough_tool_type"],
                     "--dia", "%.4f" % values["rough_tool_diameter"],
@@ -1261,7 +1264,7 @@ class EngineRun:
         # grid geometry in the heightfield sidecar convention.
         stock_finish = os.path.join(self.work, "stock_after_finish.npy")
         stock_rest = os.path.join(self.work, "stock_after_rest.npy")
-        argv_f = [py, "-m", "verify.zmap", fin,
+        argv_f = [py, "-m", "verify.zmap", fin, "--jobs", str(ZMAP_JOBS),
                   "--part", hf01,
                   "--tool", "ball",
                   "--dia", "%.4f" % values["tool_diameter"],
@@ -1396,7 +1399,7 @@ class EngineRun:
             #     the leftover after the last program of the chain
             stock_rest = os.path.join(self.work, "stock_after_rest.npy")
             fr.remove_stale(stock_rest)
-            argv_zr = [py, "-m", "verify.zmap", rest_nc,
+            argv_zr = [py, "-m", "verify.zmap", rest_nc, "--jobs", str(ZMAP_JOBS),
                        "--part", hf01,
                        "--tool", "ball",
                        "--dia", "%.4f" % rest["diameter_mm"],
