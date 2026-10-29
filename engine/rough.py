@@ -573,7 +573,20 @@ def island_clear_fn(islands, req):
     away from every island loop AND not inside one (the exact drop-cutter
     forbidden geometry - the ground truth the emitted CL must obey,
     independent of the stock heightfield model; R1: the inside test closes the
-    distance-only blind spot that let centres deep inside an island pass)."""
+    distance-only blind spot that let centres deep inside an island pass).
+
+    SP-P1C (speed only, identical booleans): built once per call,
+    (a) a uniform 2D bucket grid, cell 1.0 mm, each segment listed in every
+    bucket its bbox expanded by req + 1e-6 touches - a point at distance
+    < req from a segment lies inside that expanded bbox, so the bucket's
+    segment list is an exact superset of possible < req violations; and
+    (b) y-strips, height 1.0 mm, each edge of every closed loop (len >= 3,
+    the loops _inside_loops gets) listed in every strip its
+    [min(y, yn) - 1e-9, max(y, yn) + 1e-9] overlaps - a crossing point has
+    min(y, yn) <= py < max(y, yn), so the strip's edge list is an exact
+    superset of crossing edges. f groups points by bucket/strip and applies
+    the SAME _pt_seg_dist_np / crossing predicate / xint expression, so the
+    result is bit-for-bit the old all-segments + all-loops test."""
     import numpy as np
     segs = []
     for lp in islands:
@@ -587,15 +600,72 @@ def island_clear_fn(islands, req):
     A = AB[:, 0, :]
     B = AB[:, 1, :]
 
+    m = req + 1e-6
+    gi0 = np.floor(np.minimum(A[:, 0], B[:, 0]) - m).astype(np.int64)
+    gi1 = np.floor(np.maximum(A[:, 0], B[:, 0]) + m).astype(np.int64)
+    gj0 = np.floor(np.minimum(A[:, 1], B[:, 1]) - m).astype(np.int64)
+    gj1 = np.floor(np.maximum(A[:, 1], B[:, 1]) + m).astype(np.int64)
+    buckets = {}
+    for k in range(len(AB)):
+        for i in range(int(gi0[k]), int(gi1[k]) + 1):
+            for j in range(int(gj0[k]), int(gj1[k]) + 1):
+                buckets.setdefault((i, j), []).append(k)
+    buckets = {kk: np.asarray(vv, dtype=np.int64)
+               for kk, vv in buckets.items()}
+
+    E = [np.stack([L[:, 0], L[:, 1], np.roll(L[:, 0], -1),
+                   np.roll(L[:, 1], -1)], axis=1)
+         for L in (np.asarray(lp, dtype=float) for lp in islands)
+         if len(L) >= 3]
+    ED = np.concatenate(E, axis=0) if E else np.zeros((0, 4))
+    ex, ey, exn, eyn = ED[:, 0], ED[:, 1], ED[:, 2], ED[:, 3]
+    sj0 = np.floor(np.minimum(ey, eyn) - 1e-9).astype(np.int64)
+    sj1 = np.floor(np.maximum(ey, eyn) + 1e-9).astype(np.int64)
+    strips = {}
+    for e in range(len(ED)):
+        for j in range(int(sj0[e]), int(sj1[e]) + 1):
+            strips.setdefault(j, []).append(e)
+    strips = {kk: np.asarray(vv, dtype=np.int64)
+              for kk, vv in strips.items()}
+
     def f(pts):
         P = np.asarray(pts, dtype=float)
-        out = np.full(len(P), np.inf)
-        for s in range(0, len(P), 512):
-            blk = P[s:s + 512]
-            d = _pt_seg_dist_np(blk, A, AB[:, 1, :])
-            out[s:s + 512] = d.min(axis=1)
-        ins = _inside_loops(P, [lp for lp in islands if len(lp) >= 3])
-        return [bool(v >= req) and not i for v, i in zip(out, ins)]
+        n = len(P)
+        bad = np.zeros(n, dtype=bool)
+        gidx = {}
+        for t in range(n):
+            gidx.setdefault((int(np.floor(P[t, 0])),
+                             int(np.floor(P[t, 1]))), []).append(t)
+        for key, idxs in gidx.items():
+            seg = buckets.get(key)
+            if seg is None:
+                continue
+            Ac, Bc = A[seg], B[seg]
+            for s in range(0, len(idxs), 512):
+                sub = idxs[s:s + 512]
+                bad[sub] = (_pt_seg_dist_np(P[sub], Ac, Bc) < req).any(axis=1)
+        tot = np.zeros(n, dtype=np.int64)
+        sidx = {}
+        for t in range(n):
+            sidx.setdefault(int(np.floor(P[t, 1])), []).append(t)
+        for key, idxs in sidx.items():
+            ed = strips.get(key)
+            if ed is None:
+                continue
+            cx, cy, cnx, cny = ex[ed], ey[ed], exn[ed], eyn[ed]
+            for s in range(0, len(idxs), 512):
+                sub = idxs[s:s + 512]
+                blk = P[sub]
+                py = blk[:, 1][:, None]
+                cross = (cy[None, :] > py) != (cny[None, :] > py)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    xint = cx[None, :] + (py - cy[None, :]) \
+                           * (cnx[None, :] - cx[None, :]) \
+                           / (cny[None, :] - cy[None, :])
+                hit = cross & (blk[:, 0][:, None] < xint)
+                tot[sub] += hit.sum(axis=1)
+        ins = (tot % 2) == 1
+        return [bool(not a and not b) for a, b in zip(bad, ins)]
     return f
 
 

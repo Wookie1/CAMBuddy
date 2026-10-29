@@ -70,13 +70,23 @@ class bore_context:     # BS1a4d-f: SCOPED bore fn (no bare module global):
 
 def _march(p, ux, uy, isl_ok3, maxd):
     """largest d = k*MARCH_STEP with every sampled point island-legal
-    (exclusive of p, inclusive of the last good one) along +u from p."""
+    (exclusive of p, inclusive of the last good one) along +u from p.
+    SP-P1C: the candidate points k*MARCH_STEP (k = 1..K, K the largest k
+    with k*MARCH_STEP <= maxd) are evaluated in batches of 32 per isl_ok3
+    call (isl_ok3 is a pure closure - no counters or stats, audited in
+    SPP1C_RESULTS); d accumulates exactly as the old one-point loop, so
+    the returned float is identical."""
+    cand = []
+    dn = 0.0
+    while dn + MARCH_STEP <= maxd:
+        dn += MARCH_STEP
+        cand.append((p[0] + ux * dn, p[1] + uy * dn))
     d = 0.0
-    while d + MARCH_STEP <= maxd:
-        dn = d + MARCH_STEP
-        if not isl_ok3([(p[0] + ux * dn, p[1] + uy * dn)])[0]:
-            break
-        d = dn
+    for s in range(0, len(cand), 32):
+        for ok in isl_ok3(cand[s:s + 32]):
+            if not ok:
+                return d
+            d += MARCH_STEP
     return d
 
 
