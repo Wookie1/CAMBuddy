@@ -69,6 +69,7 @@ class Env {
     page.on("framenavigated", (f) => { if (f !== page.mainFrame()) this.navigations.push(f.url()); });
     page.on("popup", (p) => this.popups.push(p.url()));
     await page.addInitScript(STORAGE_GUARD);
+    if (opts.init) await page.addInitScript(opts.init);
     await page.addInitScript((c) => { if (window.top === window) window.__CFG = c; }, cfg || {});
     await page.goto(opts.url || MOCK_URL);
     this.panel = await this.waitPanel();
@@ -918,6 +919,108 @@ test("dev.html harness: loads network-free, answers every method, rough and fini
   await env.page.click("#theme");
   await env.panel.waitForFunction(() => document.documentElement.dataset.theme === "dark");
   await env.page.waitForTimeout(200);
+});
+
+// ------------------------------------------------------------------ viewer --
+function viewFixture() {
+  const bin = path.join(TESTDATA, "view_fixture.bin");
+  const js = path.join(TESTDATA, "view_fixture.json");
+  if (!fs.existsSync(bin) || !fs.existsSync(js)) throw new Error("fixture view.bin/view.json missing (write connector/testdata/view_fixture.* with connector/view.py)");
+  return { bin: fs.readFileSync(bin).toString("base64"), json: JSON.parse(fs.readFileSync(js, "utf8")) };
+}
+function viewerCfg(fx) {
+  return { results: { adaptive_rough: { state: "succeeded", result: {}, files: ["rough.nc", "check.json", "preview.png", "view.bin", "view.json"] } }, checkJson: SAMPLE, viewBinBase64: fx.bin, viewJson: fx.json };
+}
+// pixel fingerprint of the viewer canvas (WebGL via the stored gl, 2D via getImageData)
+async function canvasFp(env) {
+  return env.panel.$eval(".v3d-canvas", (c) => {
+    let data;
+    if (c.__v3dgl) {
+      data = new Uint8Array(c.width * c.height * 4);
+      c.__v3dgl.readPixels(0, 0, c.width, c.height, c.__v3dgl.RGBA, c.__v3dgl.UNSIGNED_BYTE, data);
+    } else {
+      data = new Uint8ClampedArray(c.getContext("2d").getImageData(0, 0, c.width, c.height).data);
+    }
+    const colors = new Set();
+    let sum = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      colors.add((data[i] >> 3) + "," + (data[i + 1] >> 3) + "," + (data[i + 2] >> 3));
+      sum = (sum + data[i] * 3 + data[i + 1] * 7 + data[i + 2] * 11) % 1000000007;
+    }
+    return { colors: colors.size, sum, mode: c.dataset.mode };
+  });
+}
+async function openViewer(env, opts) {
+  await env.open(viewerCfg(viewFixture()), opts);
+  await clickRun(env, "rough");
+  await waitFinal(env, "rough");
+  await env.panel.waitForSelector(".v3d-canvas", { timeout: 5000 });
+  await env.panel.waitForFunction(() => {
+    const c = document.querySelector(".v3d-canvas");
+    return c && c.dataset.drawn === "1";
+  }, null, { timeout: 5000 });
+}
+
+test("viewer: WebGL draws non-blank canvas from a fixture view.bin", async (env) => {
+  await openViewer(env);
+  const fp = await canvasFp(env);
+  assert.strictEqual(fp.mode, "webgl", "viewer did not use WebGL: " + fp.mode);
+  assert(fp.colors > 3, "WebGL canvas nearly blank (distinct colors): " + fp.colors);
+  await (await env.page.$("#panel")).screenshot({ path: path.join(SCREENS, "viewer_webgl.png") });
+  return "colors=" + fp.colors;
+});
+
+test("viewer: forced 2D fallback draws a non-blank 2D canvas", async (env) => {
+  await openViewer(env, { init: "(() => { const g = HTMLCanvasElement.prototype.getContext; HTMLCanvasElement.prototype.getContext = function (t, o) { if (String(t) === 'webgl' || String(t) === 'experimental-webgl') return null; return g.call(this, t, o); }; })();" });
+  const fp = await canvasFp(env);
+  assert.strictEqual(fp.mode, "2d", "no automatic 2D fallback: " + fp.mode);
+  assert(fp.colors > 3, "2D fallback nearly blank (distinct colors): " + fp.colors);
+  await (await env.page.$("#panel")).screenshot({ path: path.join(SCREENS, "viewer_fallback.png") });
+  return "colors=" + fp.colors;
+});
+
+test("viewer: non-panel run shows the note", async (env) => {
+  await env.open({ checkJson: SAMPLE });
+  await env.panel.click("#tab-check");
+  await env.mock(() => window.__mock.pushRun({ id: "chk-9", action: "check_program", state: "succeeded", progress: 1,
+    result: { verdict: "ready", summary: "Clean.", attention: [] }, files: ["check.json", "preview.png", "view.bin", "view.json"] }));
+  await env.waitText("#check-runs", /not started in this panel/, 5000);
+  assert.strictEqual(await env.panel.$(".v3d-canvas"), null, "a viewer canvas appeared for a run the panel did not start");
+});
+
+test("viewer: layer toggles change pixels", async (env) => {
+  await openViewer(env);
+  const before = await canvasFp(env);
+  await env.panel.uncheck(".v3d-stock");
+  await env.panel.waitForTimeout(150);
+  const after = await canvasFp(env);
+  assert(before.sum !== after.sum, "hiding the stock layer did not change the canvas");
+  await env.panel.check(".v3d-stock");
+  await env.panel.uncheck(".v3d-path");
+  await env.panel.waitForTimeout(150);
+  const after2 = await canvasFp(env);
+  assert(after.sum !== after2.sum, "hiding the path layer did not change the canvas");
+  await env.panel.check(".v3d-path");
+  await env.panel.uncheck(".v3d-markers");
+  await env.panel.waitForTimeout(150);
+  const after3 = await canvasFp(env);
+  assert(after2.sum !== after3.sum, "hiding the markers layer did not change the canvas");
+  return "sums " + before.sum + "/" + after.sum + "/" + after2.sum + "/" + after3.sum;
+});
+
+test("viewer: no network, storage or console errors while showing a run", async (env) => {
+  await openViewer(env);
+  const files = (await env.sent("run.file")).map((m) => m.params.name);
+  assert(files.includes("view.bin") && files.includes("view.json"), "viewer did not fetch both files: " + files.join(","));
+});
+
+test("viewer: panel bundle <= 2 MB", () => {
+  const files = [];
+  (function walk(d) { for (const n of fs.readdirSync(d)) { const p = path.join(d, n); fs.statSync(p).isDirectory() ? walk(p) : files.push(p); } })(PANEL_DIR);
+  const total = files.reduce((s, f) => s + fs.statSync(f).size, 0);
+  assert(files.length <= 50, "too many files: " + files.length);
+  assert(total <= 2 * 1024 * 1024, "too big: " + total);
+  return { files: files.length, bytes: total };
 });
 
 // ================================================================== runner ==

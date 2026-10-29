@@ -918,6 +918,7 @@
     S.results[form] = { run, check, checkErr, files };
     paintResults(form);
     showPreview(run, files, c.preview, c);
+    if (window.SteveCAMViewer) window.SteveCAMViewer.attach(c, run, files, call);
   }
   function outputDir(result) {
     if (!isObj(result)) return null;
@@ -967,6 +968,7 @@
     if (FINAL.has(run.state) && (run.result || c.check)) {
       c.body.append(RP.render(RP.build(run.result, c.check), S.units, { files: c.files, outputDir: outputDir(run.result) }));
     }
+    if (window.SteveCAMViewer && c.files.indexOf("view.bin") >= 0) window.SteveCAMViewer.noteInto(c.body);
   }
 
   // ------------------------------------------------------------ measure --
@@ -1009,6 +1011,7 @@
   }
   function applyTheme(theme) {
     document.documentElement.setAttribute("data-theme", theme === "dark" ? "dark" : "light");
+    if (window.SteveCAMViewer) window.SteveCAMViewer.theme();
   }
   function applyContext(ctx) {
     if (ctx.theme) applyTheme(ctx.theme);
