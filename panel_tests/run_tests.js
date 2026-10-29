@@ -1042,6 +1042,63 @@ test("viewer: panel bundle <= 2 MB", () => {
   return { files: files.length, bytes: total };
 });
 
+// ---------------------------------------------------------------- show3d --
+function show3dCfg(extra) {
+  const fx = viewFixture();
+  const runs = [
+    { run_id: "3003", action: "slope_split_finish", document_id: "doc-3", at: "2026-10-28T07:41:00.000Z", has_view: true },
+    { run_id: "2002", action: "check_program", document_id: "doc-2", at: "2026-10-27T18:22:00.000Z", has_view: true },
+    { run_id: "1001", action: "adaptive_rough", document_id: "doc-1", at: "2026-10-26T09:05:00.000Z", has_view: false },
+  ];
+  return Object.assign({ lastRuns: runs, viewBinBase64: fx.bin, viewJson: fx.json }, extra);
+}
+
+test("show3d: recent runs list from last_runs event", async (env) => {
+  await env.open(show3dCfg());
+  await env.panel.waitForSelector("#recent:not([hidden])");
+  const t = await env.text("#recent");
+  assert.match(t, /Rough/);
+  assert.match(t, /Check/);
+  assert.match(t, /Finish/);
+  assert.match(t, /2026-10-28/);
+  assert.match(t, /2026-10-26/);
+  assert.strictEqual((t.match(/has 3D/g) || []).length, 2, "has 3D markers: " + t);
+  const btns = await env.panel.$$eval(".show3d-btn", (bs) => bs.map((b) => [b.dataset.runId, b.disabled]));
+  assert.deepStrictEqual(btns.map((b) => b[0]), ["3003", "2002", "1001"], "row order / ids: " + JSON.stringify(btns));
+  assert.deepStrictEqual(btns.map((b) => b[1]), [false, false, true], "Show 3D must be enabled only where has_view: " + JSON.stringify(btns));
+  await (await env.page.$("#panel")).screenshot({ path: path.join(SCREENS, "show3d_recent.png") });
+});
+
+test("show3d: Show 3D starts view.load and draws the viewer", async (env) => {
+  await env.open(show3dCfg());
+  await env.panel.waitForSelector("#recent:not([hidden])");
+  await env.panel.click(".show3d-btn[data-run-id='2002']");
+  await env.page.waitForFunction(() => window.__mock.sent("run", "view.load").length > 0, null, { timeout: 3000 });
+  const sent = (await env.sent("run", "view.load"))[0];
+  assert.deepStrictEqual(sent.params.inputs, { run_id: "2002" }, "wrong view.load inputs");
+  await env.panel.waitForFunction(() => {
+    const c = document.querySelector(".v3d-canvas");
+    return c && c.dataset.drawn === "1";
+  }, null, { timeout: 5000 });
+  const fp = await canvasFp(env);
+  assert.strictEqual(fp.mode, "webgl", "viewer did not use WebGL: " + fp.mode);
+  assert(fp.colors > 3, "show3d canvas nearly blank: " + fp.colors);
+  await env.settle();
+  assert.strictEqual((await env.sent("run", "view.load")).length, 1, "a second view.load run was started");
+  await (await env.page.$("#panel")).screenshot({ path: path.join(SCREENS, "show3d_viewer.png") });
+  return "colors=" + fp.colors;
+});
+
+test("show3d: no auto-start on open", async (env) => {
+  await env.open(show3dCfg());
+  await env.panel.waitForSelector("#recent:not([hidden])");
+  await env.settle();
+  assert.strictEqual((await env.sent("run", "view.load")).length, 0, "view.load was started without a click");
+  const runs = (await env.sent("run")).map((m) => m.params.action);
+  assert.deepStrictEqual(runs, ["tools.list", "job.get"], "unexpected runs started on open: " + runs.join(","));
+  assert.strictEqual(await env.panel.$(".v3d-canvas"), null, "a viewer appeared without a click");
+});
+
 // ================================================================== runner ==
 (async () => {
   browser = await chromium.launch();

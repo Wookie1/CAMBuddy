@@ -18,10 +18,15 @@ JOB_GET = "job.get"
 JOB_RENUMBER = "job.renumber"
 JOB_SETUP = "job.setup"
 TOOL_ACTIONS = (TOOLS_LIST, TOOLS_UPDATE, JOB_GET, JOB_RENUMBER, JOB_SETUP)
+# SHOW3D: open a stored run's 3D view (display only, no engine, no document)
+VIEW_ACTION = "view.load"
+TOOL_ACTIONS = TOOL_ACTIONS + (VIEW_ACTION,)
 # track 2 (b): measure the oriented model (engine prepare path, no cutting)
 MEASURE_ACTION = "model.measure"
 ENGINE_ACTIONS = ACTIONS + (MEASURE_ACTION,)
 EVENT = "engine_state"
+# SHOW3D: the newest cutting/check runs, posted after every one of them ends
+LAST_RUNS_EVENT = "last_runs"
 
 # inputs whose numeric value is a length/feeds in mm (or mm/min):
 MM_FIELDS = ("stock_xy", "stock_x", "stock_y", "stock_top", "stock_bottom",
@@ -369,6 +374,26 @@ MEASURE_ACTION_SPEC = {
               "[x, y, z]}} after orientation",
 }
 
+_VIEW_LOAD_ACTION_SPEC = {
+    "name": VIEW_ACTION,
+    "title": "Show a run's 3D view",
+    "description": ("Use to open the stored 3D view of one of this "
+                    "connector's recent runs: attaches that run's view.bin "
+                    "and view.json (and its 3D pictures when present) to "
+                    "this run. Display only: nothing is planned, cut or "
+                    "posted."),
+    "confirm": False,
+    "inputs": {"type": "object", "properties": {
+        "run_id": {"type": "string", "maxLength": 128, "title": "Run id",
+                   "description": "the connector run id whose 3D view to "
+                                  "show; REQUIRED: one of the last_runs "
+                                  "event's run ids with has_view true"}},
+        "required": ["run_id"]},
+    "result": "{run_id, files}: the view files attached to this run "
+              "(view.bin, view.json, view_iso.png and view_top.png when "
+              "the run has them).",
+}
+
 TOOL_ACTION_SPECS = [
     {"name": TOOLS_LIST, "title": "List the tool library",
      "description": "The X7 tool library (~/.stevecam/tools.json): every "
@@ -474,11 +499,18 @@ def _annotate(action):
 
 CATALOG = {"actions": [ROUGHING_ACTION, SLOPE_ACTION_SPEC,
                        CHECK_ACTION_SPEC, MEASURE_ACTION_SPEC]
-           + TOOL_ACTION_SPECS,
+           + TOOL_ACTION_SPECS + [_VIEW_LOAD_ACTION_SPEC],
            "events": [{
                "name": EVENT,
                "description": "Engine state: idle or busy, the current "
                             "action and its progress.",
+           }, {
+               "name": LAST_RUNS_EVENT,
+               "description": "The connector's most recent cutting/check "
+                              "runs (newest first, at most 10): {runs: "
+                              "[{run_id, action, document_id, at, "
+                              "has_view}]}. Posted after every such run "
+                              "ends.",
            }]}
 
 

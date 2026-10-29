@@ -160,6 +160,7 @@ def for_tool_action(action, result):
         "job.get": "Job for document %s." % result.get("document_id"),
         "job.renumber": "Job renumbering saved.",
         "job.setup": "Job setup saved.",
+        "view.load": "The run's 3D view is attached to this run.",
     }.get(action, "Done.")
     return {"verdict": verdict_of(attention), "summary": summary,
             "attention": attention}

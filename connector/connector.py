@@ -8,9 +8,11 @@ Persistent ledger: never act on a run id twice. Never contacts
 stevecad.studio unless the configured base_url says so; tests point it at
 the local mock.
 """
+import datetime
 import hashlib
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -28,6 +30,11 @@ from runner import EngineRun, EngineError, Cancelled  # noqa: E402
 
 VERSION = "1.0.0"
 PANEL_NAME = catalog_mod.ACTION
+# SHOW3D: this connector's own run-id shape (the ids STEVE sends: digits or
+# uuid-like). No separators, no dots: anything else is refused unread.
+RUN_ID_MAX = 128             # view.load run_id length cap (STEVE's id format is not assumed)
+LAST_RUNS_MAX = 10           # the last_runs event lists at most this many
+LAST_RUNS_MAX_BYTES = 8 * 1024   # event data stays under 8 kB
 
 
 def prepare_values(values_in, action):
@@ -256,6 +263,136 @@ class Connector:
         return toollib.renumber(home, repo, values["document_id"],
                                 values["tool_id"], values["t"])
 
+    # ------------------------------------------------------------ show3d --
+    VIEW_FILES = (("view.bin", "application/octet-stream"),
+                  ("view.json", "application/json"),
+                  ("view_iso.png", "image/png"),
+                  ("view_top.png", "image/png"))
+
+    def _view_load_files(self, run_id):
+        """SHOW3D: [(name, path, media)] for view.load, or None to refuse.
+        STEVE's run-id format is not assumed: run_id must EXACTLY equal the
+        name of an existing direct child of <home>/runs (os.listdir, string
+        equality), never contain '/', '\\' or NUL, never start with '.',
+        and be <= RUN_ID_MAX long; the directory must resolve INSIDE
+        <home>/runs (no symlink escape); view.bin + view.json must be plain
+        files in it (the pictures are optional). Nothing is ever read
+        outside <home>/runs."""
+        if (not isinstance(run_id, str) or not 0 < len(run_id) <= RUN_ID_MAX
+                or run_id.startswith(".")
+                or any(ch in run_id for ch in ("/", "\\", "\0"))):
+            return None
+        root = os.path.realpath(os.path.join(self.home, "runs"))
+        try:
+            if run_id not in os.listdir(root):
+                return None
+        except OSError:
+            return None
+        d = os.path.join(root, run_id)
+        if os.path.realpath(d) != d or not os.path.isdir(d):
+            return None
+        out = []
+        for name, media in self.VIEW_FILES:
+            p = os.path.join(d, name)
+            if os.path.realpath(p) != p or not os.path.isfile(p):
+                if name in ("view.bin", "view.json"):
+                    return None      # no 3D view for that run
+                continue
+            out.append((name, p, media))
+        return out
+
+    def _run_view_load(self, run_id, values):
+        """SHOW3D: upload byte-copies of another run's view files as the
+        files of this view.load run (display only; runs fast, no engine)."""
+        src = self._view_load_files(values.get("run_id"))
+        if src is None:
+            err = errors.make_error("no_view", "no 3D view for that run",
+                                    field="run_id")
+            try:
+                self.client.report_run(
+                    run_id, "failed", error=err,
+                    result=envelope.for_failure(catalog_mod.VIEW_ACTION,
+                                                err))
+            except SteveError:
+                pass
+            return
+        try:
+            for name, path, media in src:
+                with open(path, "rb") as fh:
+                    self.client.put_file(run_id, name, fh.read(), media)
+            result = {"run_id": values["run_id"],
+                      "files": [n for n, _p, _m in src]}
+            result = dict(result, **envelope.for_tool_action(
+                catalog_mod.VIEW_ACTION, result))
+            self.client.report_run(run_id, "succeeded", result=result,
+                                   message="done")
+        except SteveError:
+            pass
+
+    @staticmethod
+    def _utc_now():
+        return datetime.datetime.now(
+            datetime.timezone.utc).isoformat(
+                timespec="milliseconds").replace("+00:00", "Z")
+
+    def record_run_end(self, run_id, action, document_id):
+        """SHOW3D: a cutting/check run ended - keep a small per-run meta
+        file (<home>/runs/<id>/run_meta.json) and post the last_runs event.
+        Never raises into the run loop."""
+        try:
+            d = os.path.join(self.home, "runs", str(run_id))
+            has_view = (os.path.isfile(os.path.join(d, "view.bin"))
+                        and os.path.isfile(os.path.join(d, "view.json")))
+            meta = {"run_id": str(run_id), "action": str(action),
+                    "document_id": str(document_id or ""),
+                    "at": self._utc_now(), "has_view": bool(has_view)}
+            os.makedirs(d, exist_ok=True)
+            tmp = os.path.join(d, "run_meta.json.tmp")
+            with open(tmp, "w") as fh:
+                json.dump(meta, fh, sort_keys=True)
+            os.replace(tmp, os.path.join(d, "run_meta.json"))
+        except OSError:
+            pass
+        try:
+            self.client.post_event(catalog_mod.LAST_RUNS_EVENT,
+                                   self._last_runs_data())
+        except SteveError:
+            pass
+
+    def _last_runs_data(self):
+        """The newest <= LAST_RUNS_MAX recorded runs, newest first, always
+        under 8 kB of JSON (fields are length-capped; entries are dropped
+        from the end if it were ever not enough). "state" is a snapshot of
+        the engine being idle when the run history is posted, so every
+        event's data carries a state."""
+        root = os.path.join(self.home, "runs")
+        entries = []
+        try:
+            names = os.listdir(root)
+        except OSError:
+            names = []
+        for n in names:
+            try:
+                with open(os.path.join(root, n, "run_meta.json")) as fh:
+                    m = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(m, dict):
+                continue
+            entries.append({"run_id": str(m.get("run_id", n))[:64],
+                            "action": str(m.get("action", ""))[:64],
+                            "document_id": str(m.get("document_id", ""))[:128],
+                            "at": str(m.get("at", ""))[:32],
+                            "has_view": bool(m.get("has_view"))})
+        entries.sort(key=lambda e: (e["at"], e["run_id"]), reverse=True)
+        runs = entries[:LAST_RUNS_MAX]
+        data = {"state": "idle", "runs": runs}
+        while runs and len(json.dumps(data).encode("utf-8")) \
+                >= LAST_RUNS_MAX_BYTES:
+            runs.pop()
+            data = {"state": "idle", "runs": runs}
+        return data
+
     def _run_tool_action(self, run_id, env, action):
         try:
             self.client.report_run(run_id, "received")
@@ -268,6 +405,8 @@ class Connector:
                 return
             self.client.report_run(run_id, "running", progress=0.5,
                                    message=action)
+            if action == catalog_mod.VIEW_ACTION:
+                return self._run_view_load(run_id, values)
             try:
                 result = self.tool_action(action, values)
             except toollib.ToolLibError as e:
@@ -307,6 +446,17 @@ class Connector:
     def _run_job(self, run_id, env, action):
         self.current_run = run_id
         work = os.path.join(self.home, "runs", str(run_id))
+        # SHOW3D: what the last_runs event needs once this run ends
+        doc_id = (env.get("inputs") or {}).get("document_id")
+        rejected = False
+
+        def end_run():
+            """SHOW3D: this run ended - post last_runs first, then the
+            engine_state idle (engine_state stays the latest event)."""
+            if action in catalog_mod.ACTIONS and not rejected:
+                self.record_run_end(run_id, action, doc_id)
+            self.emit_state("idle")
+
         self.emit_state("busy", action, 0.0)
         try:
             self.client.report_run(run_id, "received")
@@ -353,7 +503,8 @@ class Connector:
                         error=errors.make_error(
                             "input_digest_mismatch",
                             "download failed sha256/bytes check", field=name))
-                    self.emit_state("idle")
+                    rejected = True
+                    end_run()
                     return
                 os.makedirs(work, exist_ok=True)
                 # each program field keeps its own file (program.nc,
@@ -372,8 +523,10 @@ class Connector:
             ok, code, values = prepare_values(env.get("inputs", {}), action)
             if not ok:
                 self.client.report_run(run_id, "rejected", error=values)
-                self.emit_state("idle")
+                rejected = True
+                end_run()
                 return
+            doc_id = values.get("document_id") or doc_id
 
             if action == catalog_mod.ACTION:
                 result, files = engine.run(step_path, values, on_progress)
@@ -409,14 +562,14 @@ class Connector:
                                        fname[:-3])
             self.client.report_run(run_id, "succeeded", result=result,
                                  message="done")
-            self.emit_state("idle")
+            end_run()
         except Cancelled:
             try:
                 self.client.report_run(run_id, "cancelled",
                                      message="cancelled")
             except SteveError:
                 pass
-            self.emit_state("idle")
+            end_run()
         except Exception as e:  # noqa: BLE001 - every path reports
             if isinstance(e, EngineError):
                 err = e.as_error()
@@ -431,7 +584,7 @@ class Connector:
                     result=envelope.for_failure(action, err))
             except SteveError:
                 pass
-            self.emit_state("idle")
+            end_run()
         finally:
             self.running = None
             self.current_run = None

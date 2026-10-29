@@ -9,7 +9,7 @@
     { tool_id: "tl-ball-6", t: 20, h: 20, d: 20, name: "6 mm ball", type: "ball", dia_mm: 6, corner_r_mm: 3, flute_len_mm: 12, reach_mm: 30, holder: "BT30-ER16-60", rpm: 12000, feed_mm_min: 1800, plunge_mm_min: 600 },
     { tool_id: "tl-ball-3", t: 33, h: 33, d: 33, name: "3 mm ball", type: "ball", dia_mm: 3, corner_r_mm: 1.5, flute_len_mm: 6, reach_mm: 20, holder: "BT30-ER16-60", rpm: 15000, feed_mm_min: 1000, plunge_mm_min: 300 },
   ];
-  const ALL = ["adaptive_rough", "slope_split_finish", "check_program", "model.measure", "tools.list", "tools.update", "job.get", "job.renumber", "job.setup"];
+  const ALL = ["adaptive_rough", "slope_split_finish", "check_program", "model.measure", "tools.list", "tools.update", "job.get", "job.renumber", "job.setup", "view.load"];
   const CFG = Object.assign({
     actions: ALL, allowed: {}, schema: "extended", manual: [], callErrors: {}, results: {}, checkJson: null,
     jobSetup: null, tools: TOOLS, pockets: 12, toolsUsed: ["tl-flat-12", "tl-ball-6"], theme: "light",
@@ -49,7 +49,8 @@
   function actions() {
     const cat = window.CATALOG.catalog(CFG.schema === "extended");
     const util = { "tools.list": {}, "tools.update": { tool: { type: "object" } }, "job.get": { document_id: { type: "string" } },
-      "job.renumber": { document_id: {}, tool_id: {}, t: { type: "integer" } }, "job.setup": { document_id: {}, setup: { type: "object" } } };
+      "job.renumber": { document_id: {}, tool_id: {}, t: { type: "integer" } }, "job.setup": { document_id: {}, setup: { type: "object" } },
+      "view.load": { run_id: { type: "string" } } };
     return CFG.actions.map((name, i) => ({
       id: "act-" + (i + 1), name, title: name, allowed: CFG.allowed[name] !== false, needs_confirmation: false,
       sends_open_document_on_click: true,
@@ -103,6 +104,11 @@
       const s = CFG.measure;
       return finishLater(r, { state: "succeeded", result: { size_mm: s, bbox_mm: { min: [-s.x / 2, -s.y / 2, 0], max: [s.x / 2, s.y / 2, s.z] } } });
     }
+    if (action === "view.load") {
+      const r = newRun(action, "running"); send({ steve: 1, id, result: plainRun(r) });
+      return finishLater(r, { state: "succeeded", result: { run_id: inputs.run_id, verdict: "ready", summary: "3D view attached.", attention: [] },
+        files: ["view.bin", "view.json"] });
+    }
     // CAM runs, automatic
     const r = newRun(action, "awaiting_confirmation");
     send({ steve: 1, id, result: plainRun(r) });
@@ -141,7 +147,11 @@
     if (!m || m.steve !== 1) return;  // markers from tests
     const { id, method, params } = m;
     if (method === "context") send({ steve: 1, id, result: { panel: "stevecam", connector: "stevecam", document: CFG.doc, theme: CFG.theme } });
-    else if (method === "events") send({ steve: 1, id, result: [{ name: "engine_state", data: { state: "idle", action: null, progress: null }, at: 1 }] });
+    else if (method === "events") {
+      const evs = [{ name: "engine_state", data: { state: "idle", action: null, progress: null }, at: 1 }];
+      if (CFG.lastRuns) evs.push({ name: "last_runs", data: { runs: CFG.lastRuns }, at: 2 });
+      send({ steve: 1, id, result: evs });
+    }
     else if (method === "actions") send({ steve: 1, id, result: actions() });
     else if (method === "run") onRun(id, params || {});
     else if (method === "run.get") send(M.runs[params.id] ? { steve: 1, id, result: plainRun(M.runs[params.id]) } : { steve: 1, id, error: { code: "action_not_found", message: "no run" } });
