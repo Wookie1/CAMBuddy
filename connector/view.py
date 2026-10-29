@@ -59,6 +59,24 @@ def downsample(a, k, mode):
 
 
 NODATA = 65535             # uint16 code for a non-finite cell (no stock / outside the grid)
+BELOW_TOL = 0.01           # mm: "below part" (red) only below this, the judge's gouge tolerance
+
+
+def block_nanmin(a, k):
+    """Per-block minimum of the FINITE values of a (ny, nx) grid; a block
+    with no finite value is nan (-> nodata). Edges padded with nan."""
+    if k <= 1:
+        return np.where(np.isfinite(a), a, np.nan)
+    ny, nx = a.shape
+    a = np.where(np.isfinite(a), a, np.nan)
+    py, px = (-ny) % k, (-nx) % k
+    if py or px:
+        a = np.pad(a, ((0, py), (0, px)), constant_values=np.nan)
+    b = a.reshape(a.shape[0] // k, k, a.shape[1] // k, k)
+    with np.errstate(all="ignore"):
+        allnan = np.all(np.isnan(b), axis=(1, 3))
+        m = np.nanmin(np.where(np.isnan(b), np.inf, b), axis=(1, 3))
+    return np.where(allnan, np.nan, m)
 
 
 def quantize(a, zoff, scale):
@@ -197,6 +215,18 @@ def build_view(out_bin, out_json, part_npy, stock_npy, programs, checks,
     body = quantize(pgrid, zoff, scale).tobytes()
     offsets = {"part": 0, "stock": len(body)}
     body += quantize(sgrid, zoff, scale).tobytes()
+    # v2 "left": per-block MIN of the FINE (stock - part) at the source cell
+    # (block max of part vs block min of stock invents wall-height "below
+    # part" at every steep wall; the fine difference does not)
+    with np.errstate(invalid="ignore"):
+        lgrid = block_nanmin(stock - part, k)
+    lfin = lgrid[np.isfinite(lgrid)]
+    loff = math.floor(float(lfin.min()) * 1000.0) / 1000.0 if lfin.size else 0.0
+    lmax = float(lfin.max()) if lfin.size else 0.0
+    lscale = SCALE if lmax - loff <= (NODATA - 1) * SCALE \
+        else (lmax - loff) / 65534.0
+    offsets["left"] = len(body)
+    body += quantize(lgrid, loff, lscale).tobytes()
     progs = []
     for name, path in programs:
         pts, flags = program_path(path)
@@ -227,11 +257,13 @@ def build_view(out_bin, out_json, part_npy, stock_npy, programs, checks,
                          % (len(body), MAX_BYTES))
     with open(out_bin, "wb") as fh:
         fh.write(body)
-    hdr = {"format": "stevecam-view", "version": 1, "units": "mm",
+    hdr = {"format": "stevecam-view", "version": 2, "units": "mm",
            "grid": {"x0": float(x0), "y0": float(y0),
                     "cell": float(cell * k), "nx": int(nx), "ny": int(ny)},
            "z": {"offset": float(zoff), "scale": float(scale),
-                 "nodata": NODATA},
+                 "nodata": NODATA, "left_offset": float(loff),
+                 "left_scale": float(lscale)},
+           "below_tol_mm": BELOW_TOL,
            "programs": progs, "markers": markers,
            "offsets": offsets, "bytes": len(body)}
     with open(out_json, "w") as fh:

@@ -970,6 +970,25 @@ test("viewer: WebGL draws non-blank canvas from a fixture view.bin", async (env)
   return "colors=" + fp.colors;
 });
 
+test("viewer: v2 file (fine-grid stock left) draws in WebGL", async (env) => {
+  // view.bin v2 adds the "left" grid; a viewer that only accepted v1 drew nothing
+  const bin = path.join(TESTDATA, "view_fixture_v2.bin");
+  const js = path.join(TESTDATA, "view_fixture_v2.json");
+  const fx = { bin: fs.readFileSync(bin).toString("base64"), json: JSON.parse(fs.readFileSync(js, "utf8")) };
+  assert.strictEqual(fx.json.version, 2, "fixture is not v2");
+  await env.open(viewerCfg(fx));
+  await clickRun(env, "rough");
+  await waitFinal(env, "rough");
+  await env.panel.waitForFunction(() => {
+    const c = document.querySelector(".v3d-canvas");
+    return c && c.dataset.drawn === "1";
+  }, null, { timeout: 5000 });
+  const fp = await canvasFp(env);
+  assert.strictEqual(fp.mode, "webgl", "viewer did not use WebGL: " + fp.mode);
+  assert(fp.colors > 3, "v2 canvas nearly blank (distinct colors): " + fp.colors);
+  return "colors=" + fp.colors;
+});
+
 test("viewer: forced 2D fallback draws a non-blank 2D canvas", async (env) => {
   await openViewer(env, { init: "(() => { const g = HTMLCanvasElement.prototype.getContext; HTMLCanvasElement.prototype.getContext = function (t, o) { if (String(t) === 'webgl' || String(t) === 'experimental-webgl') return null; return g.call(this, t, o); }; })();" });
   const fp = await canvasFp(env);

@@ -35,10 +35,18 @@
     var g = hdr.grid, z = hdr.z, o = hdr.offsets, n = g.nx * g.ny;
     var part = new Float32Array(n), stock = new Float32Array(n);
     var ND = z.nodata === undefined ? -1 : z.nodata;
+    var left = new Float32Array(n), hasLeft = o.left !== undefined;
+    var TOL = hdr.below_tol_mm === undefined ? 0.01 : hdr.below_tol_mm;
     for (var i = 0; i < n; i++) {
       var qp = dv.getUint16(o.part + i * 2, true), qs = dv.getUint16(o.stock + i * 2, true);
       part[i] = z.offset + (qp === ND ? 0 : qp) * z.scale;          // no data: grid floor
       stock[i] = qs === ND ? part[i] : z.offset + qs * z.scale;     // no stock: nothing left
+      var l = stock[i] - part[i];                                   // v1: block difference
+      if (hasLeft) {                                                // v2: fine-grid stock left
+        var ql = dv.getUint16(o.left + i * 2, true);
+        l = ql === ND ? 0 : z.left_offset + ql * z.left_scale;
+      }
+      left[i] = (l < 0 && l >= -TOL) ? 0 : l;                       // within the gate's tolerance
     }
     var progs = (hdr.programs || []).map(function (p) {
       var pts = new Float32Array(p.points * 3), fl = new Uint8Array(p.points);
@@ -50,7 +58,7 @@
       }
       return { name: p.name, pts: pts, flags: fl };
     });
-    return { part: part, stock: stock, progs: progs };
+    return { part: part, stock: stock, left: left, progs: progs };
   }
 
   // scene fit: model mm -> roughly [-1, 1]
@@ -143,7 +151,7 @@
       return [0.45 + 0.35 * t, 0.47 + 0.35 * t, 0.52 + 0.35 * t];
     });
     var stockMesh = surf(function (p) { return scene.stock[p]; }, function (p) {
-      var left = scene.stock[p] - scene.part[p];
+      var left = scene.left[p];
       return left < 0 ? BELOW : heat(left);
     });
     var line = [], mark = [];
@@ -252,7 +260,7 @@
         for (var iy = 0; iy < g.ny; iy++) {
           for (var ix = 0; ix < g.nx; ix++) {
             var p = iy * g.nx + ix;
-            var left = v.scene.stock[p] - v.scene.part[p];
+            var left = v.scene.left[p];
             var col = left < 0 ? BELOW : heat(left);
             var sh2 = 0.7 + 0.3 * (v.scene.stock[p] - zmin) / Math.max(zmax - zmin, 1e-6);
             ctx.fillStyle = "rgb(" + Math.round(col[0] * 255 * sh2) + "," +
@@ -402,7 +410,7 @@
         return res[0].blob.text().then(function (txt) {
           return res[1].blob.arrayBuffer().then(function (buf) {
             var hdr = JSON.parse(txt);
-            if (hdr.format !== "stevecam-view" || hdr.version !== 1) return fail("unknown view format");
+            if (hdr.format !== "stevecam-view" || (hdr.version !== 1 && hdr.version !== 2)) return fail("unknown view format");
             mount(holder, hdr, decode(hdr, buf), buf);
           });
         });
