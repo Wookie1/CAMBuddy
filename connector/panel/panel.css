@@ -156,3 +156,8 @@ ul.plain, ul.warn { margin: 2px 0; padding-left: 18px; }
 .v3d-tools input[type="checkbox"] { width: auto; margin: 0; padding: 0; }
 .v3d-status { font-size: 12px; color: var(--muted); margin-top: 4px; }
 .v3d-note { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
+.recent-run { border-top: 1px solid var(--line); padding: 6px 0; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.recent-run:first-child { border-top: none; padding-top: 0; }
+.recent-info { flex: 1 1 auto; min-width: 0; }
+.recent-run .show3d-btn { font-size: 12px; padding: 3px 10px; }
+.recent-view { flex: 1 1 100%; min-width: 0; }

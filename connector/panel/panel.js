@@ -971,6 +971,54 @@
     if (window.SteveCAMViewer && c.files.indexOf("view.bin") >= 0) window.SteveCAMViewer.noteInto(c.body);
   }
 
+  // --------------------------------------------------------- recent runs --
+  function recentTime(at) { return String(at || "").slice(0, 16).replace("T", " "); }
+  function renderRecent() {
+    const box = $("recent"), list = $("recent-list");
+    const runs = (S.lastRuns || []).slice(0, 10);
+    box.hidden = !runs.length;
+    list.replaceChildren();
+    for (const r of runs) {
+      const row = el("div", { class: "recent-run" });
+      row.append(el("div", { class: "recent-info" },
+        el("strong", { text: ENGINE_ACTION[r.action] || String(r.action || "run") }),
+        el("span", { class: "muted small", text: " " + recentTime(r.at) }),
+        el("span", { class: "muted small", text: r.has_view ? " · has 3D" : " · no 3D view" })));
+      const holder = el("div", { class: "recent-view" });
+      if (present("view.load")) {
+        const btn = el("button", { type: "button", class: "secondary show3d-btn",
+          "data-run-id": String(r.run_id), text: "Show 3D",
+          disabled: !r.has_view || !allowed("view.load") });
+        btn.addEventListener("click", () => {
+          if (btn.disabled) return;
+          btn.disabled = true;   // from click until this run ends
+          holder.replaceChildren(el("p", { class: "muted small", text: "Loading this run's 3D view…" }));
+          startRun("view.load", { run_id: r.run_id }, "SteveCAM panel: show 3D", (run) => {
+            if (run.state === "error") {
+              holder.replaceChildren(el("p", { class: "run-err", text: errText(run.callError) }));
+              btn.disabled = false;
+              return;
+            }
+            if (!FINAL.has(run.state)) return;
+            if (run.state !== "succeeded") {
+              holder.replaceChildren(el("p", { class: "run-err", text:
+                "Couldn't load the 3D view: " + (run.error ? errText(run.error) : (STATE_TEXT[run.state] || run.state)) + "." }));
+              btn.disabled = false;
+              return;
+            }
+            btn.disabled = false;
+            holder.replaceChildren();
+            if (window.SteveCAMViewer) window.SteveCAMViewer.attach({ results: holder }, run, fileNames(run.files), call);
+            else holder.append(el("p", { class: "muted small", text: "The 3D viewer is not available." }));
+          });
+        });
+        row.append(btn);
+      }
+      row.append(holder);
+      list.append(row);
+    }
+  }
+
   // ------------------------------------------------------------ measure --
   function onMeasureClick() {
     if (S.busy.measure || !S.doc || !allowed(ACTION.measure)) return;
@@ -1035,6 +1083,11 @@
     updateButtons();
   }
   function onEvent(name, data) {
+    if (name === "last_runs") {
+      S.lastRuns = isObj(data) && Array.isArray(data.runs) ? data.runs.filter(isObj) : [];
+      renderRecent();
+      return;
+    }
     if (name !== "engine_state" || !isObj(data)) return;
     const pill = $("engine");
     const state = String(data.state || "unknown");
@@ -1088,6 +1141,7 @@
     $("save-row").hidden = !hasJobSetup();
     paintAll();
     updateButtons();
+    renderRecent();
   }
   let currentTab = "rough";
   function selectTab(t) {
