@@ -16,6 +16,7 @@ import threading
 
 import toollib
 import view  # TASK_VIEW3D: display-only view.bin/view.json builder
+import viewimg  # TASK VIEW3D-IMG: display-only view_iso/view_top.png render
 
 # Engagement warning factors (report-only warnings, never gates):
 # roughing warns above ROUGH_ENGAGE_FACTOR x optimal load, finishing above
@@ -391,6 +392,40 @@ class EngineRun:
                                if f not in ("view.bin", "view.json")]
             files.pop("view.bin", None)
             files.pop("view.json", None)
+        # TASK VIEW3D-IMG: the pictures are dropped from the uploads with
+        # their source; they leave result["files"] only when the render
+        # itself failed (with a failed view.bin there is no source and no
+        # upload, but the existing view-failure pin keeps the names in the
+        # result list)
+        if getattr(self, "_view_failed", False):
+            files.pop("view_iso.png", None)
+            files.pop("view_top.png", None)
+        if getattr(self, "_viewimg_failed", False):
+            result["files"] = [f for f in result["files"]
+                               if f not in ("view_iso.png", "view_top.png")]
+            files.pop("view_iso.png", None)
+            files.pop("view_top.png", None)
+
+    def _build_view_images(self, view_json, view_bin, out_iso, out_top,
+                           tools):
+        """TASK VIEW3D-IMG: display-only view_iso.png/view_top.png rendered
+        from this run's view.bin/view.json. Like the view data a failure
+        never fails the run: the PNGs are dropped from the run's files and a
+        one-line note goes to the run log; gates/check.json untouched."""
+        self._viewimg_failed = False
+        if getattr(self, "_view_failed", False):
+            return  # no view.bin/view.json to render from (dropped already)
+        try:
+            viewimg.render_images(view_json, view_bin, out_iso, out_top,
+                                  tools)
+        except Exception as e:  # noqa: BLE001 - display only, never fatal
+            self._viewimg_failed = True
+            try:
+                with open(os.path.join(self.work, "run.log"), "a") as fh:
+                    fh.write("viewimg: skipped (%s: %s)\n"
+                             % (type(e).__name__, e))
+            except OSError:
+                pass
 
     def _tools_json_args(self):
         return ["--tools-json", self.tools_path] if self.tools_path else []
@@ -641,6 +676,13 @@ class EngineRun:
                         os.path.join(self.work, "view.json"),
                         hf_zmap, stock_after, [("rough.nc", nc)],
                         {"rough": check})
+        self._build_view_images(
+            os.path.join(self.work, "view.json"),
+            os.path.join(self.work, "view.bin"),
+            os.path.join(self.work, "view_iso.png"),
+            os.path.join(self.work, "view_top.png"),
+            {"rough.nc": "T%d %s %.3f mm" % (number, values["tool_type"],
+                                             values["tool_diameter"])})
         result = {
             "units": values["units"],
             "posted_units": posted,
@@ -670,7 +712,8 @@ class EngineRun:
             "origin_offset_mm": prep.get("origin_offset", [0.0, 0.0, 0.0]),
             "tools_table": self._table_record(),
             "files": ["rough.nc", "check.json", "preview.png",
-                      "view.bin", "view.json"],
+                      "view.bin", "view.json",
+                      "view_iso.png", "view_top.png"],
         }
         files = {"rough.nc": (nc, "application/octet-stream"),
                  "check.json": (check_path, "application/json"),
@@ -678,7 +721,11 @@ class EngineRun:
                  "view.bin": (os.path.join(self.work, "view.bin"),
                               "application/octet-stream"),
                  "view.json": (os.path.join(self.work, "view.json"),
-                               "application/json")}
+                               "application/json"),
+                 "view_iso.png": (os.path.join(self.work, "view_iso.png"),
+                                  "image/png"),
+                 "view_top.png": (os.path.join(self.work, "view_top.png"),
+                                  "image/png")}
         self._record_used(values, [number])
         self._drop_view_if_failed(result, files)
         return result, files
@@ -880,6 +927,14 @@ class EngineRun:
                         [(pname + ".nc", ppath)
                          for pname, ppath, _, _ in resolved],
                         {e["name"]: e["check"] for e in entries})
+        self._build_view_images(
+            os.path.join(self.work, "view.json"),
+            os.path.join(self.work, "view.bin"),
+            os.path.join(self.work, "view_iso.png"),
+            os.path.join(self.work, "view_top.png"),
+            {e["name"] + ".nc": "T%d %s %.3f mm"
+             % (e["tool"]["number"], e["tool"]["type"],
+                e["tool"]["diameter_mm"]) for e in entries})
 
         result = {
             "units": "mm",
@@ -911,7 +966,8 @@ class EngineRun:
             "cut_length_mm": first["check"]["cutting_length_mm"],
             "rapid_length_mm": first["check"]["rapid_length_mm"],
             "tools_table": self._table_record(),
-            "files": ["check.json", "preview.png", "view.bin", "view.json"],
+            "files": ["check.json", "preview.png", "view.bin", "view.json",
+                      "view_iso.png", "view_top.png"],
         }
         files = {"check.json": (os.path.join(self.work, "check.json"),
                                  "application/json"),
@@ -919,7 +975,11 @@ class EngineRun:
                  "view.bin": (os.path.join(self.work, "view.bin"),
                               "application/octet-stream"),
                  "view.json": (os.path.join(self.work, "view.json"),
-                               "application/json")}
+                               "application/json"),
+                 "view_iso.png": (os.path.join(self.work, "view_iso.png"),
+                                  "image/png"),
+                 "view_top.png": (os.path.join(self.work, "view_top.png"),
+                                  "image/png")}
         self._record_used(values, [e["tool"]["number"] for e in entries])
         self._drop_view_if_failed(result, files)
         return result, files
@@ -1437,6 +1497,21 @@ class EngineRun:
         self._build_view(os.path.join(self.work, "view.bin"),
                         os.path.join(self.work, "view.json"),
                         hf01, final_stock, view_progs, view_checks)
+        view_tools = {
+            "rough.nc": "T%d %s %.3f mm" % (
+                rough_number, values["rough_tool_type"],
+                values["rough_tool_diameter"]),
+            "finish.nc": "T%d ball %.3f mm" % (finish_number,
+                                               values["tool_diameter"]),
+        }
+        if rest:
+            view_tools["rest.nc"] = "T%d %s %.3f mm" % (
+                rest_number, rest["type"], rest["diameter_mm"])
+        self._build_view_images(
+            os.path.join(self.work, "view.json"),
+            os.path.join(self.work, "view.bin"),
+            os.path.join(self.work, "view_iso.png"),
+            os.path.join(self.work, "view_top.png"), view_tools)
 
         cycle_s = check_r["cycle_time_s"] + check_f["cycle_time_s"]
         cut_mm = check_r["cutting_length_mm"] + check_f["cutting_length_mm"]
@@ -1503,7 +1578,8 @@ class EngineRun:
             "origin_offset_mm": prep.get("origin_offset", [0.0, 0.0, 0.0]),
             "tools_table": self._table_record(),
             "files": ["rough.nc", "finish.nc", "check.json",
-                      "preview.png", "view.bin", "view.json"],
+                      "preview.png", "view.bin", "view.json",
+                      "view_iso.png", "view_top.png"],
         }
         files = {"rough.nc": (nc, "application/octet-stream"),
                  "finish.nc": (fin, "application/octet-stream"),
@@ -1513,7 +1589,11 @@ class EngineRun:
                  "view.bin": (os.path.join(self.work, "view.bin"),
                               "application/octet-stream"),
                  "view.json": (os.path.join(self.work, "view.json"),
-                               "application/json")}
+                               "application/json"),
+                 "view_iso.png": (os.path.join(self.work, "view_iso.png"),
+                                  "image/png"),
+                 "view_top.png": (os.path.join(self.work, "view_top.png"),
+                                  "image/png")}
         if rest:
             result["zmap"]["gouges"]["rest"] = check_s["gouges"]["count"]
             result["zmap"]["rapid_collisions"]["rest"] = \

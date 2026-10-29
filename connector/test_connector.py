@@ -316,7 +316,8 @@ class TestEndToEnd:
 
         # files uploaded before the final state, correct digests recorded
         assert mock.file_names(501) == ["check.json", "preview.png",
-                                       "rough.nc", "view.bin", "view.json"]
+                                       "rough.nc", "view.bin", "view.json",
+                                       "view_iso.png", "view_top.png"]
         files = {n: mock.file_info(501, n) for n in mock.file_names(501)}
         assert files["preview.png"]["bytes"] > 1000
         assert files["preview.png"]["media"] == "image/png"
@@ -1054,7 +1055,8 @@ class TestRestPass:
         assert result["zmap"]["gouges"]["rest"] == 0
         assert result["files"] == ["rough.nc", "finish.nc", "rest.nc",
                                   "check.json", "preview.png",
-                                  "view.bin", "view.json"]
+                                  "view.bin", "view.json",
+                                  "view_iso.png", "view_top.png"]
         assert "rest.nc" in files
         # combined = rough + finish + rest (each fake reports 1.0 s / 100 mm)
         assert result["estimated_time_min"] == pytest.approx(3.0 / 60.0,
@@ -2204,7 +2206,8 @@ class TestCheckProgramE2E:
         # check.json + preview.png only: NO .nc upload, nothing new in the
         # programs folder (nothing is sent anywhere near the machine)
         assert mock.file_names(910) == ["check.json", "preview.png",
-                                          "view.bin", "view.json"]
+                                          "view.bin", "view.json",
+                                          "view_iso.png", "view_top.png"]
         assert not list(programs.glob("O4501*"))
 
     def test_stale_program_2_in_reused_run_dir_is_not_judged(self, live):
@@ -2374,7 +2377,8 @@ class TestCheckProgramSequenceE2E:
 
         # no .nc upload, nothing to the programs folder
         assert mock.file_names(913) == ["check.json", "preview.png",
-                                          "view.bin", "view.json"]
+                                          "view.bin", "view.json",
+                                          "view_iso.png", "view_top.png"]
         assert not list(programs.glob("O4510*"))
         assert not list(programs.glob("O4511*"))
 
