@@ -19,9 +19,11 @@ change: the XYZ path is identical. Returns (new_moves, stats) with stats
 {windows_slowed, mm_slowed, min_feed, floor_bound}.
 """
 import math
+import os
 
 import numpy as np
 
+from engine import ckern as _ckern
 from engine import entry_depth
 
 FINE = entry_depth.FINE            # 0.1 mm, the judge's cell
@@ -66,12 +68,32 @@ def _helix_pitch(run):
     return round(dz / (arc / (2.0 * math.pi * r)), 4)
 
 
+_CKERN = _ckern.get_lib()      # SP-K1: compiled twin of _stamp_move, or None
+_CKERN_PRINTED = False
+
+
+def _ckern_for_call():
+    """The kernel library for this call: None while STEVECAM_NO_CKERN is set
+    (or the .dylib is missing); prints the chosen path once."""
+    global _CKERN_PRINTED
+    use = None if os.environ.get("STEVECAM_NO_CKERN") else _CKERN
+    if not _CKERN_PRINTED:
+        print("load_limit._stamp_move: %s kernel"
+              % ("compiled C (ckern)" if use is not None else "Python"))
+        _CKERN_PRINTED = True
+    return use
+
+
 def _stamp_move(L, x0, y0, fine, R, cr, a0, kR, pad2, p, cur):
     """Stamp one G1 move into L (the replay_stock disk profile: flat inside
     R - cr, the corner torus beyond; G0 never cuts - caller) sampled at
     <= fine/4, and measure what it removed against the LIVE stock BEFORE it:
     (area, depth) = (plan area of cells removed, each counted once, deepest
     removed column)."""
+    _lib = _ckern_for_call()
+    if _lib is not None:
+        return _ckern.stamp_move(L, x0, y0, fine, R, cr, a0, kR, pad2, p,
+                                 cur, REMOVE_EPS)
     dx, dy, dz = (cur[k] - p[k] for k in range(3))
     length = math.sqrt(dx * dx + dy * dy + dz * dz)
     n = 1 if length <= 0.0 else max(2, int(math.ceil(length / (fine / 4.0))))
