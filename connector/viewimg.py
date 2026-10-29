@@ -60,6 +60,14 @@ def load_view(json_path, bin_path):
 
     part = grid(hdr["offsets"]["part"])
     stock = grid(hdr["offsets"]["stock"])
+    if "left" in hdr["offsets"]:          # v2: fine-grid stock left per block
+        q = np.frombuffer(raw[hdr["offsets"]["left"]:hdr["offsets"]["left"]
+                              + npix * 2], dtype="<u2").reshape(ny, nx)
+        left = q.astype(np.float64) * z["left_scale"] + z["left_offset"]
+        left[q == nd] = np.nan
+    else:                                 # v1 files: block difference
+        left = stock - part
+    hdr["_left"] = left
     programs = []
     for p in hdr["programs"]:
         n = p["points"]
@@ -259,7 +267,10 @@ def render_images(view_json, view_bin, out_iso, out_top, tools=None):
     ["name - tool", ...], "color_key_mm": {...}}."""
     hdr, part, stock, programs, markers = load_view(view_json, view_bin)
     g = hdr["grid"]
-    resid = stock - part
+    resid = hdr.pop("_left")
+    tol = hdr.get("below_tol_mm", 0.01)
+    resid = np.where(np.isfinite(resid) & (resid < 0.0) & (resid >= -tol),
+                     0.0, resid)          # within the judge's tolerance: not red
     finr = resid[np.isfinite(resid)]
     pmax = float(finr[finr > 0].max()) if (finr > 0).any() else 0.0
     nmin = float(-finr[finr < 0].min()) if (finr < 0).any() else 0.0

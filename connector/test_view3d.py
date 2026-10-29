@@ -84,7 +84,7 @@ def test_view3d_file_written_and_bounded(tmp_path, monkeypatch):
     assert "--stock-out" in zc, "the judging zmap call has no --stock-out"
 
     hdr = json.load(open(json_path))
-    assert hdr["format"] == "stevecam-view" and hdr["version"] == 1
+    assert hdr["format"] == "stevecam-view" and hdr["version"] == 2
     assert hdr["units"] == "mm"
     for k in ("x0", "y0", "cell", "nx", "ny"):
         assert k in hdr["grid"], "grid.%s missing" % k
@@ -151,9 +151,11 @@ def test_view3d_heightfield_roundtrip_bounds(tmp_path):
     raw = open(out_bin, "rb").read()
     off, sc = hdr["z"]["offset"], hdr["z"]["scale"]
     assert sc <= 0.01 + 1e-12
-    pq = np.frombuffer(raw[g["ny"] * g["nx"] * 0: g["ny"] * g["nx"] * 2],
+    n2 = g["ny"] * g["nx"] * 2                 # v2: read by header offsets
+    po, so = hdr["offsets"]["part"], hdr["offsets"]["stock"]
+    pq = np.frombuffer(raw[po:po + n2],
                        dtype="<u2").reshape(g["ny"], g["nx"])
-    sq = np.frombuffer(raw[g["ny"] * g["nx"] * 2:],
+    sq = np.frombuffer(raw[so:so + n2],
                        dtype="<u2").reshape(g["ny"], g["nx"])
     pd = pq.astype(np.float64) * sc + off
     sd = sq.astype(np.float64) * sc + off
@@ -371,12 +373,77 @@ def test_view3d_failure_never_fails_the_run(tmp_path, monkeypatch):
         raise RuntimeError("forced view failure")
     monkeypatch.setattr(view, "build_view", boom)
     r_bad, f_bad, _ = _run_chain(bad_dir, monkeypatch)
-    assert "view.bin" not in r_bad["files"] and "view.json" not in r_bad["files"]
-    assert "view.bin" not in f_bad and "view.json" not in f_bad
-    assert r_bad["files"] == [f for f in r_ok["files"]
-                              if f not in ("view.bin", "view.json")]
+    vnames = ("view.bin", "view.json", "view_iso.png", "view_top.png")
+    assert not any(v in r_bad["files"] for v in vnames)
+    assert not any(v in f_bad for v in vnames)
+    assert r_bad["files"] == [f for f in r_ok["files"] if f not in vnames]
+    # every name the result lists is an uploaded file (both runs)
+    for r, f in ((r_ok, f_ok), (r_bad, f_bad)):
+        assert all(n in f for n in r["files"]), \
+            "result lists files that are not uploaded: %s" % [
+                n for n in r["files"] if n not in f]
     assert _sha(f_bad["check.json"][0]) == _sha(f_ok["check.json"][0]), \
         "check.json changed when the view failed"
     assert r_bad["zmap"] == r_ok["zmap"], "gates changed when the view failed"
     log = open(os.path.join(str(bad_dir), "run.log")).read()
     assert "view: skipped (RuntimeError: forced view failure)" in log
+
+
+# ------------------------------ v2 "left" grid (coordinator 2026-10-29) ----
+def _wall_scene(tmp_path, gouge=0.0):
+    """A 2 mm-cell-aligned vertical wall 14 mm tall, finished to the part
+    (stock == part everywhere), optionally one 0.1 mm cell gouged."""
+    cell = 0.1
+    xs = np.arange(60)
+    part = np.where(xs[None, :] < 33, 30.0, 16.0) * np.ones((40, 1))  # wall at x=3.3 mm
+    stock = part.copy()
+    if gouge:
+        stock[20, 10] -= gouge
+    pn, sn = tmp_path / "part.npy", tmp_path / "stock.npy"
+    np.save(pn, part)
+    np.save(sn, stock)
+    meta = {"x0": 0.0, "y0": 0.0, "cell": cell, "tess_tol": 0.01}
+    for p in (pn, sn):
+        with open(os.path.splitext(str(p))[0] + ".json", "w") as fh:
+            json.dump(meta, fh)
+    return str(pn), str(sn)
+
+
+def _red_blocks(tmp_path, pn, sn):
+    import viewimg
+    import view
+    vb, vj = str(tmp_path / "v.bin"), str(tmp_path / "v.json")
+    view.build_view(vb, vj, pn, sn, [], {})
+    hdr, part, stock, _, _ = viewimg.load_view(vj, vb)
+    left = hdr["_left"]
+    return int((np.isfinite(left) & (left < -hdr.get("below_tol_mm", 0.01))).sum())
+
+
+def test_view3d_wall_no_false_below_part(tmp_path):
+    """A finished vertical wall with no gouge must give 0 'below part' (red)
+    blocks. Block max(part) - block min(stock) gave the wall height (-14 mm)
+    at the wall's blocks on 42a39d7."""
+    pn, sn = _wall_scene(tmp_path)
+    n = _red_blocks(tmp_path, pn, sn)
+    assert n == 0, "%d false below-part blocks at a clean wall" % n
+
+
+def test_view3d_real_gouge_is_red(tmp_path):
+    """One 0.1 mm cell gouged 0.05 mm (> the 0.01 tolerance) must show red."""
+    pn, sn = _wall_scene(tmp_path, gouge=0.05)
+    n = _red_blocks(tmp_path, pn, sn)
+    assert n == 1, "gouged block not red (red blocks %d)" % n
+
+
+def test_view3d_v1_file_still_decodes():
+    """The committed fixture is a v1 file (no 'left' grid): it decodes, and
+    stock left falls back to the block difference stock - part."""
+    import viewimg
+    vj = os.path.join(HERE, "testdata", "view_fixture.json")
+    vb = os.path.join(HERE, "testdata", "view_fixture.bin")
+    hdr, part, stock, programs, markers = viewimg.load_view(vj, vb)
+    assert hdr["version"] == 1 and "left" not in hdr["offsets"]
+    left = hdr["_left"]
+    both = np.isfinite(part) & np.isfinite(stock)
+    assert np.allclose(left[both], (stock - part)[both])
+    assert len(programs) == 1 and len(markers) == 2

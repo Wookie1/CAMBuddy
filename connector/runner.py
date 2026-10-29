@@ -387,24 +387,17 @@ class EngineRun:
                 pass
 
     def _drop_view_if_failed(self, result, files):
+        """A failed view drops all four view* files (the pictures have no
+        source); a failed render drops only the two pictures. result["files"]
+        and the uploads always name the same files."""
+        drop = ()
         if getattr(self, "_view_failed", False):
-            result["files"] = [f for f in result["files"]
-                               if f not in ("view.bin", "view.json")]
-            files.pop("view.bin", None)
-            files.pop("view.json", None)
-        # TASK VIEW3D-IMG: the pictures are dropped from the uploads with
-        # their source; they leave result["files"] only when the render
-        # itself failed (with a failed view.bin there is no source and no
-        # upload, but the existing view-failure pin keeps the names in the
-        # result list)
-        if getattr(self, "_view_failed", False):
-            files.pop("view_iso.png", None)
-            files.pop("view_top.png", None)
-        if getattr(self, "_viewimg_failed", False):
-            result["files"] = [f for f in result["files"]
-                               if f not in ("view_iso.png", "view_top.png")]
-            files.pop("view_iso.png", None)
-            files.pop("view_top.png", None)
+            drop = ("view.bin", "view.json", "view_iso.png", "view_top.png")
+        elif getattr(self, "_viewimg_failed", False):
+            drop = ("view_iso.png", "view_top.png")
+        result["files"] = [f for f in result["files"] if f not in drop]
+        for f in drop:
+            files.pop(f, None)
 
     def _build_view_images(self, view_json, view_bin, out_iso, out_top,
                            tools):
