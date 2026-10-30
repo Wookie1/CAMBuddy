@@ -308,3 +308,278 @@ void zcut_sample(double *stock, int64_t nx, int64_t ny,
         out->updated = 1;
     }
 }
+
+/* ---------------------------------------------------------------------
+ * task SP-K2B: the WHOLE per-sample loop of simulate() for ONE move in C.
+ *
+ * For each sample (sx, sy, sz) of the move, in the Python order:
+ *   1. near-mask precheck: floor((sx-x0)/cell), floor((sy-y0)/cell) out of
+ *      the grid or outside the dilated window mask -> air (cutting adds
+ *      seg_len) and skip the sample;
+ *   2. the shank block (cutting & shank_on): window of radius ks,
+ *      vsh = where(dd <= Rs + 0.75*cell, np.maximum(stock, part), -inf),
+ *      vtop = max (NaN-poisoned like np.max); HIT if vtop > sz + flute + 0.01;
+ *      running max excess picks shank_worst_xy;
+ *   3. the holder block (cutting & holder_on): Bstat pretest at the clipped
+ *      centre cell, then vH = where(dd <= Rh, max(where(isfinite(stock),
+ *      stock, -inf), part), -inf); HIT if vtop > nose = sz + stickout;
+ *      running max intrusion picks holder_worst_xy;
+ *   4. the SP-K2 cut block (zcut_sample above), its per-sample scalars
+ *      folded into the move accumulators exactly as the Python loop does.
+ *
+ * worst-xy pick reproduces np.argmin's tie rule: among equal minima of
+ *     cand = dd + where(part >= vtop - 1e-9, 0.0, 1e6)
+ *     cand = where(vsh/vH >= vtop - 1e-9, cand, inf)
+ * the FIRST index in row-major order (j outer, i inner, strict <) wins.
+ * Air length accumulates by repeated += seg_len in the same order as the
+ * Python loop within a move (the per-move sum is folded into air_length).
+ * ------------------------------------------------------------------- */
+
+/* per-move parameters; layout must match zkern.ZMoveParams in __init__.py */
+typedef struct {
+    double *stock;          /* (ny, nx) row-major, live grid */
+    const double *part;     /* (ny, nx) part top-Z */
+    const double *xs;       /* nx cell-centre x */
+    const double *ys;       /* ny cell-centre y */
+    const unsigned char *wm;    /* window mask uint8 grid or NULL */
+    const unsigned char *nearm; /* dilated window mask uint8 grid or NULL */
+    const double *bstat;    /* holder static bound grid or NULL */
+    int64_t nx, ny;
+    double x0, y0, cell;
+    double R;               /* tool radius */
+    int64_t tool;           /* 0 flat, 1 bull, 2 ball */
+    double corner;
+    int64_t k;              /* cut window radius */
+    double eps;             /* REMOVE_EPS */
+    double fwd_bin;         /* FWD_BIN_MM */
+    int64_t shank_on;
+    double Rs;              /* shank radius */
+    double flute;
+    int64_t ks;             /* shank window radius */
+    int64_t holder_on;
+    double Rh;              /* holder envelope radius */
+    double stickout;
+    int64_t kH;             /* holder window radius */
+    /* per-move (set by the caller before each zcut_move call) */
+    int64_t cutting;
+    int64_t engage_track;
+    int64_t zb_on;
+    double dx_t, dy_t;      /* unit travel direction */
+    const double *pre;      /* ZE2B pre-move snapshot or NULL */
+    int64_t pre_stride, pre_ilo, pre_jlo;
+    /* scratch, (2k+1)^2 */
+    double *scr_v;
+    unsigned char *scr_m;
+} ZMoveParams;
+
+/* per-move outputs; layout must match zkern.ZMoveOut in __init__.py */
+typedef struct {
+    double move_area;
+    double move_max_depth;
+    double move_max_engage;
+    int64_t move_shank;
+    int64_t move_holder;
+    int64_t move_collided;
+    int64_t hist_any;       /* some sample had nrem > 0 */
+} ZMoveOut;
+
+/* cross-move running state; layout must match zkern.ZRunState.
+ * air_length accumulates ONE SEG_LEN AT A TIME in call order, so the C
+ * path's air_length is BIT-identical to the Python loop's running sum. */
+typedef struct {
+    double shank_depth;
+    int64_t shank_worst_set;
+    double shank_worst_x, shank_worst_y;
+    double holder_intrusion;
+    int64_t holder_worst_set;
+    double holder_worst_x, holder_worst_y;
+    double air_length;
+} ZRunState;
+
+/* shank worst-xy: np.argmin(cand), first equal minimum in row-major order */
+static void shank_worst(const ZMoveParams *p, int64_t slo, int64_t shi,
+                        int64_t tlo, int64_t thi, double sx, double sy,
+                        double pad, double vt, double *wx, double *wy)
+{
+    const double INF = INFINITY;
+    double best = INF;
+    int64_t bj = tlo, bi = slo;
+    for (int64_t j = tlo; j < thi; j++) {
+        double gy = p->ys[j] - sy;
+        for (int64_t i = slo; i < shi; i++) {
+            double dd = hypot(p->xs[i] - sx, gy);
+            double c = dd + (p->part[j * p->nx + i] >= vt ? 0.0 : 1e6);
+            double vsh = dd <= pad
+                         ? nm(p->stock[j * p->nx + i], p->part[j * p->nx + i])
+                         : -INF;
+            if (!(vsh >= vt)) c = INF;
+            if (c < best) { best = c; bj = j; bi = i; }
+        }
+    }
+    *wx = p->xs[bi];
+    *wy = p->ys[bj];
+}
+
+/* holder worst-xy: same argmin tie rule, holder masks */
+static void holder_worst(const ZMoveParams *p, int64_t slo, int64_t shi,
+                         int64_t tlo, int64_t thi, double sx, double sy,
+                         double vt, double *wx, double *wy)
+{
+    const double INF = INFINITY;
+    double best = INF;
+    int64_t bj = tlo, bi = slo;
+    for (int64_t j = tlo; j < thi; j++) {
+        double gy = p->ys[j] - sy;
+        for (int64_t i = slo; i < shi; i++) {
+            double dd = hypot(p->xs[i] - sx, gy);
+            double c = dd + (p->part[j * p->nx + i] >= vt ? 0.0 : 1e6);
+            double s = p->stock[j * p->nx + i];
+            double vH = dd <= p->Rh
+                        ? nm(isfinite(s) ? s : -INF, p->part[j * p->nx + i])
+                        : -INF;
+            if (!(vH >= vt)) c = INF;
+            if (c < best) { best = c; bj = j; bi = i; }
+        }
+    }
+    *wx = p->xs[bi];
+    *wy = p->ys[bj];
+}
+
+void zcut_move(const ZMoveParams *p, const double *samples, int64_t nsamp,
+               double seg_len, ZMoveOut *out, ZRunState *run,
+               double *zb, unsigned int *move_hist)
+{
+    const double INF = INFINITY;
+    const int64_t nx = p->nx, ny = p->ny;
+    const int cutting = (int)p->cutting;
+    unsigned int hist[FWD_NBINS];
+    ZOut zout;
+    double wx, wy;
+
+    memset(out, 0, sizeof(*out));
+    memset(move_hist, 0, FWD_NBINS * sizeof(unsigned int));
+
+    for (int64_t s = 0; s < nsamp; s++) {
+        const double sx = samples[3 * s];
+        const double sy = samples[3 * s + 1];
+        const double sz = samples[3 * s + 2];
+        const int64_t i0 = (int64_t)floor((sx - p->x0) / p->cell);
+        const int64_t j0 = (int64_t)floor((sy - p->y0) / p->cell);
+
+        /* 1. near-mask precheck (dilated window): cannot touch a window
+         * cell -> air for a cutting sample, skip everything else */
+        if (p->nearm && (i0 < 0 || j0 < 0 || i0 >= nx || j0 >= ny ||
+                         !p->nearm[j0 * nx + i0])) {
+            if (cutting) run->air_length += seg_len;
+            continue;
+        }
+
+        /* 2. shank block: material within Rs + 0.75*cell above flute top */
+        if (cutting && p->shank_on) {
+            int64_t slo = i0 - p->ks, shi = i0 + p->ks + 1;
+            int64_t tlo = j0 - p->ks, thi = j0 + p->ks + 1;
+            if (slo < 0) slo = 0;
+            if (shi > nx) shi = nx;
+            if (tlo < 0) tlo = 0;
+            if (thi > ny) thi = ny;
+            if (slo < shi && tlo < thi) {
+                const double pad = p->Rs + 0.75 * p->cell;
+                int vnan = 0;
+                double vtop = -INF;
+                for (int64_t j = tlo; j < thi; j++) {
+                    double gy = p->ys[j] - sy;
+                    for (int64_t i = slo; i < shi; i++) {
+                        double dd = hypot(p->xs[i] - sx, gy);
+                        if (dd <= pad) {
+                            double v = nm(p->stock[j * nx + i],
+                                          p->part[j * nx + i]);
+                            if (isnan(v)) vnan = 1;
+                            else if (v > vtop) vtop = v;
+                        }
+                    }
+                }
+                if (!vnan && vtop > sz + p->flute + 0.01) {
+                    out->move_shank = 1;
+                    double excess = vtop - (sz + p->flute);
+                    if (excess > run->shank_depth) {
+                        run->shank_depth = excess;
+                        shank_worst(p, slo, shi, tlo, thi, sx, sy,
+                                    pad, vtop - 1e-9, &wx, &wy);
+                        run->shank_worst_x = wx;
+                        run->shank_worst_y = wy;
+                        run->shank_worst_set = 1;
+                    }
+                }
+            }
+        }
+
+        /* 3. holder block: envelope material above the nose at tip+stickout */
+        if (cutting && p->holder_on) {
+            const double nose = sz + p->stickout;
+            int64_t ioc = i0 < 0 ? 0 : (i0 > nx - 1 ? nx - 1 : i0);
+            int64_t joc = j0 < 0 ? 0 : (j0 > ny - 1 ? ny - 1 : j0);
+            if (p->bstat[joc * nx + ioc] > nose) {
+                int64_t slo = i0 - p->kH, shi = i0 + p->kH + 1;
+                int64_t tlo = j0 - p->kH, thi = j0 + p->kH + 1;
+                if (slo < 0) slo = 0;
+                if (shi > nx) shi = nx;
+                if (tlo < 0) tlo = 0;
+                if (thi > ny) thi = ny;
+                if (slo < shi && tlo < thi) {
+                    int vnan = 0;
+                    double vtop = -INF;
+                    for (int64_t j = tlo; j < thi; j++) {
+                        double gy = p->ys[j] - sy;
+                        for (int64_t i = slo; i < shi; i++) {
+                            double dd = hypot(p->xs[i] - sx, gy);
+                            if (dd <= p->Rh) {
+                                double st = p->stock[j * nx + i];
+                                double v = nm(isfinite(st) ? st : -INF,
+                                              p->part[j * nx + i]);
+                                if (isnan(v)) vnan = 1;
+                                else if (v > vtop) vtop = v;
+                            }
+                        }
+                    }
+                    if (!vnan && vtop > nose) {
+                        out->move_holder = 1;
+                        double intr = vtop - nose;
+                        if (intr > run->holder_intrusion) {
+                            run->holder_intrusion = intr;
+                            holder_worst(p, slo, shi, tlo, thi, sx, sy,
+                                         vtop - 1e-9, &wx, &wy);
+                            run->holder_worst_x = wx;
+                            run->holder_worst_y = wy;
+                            run->holder_worst_set = 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* 4. the SP-K2 cut block, then fold its scalars into the move
+         * accumulators exactly as the Python per-sample code does */
+        zcut_sample(p->stock, nx, ny, i0, j0, p->k, p->xs, p->ys,
+                    sx, sy, sz, p->R, p->tool, p->corner, p->wm,
+                    cutting, (int)p->engage_track, (int)p->zb_on, p->cell,
+                    p->eps, p->fwd_bin, p->dx_t, p->dy_t,
+                    (cutting && p->zb_on) ? p->pre : NULL,
+                    p->pre_stride, p->pre_ilo, p->pre_jlo,
+                    zb, hist, p->scr_v, p->scr_m, &zout);
+        if (zout.air) run->air_length += seg_len;
+        if (cutting) {
+            out->move_area += (double)zout.nrem * p->cell * p->cell;
+            if (zout.hist_any) {
+                out->hist_any = 1;
+                for (int b = 0; b < FWD_NBINS; b++)
+                    move_hist[b] += hist[b];
+            }
+            if (zout.dmax_valid && zout.dmax > out->move_max_depth)
+                out->move_max_depth = zout.dmax;
+            if (zout.ew_valid && zout.ew > out->move_max_engage)
+                out->move_max_engage = zout.ew;
+        } else if (zout.collided) {
+            out->move_collided = 1;
+        }
+    }
+}

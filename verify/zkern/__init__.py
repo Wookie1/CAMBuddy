@@ -44,6 +44,82 @@ _D = ctypes.c_double
 _I = ctypes.c_int64
 _P = ctypes.c_void_p
 
+
+class ZMoveParams(ctypes.Structure):
+    """Task SP-K2B. Layout must match ZMoveParams in zcut.c."""
+    _fields_ = [
+        ("stock", _P),
+        ("part", _P),
+        ("xs", _P),
+        ("ys", _P),
+        ("wm", _P),
+        ("nearm", _P),
+        ("bstat", _P),
+        ("nx", _I),
+        ("ny", _I),
+        ("x0", _D),
+        ("y0", _D),
+        ("cell", _D),
+        ("R", _D),
+        ("tool", _I),
+        ("corner", _D),
+        ("k", _I),
+        ("eps", _D),
+        ("fwd_bin", _D),
+        ("shank_on", _I),
+        ("Rs", _D),
+        ("flute", _D),
+        ("ks", _I),
+        ("holder_on", _I),
+        ("Rh", _D),
+        ("stickout", _D),
+        ("kH", _I),
+        ("cutting", _I),
+        ("engage_track", _I),
+        ("zb_on", _I),
+        ("dx_t", _D),
+        ("dy_t", _D),
+        ("pre", _P),
+        ("pre_stride", _I),
+        ("pre_ilo", _I),
+        ("pre_jlo", _I),
+        ("scr_v", _P),
+        ("scr_m", _P),
+    ]
+
+
+class ZMoveOut(ctypes.Structure):
+    """Layout must match ZMoveOut in zcut.c."""
+    _fields_ = [
+        ("move_area", ctypes.c_double),
+        ("move_max_depth", ctypes.c_double),
+        ("move_max_engage", ctypes.c_double),
+        ("move_shank", ctypes.c_int64),
+        ("move_holder", ctypes.c_int64),
+        ("move_collided", ctypes.c_int64),
+        ("hist_any", ctypes.c_int64),
+    ]
+
+
+class ZRunState(ctypes.Structure):
+    """Layout must match ZRunState in zcut.c."""
+    _fields_ = [
+        ("shank_depth", ctypes.c_double),
+        ("shank_worst_set", ctypes.c_int64),
+        ("shank_worst_x", ctypes.c_double),
+        ("shank_worst_y", ctypes.c_double),
+        ("holder_intrusion", ctypes.c_double),
+        ("holder_worst_set", ctypes.c_int64),
+        ("holder_worst_x", ctypes.c_double),
+        ("holder_worst_y", ctypes.c_double),
+        ("air_length", ctypes.c_double),
+    ]
+
+
+_D = ctypes.c_double
+_I = ctypes.c_int64
+_P = ctypes.c_void_p
+
 _ARGTYPES = [
     _P, _I, _I, _I, _I, _I,          # stock, nx, ny, i0, j0, k
     _P, _P,                          # xs, ys
@@ -57,6 +133,16 @@ _ARGTYPES = [
     _P, _P,                          # zb state (4 doubles), hist out (100 u32)
     _P, _P,                          # scratch: surface doubles, mask bytes
     ctypes.POINTER(ZOut),
+]
+
+_ARGTYPES_MOVE = [
+    ctypes.POINTER(ZMoveParams),     # params struct
+    _P, _I,                          # samples (n,3) flat, nsamp
+    _D,                              # seg_len
+    ctypes.POINTER(ZMoveOut),        # per-move outputs
+    ctypes.POINTER(ZRunState),       # cross-move running state
+    _P,                              # zb state (4 doubles)
+    _P,                              # move hist out (100 u32)
 ]
 
 
@@ -82,6 +168,9 @@ def load():
         fn = lib.zcut_sample
         fn.restype = None
         fn.argtypes = _ARGTYPES
+        fn2 = lib.zcut_move          # task SP-K2B: per-move whole-loop kernel
+        fn2.restype = None
+        fn2.argtypes = _ARGTYPES_MOVE
     except Exception:
         return None
     return lib
