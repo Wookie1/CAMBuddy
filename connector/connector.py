@@ -14,6 +14,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 
@@ -35,6 +36,66 @@ PANEL_NAME = catalog_mod.ACTION
 RUN_ID_MAX = 128             # view.load run_id length cap (STEVE's id format is not assumed)
 LAST_RUNS_MAX = 10           # the last_runs event lists at most this many
 LAST_RUNS_MAX_BYTES = 8 * 1024   # event data stays under 8 kB
+
+
+# --------------------------------------------------------------- pidfile --
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _pid_is_connector(pid):
+    """True when PID's command line mentions connector.py."""
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "connector.py" in out.stdout
+
+
+def acquire_pidfile(home):
+    """MENUBAR: claim <home>/connector.pid for os.getpid() -> (True, None).
+    (False, PID) only when a live connector.py already holds it. No file,
+    unreadable content, a dead PID or a live PID of some other program are
+    all taken over. Written atomically (tmp + os.replace)."""
+    path = os.path.join(config_mod.state_dir(home), "connector.pid")
+    other = None
+    try:
+        with open(path) as fh:
+            other = int(fh.read().strip())
+    except (OSError, ValueError):
+        other = None
+    if (other is not None and other > 0 and other != os.getpid()
+            and _pid_alive(other) and _pid_is_connector(other)):
+        return False, other
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("%d\n" % os.getpid())
+    os.replace(tmp, path)
+    return True, None
+
+
+def release_pidfile(home):
+    """Remove <home>/connector.pid only when it holds our own PID."""
+    path = os.path.join(config_mod.state_dir(home), "connector.pid")
+    try:
+        with open(path) as fh:
+            pid = int(fh.read().strip())
+    except (OSError, ValueError):
+        return
+    if pid == os.getpid():
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def prepare_values(values_in, action):
@@ -77,6 +138,49 @@ class Connector:
         self._last_event = None
         self._last_keys_refresh = 0.0
         self._stop = False
+        # MENUBAR: <home>/status.json for the menu-bar app (secret-free).
+        self.status_path = os.path.join(self.home, "status.json")
+        self.commit = self._git_commit()
+        self.last_run = self._newest_run()
+
+    # -------------------------------------------------------------- status --
+    def _git_commit(self):
+        """Short HEAD of the repo this connector runs from ('' on failure),
+        computed once at start."""
+        try:
+            out = subprocess.run(
+                ["git", "-C", self.cfg["repo_root"], "rev-parse", "--short",
+                 "HEAD"], capture_output=True, text=True, timeout=10)
+            return out.stdout.strip() if out.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    def _newest_run(self):
+        """The newest entry of _last_runs_data()["runs"], or None. Never
+        raises."""
+        try:
+            runs = self._last_runs_data().get("runs") or []
+            return runs[0] if runs else None
+        except Exception:
+            return None
+
+    def _write_status(self, state, action=None, progress=None):
+        """Atomic <home>/status.json: {pid, state, action, progress,
+        updated (UTC ISO), fingerprint, connector_name, commit, last_run}.
+        NEVER carries keys, steve_keys, tokens, identity or the pairing
+        code. Never raises into the run loop."""
+        try:
+            data = {"pid": os.getpid(), "state": state, "action": action,
+                    "progress": progress, "updated": self._utc_now(),
+                    "fingerprint": self.fingerprint,
+                    "connector_name": self.cfg["connector_name"],
+                    "commit": self.commit, "last_run": self.last_run}
+            tmp = self.status_path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(data, fh, sort_keys=True)
+            os.replace(tmp, self.status_path)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ persist --
     @staticmethod
@@ -182,6 +286,9 @@ class Connector:
     # ------------------------------------------------------------- events --
     def emit_state(self, state, action=None, progress=None):
         data = {"state": state, "action": action, "progress": progress}
+        # MENUBAR: status.json is refreshed on EVERY call, even when the
+        # event is unchanged or the post below fails.
+        self._write_status(state, action, progress)
         if data == self._last_event:
             return
         self._last_event = data
@@ -353,6 +460,11 @@ class Connector:
             os.replace(tmp, os.path.join(d, "run_meta.json"))
         except OSError:
             pass
+        # MENUBAR: refresh last_run (and status.json) with the new entry.
+        self.last_run = self._newest_run()
+        ev = self._last_event or {}
+        self._write_status(ev.get("state", "idle"), ev.get("action"),
+                           ev.get("progress"))
         try:
             self.client.post_event(catalog_mod.LAST_RUNS_EVENT,
                                    self._last_runs_data())
@@ -608,6 +720,7 @@ class Connector:
     def run_forever(self):
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
+        self._write_status("starting")
         self.enroll()
         self.get_token_blocking()
         self.publish_catalog_and_panel()
@@ -639,6 +752,7 @@ class Connector:
             if cursor != self.state.get("cursor"):
                 self.state["cursor"] = cursor
                 self._save()
+        self._write_status("off")
 
 
 def main(argv=None):
@@ -646,9 +760,17 @@ def main(argv=None):
     args = argv if argv is not None else sys.argv[1:]
     if "--home" in args:
         home = args[args.index("--home") + 1]
-    c = Connector(home)
-    print("connector fingerprint %s" % c.fingerprint, flush=True)
-    c.run_forever()
+    ok, other = acquire_pidfile(home)
+    if not ok:
+        print("connector already running (pid %s); not starting a "
+              "second one" % other, flush=True)
+        return 0
+    try:
+        c = Connector(home)
+        print("connector fingerprint %s" % c.fingerprint, flush=True)
+        c.run_forever()
+    finally:
+        release_pidfile(home)
     return 0
 
 
