@@ -202,15 +202,37 @@ def limit_feeds(moves, dia, corner, box, top_z, cut_feed, fine=FINE,
     out = [dict(m) for m in moves]
     recs = []
     desc_run, hp_carry, pos = [], None, None
-    for mi, mv in enumerate(moves):
+    curs = []
+    # SP-K1B: resolve every move's position once (same logic as the loop
+    # below), then let the C kernel stamp ALL G1 moves in one batch call;
+    # the per-move loop then only does the bookkeeping it did before.
+    for mv in moves:
         cur = tuple(pos[i] if mv.get(k) is None else mv[k]
                     for i, k in enumerate("xyz")) \
             if pos is not None else (mv.get("x"), mv.get("y"), mv.get("z"))
         if None in cur:
             cur = tuple(v if v is not None else 0.0 for v in cur)
+        curs.append(cur)
+        pos = cur
+    _lib = _ckern_for_call()
+    _ab = _ad = None
+    if _lib is not None and len(moves) > 1:
+        xyz = np.array(curs, dtype=np.float64)
+        flags = np.zeros(len(moves), dtype=np.int64)
+        for mi, mv in enumerate(moves):
+            if mi and mv["g"] == 1:
+                flags[mi] = 1
+        _ab, _ad = _ckern.stamp_batch(L, x0, y0, fine, R, cr, a0, kR, pad2,
+                                      xyz, flags, REMOVE_EPS)
+    pos = None
+    for mi, mv in enumerate(moves):
+        cur = curs[mi]
         if pos is not None and mv["g"] == 1:
-            area, depth = _stamp_move(L, x0, y0, fine, R, cr, a0, kR, pad2,
-                                      pos, cur)
+            if _ab is not None:
+                area, depth = float(_ab[mi]), float(_ad[mi])
+            else:
+                area, depth = _stamp_move(L, x0, y0, fine, R, cr, a0, kR,
+                                          pad2, pos, cur)
             dx, dy, dz = (cur[k] - pos[k] for k in range(3))
             length = math.sqrt(dx * dx + dy * dy + dz * dz)
             if abs(dz) <= 1e-6 and length > 0.0:

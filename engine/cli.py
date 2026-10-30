@@ -767,6 +767,12 @@ def main(argv=None):
                                   keep_tool_down=a.keep_tool_down,
                                    progress=prog, stock_out=a.stock_out,
                                     ramp_angle_deg=a.ramp_angle_deg)
+    # SP-K1B: which stamping kernel the load-limit replay will use
+    from engine import load_limit as _load_limit
+    stats["stamp_kernel"] = ("c" if _load_limit._CKERN is not None
+                             and not os.environ.get("STEVECAM_NO_CKERN")
+                             else "python")
+    print("stamp_kernel: %s" % stats["stamp_kernel"], flush=True)
     if a.load_limit:
         # FL-LOAD: slow the feed on over-loaded windows ONLY (flag OFF: this
         # post-pass never runs and the emitted program is untouched)
