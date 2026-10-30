@@ -9,6 +9,7 @@ Run through the small-test lane:
 """
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -22,6 +23,7 @@ sys.path.insert(0, HERE)
 import connector as connector_mod  # noqa: E402
 import crypto                      # noqa: E402
 from client import SteveError      # noqa: E402
+from mock_steve import MockSteve   # noqa: E402
 
 REFUSAL = ("connector already running (pid %d); "
            "not starting a second one")
@@ -160,3 +162,60 @@ def test_last_run_refreshed_in_record_run_end(conn, monkeypatch):
     assert st["last_run"] is not None
     assert st["last_run"]["run_id"] == "1001"
     assert st["last_run"]["action"] == "adaptive_rough"
+
+
+# ------------------------------------------------ MENUBAR2: SIGTERM exit 0 --
+
+def test_sigterm_exits_zero(tmp_path):
+    """MENUBAR2: a REAL `connector.py --home <tmp>` child running its message
+    loop against a local fake STEVE (mock_steve.MockSteve, a stdlib
+    http.server thread on 127.0.0.1:<free port>) exits 0 on SIGTERM: the
+    handler sets _stop, the loop ends after the current <=1 s long-poll,
+    main() releases the pidfile and returns 0, status.json says "off"."""
+    home = tmp_path / "home"
+    home.mkdir()
+    with open(home / "config.toml", "w") as fh:
+        fh.write('pairing_code = "PAIR-1234"\npoll_wait = 1\ntoken_retry = 1\n'
+                 'programs_dir = "%s"\nrepo_root = "%s"\n'
+                 % (tmp_path / "programs", REPO))
+    mock = MockSteve(code="PAIR-1234")
+    base = mock.serve_forever()          # 127.0.0.1 on a free port
+    env = dict(os.environ)
+    env["STEVE_BASE_URL"] = base
+    env.pop("STEVECAM_HOME", None)
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(HERE, "connector.py"), "--home",
+         str(home)], cwd=REPO, env=env,
+         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert mock.wait_enroll(20), "connector never enrolled"
+        mock.confirm()
+        # wait until the child's own status.json says "idle" (<= 20 s):
+        # it has passed enroll/token/publish and sits in the message loop
+        status = home / "status.json"
+        pidfile = home / "connector.pid"
+        deadline = time.time() + 20
+
+        def _status_state():
+            try:
+                with open(status) as fh:
+                    return json.load(fh).get("state")
+            except (OSError, ValueError):
+                return None
+
+        while time.time() < deadline and _status_state() != "idle":
+            assert proc.poll() is None, "connector died before idle"
+            time.sleep(0.1)
+        assert _status_state() == "idle", "status.json never said idle"
+        assert int(pidfile.read_text().strip()) == proc.pid
+
+        os.kill(proc.pid, signal.SIGTERM)   # the exact PID we started
+        rc = proc.wait(timeout=15)
+        assert rc == 0, "measured exit code: %s" % rc
+        assert not pidfile.exists(), "connector.pid not released"
+        assert _status_state() == "off"
+    finally:
+        if proc.poll() is None:            # only our own child, exact PID
+            proc.kill()
+            proc.wait()
+        mock.stop()

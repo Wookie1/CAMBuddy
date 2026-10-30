@@ -62,6 +62,26 @@ func readStatusJSON() -> [String: Any]? {
     return obj
 }
 
+// ------------------------------------------------------------ stop guard --
+// MENUBAR2: what Stop / Restart should do while status.json "state" may
+// mark a run as in progress. Pure decision, no UI, no process access.
+// "busy" is the state connector.py writes during a run ("working" is the
+// label the menu shows for it); force=1 on a stevecam:// URL overrides.
+enum StopDecision {
+    case proceed
+    case confirm
+    case refuse
+}
+
+func stopDecision(state: String?, force: Bool, fromURL: Bool)
+    -> StopDecision {
+    if force { return .proceed }            // stevecam://stop?force=1
+    if state == "busy" || state == "working" {
+        return fromURL ? .refuse : .confirm
+    }
+    return .proceed
+}
+
 func openSettingsWindow() {
     NSApplication.shared.activate(ignoringOtherApps: true)
     if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil,
@@ -153,14 +173,76 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func stop() {
+    /// status.json "state" as of now ("" when the file is missing).
+    func currentStatusState() -> String {
+        (readStatusJSON()?["state"] as? String) ?? ""
+    }
+
+    /// One timestamped line in ~/.stevecam/menubar.log when a URL action is
+    /// refused because a run is in progress.
+    func logRefusal(_ action: String) {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        let line = "\(ts) refused \(action): run in progress\n"
+        let path = steveHome() + "/menubar.log"
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile()
+            if let data = line.data(using: .utf8) { fh.write(data) }
+            try? fh.close()
+        } else {
+            try? FileManager.default.createDirectory(
+                atPath: steveHome(), withIntermediateDirectories: true)
+            try? line.data(using: .utf8)?
+                .write(to: URL(fileURLWithPath: path))
+        }
+    }
+
+    /// The menu's question while a run is in progress; true only when the
+    /// user clicks Stop (Cancel does nothing).
+    private func confirmStop() -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "A run is in progress. Stop anyway?"
+        alert.addButton(withTitle: "Stop")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    func stop(fromURL: Bool = false, force: Bool = false) {
         guard !busy else { return }
         guard let pid = connectorPID() else { refresh(); return }
+        switch stopDecision(state: currentStatusState(), force: force,
+                            fromURL: fromURL) {
+        case .refuse:
+            logRefusal("stop")
+            return
+        case .confirm:
+            guard confirmStop() else { return }
+        case .proceed:
+            break
+        }
+        performStop(pid, restartAfter: false, confirmed: true)
+    }
+
+    /// The ONLY SIGTERM call site (the probe in pidAlive sends no signal).
+    /// Reached only after the stopDecision above: `confirmed` is true only
+    /// when the decision was .proceed or the user approved the alert, and
+    /// this returns unless it is true.
+    private func performStop(_ pid: Int32, restartAfter: Bool,
+                             confirmed: Bool) {
+        guard confirmed else { return }
+        guard !busy else { return }
         busy = true
         DispatchQueue.global(qos: .userInitiated).async {
             if pidRunsConnector(pid) { kill(pid, SIGTERM) }
-            let deadline = Date().addingTimeInterval(45)
-            while pidAlive(pid) && Date() < deadline { usleep(500_000) }
+            let stopDeadline = Date().addingTimeInterval(45)
+            while pidAlive(pid) && Date() < stopDeadline { usleep(500_000) }
+            if restartAfter {
+                _ = runTool("/bin/launchctl",
+                            ["kickstart", "gui/\(getuid())/\(agentLabel)"])
+                let startDeadline = Date().addingTimeInterval(15)
+                while connectorPID() == nil && Date() < startDeadline {
+                    usleep(500_000)
+                }
+            }
             DispatchQueue.main.async {
                 self.busy = false
                 self.refresh()
@@ -168,29 +250,20 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func restart() {
+    func restart(fromURL: Bool = false, force: Bool = false) {
         guard !busy else { return }
-        guard connectorPID() != nil else { start(); return }
-        busy = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            if let pid = connectorPID(), pidRunsConnector(pid) {
-                kill(pid, SIGTERM)
-            }
-            let stopDeadline = Date().addingTimeInterval(45)
-            while connectorPID() != nil && Date() < stopDeadline {
-                usleep(250_000)
-            }
-            _ = runTool("/bin/launchctl",
-                        ["kickstart", "gui/\(getuid())/\(agentLabel)"])
-            let startDeadline = Date().addingTimeInterval(15)
-            while connectorPID() == nil && Date() < startDeadline {
-                usleep(500_000)
-            }
-            DispatchQueue.main.async {
-                self.busy = false
-                self.refresh()
-            }
+        guard let pid = connectorPID() else { start(); return }
+        switch stopDecision(state: currentStatusState(), force: force,
+                            fromURL: fromURL) {
+        case .refuse:
+            logRefusal("restart")
+            return
+        case .confirm:
+            guard confirmStop() else { return }
+        case .proceed:
+            break
         }
+        performStop(pid, restartAfter: true, confirmed: true)
     }
 
     func openLog() {
@@ -199,10 +272,17 @@ final class AppModel: ObservableObject {
     }
 
     func handle(_ url: URL) {
+        // MENUBAR2: force=1 is only ever read from the URL
+        // (stevecam://stop?force=1 / stevecam://restart?force=1); the menu
+        // path always runs the decision (alert while busy). start is
+        // unchanged.
+        let force = url.query.map {
+            $0.components(separatedBy: "&").contains("force=1")
+        } ?? false
         switch url.host {
         case "start": start()
-        case "stop": stop()
-        case "restart": restart()
+        case "stop": stop(fromURL: true, force: force)
+        case "restart": restart(fromURL: true, force: force)
         default: break
         }
     }

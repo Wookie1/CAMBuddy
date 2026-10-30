@@ -92,3 +92,102 @@ Warnings only: unused `_rc`, `onChange(of:perform:)` deprecated on macOS 14 (tar
 
 Final `git diff --numstat`: `125 3  connector/connector.py` (+ new untracked files above).
 Stop here per brief (no commit).
+
+---
+
+## MENUBAR2
+
+Session start: Fri Oct 30 13:00 MST 2026 (`date` at start). Worktree
+/Users/James/ai-sandbox/stevecam-mb, branch menubar @ f72020b. Budget 45 min,
+hard stop 13:45 (70 min = 14:10). No commit. `opencode.json` was already
+modified before this session; not touched.
+
+Plan: (1) new connector/test_pidstatus.py::test_sigterm_exits_zero (append only),
+(2) busy guard + force=1 in menubar/SteveCAM.swift + appended grep test in
+menubar/test_menubar_files.py, (3) README paragraph. Targeted tests only.
+
+### Log
+Fri Oct 30 13:00:50 MST 2026
+- 13:01 `slot_m4.sh /opt/homebrew/bin/python3 -m pytest -q -p no:cacheprovider connector/test_pidstatus.py`
+  → **5 passed in 3.07s**, PYTEST_EXIT=**0** (4 existing + new test_sigterm_exits_zero green
+  on unmutated code).
+- 13:01:50 MUTATION M4 (scratch/mutM4: connector/ + verify/ copied, line
+  `signal.signal(signal.SIGTERM, self.stop)` deleted from
+  scratch/mutM4/connector/connector.py): lane pytest
+  scratch/mutM4/connector/test_pidstatus.py::test_sigterm_exits_zero
+  → **1 failed in 2.02s**, PYTEST_EXIT=**1**, measured
+  `AssertionError: measured exit code: -15` (child dies on SIGTERM, never
+  reaches exit 0) — exactly the expected -15. (First attempt went red for the
+  wrong reason, ModuleNotFoundError 'verify': the scratch copy lacked the
+  repo-root verify/ package the child imports via cwd; fixed by copying
+  verify/ into scratch/mutM4 before the real mutation run.)
+- 13:03:00 first menubar/test_menubar_files.py run after Swift edits → exit 1
+  (new guard test: `kill(` found in stop()'s region — the doc-comment mention;
+  scanner made brace-aware, comments stripped).
+- 13:03:22 → exit 1 (`kill(pid, SIGTERM)` literal appeared twice: once in a
+  doc comment; reworded the comment).
+- 13:03:26 `slot_m4.sh ... pytest -q -p no:cacheprovider menubar/test_menubar_files.py`
+  → **6 passed in 0.28s**, PYTEST_EXIT=**0** (5 existing + new
+  test_swift_stop_guard; includes swiftc -typecheck green).
+- 13:03:29 `slot_m4.sh /usr/bin/swiftc -O -swift-version 5 -parse-as-library
+  menubar/SteveCAM.swift -o scratch/SteveCAM` → SWIFTC_EXIT=**0**, binary
+  **204,184 bytes** (was 200,104; warnings only: unused `_rc`, onChange deprecated).
+- README.md: busy-guard + force=1 paragraph added after the URL-scheme section.
+- 13:03:56 AT-RISK set, one lane run: pytest -q -p no:cacheprovider
+  connector/test_pidstatus.py menubar/test_menubar_files.py
+  connector/test_show3d.py connector/test_units_publish.py
+  → **42 passed in 17.63s**, PYTEST_EXIT=**0**.
+
+## MENUBAR2 summary
+
+Item 1 — connector/test_pidstatus.py::test_sigterm_exits_zero (NEW, appended;
+the file's four existing tests untouched — diff is +59/−0):
+- real child `python3 connector/connector.py --home <tmp>` against the
+  mock_steve fake STEVE (stdlib http.server thread, 127.0.0.1:<free port>,
+  via STEVE_BASE_URL); tmp config.toml poll_wait = 1; waits for the child's
+  status.json "idle" (<=20 s), SIGTERM to the exact PID, asserts exit 0
+  (<=15 s), connector.pid gone, status.json "off"; finally kills only its own
+  child by exact PID.
+- BEFORE/AFTER: handler exists on this branch, so green on first run
+  (5 passed in 3.07s, exit 0); RED proved by mutation M4 below.
+- MUTATION M4 measured: exit code **−15** (`measured exit code: -15`,
+  1 failed in 2.02s, exit 1) with the SIGTERM handler line deleted in
+  scratch/mutM4 — matches the expected −15.
+
+Item 2 — menubar/SteveCAM.swift busy guard (+105/−25):
+- pure `func stopDecision(state: String?, force: Bool, fromURL: Bool) ->
+  StopDecision {proceed, confirm, refuse}`; "busy"/"working" = run in progress.
+- menu Stop/Restart while busy → NSAlert "A run is in progress. Stop anyway?"
+  (Stop / Cancel; Cancel does nothing); stevecam://stop|restart while busy →
+  REFUSE, no signal, one timestamped line "refused stop: run in progress"
+  (resp. restart) appended to ~/.stevecam/menubar.log; force=1
+  (stevecam://stop?force=1) proceeds without asking; stevecam://start
+  unchanged; "Turn off after" still stops only after status said idle (it now
+  goes through the same decision, so a run that started in the meantime asks
+  instead of killing).
+- single SIGTERM executor `performStop(_:restartAfter:confirmed:)`;
+  `guard confirmed else { return }` — reached only after stopDecision.
+- menubar/test_menubar_files.py::test_swift_stop_guard (NEW, appended; the
+  five existing tests untouched — diff +78/−0) greps: exact alert text, the
+  Stop/Cancel buttons, force / force=1 / fromURL wiring, refusal log line,
+  and that every kill( site is decision-gated: brace-aware scan (comments
+  stripped) attributes each kill( line to its enclosing func; the only
+  allowed owners are pidAlive (kill(pid, 0) probe) and performStop (which
+  takes `confirmed: Bool` and returns unless true), kill(pid, SIGTERM)
+  appears exactly once, and stop()/restart() call stopDecision( before
+  performStop(.
+- swiftc -typecheck green (inside test_menubar_files.py); -O build into
+  scratch/SteveCAM: exit 0, **204,184 bytes**.
+
+Item 3 — menubar/README.md: +10 lines, busy guard + force=1 paragraph.
+
+Changed lines (`git diff --numstat`, 13:04, excl. this results file):
+`59 0 connector/test_pidstatus.py`, `105 25 menubar/SteveCAM.swift`,
+`78 0 menubar/test_menubar_files.py`, `10 0 menubar/README.md`
+(`26 4 opencode.json` was pre-existing, not touched). connector/connector.py
+NOT changed (no red test required it). Scratch: scratch/mutM4/ (mutation
+copy), scratch/SteveCAM (200 KB binary). Nothing committed; no engine run;
+no launchctl; ~/.stevecam untouched; locks untouched.
+
+Session end: Fri Oct 30 13:04 MST 2026 (~5 min wall, inside the 45 min
+budget). Stop here per brief.

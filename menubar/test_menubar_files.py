@@ -15,6 +15,7 @@ this file and the task brief cannot match themselves.
 """
 import os
 import plistlib
+import re
 import subprocess
 import sys
 
@@ -100,3 +101,80 @@ def test_shell_scripts_parse():
         out = subprocess.run(["bash", "-n", path], capture_output=True,
                              text=True)
         assert out.returncode == 0, "%s: %s" % (path, out.stderr)
+
+
+# ------------------------------------------------ MENUBAR2: busy guard ----
+
+def test_swift_stop_guard():
+    """MENUBAR2: the Stop/Restart busy guard in SteveCAM.swift. Checks:
+    1. the exact alert text and the Stop / Cancel buttons;
+    2. the pure decision function stopDecision(state:force:fromURL:) with
+       proceed/confirm/refuse, force read only from the URL (force=1) and
+       stevecam://start unchanged;
+    3. a refusal is recorded ("... refused <action>: run in progress");
+    4. every kill( call site is reached only after the decision: scanning
+       the file brace-by-brace, the function whose body contains a kill(
+       (code after "//" comments ignored) must be either pidAlive
+       (kill(pid, 0) liveness probe, sends no signal) or performStop, the
+       single SIGTERM executor, which takes an explicit `confirmed: Bool`
+       and returns unless it is true; stop() and restart() call
+       stopDecision( before performStop(, and kill(pid, SIGTERM) appears
+       exactly once in the file.
+    """
+    text = open(os.path.join(HERE, "SteveCAM.swift")).read()
+    # 1. the alert shown by the menu's Stop/Restart while a run is in progress
+    assert '"A run is in progress. Stop anyway?"' in text
+    assert 'addButton(withTitle: "Stop")' in text
+    assert 'addButton(withTitle: "Cancel")' in text
+    # 2. pure decision + force=1 for URLs + start untouched
+    assert "func stopDecision(state: String?, force: Bool, fromURL: Bool)" \
+        in text
+    assert "-> StopDecision" in text
+    for case in ("case proceed", "case confirm", "case refuse"):
+        assert case in text, case
+    assert "force=1" in text                       # stevecam://stop?force=1
+    assert 'stop(fromURL: true, force: force)' in text
+    assert 'restart(fromURL: true, force: force)' in text
+    assert 'case "start": start()' in text
+    # 3. refusals are logged to ~/.stevecam/menubar.log
+    assert 'logRefusal("stop")' in text
+    assert 'logRefusal("restart")' in text
+    assert "run in progress" in text               # the logged line
+    # 4. kill( sites are gated by the decision (see docstring)
+    #    brace-aware scan: a kill( belongs to the func whose { opened first
+    #    at or below the current depth; text after "//" does not count
+    lines = [re.sub(r"//.*", "", ln) for ln in text.splitlines()]
+    depth = 0
+    stack = []            # [(func_name, depth_at_open)]
+    bodies = {}           # func name -> its code lines
+    killers = set()
+    for ln in lines:
+        m = re.search(r"\bfunc (\w+)", ln)
+        opens, closes = ln.count("{"), ln.count("}")
+        pre = depth
+        depth += opens - closes
+        if m:
+            stack.append((m.group(1), pre + (1 if opens else 0)))
+            bodies.setdefault(m.group(1), [])
+        for fn, d in stack:
+            if pre >= d:
+                bodies[fn].append(ln)
+        if "kill(" in ln:
+            owner = [fn for fn, d in stack if pre >= d]
+            assert owner, "kill( outside any func"
+            killers.add(owner[-1])
+        while stack and depth < stack[-1][1]:
+            stack.pop()
+    assert killers <= {"pidAlive", "performStop"}, sorted(killers)
+    for name in killers:
+        body = "\n".join(bodies[name])
+        if name == "pidAlive":
+            assert "kill(pid, 0)" in body          # probe, not a signal
+        else:
+            assert "confirmed: Bool" in body       # performStop's parameter
+            assert "guard confirmed else" in body
+    assert text.count("kill(pid, SIGTERM)") == 1   # the single executor
+    for name in ("stop", "restart"):
+        body = "\n".join(bodies[name])
+        assert "stopDecision(" in body and "performStop(" in body
+        assert body.index("stopDecision(") < body.index("performStop(")

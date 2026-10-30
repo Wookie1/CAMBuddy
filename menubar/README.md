@@ -53,6 +53,16 @@ is not respawned), `ThrottleInterval 10`.
 URL scheme: `stevecam://start`, `stevecam://stop`, `stevecam://restart` do
 the same as the menu items.
 
+**Busy guard.** While the connector's status.json says a run is in progress
+(`state` = `busy`), menu **Stop** / **Restart** first ask *"A run is in
+progress. Stop anyway?"* (Stop / Cancel; Cancel does nothing), and the URL
+actions `stevecam://stop` / `stevecam://restart` REFUSE instead — no signal
+is sent and one timestamped line `refused stop: run in progress` (or
+`refused restart: ...`) is appended to `~/.stevecam/menubar.log`. A URL with
+`force=1` (`stevecam://stop?force=1`) stops without asking;
+`stevecam://start` is unchanged and the *Turn off after* timer still only
+acts while idle.
+
 ## Tests
 
     /Users/James/ai-sandbox/stevecam-ops/slot_m4.sh /opt/homebrew/bin/python3 \
