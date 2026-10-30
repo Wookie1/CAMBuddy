@@ -2991,7 +2991,9 @@ def _assert_pinned_plus_zg1(pinned, new, part_mask, label):
             json.dumps(v, sort_keys=True), \
             "flat/bull JSON changed at %r: %r" % (k, label)
     extra = set(new) - set(pinned)
-    assert extra == {"below_stock_bottom", "part_mask"}, \
+    # SP-K2: zcut_kernel is the one additional key the task brief mandates
+    # in the report JSON; every pinned b1688b8 value stays byte-identical.
+    assert extra == {"below_stock_bottom", "part_mask", "zcut_kernel"}, \
         "extra keys %r: %r" % (sorted(extra), label)
     assert new["below_stock_bottom"]["count"] == 0, new["below_stock_bottom"]
     assert new["part_mask"] == part_mask, (new["part_mask"], label)
