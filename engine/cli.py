@@ -41,6 +41,8 @@ ORIGINS = ("stock_bottom_centre", "stock_top_centre", "model_origin")
 # below this (mm, under every post's output resolution) no translation is
 # applied: a model already in the chosen frame keeps today's exact STEP
 ORIGIN_EPS = 1e-4
+# rough Adaptive2d path tolerance (mm). 2026-10-30: 0.05 -> 0.1, about 2x faster a2d, gates re-proved on CF.
+ROUGH_A2D_TOLERANCE = 0.1
 
 
 def origin_offset(stock, origin):
@@ -435,7 +437,7 @@ def main(argv=None):
                    help="spindle rpm (James's cutting data)")
     r.add_argument("--workers", type=int, default=None,
                   help="parallel waterline workers (default $ENGINE_WORKERS or 4)")
-    r.add_argument("--tolerance", type=float, default=0.05,
+    r.add_argument("--tolerance", type=float, default=ROUGH_A2D_TOLERANCE,
                   help="Adaptive2d path tolerance mm")
     r.add_argument("--keep-tool-down", dest="keep_tool_down", type=float,
                    default=3.0,
