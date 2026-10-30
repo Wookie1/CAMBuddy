@@ -377,6 +377,43 @@ def level_islands(surf, cutter_big, Zg, xs, ys, z, axl, threads=None):
     return forbidden, Fm
 
 
+# SP-P3A: every level's islands are pure part geometry (CL grid + part STL),
+# so they are computed up front in a spawn-context process pool that is shut
+# down before the first Adaptive2d call (a2d's link budget is clock-based).
+ISLAND_POOL = 6            # worker processes (6 x 2 OCL threads = 12 cores)
+ISLAND_POOL_THREADS = 2
+_ISL_W = {}
+
+
+def _isl_pool_init(stl_path, tool_r, leave, corner_r, Zg, xs, ys, axl,
+                   threads):
+    from engine import model
+    _ISL_W.update(surf=model.load_surf(stl_path), Zg=Zg, xs=xs, ys=ys,
+                  cutter=big_cutter(tool_r, leave, corner_r), axl=axl,
+                  threads=threads)
+
+
+def _isl_pool_job(z):
+    w = _ISL_W
+    return z, level_islands(w["surf"], w["cutter"], w["Zg"], w["xs"],
+                            w["ys"], z, w["axl"], threads=w["threads"])
+
+
+def precompute_islands(stl_path, zs, tool_r, leave, corner_r, Zg, xs, ys,
+                       axl, pool=ISLAND_POOL, threads=ISLAND_POOL_THREADS):
+    """{z: level_islands(..., z, ...)} for every distinct z, computed in a
+    spawn pool (plain lists / numpy back, never OCL objects); (cache, n)."""
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+    zs = list(dict.fromkeys(zs))
+    n = min(len(zs), pool)
+    with ProcessPoolExecutor(n, mp_context=mp.get_context("spawn"),
+                             initializer=_isl_pool_init,
+                             initargs=(stl_path, tool_r, leave, corner_r, Zg,
+                                       xs, ys, axl, threads)) as ex:
+        return dict(ex.map(_isl_pool_job, zs)), n
+
+
 def plan_levels(stock_zmax, floor_z, leave, stepdown, flat_floors=None,
                axial_leave=None, final_zmin=None, min_level_gap=0.5):
     """Z levels (tip depths) top-down (legacy, round 6).
@@ -1309,6 +1346,15 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     # tolerance, so centres at a2d's tool_r + leave offset stay outside F.
     isl_margin = 2.0 * pitch + tolerance + 0.2
     erode_r = max(R - isl_margin, pitch)
+    isl_cache = {}
+    stats["island_pool"], stats["island_pool_s"] = 0, 0.0
+    if stl_path and len(order) > 1 and \
+            os.environ.get("STEVECAM_NO_ISLAND_POOL") != "1":
+        t0 = time.time()
+        isl_cache, stats["island_pool"] = precompute_islands(
+            stl_path, order, tool_r, leave, corner_r, Zg, gxs, gys, axl)
+        stats["island_pool_s"] = round(time.time() - t0, 3)
+        stats["t_islands"] += time.time() - t0
 
     moves = []
     prev = [None, None, clearance_z]
@@ -2005,8 +2051,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # territory core.
         outers, holes = stock.contours(grown)
         t0 = time.time()
-        islands, Fm = level_islands(surf, cutter_big, Zg, gxs, gys, z, axl,
-                                    threads=threads)
+        hit = isl_cache.get(z)   # SP-P3A: fresh copies, as serial returns
+        islands, Fm = (copy.deepcopy(hit[0]), hit[1].copy()) if hit else \
+            level_islands(surf, cutter_big, Zg, gxs, gys, z, axl,
+                          threads=threads)
         t_isl = time.time() - t0
         stats["t_islands"] += t_isl
         # ground-truth clearance oracle for THIS level: the refined forbidden
