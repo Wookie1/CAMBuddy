@@ -13,3 +13,4 @@ docs/*.pdf
 .DS_Store
 samples/*.nc
 engine/ckern/libstamp.dylib
+verify/zkern/libzcut.dylib

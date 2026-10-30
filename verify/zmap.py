@@ -5,6 +5,7 @@ heightfield and report gouges, leftover stock, rapid collisions and air time.
 Plain Python 3 + numpy. No FreeCAD imports.
 """
 import argparse
+import ctypes
 import json
 import math
 import os
@@ -12,6 +13,16 @@ import re
 import sys
 
 import numpy as np
+
+try:  # task SP-K2: optional C kernel for the per-sample stock cut
+    try:  # `python -m verify.zmap` (the connector) needs the package path
+        from verify import zkern as _zkern
+    except ImportError:  # `python verify/zmap.py`: verify/ is sys.path[0]
+        import zkern as _zkern
+    _KERN = _zkern.load()
+except Exception:  # no C kernel available -> pure-Python path
+    _zkern = None
+    _KERN = None
 
 WORD_RE = re.compile(r"([A-Za-z])\s*([-+]?[0-9]*\.?[0-9]+)")
 GOUGE_TOL = 0.02  # mm below part surface before a cell counts as gouged
@@ -1439,6 +1450,31 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     surf_buf = np.empty((2 * k + 1, 2 * k + 1)) if ball_surf else None
     zb_on = engage_track and tool == "ball"  # task ZE2B (ball only)
     zb_moves = []
+    # task SP-K2B: with the kernel loaded, the WHOLE per-sample loop of one
+    # move (near-mask precheck, shank block, holder block, SP-K2 cut block)
+    # runs in one C call per move; all per-move bookkeeping and reporting
+    # stays here in Python.
+    kern = _KERN
+    if kern is not None:
+        stock_p = stock.ctypes.data_as(ctypes.c_void_p)
+        xs_p = xs.ctypes.data_as(ctypes.c_void_p)
+        ys_p = ys.ctypes.data_as(ctypes.c_void_p)
+        wm_np = (np.ascontiguousarray(window, dtype=np.uint8)
+                 if window is not None else None)
+        wm_p = (wm_np.ctypes.data_as(ctypes.c_void_p)
+                if wm_np is not None else None)
+        zb_state = (ctypes.c_double * 4)()
+        hist_move = (ctypes.c_uint32 * FWD_NBINS)()
+        hist_move_np = np.frombuffer(hist_move, dtype=np.uint32)
+        hist_move_p = ctypes.cast(hist_move, ctypes.c_void_p)
+        nscr = (2 * k + 1) * (2 * k + 1)
+        scr_v = (ctypes.c_double * nscr)()
+        scr_m = (ctypes.c_ubyte * nscr)()
+        zb_state_p = ctypes.cast(zb_state, ctypes.c_void_p)
+        scr_v_p = ctypes.cast(scr_v, ctypes.c_void_p)
+        scr_m_p = ctypes.cast(scr_m, ctypes.c_void_p)
+        tool_id = {"flat": 0, "bull": 1, "ball": 2}[tool]
+
     # shank/over-flute check (only with flute): radius S/2, its own window
     shank_on = flute is not None
     Rs = (shank_dia if shank_dia else dia) / 2.0
@@ -1471,6 +1507,49 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             near = w
     else:
         near = None
+
+    if kern is not None:
+        # task SP-K2B: static per-move kernel parameters; the per-move
+        # fields (cutting, travel direction, ZE2B snapshot) are set on
+        # kparams before each zcut_move call
+        part_c = np.ascontiguousarray(part, dtype=float)
+        near_c = (np.ascontiguousarray(near, dtype=np.uint8)
+                  if near is not None else None)
+        kparams = _zkern.ZMoveParams()
+        kparams.stock = stock_p
+        kparams.part = part_c.ctypes.data_as(ctypes.c_void_p)
+        kparams.xs = xs_p
+        kparams.ys = ys_p
+        kparams.wm = wm_p
+        kparams.nearm = (near_c.ctypes.data_as(ctypes.c_void_p)
+                         if near_c is not None else None)
+        kparams.bstat = (Bstat.ctypes.data_as(ctypes.c_void_p)
+                         if holder_on else None)
+        kparams.nx = nx
+        kparams.ny = ny
+        kparams.x0 = x0
+        kparams.y0 = y0
+        kparams.cell = cell
+        kparams.R = R
+        kparams.tool = tool_id
+        kparams.corner = corner
+        kparams.k = k
+        kparams.eps = REMOVE_EPS
+        kparams.fwd_bin = FWD_BIN_MM
+        kparams.shank_on = 1 if shank_on else 0
+        kparams.Rs = Rs if shank_on else 0.0
+        kparams.flute = flute if flute is not None else 0.0
+        kparams.ks = ks
+        kparams.holder_on = 1 if holder_on else 0
+        kparams.Rh = Rh if holder_on else 0.0
+        kparams.stickout = stickout if holder_on else 0.0
+        kparams.kH = kH if holder_on else 0
+        kparams.engage_track = 1 if engage_track else 0
+        kparams.zb_on = 1 if zb_on else 0
+        kparams.scr_v = scr_v_p
+        kparams.scr_m = scr_m_p
+        krun = _zkern.ZRunState()
+        kmove_out = _zkern.ZMoveOut()
 
     if moves and "z" in moves[0] and moves[0].get("resolved"):
         resolved = moves
@@ -1604,6 +1683,15 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             zb_jhi = min(ny, int(math.floor((bx[:, 1].max() - y0) / cell)) + k + 1)
             if zb_ilo < zb_ihi and zb_jlo < zb_jhi:
                 zb_pre = stock[zb_jlo:zb_jhi, zb_ilo:zb_ihi].copy()
+        if kern is not None:
+            zb_state[0] = zb_state[1] = zb_state[2] = zb_state[3] = 0.0
+            if zb_pre is not None:
+                kparams.pre = zb_pre.ctypes.data_as(ctypes.c_void_p)
+                kparams.pre_stride = zb_ihi - zb_ilo
+                kparams.pre_ilo = zb_ilo
+                kparams.pre_jlo = zb_jlo
+            else:
+                kparams.pre = None
         # travel direction for engagement (perpendicular chord width)
         dx_t = x1 - cur[0]
         dy_t = y1 - cur[1]
@@ -1658,195 +1746,222 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                     if np.isfinite(s0) and s0 - zmin_m > flute + 1e-9:
                         move_over_flute = True
         seg_len = length / max(1, len(samples))
-        for (sx, sy, sz) in samples:
-            if near is not None:
-                ix = int(math.floor((sx - x0) / cell))
-                jy = int(math.floor((sy - y0) / cell))
-                if ix < 0 or jy < 0 or ix >= nx or jy >= ny \
-                        or not near[jy, ix]:
-                    if cutting:  # cannot touch any window cell -> air
-                        air_length += seg_len
-                    continue
-            i0 = int(math.floor((sx - x0) / cell))
-            j0 = int(math.floor((sy - y0) / cell))
-            if cutting and shank_on:
-                # shank above the flutes: z > tip + F within radius S/2 of the
-                # centre. HIT if stock/part there rises above the flute top
-                slo, shi = max(0, i0 - ks), min(nx, i0 + ks + 1)
-                tlo, thi = max(0, j0 - ks), min(ny, j0 + ks + 1)
-                if slo < shi and tlo < thi:
-                    dd = np.hypot(xs[slo:shi] - sx, (ys[tlo:thi] - sy)[:, None])
-                    dsh = dd <= Rs + 0.75 * cell
-                    vsh = np.where(dsh, np.maximum(stock[tlo:thi, slo:shi],
-                                                   part[tlo:thi, slo:shi]),
-                                  -np.inf)
-                    vtop = float(vsh.max())
-                    if vtop > sz + flute + 0.01:
-                        move_shank = True
-                        excess = vtop - (sz + flute)
-                        if excess > shank_depth:
-                            shank_depth = excess
-                            # among cells at the max height, report the one
-                            # whose PART is that high (the wall itself, not
-                            # just uncut stock) and closest to the centre
-                            psl = part[tlo:thi, slo:shi]
-                            cand = dd + np.where(psl >= vtop - 1e-9,
-                                               0.0, 1e6)
-                            cand = np.where(vsh >= vtop - 1e-9, cand, np.inf)
-                            tj, ti = np.unravel_index(int(np.argmin(cand)),
-                                                     cand.shape)
-                            shank_worst_xy = [float(xs[slo + ti]),
-                                            float(ys[tlo + tj])]
-            if cutting and holder_on:
-                # S5: material within the holder envelope (radius max_r + 1 mm)
-                # standing above the nose at tip + stick-out -> the holder stack
-                # cannot keep its 1.0 mm clearance
-                nose = sz + stickout
-                ioc = min(max(i0, 0), nx - 1)
-                joc = min(max(j0, 0), ny - 1)
-                if float(Bstat[joc, ioc]) > nose:
-                    slo, shi = max(0, i0 - kH), min(nx, i0 + kH + 1)
-                    tlo, thi = max(0, j0 - kH), min(ny, j0 + kH + 1)
+        if kern is not None:
+            # task SP-K2B: the WHOLE per-sample loop for this move (near-mask
+            # precheck, shank block, holder block, SP-K2 cut block) runs in
+            # one C call per move; the samples go over as a flat (n, 3)
+            # float64 array of exactly what _move_samples built.
+            sarr = np.ascontiguousarray(np.asarray(samples, dtype=float))
+            kparams.cutting = 1 if cutting else 0
+            kparams.dx_t = dx_t
+            kparams.dy_t = dy_t
+            kern.zcut_move(ctypes.byref(kparams),
+                           sarr.ctypes.data_as(ctypes.c_void_p),
+                           len(samples), seg_len, ctypes.byref(kmove_out),
+                           ctypes.byref(krun), zb_state_p, hist_move_p)
+            if cutting:
+                move_shank = bool(kmove_out.move_shank)
+                move_holder = bool(kmove_out.move_holder)
+                move_area = kmove_out.move_area
+                move_max_depth = kmove_out.move_max_depth
+                move_max_engage = kmove_out.move_max_engage
+                if kmove_out.hist_any:
+                    move_hist = hist_move_np.copy()
+            else:
+                move_collided = bool(kmove_out.move_collided)
+        else:
+            for (sx, sy, sz) in samples:
+                if near is not None:
+                    ix = int(math.floor((sx - x0) / cell))
+                    jy = int(math.floor((sy - y0) / cell))
+                    if ix < 0 or jy < 0 or ix >= nx or jy >= ny \
+                            or not near[jy, ix]:
+                        if cutting:  # cannot touch any window cell -> air
+                            air_length += seg_len
+                        continue
+                i0 = int(math.floor((sx - x0) / cell))
+                j0 = int(math.floor((sy - y0) / cell))
+                if cutting and shank_on:
+                    # shank above the flutes: z > tip + F within radius S/2 of the
+                    # centre. HIT if stock/part there rises above the flute top
+                    slo, shi = max(0, i0 - ks), min(nx, i0 + ks + 1)
+                    tlo, thi = max(0, j0 - ks), min(ny, j0 + ks + 1)
                     if slo < shi and tlo < thi:
                         dd = np.hypot(xs[slo:shi] - sx, (ys[tlo:thi] - sy)[:, None])
-                        dH = dd <= Rh
-                        mat = np.maximum(
-                            np.where(np.isfinite(stock[tlo:thi, slo:shi]),
-                                   stock[tlo:thi, slo:shi], -np.inf),
-                            part[tlo:thi, slo:shi])
-                        vH = np.where(dH, mat, -np.inf)
-                        vtop = float(vH.max())
-                        if vtop > nose:
-                            move_holder = True
-                            intr = vtop - nose
-                            if intr > holder_intrusion:
-                                holder_intrusion = intr
+                        dsh = dd <= Rs + 0.75 * cell
+                        vsh = np.where(dsh, np.maximum(stock[tlo:thi, slo:shi],
+                                                       part[tlo:thi, slo:shi]),
+                                      -np.inf)
+                        vtop = float(vsh.max())
+                        if vtop > sz + flute + 0.01:
+                            move_shank = True
+                            excess = vtop - (sz + flute)
+                            if excess > shank_depth:
+                                shank_depth = excess
                                 # among cells at the max height, report the one
-                                # whose PART is that high and closest to centre
+                                # whose PART is that high (the wall itself, not
+                                # just uncut stock) and closest to the centre
                                 psl = part[tlo:thi, slo:shi]
                                 cand = dd + np.where(psl >= vtop - 1e-9,
                                                    0.0, 1e6)
-                                cand = np.where(vH >= vtop - 1e-9, cand, np.inf)
+                                cand = np.where(vsh >= vtop - 1e-9, cand, np.inf)
                                 tj, ti = np.unravel_index(int(np.argmin(cand)),
-                                                        cand.shape)
-                                holder_worst_xy = [float(xs[slo + ti]),
+                                                         cand.shape)
+                                shank_worst_xy = [float(xs[slo + ti]),
                                                 float(ys[tlo + tj])]
-            ilo, ihi = max(0, i0 - k), min(nx, i0 + k + 1)
-            jlo, jhi = max(0, j0 - k), min(ny, j0 + k + 1)
-            if ilo >= ihi or jlo >= jhi:
-                continue
-            gx = xs[ilo:ihi] - sx
-            gy = ys[jlo:jhi] - sy
-            win = stock[jlo:jhi, ilo:ihi]
-            # no cell in reach is above the tool tip -> nothing to cut here
-            if float(win.max()) <= sz + 1e-6:
-                if cutting:
-                    air_length += seg_len
-                continue
-            d = np.hypot(gx[None, :], gy[:, None])
-            msk = d <= R + 1e-9
-            if window is not None:
-                msk &= window[jlo:jhi, ilo:ihi]
-            if not msk.any():
-                continue
-            if ball_surf:
-                # exact dz(d) chain into scratch, then sz + dz (same ops)
-                t = surf_buf[:gy.size, :gx.size]
-                np.multiply(d, d, out=t)
-                np.subtract(R * R, t, out=t)
-                np.maximum(t, 0.0, out=t)
-                np.sqrt(t, out=t)
-                np.subtract(R, t, out=t)
-                np.add(sz, t, out=t)
-                newv = np.where(msk, t, np.inf)
-            else:
-                newv = np.where(msk, sz + dz(d), np.inf)
-            cut = win - newv
-            # task SP2: outside msk newv is +inf so cut is -inf and the clip
-            # to >= 0 yields the same 0.0 the masked where wrote there
-            removed = float(np.sum(np.clip(cut, 0.0, None)))
-            if cutting and engage_track:
-                # task ZE2: cells this sample actually removes (finite positive
-                # cut height); each cell is counted at most once per move since
-                # the stock update drops it to the cut surface below
-                nrem = int(np.count_nonzero(cut > REMOVE_EPS))
-                move_area += nrem * cell * cell
-                if nrem:
-                    hb = np.minimum((cut[cut > REMOVE_EPS] / FWD_BIN_MM)
-                                    .astype(np.int64), FWD_NBINS - 1)
-                    hh = np.bincount(hb, minlength=FWD_NBINS).astype(np.uint32)
-                    move_hist = hh if move_hist is None else move_hist + hh
-            if cutting and zb_on:
-                # task ZE2B: vol = live cut (telescopes, each cell once); a/ext
-                # vs the pre-move snapshot where r = stock - z_b > 0.01
-                cb = msk & np.isfinite(cut) & (cut > REMOVE_EPS)
-                if cb.any():
-                    zb_vol += float(cut[cb].sum()) * cell * cell
-                if zb_pre is not None:
-                    sub = zb_pre[jlo - zb_jlo:jhi - zb_jlo, ilo - zb_ilo:ihi - zb_ilo]
-                    eb = msk & np.isfinite(sub) & (sub - newv > 0.01)
-                    if eb.any():
-                        zb_a = max(zb_a, float(np.max(sub[eb] - sz)))
-                        pu = (dx_t * gx[None, :] + dy_t * gy[:, None])[eb]
-                        pv = (-dy_t * gx[None, :] + dx_t * gy[:, None])[eb]
-                        zb_ext = max(zb_ext, float(pv.max() - pv.min()))
-                        zb_dext = max(zb_dext, math.hypot(float(pu.max() - pu.min()),
-                                                        float(pv.max() - pv.min())))
-            if cutting and engage_track:
-                # task ZE: axial depth at this sample = deepest column of
-                # stock removed above the tool surface under the footprint
-                # (cut = stock_before - cut surface; -inf outside the disk
-                # and over non-finite stock, so a finite max is a column this
-                # move actually cuts)
-                dmax = float(np.max(cut))
-                if np.isfinite(dmax) and dmax > move_max_depth:
-                    move_max_depth = dmax
-            if cutting:
-                # engaged = any stock cell at/over the footprint edge above the
-                # tip. The radius is padded by half a cell diagonal so that
-                # slivers of cells clipped by the disk edge still count (the
-                # cell-center mask alone would report false air while cutting).
-                # Must use msk_e-filtered max so that engaged=True implies
-                # msk_e has True cells (prevents inf/NaN in engagement width).
-                msk_e = d <= R + 0.75 * cell
+                if cutting and holder_on:
+                    # S5: material within the holder envelope (radius max_r + 1 mm)
+                    # standing above the nose at tip + stick-out -> the holder stack
+                    # cannot keep its 1.0 mm clearance
+                    nose = sz + stickout
+                    ioc = min(max(i0, 0), nx - 1)
+                    joc = min(max(j0, 0), ny - 1)
+                    if float(Bstat[joc, ioc]) > nose:
+                        slo, shi = max(0, i0 - kH), min(nx, i0 + kH + 1)
+                        tlo, thi = max(0, j0 - kH), min(ny, j0 + kH + 1)
+                        if slo < shi and tlo < thi:
+                            dd = np.hypot(xs[slo:shi] - sx, (ys[tlo:thi] - sy)[:, None])
+                            dH = dd <= Rh
+                            mat = np.maximum(
+                                np.where(np.isfinite(stock[tlo:thi, slo:shi]),
+                                       stock[tlo:thi, slo:shi], -np.inf),
+                                part[tlo:thi, slo:shi])
+                            vH = np.where(dH, mat, -np.inf)
+                            vtop = float(vH.max())
+                            if vtop > nose:
+                                move_holder = True
+                                intr = vtop - nose
+                                if intr > holder_intrusion:
+                                    holder_intrusion = intr
+                                    # among cells at the max height, report the one
+                                    # whose PART is that high and closest to centre
+                                    psl = part[tlo:thi, slo:shi]
+                                    cand = dd + np.where(psl >= vtop - 1e-9,
+                                                       0.0, 1e6)
+                                    cand = np.where(vH >= vtop - 1e-9, cand, np.inf)
+                                    tj, ti = np.unravel_index(int(np.argmin(cand)),
+                                                            cand.shape)
+                                    holder_worst_xy = [float(xs[slo + ti]),
+                                                    float(ys[tlo + tj])]
+                ilo, ihi = max(0, i0 - k), min(nx, i0 + k + 1)
+                jlo, jhi = max(0, j0 - k), min(ny, j0 + k + 1)
+                if ilo >= ihi or jlo >= jhi:
+                    continue
+                gx = xs[ilo:ihi] - sx
+                gy = ys[jlo:jhi] - sy
+                win = stock[jlo:jhi, ilo:ihi]
+                # no cell in reach is above the tool tip -> nothing to cut here
+                if float(win.max()) <= sz + 1e-6:
+                    if cutting:
+                        air_length += seg_len
+                    continue
+                d = np.hypot(gx[None, :], gy[:, None])
+                msk = d <= R + 1e-9
                 if window is not None:
-                    msk_e &= window[jlo:jhi, ilo:ihi]
-                # task SP2: msk_e.any() is implied -- with an empty msk_e the
-                # masked max is -inf and the comparison is False either way
-                engaged = (float(np.max(np.where(msk_e, win, -np.inf)))
-                           > sz + 1e-6)
-                # radial engagement: chord width of engaged arc perpendicular to
-                # travel (dx_t, dy_t); equivalent radial width = 2*R*sin(theta/2)
-                if engaged and engage_track:
-                    perp_x, perp_y = -dy_t, dx_t
-                    proj = (gx[None, :] * perp_x + gy[:, None] * perp_y)
-                    # Measure the chord over the cells THIS move actually cuts:
-                    # stock above the tip inside the padded footprint, before
-                    # the stock update. Using msk_e alone (or a -inf-filled
-                    # window) reads ~2R even for a light side cut.
-                    cells = msk_e & (win > sz + 1e-6)
-                    if cells.any():
-                        cproj = proj[cells]
-                        ew = float(cproj.max()) - float(cproj.min())
-                    else:
-                        ew = np.nan
-                    # Finite guard BEFORE the clamp: clamping first would turn
-                    # inf into 2R and the guard could never fire.
-                    if not np.isfinite(ew):
-                        ew = 0.0
-                    # Clamp to [0, dia]: the padded mask (R + 0.75*cell) can
-                    # make ew slightly exceed the tool diameter.
-                    ew = min(max(ew, 0.0), 2.0 * R)
-                    if ew > move_max_engage:
-                        move_max_engage = ew
-                if removed > REMOVE_EPS:
-                    stock[jlo:jhi, ilo:ihi] = np.minimum(win, newv)
-                if not engaged:
-                    air_length += seg_len
-            else:  # rapid
-                # task SP2: outside msk cut is -inf, never > REMOVE_EPS
-                if np.any(cut > REMOVE_EPS):
-                    move_collided = True
+                    msk &= window[jlo:jhi, ilo:ihi]
+                if not msk.any():
+                    continue
+                if ball_surf:
+                    # exact dz(d) chain into scratch, then sz + dz (same ops)
+                    t = surf_buf[:gy.size, :gx.size]
+                    np.multiply(d, d, out=t)
+                    np.subtract(R * R, t, out=t)
+                    np.maximum(t, 0.0, out=t)
+                    np.sqrt(t, out=t)
+                    np.subtract(R, t, out=t)
+                    np.add(sz, t, out=t)
+                    newv = np.where(msk, t, np.inf)
+                else:
+                    newv = np.where(msk, sz + dz(d), np.inf)
+                cut = win - newv
+                # task SP2: outside msk newv is +inf so cut is -inf and the clip
+                # to >= 0 yields the same 0.0 the masked where wrote there
+                removed = float(np.sum(np.clip(cut, 0.0, None)))
+                if cutting and engage_track:
+                    # task ZE2: cells this sample actually removes (finite positive
+                    # cut height); each cell is counted at most once per move since
+                    # the stock update drops it to the cut surface below
+                    nrem = int(np.count_nonzero(cut > REMOVE_EPS))
+                    move_area += nrem * cell * cell
+                    if nrem:
+                        hb = np.minimum((cut[cut > REMOVE_EPS] / FWD_BIN_MM)
+                                        .astype(np.int64), FWD_NBINS - 1)
+                        hh = np.bincount(hb, minlength=FWD_NBINS).astype(np.uint32)
+                        move_hist = hh if move_hist is None else move_hist + hh
+                if cutting and zb_on:
+                    # task ZE2B: vol = live cut (telescopes, each cell once); a/ext
+                    # vs the pre-move snapshot where r = stock - z_b > 0.01
+                    cb = msk & np.isfinite(cut) & (cut > REMOVE_EPS)
+                    if cb.any():
+                        zb_vol += float(cut[cb].sum()) * cell * cell
+                    if zb_pre is not None:
+                        sub = zb_pre[jlo - zb_jlo:jhi - zb_jlo, ilo - zb_ilo:ihi - zb_ilo]
+                        eb = msk & np.isfinite(sub) & (sub - newv > 0.01)
+                        if eb.any():
+                            zb_a = max(zb_a, float(np.max(sub[eb] - sz)))
+                            pu = (dx_t * gx[None, :] + dy_t * gy[:, None])[eb]
+                            pv = (-dy_t * gx[None, :] + dx_t * gy[:, None])[eb]
+                            zb_ext = max(zb_ext, float(pv.max() - pv.min()))
+                            zb_dext = max(zb_dext, math.hypot(float(pu.max() - pu.min()),
+                                                            float(pv.max() - pv.min())))
+                if cutting and engage_track:
+                    # task ZE: axial depth at this sample = deepest column of
+                    # stock removed above the tool surface under the footprint
+                    # (cut = stock_before - cut surface; -inf outside the disk
+                    # and over non-finite stock, so a finite max is a column this
+                    # move actually cuts)
+                    dmax = float(np.max(cut))
+                    if np.isfinite(dmax) and dmax > move_max_depth:
+                        move_max_depth = dmax
+                if cutting:
+                    # engaged = any stock cell at/over the footprint edge above the
+                    # tip. The radius is padded by half a cell diagonal so that
+                    # slivers of cells clipped by the disk edge still count (the
+                    # cell-center mask alone would report false air while cutting).
+                    # Must use msk_e-filtered max so that engaged=True implies
+                    # msk_e has True cells (prevents inf/NaN in engagement width).
+                    msk_e = d <= R + 0.75 * cell
+                    if window is not None:
+                        msk_e &= window[jlo:jhi, ilo:ihi]
+                    # task SP2: msk_e.any() is implied -- with an empty msk_e the
+                    # masked max is -inf and the comparison is False either way
+                    engaged = (float(np.max(np.where(msk_e, win, -np.inf)))
+                               > sz + 1e-6)
+                    # radial engagement: chord width of engaged arc perpendicular to
+                    # travel (dx_t, dy_t); equivalent radial width = 2*R*sin(theta/2)
+                    if engaged and engage_track:
+                        perp_x, perp_y = -dy_t, dx_t
+                        proj = (gx[None, :] * perp_x + gy[:, None] * perp_y)
+                        # Measure the chord over the cells THIS move actually cuts:
+                        # stock above the tip inside the padded footprint, before
+                        # the stock update. Using msk_e alone (or a -inf-filled
+                        # window) reads ~2R even for a light side cut.
+                        cells = msk_e & (win > sz + 1e-6)
+                        if cells.any():
+                            cproj = proj[cells]
+                            ew = float(cproj.max()) - float(cproj.min())
+                        else:
+                            ew = np.nan
+                        # Finite guard BEFORE the clamp: clamping first would turn
+                        # inf into 2R and the guard could never fire.
+                        if not np.isfinite(ew):
+                            ew = 0.0
+                        # Clamp to [0, dia]: the padded mask (R + 0.75*cell) can
+                        # make ew slightly exceed the tool diameter.
+                        ew = min(max(ew, 0.0), 2.0 * R)
+                        if ew > move_max_engage:
+                            move_max_engage = ew
+                    if removed > REMOVE_EPS:
+                        stock[jlo:jhi, ilo:ihi] = np.minimum(win, newv)
+                    if not engaged:
+                        air_length += seg_len
+                else:  # rapid
+                    # task SP2: outside msk cut is -inf, never > REMOVE_EPS
+                    if np.any(cut > REMOVE_EPS):
+                        move_collided = True
+        if kern is not None and cutting and zb_on:
+            zb_vol, zb_a, zb_ext, zb_dext = (zb_state[0], zb_state[1],
+                                             zb_state[2], zb_state[3])
         if cutting:
             cut_length += length
             if axial_depth > 0.0:
@@ -2005,10 +2120,25 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             hp_carry = None
         cur = [x1, y1, z1]
 
+    if kern is not None:
+        # task SP-K2B: the per-move kernel ran the shank/holder blocks and
+        # owns their running accumulators; pick them up for the report.
+        # air_length was summed ONE SEG_LEN AT A TIME in the kernel, in the
+        # same sample order as the Python loop, so it is bit-identical.
+        air_length = krun.air_length
+        shank_depth = krun.shank_depth
+        shank_worst_xy = ([krun.shank_worst_x, krun.shank_worst_y]
+                          if krun.shank_worst_set else None)
+        holder_intrusion = krun.holder_intrusion
+        holder_worst_xy = ([krun.holder_worst_x, krun.holder_worst_y]
+                           if krun.holder_worst_set else None)
+
     ae2_windows = _ae2_windows(ae2_moves) if engage_track else []
     zb_windows = _ze2b_windows(zb_moves, dia) if zb_on else []
     result = {
         "stock": stock,
+        # task SP-K2: which per-sample cut kernel produced this report
+        "zcut_kernel": "c" if kern is not None else "python",
         "rapid_collisions": {"count": rapid_collisions,
                             "first_line": first_rapid_line},
         "outside_grid": {"count": outside_grid,
@@ -2166,6 +2296,8 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
         results = pool.map(_chunk_worker, range(len(spans)))
     combined = {
         "stock": np.min(np.stack([r["stock"] for r in results]), axis=0),
+        # task SP-K2: all chunks run in one process family -> same kernel
+        "zcut_kernel": results[0]["zcut_kernel"] if results else "python",
         "rapid_collisions": {
             "count": sum(r["rapid_collisions"]["count"] for r in results),
             "first_line": min((r["rapid_collisions"]["first_line"]
@@ -2638,6 +2770,7 @@ def main(argv=None):
         "stock_in": os.path.abspath(args.stock_in) if args.stock_in else None,
         "holder": _holder_report(args, holder_name, holder_stick),
         "cell": cell,
+        "zcut_kernel": res["zcut_kernel"],
         "window": ("speed option: only cells within 2 mm of steep walls are "
                    "simulated and judged; gouges and every other check outside "
                    "the window are NOT judged; never use for a gate or a "
