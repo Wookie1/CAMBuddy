@@ -5,6 +5,7 @@ heightfield and report gouges, leftover stock, rapid collisions and air time.
 Plain Python 3 + numpy. No FreeCAD imports.
 """
 import argparse
+import ctypes
 import json
 import math
 import os
@@ -12,6 +13,13 @@ import re
 import sys
 
 import numpy as np
+
+try:  # task SP-K2: optional C kernel for the per-sample stock cut
+    import zkern as _zkern
+    _KERN = _zkern.load()
+except Exception:  # no C kernel available -> pure-Python path
+    _zkern = None
+    _KERN = None
 
 WORD_RE = re.compile(r"([A-Za-z])\s*([-+]?[0-9]*\.?[0-9]+)")
 GOUGE_TOL = 0.02  # mm below part surface before a cell counts as gouged
@@ -1439,6 +1447,31 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     surf_buf = np.empty((2 * k + 1, 2 * k + 1)) if ball_surf else None
     zb_on = engage_track and tool == "ball"  # task ZE2B (ball only)
     zb_moves = []
+    # task SP-K2: per-sample cut runs in the C kernel (verify/zkern) when it
+    # loaded (ZMAP_NO_CKERN unset); everything else stays on the Python path.
+    kern = _KERN
+    if kern is not None:
+        stock_p = stock.ctypes.data_as(ctypes.c_void_p)
+        xs_p = xs.ctypes.data_as(ctypes.c_void_p)
+        ys_p = ys.ctypes.data_as(ctypes.c_void_p)
+        wm_np = (np.ascontiguousarray(window, dtype=np.uint8)
+                 if window is not None else None)
+        wm_p = (wm_np.ctypes.data_as(ctypes.c_void_p)
+                if wm_np is not None else None)
+        zb_state = (ctypes.c_double * 4)()
+        hist_buf = (ctypes.c_uint32 * FWD_NBINS)()
+        hist_np = np.frombuffer(hist_buf, dtype=np.uint32)
+        zout = _zkern.ZOut()
+        nscr = (2 * k + 1) * (2 * k + 1)
+        scr_v = (ctypes.c_double * nscr)()
+        scr_m = (ctypes.c_ubyte * nscr)()
+        zb_state_p = ctypes.cast(zb_state, ctypes.c_void_p)
+        hist_p = ctypes.cast(hist_buf, ctypes.c_void_p)
+        scr_v_p = ctypes.cast(scr_v, ctypes.c_void_p)
+        scr_m_p = ctypes.cast(scr_m, ctypes.c_void_p)
+        tool_id = {"flat": 0, "bull": 1, "ball": 2}[tool]
+        zb_pre_p, zb_pre_st, zb_pre_i0, zb_pre_j0 = None, 0, 0, 0
+
     # shank/over-flute check (only with flute): radius S/2, its own window
     shank_on = flute is not None
     Rs = (shank_dia if shank_dia else dia) / 2.0
@@ -1604,6 +1637,15 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
             zb_jhi = min(ny, int(math.floor((bx[:, 1].max() - y0) / cell)) + k + 1)
             if zb_ilo < zb_ihi and zb_jlo < zb_jhi:
                 zb_pre = stock[zb_jlo:zb_jhi, zb_ilo:zb_ihi].copy()
+        if kern is not None:
+            zb_state[0] = zb_state[1] = zb_state[2] = zb_state[3] = 0.0
+            if zb_pre is not None:
+                zb_pre_p = zb_pre.ctypes.data_as(ctypes.c_void_p)
+                zb_pre_st = zb_ihi - zb_ilo
+                zb_pre_i0 = zb_ilo
+                zb_pre_j0 = zb_jlo
+            else:
+                zb_pre_p = None
         # travel direction for engagement (perpendicular chord width)
         dx_t = x1 - cur[0]
         dy_t = y1 - cur[1]
@@ -1731,6 +1773,33 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                                                         cand.shape)
                                 holder_worst_xy = [float(xs[slo + ti]),
                                                 float(ys[tlo + tj])]
+            if kern is not None:
+                # task SP-K2: the whole window block (early-out, mask, tool
+                # surface, removed/nrem/histogram, ZE2B, engagement chord,
+                # stock update) runs in zcut.c; only the scalars come back.
+                kern.zcut_sample(stock_p, nx, ny, i0, j0, k, xs_p, ys_p,
+                                 sx, sy, sz, R, tool_id, corner, wm_p,
+                                 1 if cutting else 0, 1 if engage_track else 0,
+                                 1 if zb_on else 0, cell, REMOVE_EPS,
+                                 FWD_BIN_MM, dx_t, dy_t,
+                                 zb_pre_p if (cutting and zb_on) else None,
+                                 zb_pre_st, zb_pre_i0, zb_pre_j0,
+                                 zb_state_p, hist_p, scr_v_p, scr_m_p,
+                                 ctypes.byref(zout))
+                if zout.air:
+                    air_length += seg_len
+                if cutting:
+                    move_area += zout.nrem * cell * cell
+                    if zout.hist_any:
+                        hh = hist_np.copy()
+                        move_hist = hh if move_hist is None else move_hist + hh
+                    if zout.dmax_valid and zout.dmax > move_max_depth:
+                        move_max_depth = zout.dmax
+                    if zout.ew_valid and zout.ew > move_max_engage:
+                        move_max_engage = zout.ew
+                elif zout.collided:
+                    move_collided = True
+                continue
             ilo, ihi = max(0, i0 - k), min(nx, i0 + k + 1)
             jlo, jhi = max(0, j0 - k), min(ny, j0 + k + 1)
             if ilo >= ihi or jlo >= jhi:
@@ -1847,6 +1916,9 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 # task SP2: outside msk cut is -inf, never > REMOVE_EPS
                 if np.any(cut > REMOVE_EPS):
                     move_collided = True
+        if kern is not None and cutting and zb_on:
+            zb_vol, zb_a, zb_ext, zb_dext = (zb_state[0], zb_state[1],
+                                             zb_state[2], zb_state[3])
         if cutting:
             cut_length += length
             if axial_depth > 0.0:
@@ -2009,6 +2081,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     zb_windows = _ze2b_windows(zb_moves, dia) if zb_on else []
     result = {
         "stock": stock,
+        # task SP-K2: which per-sample cut kernel produced this report
+        "zcut_kernel": "c" if kern is not None else "python",
         "rapid_collisions": {"count": rapid_collisions,
                             "first_line": first_rapid_line},
         "outside_grid": {"count": outside_grid,
@@ -2166,6 +2240,8 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
         results = pool.map(_chunk_worker, range(len(spans)))
     combined = {
         "stock": np.min(np.stack([r["stock"] for r in results]), axis=0),
+        # task SP-K2: all chunks run in one process family -> same kernel
+        "zcut_kernel": results[0]["zcut_kernel"] if results else "python",
         "rapid_collisions": {
             "count": sum(r["rapid_collisions"]["count"] for r in results),
             "first_line": min((r["rapid_collisions"]["first_line"]
@@ -2638,6 +2714,7 @@ def main(argv=None):
         "stock_in": os.path.abspath(args.stock_in) if args.stock_in else None,
         "holder": _holder_report(args, holder_name, holder_stick),
         "cell": cell,
+        "zcut_kernel": res["zcut_kernel"],
         "window": ("speed option: only cells within 2 mm of steep walls are "
                    "simulated and judged; gouges and every other check outside "
                    "the window are NOT judged; never use for a gate or a "
