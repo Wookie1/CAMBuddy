@@ -191,3 +191,70 @@ no launchctl; ~/.stevecam untouched; locks untouched.
 
 Session end: Fri Oct 30 13:04 MST 2026 (~5 min wall, inside the 45 min
 budget). Stop here per brief.
+
+---
+
+## MENUBAR3
+Session start: Fri Oct 30 13:05 MST 2026 (`date`). Worktree
+/Users/James/ai-sandbox/stevecam-mb, branch menubar @ 71194c0 (brief) on
+8b375e3. Not committed (per brief). `opencode.json` was already modified
+before this session started; it was not touched.
+
+### Change (file:line)
+menubar/SteveCAM.swift (+18 / −1, `git diff --numstat`):
+- L85-95 (`openSettingsWindow`): added comment — now macOS 13 fallback only;
+  behaviour unchanged (still activates, then tries the legacy selectors).
+- L382-396 (MenuContent): replaced
+  `Button("Settings...") { openSettingsWindow() }` with
+  `if #available(macOS 14, *) { SettingsLink { Text("Settings...") } }`
+  `else { Button("Settings...") { openSettingsWindow() } }`.
+  **App-activation choice: `.simultaneousGesture(TapGesture().onEnded {
+  NSApplication.shared.activate(ignoringOtherApps: true) })` on the
+  SettingsLink** (not `.onAppear` in the Settings content), so the Settings
+  window comes to the front when the link is clicked in the MenuBarExtra.
+
+menubar/test_menubar_files.py (+39 / −0): appended NEW
+`test_settings_uses_settingslink` — checks "SettingsLink" and
+`Text("Settings...")` sit between an `if #available(macOS 14` line and the
+closing `} else {` (which carries the macOS 13 Button fallback), and that
+`swiftc -typecheck -parse-as-library menubar/SteveCAM.swift` is green.
+No existing test was altered.
+
+### Test runs (all via /Users/James/ai-sandbox/stevecam-ops/slot_m4.sh, foreground)
+- 13:06 `slot_m4.sh /opt/homebrew/bin/python3 -m pytest -q -p no:cacheprovider
+  "menubar/test_menubar_files.py::test_settings_uses_settingslink"` →
+  1 passed in 0.26s, **exit 0**
+- 13:06 `slot_m4.sh /usr/bin/swiftc -typecheck -parse-as-library
+  menubar/SteveCAM.swift` → **exit 0** (only the two pre-existing warnings:
+  unused `_rc` L43, deprecated `onChange` L410)
+- 13:06 `slot_m4.sh /usr/bin/swiftc -O -swift-version 5 -parse-as-library
+  menubar/SteveCAM.swift -o scratch/SteveCAM` → **exit 0**;
+  build size: **208,664 bytes** (`ls -l scratch/SteveCAM`)
+- 13:06 `slot_m4.sh ... pytest -q -p no:cacheprovider
+  "menubar/test_menubar_files.py"` (all, at-risk) → 7 passed in 0.53s,
+  **exit 0**
+- 13:06 `slot_m4.sh ... pytest -q -p no:cacheprovider
+  "connector/test_pidstatus.py"` (all, at-risk) → 5 passed in 3.00s,
+  **exit 0**
+
+Full suite NOT run (per brief — supervisor runs it).
+
+### git diff --numstat (at 13:06, after all runs)
+    13	0	menubar/MENUBAR_RESULTS.md   (MENUBAR3 section appended; earlier
+                                        sections restored from HEAD — an
+                                        early write had accidentally replaced
+                                        them; content is now HEAD + append)
+    18	1	menubar/SteveCAM.swift
+    39	0	menubar/test_menubar_files.py
+    26	4	opencode.json                (pre-existing, not touched)
+
+### Rules compliance
+No Core Front / engine / connector run; nothing >10 min on the lane; no
+connector/test_connector.py; locks untouched; no make_app.sh /
+install_agent.sh / uninstall_agent.sh / launchctl / built-app run; no git
+stash/reset/clean/restore/checkout/rebase/cherry-pick (the results-file
+restore used read-only `git show HEAD:file > file`); ~/.stevecam and
+~/Library/LaunchAgents untouched; no processes stopped.
+
+Session end: Fri Oct 30 13:07 MST 2026 (~2 min wall, inside the 25 min
+budget). Stop here per brief.

@@ -83,6 +83,9 @@ func stopDecision(state: String?, force: Bool, fromURL: Bool)
 }
 
 func openSettingsWindow() {
+    // macOS 13 fallback only: the showSettingsWindow:/showPreferencesWindow:
+    // selectors no longer open a SwiftUI Settings scene on macOS 14+; the
+    // menu uses SettingsLink there (see MenuContent).
     NSApplication.shared.activate(ignoringOtherApps: true)
     if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil,
                          from: nil) {
@@ -369,7 +372,21 @@ struct MenuContent: View {
             .disabled(!model.running || model.busy)
         Button("Restart") { model.restart() }.disabled(model.busy)
         Button("Open log") { model.openLog() }
-        Button("Settings...") { openSettingsWindow() }
+        // The legacy selectors in openSettingsWindow() are broken on this
+        // macOS; use SwiftUI's SettingsLink (macOS 14+) and keep the
+        // selector path only as the macOS 13 fallback. Activation is done
+        // via .simultaneousGesture so the Settings window comes to front.
+        if #available(macOS 14, *) {
+            SettingsLink {
+                Text("Settings...")
+            }
+            .simultaneousGesture(
+                TapGesture().onEnded {
+                    NSApplication.shared.activate(ignoringOtherApps: true)
+                })
+        } else {
+            Button("Settings...") { openSettingsWindow() }
+        }
         Divider()
         Button("Quit SteveCAM") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")

@@ -178,3 +178,42 @@ def test_swift_stop_guard():
         body = "\n".join(bodies[name])
         assert "stopDecision(" in body and "performStop(" in body
         assert body.index("stopDecision(") < body.index("performStop(")
+
+
+# ------------------------------------------- MENUBAR3: Settings via link --
+
+def test_settings_uses_settingslink():
+    """MENUBAR3: the menu opens the SwiftUI Settings scene through
+    SettingsLink (the legacy showSettingsWindow:/showPreferencesWindow:
+    selectors are broken on this macOS). Checks:
+    1. SteveCAM.swift contains "SettingsLink" inside an
+       `#available(macOS 14` branch, i.e. on a line after
+       `if #available(macOS 14` and before the closing `} else {` that
+       carries the macOS 13 Button fallback;
+    2. `swiftc -typecheck -parse-as-library` is green.
+    """
+    text = open(os.path.join(HERE, "SteveCAM.swift")).read()
+    lines = text.splitlines()
+    start = None
+    for i, ln in enumerate(lines):
+        if re.search(r"if\s+#available\(\s*macOS\s+14\b", ln):
+            start = i
+            break
+    assert start is not None, "no `if #available(macOS 14 ...` branch"
+    end = None
+    for j in range(start, len(lines)):
+        if re.search(r"\}\s*else\b", lines[j]):
+            end = j
+            break
+    assert end is not None, "#available(macOS 14 branch has no `} else {`"
+    branch = "\n".join(lines[start:end])
+    assert "SettingsLink" in branch, \
+        "SettingsLink not inside the #available(macOS 14 branch"
+    assert 'Text("Settings...")' in branch
+    assert 'Button("Settings...") { openSettingsWindow() }' \
+        in "\n".join(lines[end:end + 4]), "macOS 13 fallback missing"
+    src = os.path.join(HERE, "SteveCAM.swift")
+    out = subprocess.run(["/usr/bin/swiftc", "-typecheck",
+                          "-parse-as-library", src],
+                         capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, out.stdout[-2000:] + out.stderr[-2000:]
