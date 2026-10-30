@@ -12,3 +12,4 @@ connector/probe_*.py
 docs/*.pdf
 .DS_Store
 samples/*.nc
+verify/zkern/libzcut.dylib

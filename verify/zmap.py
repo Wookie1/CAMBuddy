@@ -15,7 +15,10 @@ import sys
 import numpy as np
 
 try:  # task SP-K2: optional C kernel for the per-sample stock cut
-    import zkern as _zkern
+    try:  # `python -m verify.zmap` (the connector) needs the package path
+        from verify import zkern as _zkern
+    except ImportError:  # `python verify/zmap.py`: verify/ is sys.path[0]
+        import zkern as _zkern
     _KERN = _zkern.load()
 except Exception:  # no C kernel available -> pure-Python path
     _zkern = None
