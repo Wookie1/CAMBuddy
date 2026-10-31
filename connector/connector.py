@@ -12,10 +12,12 @@ import datetime
 import hashlib
 import json
 import os
+import queue
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -138,6 +140,14 @@ class Connector:
         self._last_event = None
         self._last_keys_refresh = 0.0
         self._stop = False
+        # PANELCANCEL: jobs and tool actions run on ONE long-lived FIFO
+        # worker while the message loop keeps polling (only "cancel" is
+        # handled there). self._lock serializes status/event/report writes
+        # between the worker and the loop; the worker exists only while
+        # run_forever runs - direct handle_message callers stay inline.
+        self._queue = queue.Queue()
+        self._worker = None
+        self._lock = threading.RLock()
         # MENUBAR: <home>/status.json for the menu-bar app (secret-free).
         self.status_path = os.path.join(self.home, "status.json")
         self.commit = self._git_commit()
@@ -168,17 +178,19 @@ class Connector:
         """Atomic <home>/status.json: {pid, state, action, progress,
         updated (UTC ISO), fingerprint, connector_name, commit, last_run}.
         NEVER carries keys, steve_keys, tokens, identity or the pairing
-        code. Never raises into the run loop."""
+        code. Never raises into the run loop. PANELCANCEL: serialized by
+        self._lock (worker vs loop; RLock so emit_state may nest)."""
         try:
-            data = {"pid": os.getpid(), "state": state, "action": action,
-                    "progress": progress, "updated": self._utc_now(),
-                    "fingerprint": self.fingerprint,
-                    "connector_name": self.cfg["connector_name"],
-                    "commit": self.commit, "last_run": self.last_run}
-            tmp = self.status_path + ".tmp"
-            with open(tmp, "w") as fh:
-                json.dump(data, fh, sort_keys=True)
-            os.replace(tmp, self.status_path)
+            with self._lock:
+                data = {"pid": os.getpid(), "state": state, "action": action,
+                        "progress": progress, "updated": self._utc_now(),
+                        "fingerprint": self.fingerprint,
+                        "connector_name": self.cfg["connector_name"],
+                        "commit": self.commit, "last_run": self.last_run}
+                tmp = self.status_path + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(data, fh, sort_keys=True)
+                os.replace(tmp, self.status_path)
         except Exception:
             pass
 
@@ -288,14 +300,24 @@ class Connector:
         data = {"state": state, "action": action, "progress": progress}
         # MENUBAR: status.json is refreshed on EVERY call, even when the
         # event is unchanged or the post below fails.
-        self._write_status(state, action, progress)
-        if data == self._last_event:
-            return
-        self._last_event = data
-        try:
-            self.client.post_event(catalog_mod.EVENT, data)
-        except SteveError:
-            pass
+        # PANELCANCEL: the _last_event check/update, the status write and
+        # the post are ONE critical section (worker vs loop).
+        with self._lock:
+            self._write_status(state, action, progress)
+            if data == self._last_event:
+                return
+            self._last_event = data
+            try:
+                self.client.post_event(catalog_mod.EVENT, data)
+            except SteveError:
+                pass
+
+    def _report(self, run_id, state, **kw):
+        """PANELCANCEL: client.report_run serialized against the other
+        thread's writes (same self._lock; exception behaviour unchanged -
+        SteveError propagates to the caller's existing handlers)."""
+        with self._lock:
+            return self.client.report_run(run_id, state, **kw)
 
     # ----------------------------------------------------------- messages --
     def verify_envelope(self, msg):
@@ -326,6 +348,14 @@ class Connector:
         run_id = env.get("id")
         kind = msg.get("kind")
         if kind == "cancel":
+            # PANELCANCEL: a cancel is acted on ONLY when its envelope
+            # verifies (a forged/expired/unknown-kid one is ignored
+            # silently, no report) and it names the ACTIVE job's run id;
+            # one for any other id (queued, finished, unknown) is ignored.
+            # The worker's `except Cancelled` path reports "cancelled"
+            # once and ends the run (status.json ends "idle").
+            if not ok:
+                return
             target = env.get("run")
             if self.running and self.current_run == target:
                 self.running.cancel()
@@ -346,9 +376,38 @@ class Connector:
             return
         self._remember_run(run_id)
         if action in catalog_mod.TOOL_ACTIONS:
-            self._run_tool_action(run_id, env, action)
+            self._dispatch(("tool", run_id, env, action))
             return
-        self._run_job(run_id, env, action)
+        self._dispatch(("job", run_id, env, action))
+
+    # ------------------------------------------------------------- worker --
+    def _dispatch(self, item):
+        """PANELCANCEL: while run_forever is up, jobs and tool actions go
+        to the FIFO worker (arrival order, one at a time - exactly today's
+        ordering) and the loop keeps polling; without a worker (direct
+        callers, e.g. tests) they run inline as before."""
+        if self._worker is not None:
+            self._queue.put(item)
+        else:
+            self._exec(item)
+
+    def _exec(self, item):
+        kind, run_id, env, action = item
+        if kind == "tool":
+            self._run_tool_action(run_id, env, action)
+        else:
+            self._run_job(run_id, env, action)
+
+    def _worker_loop(self):
+        while not self._stop:
+            try:
+                item = self._queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            try:
+                self._exec(item)
+            except Exception:
+                pass  # one bad job must not kill the worker
 
     def tool_action(self, action, values):
         """Track 2: tools.list / tools.update / job.get / job.renumber on
@@ -416,7 +475,7 @@ class Connector:
             err = errors.make_error("no_view", "no 3D view for that run",
                                     field="run_id")
             try:
-                self.client.report_run(
+                self._report(
                     run_id, "failed", error=err,
                     result=envelope.for_failure(catalog_mod.VIEW_ACTION,
                                                 err))
@@ -431,7 +490,7 @@ class Connector:
                       "files": [n for n, _p, _m in src]}
             result = dict(result, **envelope.for_tool_action(
                 catalog_mod.VIEW_ACTION, result))
-            self.client.report_run(run_id, "succeeded", result=result,
+            self._report(run_id, "succeeded", result=result,
                                    message="done")
         except SteveError:
             pass
@@ -461,15 +520,17 @@ class Connector:
         except OSError:
             pass
         # MENUBAR: refresh last_run (and status.json) with the new entry.
-        self.last_run = self._newest_run()
-        ev = self._last_event or {}
-        self._write_status(ev.get("state", "idle"), ev.get("action"),
-                           ev.get("progress"))
-        try:
-            self.client.post_event(catalog_mod.LAST_RUNS_EVENT,
-                                   self._last_runs_data())
-        except SteveError:
-            pass
+        # PANELCANCEL: same lock as emit_state's status/event writes.
+        with self._lock:
+            self.last_run = self._newest_run()
+            ev = self._last_event or {}
+            self._write_status(ev.get("state", "idle"), ev.get("action"),
+                               ev.get("progress"))
+            try:
+                self.client.post_event(catalog_mod.LAST_RUNS_EVENT,
+                                       self._last_runs_data())
+            except SteveError:
+                pass
 
     def _last_runs_data(self):
         """The newest <= LAST_RUNS_MAX recorded runs, newest first, always
@@ -507,15 +568,15 @@ class Connector:
 
     def _run_tool_action(self, run_id, env, action):
         try:
-            self.client.report_run(run_id, "received")
+            self._report(run_id, "received")
         except SteveError:
             pass
         ok, values = catalog_mod.validate(env.get("inputs", {}), action)
         try:
             if not ok:
-                self.client.report_run(run_id, "rejected", error=values)
+                self._report(run_id, "rejected", error=values)
                 return
-            self.client.report_run(run_id, "running", progress=0.5,
+            self._report(run_id, "running", progress=0.5,
                                    message=action)
             if action == catalog_mod.VIEW_ACTION:
                 return self._run_view_load(run_id, values)
@@ -529,10 +590,10 @@ class Connector:
             else:
                 result = dict(result, **envelope.for_tool_action(action,
                                                                  result))
-                self.client.report_run(run_id, "succeeded", result=result,
+                self._report(run_id, "succeeded", result=result,
                                        message="done")
                 return
-            self.client.report_run(run_id, "failed", error=err,
+            self._report(run_id, "failed", error=err,
                                    result=envelope.for_failure(action, err))
         except SteveError:
             pass
@@ -550,7 +611,7 @@ class Connector:
 
     def _safe_reject(self, run_id, code):
         try:
-            self.client.report_run(run_id, "rejected",
+            self._report(run_id, "rejected",
                                   error=errors.make_error(code, code))
         except SteveError:
             pass
@@ -571,7 +632,7 @@ class Connector:
 
         self.emit_state("busy", action, 0.0)
         try:
-            self.client.report_run(run_id, "received")
+            self._report(run_id, "received")
         except SteveError:
             pass
         engine = EngineRun(self.cfg, work)
@@ -582,7 +643,7 @@ class Connector:
             if p - last[0] >= 0.02 or m != last[1]:
                 last[0], last[1] = p, m
                 try:
-                    self.client.report_run(run_id, "running", progress=round(p, 3),
+                    self._report(run_id, "running", progress=round(p, 3),
                                          message=m)
                 except SteveError:
                     pass
@@ -610,7 +671,7 @@ class Connector:
                 data = self.client.download(inp["url"], inp.get("headers"))
                 digest = hashlib.sha256(data).hexdigest()
                 if digest != inp.get("sha256") or len(data) != inp.get("bytes"):
-                    self.client.report_run(
+                    self._report(
                         run_id, "rejected",
                         error=errors.make_error(
                             "input_digest_mismatch",
@@ -634,7 +695,7 @@ class Connector:
                     fh.write(data)
             ok, code, values = prepare_values(env.get("inputs", {}), action)
             if not ok:
-                self.client.report_run(run_id, "rejected", error=values)
+                self._report(run_id, "rejected", error=values)
                 rejected = True
                 end_run()
                 return
@@ -672,12 +733,12 @@ class Connector:
                 if fname.endswith(".nc"):
                     self._copy_program(path, values["program_number"],
                                        fname[:-3])
-            self.client.report_run(run_id, "succeeded", result=result,
+            self._report(run_id, "succeeded", result=result,
                                  message="done")
             end_run()
         except Cancelled:
             try:
-                self.client.report_run(run_id, "cancelled",
+                self._report(run_id, "cancelled",
                                      message="cancelled")
             except SteveError:
                 pass
@@ -691,7 +752,7 @@ class Connector:
                     "internal_error", "%s: %s" % (type(e).__name__,
                                                   str(e)[:200]))
             try:
-                self.client.report_run(
+                self._report(
                     run_id, "failed", error=err,
                     result=envelope.for_failure(action, err))
             except SteveError:
@@ -721,6 +782,11 @@ class Connector:
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
         self._write_status("starting")
+        # PANELCANCEL: the long-lived FIFO worker (jobs + tool actions) so
+        # the loop below keeps polling and can read a cancel mid-job.
+        self._worker = threading.Thread(target=self._worker_loop,
+                                        daemon=True)
+        self._worker.start()
         self.enroll()
         self.get_token_blocking()
         self.publish_catalog_and_panel()
@@ -752,6 +818,13 @@ class Connector:
             if cursor != self.state.get("cursor"):
                 self.state["cursor"] = cursor
                 self._save()
+        # PANELCANCEL: stop()/SIGTERM - cancel the active job, let the
+        # worker finish it (it drains NOTHING new: the get() poll sees
+        # _stop and exits), join it bounded, then "off" and exit 0.
+        if self.running:
+            self.running.cancel()
+        if self._worker is not None:
+            self._worker.join(timeout=60)
         self._write_status("off")
 
 
