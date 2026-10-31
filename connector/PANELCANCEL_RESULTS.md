@@ -514,3 +514,10 @@ full connector/test_connector.py NOT run (supervisor's). No lock files touched,
 no git state changes, nothing installed, no launchctl; only self-started PIDs
 signalled, by exact PID. No G-code or large outputs printed. Scratch only under
 scratch/ (panelcancel_m6_m5x + logs). Nothing committed (per brief).
+
+## Supervisor hand-edit after PANELCANCEL6 (coordinator decision 2026-10-31)
+- menubar/com.stevecam.connector.plist.in: ExitTimeOut 30 -> 45; menubar/README.md line to match.
+- menubar/test_menubar_files.py::test_plist_exit_timeout: threshold >= 30 -> >= 45 (coordinator-approved; test new on this
+  branch, never merged); docstring updated.
+- connector.py comments only: worst case SIGTERM -> exit = poll slice 10 + cancel 5 (sp-p3c _kill_all) + SHUTDOWN_GRACE 8
+  + SHUTDOWN_KILL_JOIN 4 + tail ~1 ~= 28 s < ExitTimeOut 45 (~17 s spare). SHUTDOWN_GRACE stays 8 s.

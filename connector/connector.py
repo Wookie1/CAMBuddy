@@ -39,10 +39,11 @@ PANEL_NAME = catalog_mod.ACTION
 RUN_ID_MAX = 128             # view.load run_id length cap (STEVE's id format is not assumed)
 LAST_RUNS_MAX = 10           # the last_runs event lists at most this many
 LAST_RUNS_MAX_BYTES = 8 * 1024   # event data stays under 8 kB
-# PANELCANCEL5: bounded shutdown tail (launchd ExitTimeOut 30 s in the
+# PANELCANCEL5: bounded shutdown tail (launchd ExitTimeOut 45 s in the
 # plist). Worst case from SIGTERM to exit: one in-flight poll slice
-# (Connector.POLL_INTERRUPT = 10 s) + cancel + SHUTDOWN_GRACE +
-# SHUTDOWN_KILL_JOIN + the queued-reject/"off" tail ~= 23 s < 30 s.
+# (Connector.POLL_INTERRUPT = 10 s) + cancel (up to 5 s with sp-p3c's
+# _kill_all) + SHUTDOWN_GRACE + SHUTDOWN_KILL_JOIN + the queued-reject/
+# "off" tail: 10 + 5 + 8 + 4 + ~1 ~= 28 s < 45 s.
 SHUTDOWN_GRACE = 8.0         # s to wait for the worker after cancel()
 SHUTDOWN_KILL_JOIN = 4.0     # s more to wait after SIGKILLing the engine
 # PANELCANCEL6: ids cancelled between the worker's get() and the worker
@@ -961,7 +962,7 @@ class Connector:
 
     # PANELCANCEL4 (supervisor review of 7f89867): 1.0 s made an idle
     # connector GET /messages once a second (30x the old rate); 10.0 s
-    # keeps shutdown bounded well inside the plist's ExitTimeOut 30
+    # keeps shutdown bounded well inside the plist's ExitTimeOut 45
     # (PANELCANCEL5).
     POLL_INTERRUPT = 10.0  # s: longest single GET /messages wait while idle
 

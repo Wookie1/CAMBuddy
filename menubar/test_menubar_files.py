@@ -223,9 +223,10 @@ def test_settings_uses_settingslink():
 
 def test_plist_exit_timeout(tmp_path):
     """PANELCANCEL5: the rendered plist gives the connector a bounded,
-    generous shutdown window: ExitTimeOut is an int >= 30 (launchd sends
+    generous shutdown window: ExitTimeOut is an int >= 45 (launchd sends
     SIGTERM at logout/stop and SIGKILLs after ExitTimeOut; the connector's
-    worst-case tail is ~23 s, see connector.py's SHUTDOWN_* constants)."""
+    worst-case tail is ~28 s with P3C's 5 s cancel, see connector.py's
+    SHUTDOWN_* constants; 45 leaves ~17 s spare)."""
     src = os.path.join(HERE, "com.stevecam.connector.plist.in")
     text = open(src).read()
     rendered = text.replace("@REPO@", REPO).replace("@HOME@", str(tmp_path))
@@ -236,4 +237,4 @@ def test_plist_exit_timeout(tmp_path):
     timeout = d.get("ExitTimeOut")
     assert isinstance(timeout, int) and not isinstance(timeout, bool), \
         "ExitTimeOut missing or not an int: %r" % (timeout,)
-    assert timeout >= 30, "ExitTimeOut %r < 30" % timeout
+    assert timeout >= 45, "ExitTimeOut %r < 45" % timeout
