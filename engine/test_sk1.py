@@ -13,7 +13,9 @@ the flank, load-checked like the bands.
 Run standalone with VibeCAD python:
     /Applications/VibeCAD.app/Contents/Resources/bin/python engine/test_sk1.py
 """
+import contextlib
 import hashlib
+import io
 import json
 import math
 import os
@@ -170,52 +172,60 @@ def test_sk1_air_entry_all_faces():
 
 
 def test_sk1_no_faces_today_behaviour():
-    """NO faces listed: today's behaviour exactly - the axial-plunge
-    failure with the same count as main (listing a flute without faces
-    keeps the class OFF)."""
+    """NO faces listed (jaws/clamps may sit at any face): no air-column
+    descent and no side-entry move anywhere, with or without a flute length
+    (the class stays OFF). Baseline changed with SKN: the ring is a true thin
+    skin, left standing in skin_skipped with its warning, so the run
+    completes with 0 axial plunges instead of failing the plunge gate."""
     assert HAVE_AREA, "run with VibeCAD python"
-    n_off, _ = _synth_plunge()
-    assert n_off > 0, "today's code must still fail the ring entry"
-    n_flute, _ = _synth_plunge(flute_mm=FLUTE)
-    assert n_flute == n_off, "flute without faces changed behaviour: %d != %d" \
-        % (n_flute, n_off)
-    if os.path.exists(RUNA_JSON):
-        n_main = json.load(open(RUNA_JSON))["synth_plunge_count"]
-    else:
-        n_main, _ = _synth_plunge(_main_rough_mod())
-    assert n_off == n_main, "not today's behaviour: %d != main %d" \
-        % (n_off, n_main)
-    print("SK1 no-faces: axial plunge count %d == main %d (class OFF)"
-          % (n_off, n_main))
+    for kw in ({}, {"flute_mm": FLUTE}):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            _moves, stats = _synth_rough(**kw)
+        assert not stats.get("sk1_feedin"), \
+            "air-column descent with no faces listed %s: %s" \
+            % (kw, stats["sk1_feedin"][:3])
+        assert stats["n_side_entries"] == 0, \
+            "side entry with no faces listed %s: %d" \
+            % (kw, stats["n_side_entries"])
+        skins = stats["skin_skipped"]
+        assert skins, "ring skin not in skin_skipped %s" % kw
+        assert err.getvalue().count("WARNING: thin skin") == len(skins)
+        assert stats["n_axial_plunge"] == 0, stats.get("axial_pts")
+    print("SK1 no-faces: 0 side/air entries, %d skins warned, 0 plunges "
+          "(class OFF)" % len(skins))
 
 
 def test_sk1_partial_faces():
     """Only xpos open: air entries may only descend beyond xpos - no
     descent column lies beyond an UNLISTED face (jaws/clamps may sit at
-    the closed faces)."""
+    the closed faces). Baseline changed with SKN: the skins at the other
+    faces are left standing in skin_skipped (warned) instead of aborting
+    the run on the plunge gate."""
     assert HAVE_AREA, "run with VibeCAD python"
-    try:
-        _synth_rough(side_entry_faces="xpos", flute_mm=FLUTE)
-        raise AssertionError("xpos-only run must still abort elsewhere")
-    except RuntimeError as e:
-        if "axial-plunge FAILED" not in str(e):
-            raise
-        n, stats = _plunge_count(e)
-    assert n > 0
-    feeds = (stats or {}).get("sk1_feedin") or []
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        _moves, stats = _synth_rough(side_entry_faces="xpos", flute_mm=FLUTE)
+    feeds = stats.get("sk1_feedin") or []
     for rec in feeds:
         sx, sy = rec["col"]
         assert "xpos" in _beyond(sx, sy, TOOL_R), \
             "descent column not beyond the only listed face: %r" % rec
         assert not (_beyond(sx, sy, TOOL_R) - {"xpos"}), \
             "descent column beyond an unlisted face: %r" % rec
-    print("SK1 xpos-only: %d xpos feed-ins accepted, %d plunges remain"
-          % (len(feeds), n))
+    assert stats["n_axial_plunge"] == 0, stats.get("axial_pts")
+    skins = stats["skin_skipped"]
+    assert skins, "other faces' skins not in skin_skipped"
+    assert err.getvalue().count("WARNING: thin skin") == len(skins)
+    print("SK1 xpos-only: %d xpos feed-ins accepted, %d skins left at the "
+          "other faces, 0 plunges" % (len(feeds), len(skins)))
 
 
 def test_sk1_side_entry_min_z():
     """--side-entry-min-z: at or above it the air entries run; a level
-    below it gets NO air-column entry (and therefore fails as today)."""
+    below it gets NO air-column entry. Baseline changed with SKN: that
+    level's ring is left standing in skin_skipped (warned) instead of
+    failing the plunge gate."""
     assert HAVE_AREA, "run with VibeCAD python"
     _moves, stats = _synth_rough(side_entry_faces=ALL_FACES,
                                  flute_mm=FLUTE, side_entry_min_z=0.381)
@@ -225,20 +235,21 @@ def test_sk1_side_entry_min_z():
         "no lowest-level air entry: %s" % [r["z"] for r in feeds]
     assert all(r["z"] >= 0.381 - 1e-9 for r in feeds)
     # min_z above the final floor level: that level may not air-enter
-    try:
-        _synth_rough(side_entry_faces=ALL_FACES, flute_mm=FLUTE,
-                     side_entry_min_z=0.881)
-        raise AssertionError("min_z=0.881 must block the 0.381 level")
-    except RuntimeError as e:
-        if "axial-plunge FAILED" not in str(e):
-            raise
-        n, st = _plunge_count(e)
-    feeds = (st or {}).get("sk1_feedin") or []
-    assert all(r["z"] >= 0.881 - 1e-9 for r in feeds), \
-        "air entry below min_z: %s" % [r["z"] for r in feeds]
-    assert n > 0
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        _moves, st = _synth_rough(side_entry_faces=ALL_FACES, flute_mm=FLUTE,
+                                  side_entry_min_z=0.881)
+    feeds2 = st.get("sk1_feedin") or []
+    assert all(r["z"] >= 0.881 - 1e-9 for r in feeds2), \
+        "air entry below min_z: %s" % [r["z"] for r in feeds2]
+    assert st["n_axial_plunge"] == 0, st.get("axial_pts")
+    low = [k for k in st["skin_skipped"] if k["z"] < 0.881]
+    assert low, "the level below min_z is not in skin_skipped: %s" \
+        % [k["z"] for k in st["skin_skipped"]]
+    assert err.getvalue().count("WARNING: thin skin") == \
+        len(st["skin_skipped"])
     print("SK1 min-z: %d entries >= 0.381; with min_z=0.881 no entry below "
-          "it, %d plunges remain" % (len(stats["sk1_feedin"]), n))
+          "it, %d skins left below it" % (len(stats["sk1_feedin"]), len(low)))
 
 
 def _tb_program(mod=None):

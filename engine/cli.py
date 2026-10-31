@@ -799,9 +799,11 @@ def main(argv=None):
               % (zi, z, lvl.get("region_mm2", 0.0), len(islands), nreg,
                  stats["t_islands"], stats["t_adaptive"]), flush=True)
         if a.json_progress:
+            # rough's own plan: it can insert mandatory levels past `order`
+            n = max(1, len(stats.get("levels_planned") or order))
             print(json.dumps({
-                "progress": round(0.05 + 0.9 * zi / max(1, len(order)), 3),
-                "message": "level %d/%d" % (zi, len(order))}), flush=True)
+                "progress": round(0.05 + 0.9 * min(zi, n) / n, 3),
+                "message": "level %d/%d" % (zi, n)}), flush=True)
 
     workers = a.workers if a.workers is not None else int(os.environ.get("ENGINE_WORKERS", 4))  # 4: keeps local oMLX under its memory watermark
     # SK1: flute length for the air-column feed-in load check: --flute
