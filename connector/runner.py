@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 
 import toollib
 import view  # TASK_VIEW3D: display-only view.bin/view.json builder
@@ -26,6 +27,12 @@ FINISH_ENGAGE_FACTOR = 1.5
 # zmap judge worker processes on this machine (results equal --jobs 1 except
 # chunk-order float sums in report-only keys; ~3-4 GB peak per CF judge)
 ZMAP_JOBS = 12
+# TASK SP-P3C-1: a judge that STARTS while the engine chain is still
+# running shares the machine with it -> fewer workers; a judge that starts
+# after the engine chain has finished gets the full ZMAP_JOBS again
+ZMAP_JOBS_OVERLAP = 6
+# TASK SP-P3C-1: the judge-chain progress text, defined in one place only
+CHECKING_FMT = "checking (%d of %d)"
 
 # ---------------------------------------------------------------------------
 # Task RR1b: T20 ball rest-rough defaults (parameters + defaults only).
@@ -1075,185 +1082,122 @@ class EngineRun:
                  "clcheck": (0.76, 0.80), "zmap_rough": (0.80, 0.90),
                  "zmap_finish": (0.90, 0.97)}
 
+        # TASK SP-P3C-1: two chains. The ENGINE chain (this thread) runs
+        # every step that reads only engine stocks; the JUDGE chain (one
+        # worker thread) builds hf01 and runs the zmap judges beside it.
+        # Both chains report through ONE progress sink and append to ONE
+        # steps.log, both guarded by prog_lock. Every argv stays
+        # byte-identical to the serial runner's except the --jobs value:
+        # a judge that starts while the engine chain still runs uses
+        # ZMAP_JOBS_OVERLAP, otherwise ZMAP_JOBS.
+        prog_lock = threading.Lock()
+        prog_state = {"last": 0.0, "check_n": 0, "cur": 0}
+        engine_done = threading.Event()   # every engine step returned
+        judge_done = threading.Event()    # the judge chain has returned
+        abort = threading.Event()         # engine failed: judges must end
+        ev_rough = threading.Event()      # rough.nc posted + accepted
+        ev_finish = threading.Event()     # finish.nc posted + accepted
+        ev_rest = threading.Event()       # rest.nc clchecked + accepted
+        judge_errors = []
+        judge_out = {}
+        total_judges = 3 if rest else 2
+        steps_log = os.path.join(self.work, "steps.log")
+
+        def emit(p, msg):
+            # the run's single on_progress sink; prog_lock must be held.
+            # values never decrease.
+            if p < prog_state["last"]:
+                p = prog_state["last"]
+            else:
+                prog_state["last"] = p
+            if on_progress:
+                on_progress(p, msg)
+
+        def sink(p, msg):
+            with prog_lock:
+                emit(p, msg)
+
+        def checking(n):
+            # once the engine chain has finished and judges remain, the
+            # only progress text is CHECKING_FMT % (n, total): n is the
+            # judge now running (1-based). Each judge speaks at most once;
+            # values stay monotone and reach 1.0 with the last judge.
+            with prog_lock:
+                if not engine_done.is_set() or judge_done.is_set():
+                    return
+                if n <= prog_state["check_n"]:
+                    return
+                prog_state["check_n"] = n
+                last = prog_state["last"]
+                emit(last + (1.0 - last) * n / total_judges,
+                     CHECKING_FMT % (n, total_judges))
+
+        def step(chain, name, argv, lo, hi, prog=None, **kw):
+            # one _spawn plus its steps.log line, written under prog_lock:
+            # "<step> <start epoch s> <end epoch s> <chain>"
+            t0 = time.time()
+            try:
+                return self._spawn(argv, lo, hi, prog, **kw)
+            finally:
+                t1 = time.time()
+                with prog_lock:
+                    with open(steps_log, "a") as fh:
+                        fh.write("%s %.3f %.3f %s\n" % (name, t0, t1, chain))
+
         # 1) orient + stock box + part heightfield (for the roughing clip;
         #    grid covers stock + largest tool radius of the run + margin)
         max_tool_r = max(values["tool_diameter"],
                          values["rough_tool_diameter"]) / 2.0
-        self._spawn([py, "-m", "engine.cli", "prepare",
-                    "--step", step_path, "--out-dir", self.work,
-                    "--orient", values["orientation"],
-                    "--origin", values.get("origin") or "model_origin",
-                    *_stock_args(values),
-                    "--stock-top", "%.4f" % values["stock_top"],
-                    "--stock-bottom", "%.4f" % values["stock_bottom"],
-                    "--cell", "0.5",
-                    "--tool-r", "%.4f" % max_tool_r], *P["prepare"],
-                    on_progress)
+        step("engine", "prepare",
+             [py, "-m", "engine.cli", "prepare",
+              "--step", step_path, "--out-dir", self.work,
+              "--orient", values["orientation"],
+              "--origin", values.get("origin") or "model_origin",
+              *_stock_args(values),
+              "--stock-top", "%.4f" % values["stock_top"],
+              "--stock-bottom", "%.4f" % values["stock_bottom"],
+              "--cell", "0.5",
+              "--tool-r", "%.4f" % max_tool_r], *P["prepare"], sink)
         with open(os.path.join(self.work, "prepare.json")) as fh:
             prep = json.load(fh)
         stock = prep["stock"]
         floor = stock[4] + values["floor_z"]
-
-        # 2) fresh zmap part heightfield (verify/heightfield.py, 0.01 mm
-        #    tess, 0.1 mm cell) - independent of the roughing clip grid.
-        #    The shared builder covers STOCK_BOX + TOOL_R + MARGIN: zmap
-        #    exits non-zero when the stock box or a tool footprint extends
-        #    beyond its grid.
-        # task HC: remove any stale artifacts from a reused run dir before
-        # rebuilding; after each build require the fresh files to exist and
-        # the sidecar to pin this run's STEP, cell and tess tolerance
         fr = self._freshness()
+
+        # everything the judge chain needs is computed BEFORE the thread
+        # starts: its paths, the stock and the tool data the judges use.
+        # The zmap argv lists are byte-identical to the serial runner's
+        # except the --jobs value, replaced at judge start by with_jobs.
         step_sha = fr.sha256_file(prep["step"])
         hf01 = os.path.join(self.work, "part_hf01.npy")
-        fr.remove_stale(hf01)
-        self._spawn([fc, os.path.join(repo, "verify", "heightfield.py")],
-                    0.12, 0.17, on_progress,
-                    extra_env={"STEP_IN": prep["step"], "HF_OUT": hf01,
-                              "CELL": "0.1", "TESS_TOL": "0.01",
-                              "STOCK_BOX": " ".join("%.4f" % v
-                                                    for v in stock[:4]),
-                              "TOOL_R": "%.4f" % max_tool_r})
-        try:
-            fr.require_fresh(hf01, step_sha256=step_sha, cell=0.1,
-                             tess_tol=0.01)
-        except OSError as e:
-            raise EngineError(str(e), code="stale_artifact")
-
-        # 3) adaptive roughing (LNC post, full stock); the finish and the rest
-        #    pass need the engine's own post-roughing stock for their rapid /
-        #    lift / holder clearance (--stock-from), so the rough exports it.
-        #    Task UN: every post honors the requested units (--metric only
-        #    for mm; inch posts emit G20 with a matching 0.00254 post grid)
-        metric = values["units"] == "mm"
-        post_grid = "0.001" if metric else "0.00254"
-        posted = {}
-        nc = os.path.join(self.work, "rough.nc")
-        stats_path = os.path.join(self.work, "rough_stats.json")
-        rough_stock_out = os.path.join(self.work, "stock_after_rough_engine.npy")
-        argv = [py, "-m", "engine.cli", "rough",
-                "--step", prep["step"],
-                "--stock", *[("%.4f" % v) for v in stock],
-                "--tool", "%s:%.4f:%.4f" % (values["rough_tool_type"],
-                                           values["rough_tool_diameter"],
-                                           values["rough_corner_radius"]),
-                "--out", nc, "--floor", "%.4f" % floor,
-                "--leave", "%.4f" % values["rough_stock_to_leave"],
-                "--stepdown", "%.4f" % values["rough_stepdown"],
-                "--optimal-load-mm", "%.4f" % values["rough_optimal_load"],
-                "--stepup", "%.4f" % values["rough_rest_stepup"],
-                "--hf", prep["hf"], "--min-rest", "0.5",
-                "--cut-feed", "%.1f" % values["feed"],
-                "--ramp-feed", "%.1f" % values["ramp_feed"],
-                "--spindle", str(int(values["rpm"])),
-                "--post", "lnc", "--program",
-                str(int(values["program_number"])),
-                "--tool-number", str(rough_number),
-                *self._tools_json_args(),
-                "--json-progress", "--stats-json", stats_path]
-        # always: the finish (and any rest pass) plans its rapids, lifts and
-        # holder clearance against this stock - without it the engine only
-        # adds 1 mm over the part and rapids crossed roughing terraces
-        fr.remove_stale(rough_stock_out)
-        argv += ["--stock-out", rough_stock_out]
-        argv += _origin_flags(values)
-        if metric:
-            argv += ["--metric"]
-        argv += self._load_limit_args(values)
-        self._spawn(argv, *P["rough"], on_progress)
-        posted["rough.nc"] = posted_units(nc, values["units"])
-
-        # 4) tessellate the oriented model (finish input + clcheck probe);
-        #    stale model.stl removed first, fresh non-empty output asserted
-        stl = os.path.join(self.work, "model.stl")
-        fr.remove_stale(stl)
-        self._spawn([fc, os.path.join(repo, "engine", "_tessellate.py")],
-                    0.45, 0.50, on_progress,
-                    extra_env={"STEP_IN": prep["step"], "STL_OUT": stl,
-                              "TOL": "0.01"})
-        try:
-            fr.require_stl(stl)
-        except OSError as e:
-            raise EngineError(str(e), code="stale_artifact")
-
-        # 5) slope-split finishing (neutral G-code). PQ: the engine snaps the
-        #    emitted points to the output grid matching this op's post units
-        #    (metric post -> 0.001 mm; an inch post uses 0.00254 so PQ's
-        #    snap stays a no-op on posting)
-        fin_neutral = os.path.join(self.work, "finish_neutral.ngc")
-        fin_stats = os.path.join(self.work, "finish_stats.json")
-        # RR-STOCK: the engine replays its own emitted finish moves into a
-        # 0.1 mm stock; the rest pass plans on THAT (never on a judge stock)
-        stock_fin_engine = os.path.join(
-            self.work, "stock_after_finish_engine.npy")
-        fr.remove_stale(stock_fin_engine)
-        self._spawn([py, "-m", "engine.cli", "finish",
-                    "--stl", stl,
-                    "--tool", "ball:%.4f" % values["tool_diameter"],
-                    "--out", fin_neutral,
-                    "--stepover", "%.4f" % values["stepover"],
-                    "--stepdown", "%.4f" % values["stepdown"],
-                    "--slope-threshold", "%.2f" % values["slope_threshold"],
-                    "--floor", "%.4f" % floor,
-                    "--cut-feed", "%.1f" % values["feed"],
-                    "--ramp-feed", "%.1f" % values["ramp_feed"],
-                    "--ramp-angle-deg",
-                    "%.2f" % (values.get("ramp_angle_deg") or 2.0),
-                    "--spindle", str(int(values["rpm"])),
-                    "--post-grid-mm", post_grid,
-                    "--stock-from", rough_stock_out,
-                    "--stock-out", stock_fin_engine,
-                    *self._tools_json_args(),
-                    "--stats-json", fin_stats], 0.50, 0.72, on_progress)
-
-        # 6) post to LNC in the requested units (task UN: --metric only for
-        #    mm, inch posts emit G20; the posted artifact is what clcheck
-        #    judges); header carries run-after-roughing
-        fin = os.path.join(self.work, "finish.nc")
-        argv_fp = [py, "-m", "engine.cli", "post",
-                   "--in", fin_neutral, "--out", fin,
-                   "--program", str(int(values["program_number"])),
-                   "--op-name", "SLOPE SPLIT FINISH (RUN AFTER ROUGHING)",
-                   "--tool-number", str(finish_number)]
-        argv_fp += self._tools_json_args()
-        argv_fp += _origin_flags(values)
-        if metric:
-            argv_fp += ["--metric"]
-        self._spawn(argv_fp, 0.72, 0.76, on_progress)
-        posted["finish.nc"] = posted_units(fin, values["units"])
-
-        # 7) probe_clcheck on the posted finish output (must be 0)
-        cl_lines = []
-        self._spawn([py, os.path.join(repo, "engine", "probe_clcheck.py"),
-                    fin, stl, "%.4f" % values["tool_diameter"]],
-                   0.76, 0.80, on_progress, json_out=cl_lines)
-        cl = cl_lines[-1] if cl_lines else {}
-        if cl.get("below_cl", 1) > 0:
-            raise EngineError(
-                "probe_clcheck: %d points below CL by >0.005 mm in the "
-                "finish program (max %.3f mm) - run failed"
-                % (cl["below_cl"], cl.get("max_depth_mm", 0.0)),
-                code="clcheck", where={"program": "finish.nc"})
-
-        # 8) chained zmap: roughing from full stock (--stock-out), then the
-        #    finish with the roughed stock as --stock-in
         check_rough = os.path.join(self.work, "check_rough.json")
-        stock_out = os.path.join(self.work, "stock_after_rough.npy")
-        self._spawn([py, "-m", "verify.zmap", nc, "--jobs", str(ZMAP_JOBS),
-                    "--part", hf01,
-                    "--tool", values["rough_tool_type"],
-                    "--dia", "%.4f" % values["rough_tool_diameter"],
-                    "--corner", "%.4f" % values["rough_corner_radius"],
-                    "--stock", *[("%.4f" % v) for v in stock],
-                    "--flute", "%.1f" % values["rough_flute_length"],
-                    "--optimal-load", "%.4f" % values["rough_optimal_load"],
-                    "--engage-max", "%.4f"
-                    % (ROUGH_ENGAGE_FACTOR * values["rough_optimal_load"]),
-                    "--tool-number", str(rough_number),
-                    *self._tools_json_args(),
-                    "--out-json", check_rough,
-                    "--stock-out", stock_out], *P["zmap_rough"], on_progress)
         check_finish = os.path.join(self.work, "check_finish.json")
+        check_rest_path = os.path.join(self.work, "check_rest.json")
         png_path = os.path.join(self.work, "preview.png")
+        stock_out = os.path.join(self.work, "stock_after_rough.npy")
+        stock_finish = os.path.join(self.work, "stock_after_finish.npy")
+        stock_rest = os.path.join(self.work, "stock_after_rest.npy")
+        nc = os.path.join(self.work, "rough.nc")
+        fin = os.path.join(self.work, "finish.nc")
+        rest_nc = os.path.join(self.work, "rest.nc")
+        # the judge also checks the finish's flute/shank (over_flute), from
+        # the same X7 table entry the engine's shank rule used
+        fin_tool = check_tool_entry(finish_number, self._table_file())
+        tools_json = self._tools_json_args()
+        argv_jr = [py, "-m", "verify.zmap", nc, "--jobs", str(ZMAP_JOBS),
+                   "--part", hf01,
+                   "--tool", values["rough_tool_type"],
+                   "--dia", "%.4f" % values["rough_tool_diameter"],
+                   "--corner", "%.4f" % values["rough_corner_radius"],
+                   "--stock", *[("%.4f" % v) for v in stock],
+                   "--flute", "%.1f" % values["rough_flute_length"],
+                   "--optimal-load", "%.4f" % values["rough_optimal_load"],
+                   "--engage-max", "%.4f"
+                   % (ROUGH_ENGAGE_FACTOR * values["rough_optimal_load"]),
+                   "--tool-number", str(rough_number),
+                   *tools_json,
+                   "--out-json", check_rough,
+                   "--stock-out", stock_out]
         # Finish engagement threshold: 1.5 x the finish stepover (distance
         # between finish passes) rather than the roughing optimal load; finish
         # passes are much lighter and the roughing threshold would over-flag
@@ -1262,144 +1206,29 @@ class EngineRun:
         # rest toolpath is generated from it (--rest-from) and judged on it
         # (--stock-in). zmap writes only the .npy, so the runner carries the
         # grid geometry in the heightfield sidecar convention.
-        stock_finish = os.path.join(self.work, "stock_after_finish.npy")
-        stock_rest = os.path.join(self.work, "stock_after_rest.npy")
-        argv_f = [py, "-m", "verify.zmap", fin, "--jobs", str(ZMAP_JOBS),
-                  "--part", hf01,
-                  "--tool", "ball",
-                  "--dia", "%.4f" % values["tool_diameter"],
-                  "--corner", "%.4f" % (values["tool_diameter"] / 2.0),
-                  "--stock-in", stock_out,
-                  "--engage-max", "%.4f"
-                  % (FINISH_ENGAGE_FACTOR * values["stepover"]),
-                  "--tool-number", str(finish_number),
-                  *self._tools_json_args(),
-                  "--out-json", check_finish]
-        # the judge also checks the finish's flute/shank (over_flute), from
-        # the same X7 table entry the engine's shank rule used
-        fin_tool = check_tool_entry(finish_number, self._table_file())
+        argv_jf = [py, "-m", "verify.zmap", fin, "--jobs", str(ZMAP_JOBS),
+                   "--part", hf01,
+                   "--tool", "ball",
+                   "--dia", "%.4f" % values["tool_diameter"],
+                   "--corner", "%.4f" % (values["tool_diameter"] / 2.0),
+                   "--stock-in", stock_out,
+                   "--engage-max", "%.4f"
+                   % (FINISH_ENGAGE_FACTOR * values["stepover"]),
+                   "--tool-number", str(finish_number),
+                   *tools_json,
+                   "--out-json", check_finish]
         if fin_tool["flute_mm"] is not None:
-            argv_f += ["--flute", "%.4f" % fin_tool["flute_mm"]]
+            argv_jf += ["--flute", "%.4f" % fin_tool["flute_mm"]]
         if fin_tool["shank_diameter_mm"] is not None:
-            argv_f += ["--shank-dia", "%.4f" % fin_tool["shank_diameter_mm"]]
-        if rest:
-            fr.remove_stale(stock_finish)
+            argv_jf += ["--shank-dia", "%.4f" % fin_tool["shank_diameter_mm"]]
         # TASK_VIEW3D: always export the finish's judged stock (the final
         # one when there is no rest pass) - same zmap call, no extra pass
-        argv_f += ["--stock-out", stock_finish]
+        argv_jf += ["--stock-out", stock_finish]
         if not rest:
-            argv_f += ["--png", png_path]
-        self._spawn(argv_f, *P["zmap_finish"], on_progress)
-        with open(check_rough) as fh:
-            check_r = json.load(fh)
-        with open(check_finish) as fh:
-            check_f = json.load(fh)
-        _check_zmap_gates(check_r)
-        _check_zmap_gates(check_f)
-
-        # 9) optional corner rest pass (task CR): the smaller ball cuts only
-        #    where the finish left more than min_rest mm standing, working
-        #    from the stock the finish exported. Same gates as the finish:
-        #    LNC post (program number +2, rest tool number), probe_clcheck
-        #    with the rest ball diameter (0 below CL by >0.005 mm), chained
-        #    zmap with --stock-in = the finish's --stock-out and the rest
-        #    tool's flute/shank/tool-number/holder, then _check_zmap_gates.
-        check_rest_path = os.path.join(self.work, "check_rest.json")
-        rest_nc = os.path.join(self.work, "rest.nc")
-        cl_rest = check_s = None
+            argv_jf += ["--png", png_path]
         if rest:
-            # zmap --stock-out writes only the .npy; the engine reads a
-            # heightfield's grid from its sidecar - the same geometry as the
-            # judge heightfield this stock was computed on
-            with open(os.path.splitext(hf01)[0] + ".json") as fh:
-                hf_meta = json.load(fh)
-            # merge, never overwrite: zmap's own sidecar carries the true
-            # stock_box the rest judge needs for its below_stock_bottom gate
-            sc = os.path.splitext(stock_finish)[0] + ".json"
-            meta = {}
-            if os.path.exists(sc):
-                with open(sc) as fh:
-                    meta = json.load(fh)
-            meta.update(x0=hf_meta["x0"], y0=hf_meta["y0"],
-                        cell=hf_meta["cell"])
-            with open(sc, "w") as fh:
-                json.dump(meta, fh)
-
-            # 9a) rest finish (neutral G-code): --tool is the previous (finish)
-            #     ball, --rest-tool the smaller ball that does the cutting
-            rest_neutral = os.path.join(self.work, "rest_neutral.ngc")
-            rest_stats = os.path.join(self.work, "rest_stats.json")
-            argv_rest = [py, "-m", "engine.cli", "finish",
-                        "--stl", stl,
-                        "--out", rest_neutral,
-                        "--tool", "ball:%.4f" % values["tool_diameter"],
-                        "--rest-from", stock_fin_engine,
-                        "--rest-tool", "ball:%.4f" % rest["diameter_mm"],
-                        "--min-rest", "%.4f" % (values.get("min_rest") or 0.5),
-                        "--stock-from", rough_stock_out,
-                        "--stepover", "%.4f" % values["stepover"],
-                        "--stepdown", "%.4f" % values["stepdown"],
-                        "--slope-threshold",
-                        "%.2f" % values["slope_threshold"],
-                        "--floor", "%.4f" % floor,
-                        "--cut-feed", "%.1f" % values["feed"],
-                        "--ramp-feed", "%.1f" % values["ramp_feed"],
-                        "--ramp-angle-deg",
-                        "%.2f" % (values.get("ramp_angle_deg") or 2.0),
-                        "--spindle", str(int(values["rpm"])),
-                        "--post-grid-mm", post_grid,
-                        *self._tools_json_args(),
-                        "--stats-json", rest_stats]
-            if rest["flute_mm"] is not None:
-                argv_rest += ["--flute", "%.4f" % rest["flute_mm"]]
-            if rest["shank_diameter_mm"] is not None:
-                argv_rest += ["--shank", "%.4f" % rest["shank_diameter_mm"]]
-            if rest["stickout_mm"] is not None:
-                argv_rest += ["--stickout", "%.4f" % rest["stickout_mm"]]
-            if rest["holder"]:
-                argv_rest += ["--holder", rest["holder"]]
-            self._spawn(argv_rest, *P["rest"], on_progress)
-
-            # 9b) post to LNC: program number +2, the rest tool's T/H; the
-            #     neutral header names the rest tool, so carry its geometry;
-            #     task UN: --metric only when mm is requested (else G20)
-            argv_rp = [py, "-m", "engine.cli", "post",
-                      "--in", rest_neutral, "--out", rest_nc,
-                      "--program", str(int(values["program_number"]) + 2),
-                      "--op-name", "REST PASS (RUN AFTER FINISH)",
-                      "--tool-number", str(rest_number),
-                      "--tool-kind", "ball",
-                      "--dia", "%.4f" % rest["diameter_mm"],
-                      "--corner", "%.4f" % (rest["diameter_mm"] / 2.0)]
-            argv_rp += self._tools_json_args()
-            argv_rp += _origin_flags(values)
-            if metric:
-                argv_rp += ["--metric"]
-            self._spawn(argv_rp, *P["post_rest"], on_progress)
-            posted["rest.nc"] = posted_units(rest_nc, values["units"])
-
-            # 9c) probe_clcheck on the posted rest output with the rest ball
-            #     (must be 0)
-            cl_rest_lines = []
-            self._spawn([py, os.path.join(repo, "engine",
-                                           "probe_clcheck.py"),
-                         rest_nc, stl, "%.4f" % rest["diameter_mm"]],
-                        *P["clcheck_rest"], on_progress,
-                        json_out=cl_rest_lines)
-            cl_rest = cl_rest_lines[-1] if cl_rest_lines else {}
-            if cl_rest.get("below_cl", 1) > 0:
-                raise EngineError(
-                    "probe_clcheck: %d points below CL by >0.005 mm in the "
-                    "rest program (max %.3f mm) - run failed"
-                    % (cl_rest["below_cl"], cl_rest.get("max_depth_mm", 0.0)),
-                    code="clcheck", where={"program": "rest.nc"})
-
-            # 9d) chained zmap of the rest program on the stock the finish
-            #     left, with the rest tool's geometry + holder; preview.png is
-            #     the leftover after the last program of the chain
-            stock_rest = os.path.join(self.work, "stock_after_rest.npy")
-            fr.remove_stale(stock_rest)
-            argv_zr = [py, "-m", "verify.zmap", rest_nc, "--jobs", str(ZMAP_JOBS),
+            argv_jz = [py, "-m", "verify.zmap", rest_nc, "--jobs",
+                       str(ZMAP_JOBS),
                        "--part", hf01,
                        "--tool", "ball",
                        "--dia", "%.4f" % rest["diameter_mm"],
@@ -1408,17 +1237,363 @@ class EngineRun:
                        "--engage-max", "%.4f"
                        % (FINISH_ENGAGE_FACTOR * values["stepover"]),
                        "--tool-number", str(rest_number),
-                       *self._tools_json_args(),
+                       *tools_json,
                        "--out-json", check_rest_path, "--png", png_path,
                        "--stock-out", stock_rest]
             if rest["flute_mm"] is not None:
-                argv_zr += ["--flute", "%.4f" % rest["flute_mm"]]
+                argv_jz += ["--flute", "%.4f" % rest["flute_mm"]]
             if rest["shank_diameter_mm"] is not None:
-                argv_zr += ["--shank-dia", "%.4f" % rest["shank_diameter_mm"]]
-            self._spawn(argv_zr, *P["zmap_rest"], on_progress)
-            with open(check_rest_path) as fh:
-                check_s = json.load(fh)
-            _check_zmap_gates(check_s)
+                argv_jz += ["--shank-dia",
+                            "%.4f" % rest["shank_diameter_mm"]]
+
+        def with_jobs(argv, jobs):
+            a = list(argv)
+            a[a.index("--jobs") + 1] = str(jobs)
+            return a
+
+        def judge_jobs():
+            # chosen at judge start: share the machine with a still
+            # running engine chain -> ZMAP_JOBS_OVERLAP, else ZMAP_JOBS
+            return ZMAP_JOBS if engine_done.is_set() else ZMAP_JOBS_OVERLAP
+
+        def wait_for(ev):
+            # True when the engine chain produced this judge's program;
+            # False when it failed (the engine chain sets every pending
+            # Event, so the judge chain never waits forever)
+            ev.wait()
+            return not abort.is_set()
+
+        def judge_start(n):
+            # mark the running judge (for the CHECKING text); speak only
+            # once the engine chain is done (checking() enforces that)
+            with prog_lock:
+                prog_state["cur"] = n
+            if engine_done.is_set():
+                checking(n)
+
+        def judge_chain():
+            try:
+                # j1) fresh zmap part heightfield (verify/heightfield.py,
+                #     0.01 mm tess, 0.1 mm cell) - independent of the
+                #     roughing clip grid; read only by the judges, the
+                #     rest-stock sidecar merge and the view builder.
+                #     task HC: remove any stale artifacts from a reused
+                #     run dir before rebuilding; require the fresh files
+                #     to exist and the sidecar to pin this run's STEP,
+                #     cell and tess tolerance
+                fr.remove_stale(hf01)
+                step("judge", "hf01",
+                     [fc, os.path.join(repo, "verify", "heightfield.py")],
+                     0.12, 0.17, None,
+                     extra_env={"STEP_IN": prep["step"], "HF_OUT": hf01,
+                                "CELL": "0.1", "TESS_TOL": "0.01",
+                                "STOCK_BOX": " ".join("%.4f" % v
+                                                      for v in stock[:4]),
+                                "TOOL_R": "%.4f" % max_tool_r})
+                try:
+                    fr.require_fresh(hf01, step_sha256=step_sha, cell=0.1,
+                                     tess_tol=0.01)
+                except OSError as e:
+                    raise EngineError(str(e), code="stale_artifact")
+
+                # j2) chained zmap: roughing from full stock
+                #     (--stock-out), then the finish with the roughed
+                #     stock as --stock-in, then the rest pass on the
+                #     finished stock. Each judge starts only when its
+                #     program exists AND the previous judge has finished;
+                #     the judges run sequentially in this one thread, so
+                #     the sequence below IS the previous-judge wait.
+                if not wait_for(ev_rough):
+                    return
+                judge_start(1)
+                step("judge", "zmap_rough", with_jobs(argv_jr, judge_jobs()),
+                     *P["zmap_rough"])
+                with open(check_rough) as fh:
+                    judge_out["check_r"] = json.load(fh)
+                _check_zmap_gates(judge_out["check_r"])
+
+                if not wait_for(ev_finish):
+                    return
+                judge_start(2)
+                if rest:
+                    fr.remove_stale(stock_finish)
+                step("judge", "zmap_finish",
+                     with_jobs(argv_jf, judge_jobs()), *P["zmap_finish"])
+                with open(check_finish) as fh:
+                    judge_out["check_f"] = json.load(fh)
+                _check_zmap_gates(judge_out["check_f"])
+
+                if rest:
+                    # zmap --stock-out writes only the .npy; the engine
+                    # reads a heightfield's grid from its sidecar - the
+                    # same geometry as the judge heightfield this stock
+                    # was computed on. merge, never overwrite: zmap's own
+                    # sidecar carries the true stock_box the rest judge
+                    # needs for its below_stock_bottom gate
+                    with open(os.path.splitext(hf01)[0] + ".json") as fh:
+                        hf_meta = json.load(fh)
+                    sc = os.path.splitext(stock_finish)[0] + ".json"
+                    meta = {}
+                    if os.path.exists(sc):
+                        with open(sc) as fh:
+                            meta = json.load(fh)
+                    meta.update(x0=hf_meta["x0"], y0=hf_meta["y0"],
+                                cell=hf_meta["cell"])
+                    with open(sc, "w") as fh:
+                        json.dump(meta, fh)
+
+                    if not wait_for(ev_rest):
+                        return
+                    judge_start(3)
+                    fr.remove_stale(stock_rest)
+                    step("judge", "zmap_rest",
+                         with_jobs(argv_jz, judge_jobs()), *P["zmap_rest"])
+                    with open(check_rest_path) as fh:
+                        judge_out["check_s"] = json.load(fh)
+                    _check_zmap_gates(judge_out["check_s"])
+            except BaseException as e:  # noqa: BLE001
+                # a judge failure is never swallowed by the thread: it is
+                # stored and re-raised in the main thread after the join
+                judge_errors.append(e)
+            finally:
+                judge_done.set()
+
+        judge_thread = threading.Thread(target=judge_chain, daemon=True)
+        judge_thread.start()
+
+        try:
+            # 2) adaptive roughing (LNC post, full stock); the finish and
+            #    the rest pass need the engine's own post-roughing stock
+            #    for their rapid / lift / holder clearance
+            #    (--stock-from), so the rough exports it.
+            #    Task UN: every post honors the requested units (--metric
+            #    only for mm; inch posts emit G20 with a matching 0.00254
+            #    post grid)
+            metric = values["units"] == "mm"
+            post_grid = "0.001" if metric else "0.00254"
+            posted = {}
+            stats_path = os.path.join(self.work, "rough_stats.json")
+            rough_stock_out = os.path.join(
+                self.work, "stock_after_rough_engine.npy")
+            argv = [py, "-m", "engine.cli", "rough",
+                    "--step", prep["step"],
+                    "--stock", *[("%.4f" % v) for v in stock],
+                    "--tool", "%s:%.4f:%.4f" % (values["rough_tool_type"],
+                                               values["rough_tool_diameter"],
+                                               values["rough_corner_radius"]),
+                    "--out", nc, "--floor", "%.4f" % floor,
+                    "--leave", "%.4f" % values["rough_stock_to_leave"],
+                    "--stepdown", "%.4f" % values["rough_stepdown"],
+                    "--optimal-load-mm", "%.4f" % values["rough_optimal_load"],
+                    "--stepup", "%.4f" % values["rough_rest_stepup"],
+                    "--hf", prep["hf"], "--min-rest", "0.5",
+                    "--cut-feed", "%.1f" % values["feed"],
+                    "--ramp-feed", "%.1f" % values["ramp_feed"],
+                    "--spindle", str(int(values["rpm"])),
+                    "--post", "lnc", "--program",
+                    str(int(values["program_number"])),
+                    "--tool-number", str(rough_number),
+                    *tools_json,
+                    "--json-progress", "--stats-json", stats_path]
+            # always: the finish (and any rest pass) plans its rapids,
+            # lifts and holder clearance against this stock - without it
+            # the engine only adds 1 mm over the part and rapids crossed
+            # roughing terraces
+            fr.remove_stale(rough_stock_out)
+            argv += ["--stock-out", rough_stock_out]
+            argv += _origin_flags(values)
+            if metric:
+                argv += ["--metric"]
+            argv += self._load_limit_args(values)
+            step("engine", "rough", argv, *P["rough"], sink)
+            posted["rough.nc"] = posted_units(nc, values["units"])
+            ev_rough.set()
+
+            # 3) tessellate the oriented model (finish input + clcheck
+            #    probe); stale model.stl removed first, fresh non-empty
+            #    output asserted
+            stl = os.path.join(self.work, "model.stl")
+            fr.remove_stale(stl)
+            step("engine", "tess",
+                 [fc, os.path.join(repo, "engine", "_tessellate.py")],
+                 0.45, 0.50, sink,
+                 extra_env={"STEP_IN": prep["step"], "STL_OUT": stl,
+                            "TOL": "0.01"})
+            try:
+                fr.require_stl(stl)
+            except OSError as e:
+                raise EngineError(str(e), code="stale_artifact")
+
+            # 4) slope-split finishing (neutral G-code). PQ: the engine
+            #    snaps the emitted points to the output grid matching this
+            #    op's post units (metric post -> 0.001 mm; an inch post
+            #    uses 0.00254 so PQ's snap stays a no-op on posting)
+            fin_neutral = os.path.join(self.work, "finish_neutral.ngc")
+            fin_stats = os.path.join(self.work, "finish_stats.json")
+            # RR-STOCK: the engine replays its own emitted finish moves
+            # into a 0.1 mm stock; the rest pass plans on THAT (never on a
+            # judge stock)
+            stock_fin_engine = os.path.join(
+                self.work, "stock_after_finish_engine.npy")
+            fr.remove_stale(stock_fin_engine)
+            step("engine", "finish",
+                 [py, "-m", "engine.cli", "finish",
+                  "--stl", stl,
+                  "--tool", "ball:%.4f" % values["tool_diameter"],
+                  "--out", fin_neutral,
+                  "--stepover", "%.4f" % values["stepover"],
+                  "--stepdown", "%.4f" % values["stepdown"],
+                  "--slope-threshold", "%.2f" % values["slope_threshold"],
+                  "--floor", "%.4f" % floor,
+                  "--cut-feed", "%.1f" % values["feed"],
+                  "--ramp-feed", "%.1f" % values["ramp_feed"],
+                  "--ramp-angle-deg",
+                  "%.2f" % (values.get("ramp_angle_deg") or 2.0),
+                  "--spindle", str(int(values["rpm"])),
+                  "--post-grid-mm", post_grid,
+                  "--stock-from", rough_stock_out,
+                  "--stock-out", stock_fin_engine,
+                  *tools_json,
+                  "--stats-json", fin_stats], 0.50, 0.72, sink)
+
+            # 5) post to LNC in the requested units (task UN: --metric only
+            #    for mm, inch posts emit G20; the posted artifact is what
+            #    clcheck judges); header carries run-after-roughing
+            argv_fp = [py, "-m", "engine.cli", "post",
+                       "--in", fin_neutral, "--out", fin,
+                       "--program", str(int(values["program_number"])),
+                       "--op-name", "SLOPE SPLIT FINISH (RUN AFTER ROUGHING)",
+                       "--tool-number", str(finish_number)]
+            argv_fp += tools_json
+            argv_fp += _origin_flags(values)
+            if metric:
+                argv_fp += ["--metric"]
+            step("engine", "post", argv_fp, 0.72, 0.76, sink)
+            posted["finish.nc"] = posted_units(fin, values["units"])
+            ev_finish.set()
+
+            # 6) probe_clcheck on the posted finish output (must be 0)
+            cl_lines = []
+            step("engine", "clcheck",
+                 [py, os.path.join(repo, "engine", "probe_clcheck.py"),
+                  fin, stl, "%.4f" % values["tool_diameter"]],
+                 0.76, 0.80, sink, json_out=cl_lines)
+            cl = cl_lines[-1] if cl_lines else {}
+            if cl.get("below_cl", 1) > 0:
+                raise EngineError(
+                    "probe_clcheck: %d points below CL by >0.005 mm in the "
+                    "finish program (max %.3f mm) - run failed"
+                    % (cl.get("below_cl", 1), cl.get("max_depth_mm", 0.0)),
+                    code="clcheck", where={"program": "finish.nc"})
+
+            cl_rest = None
+            if rest:
+                # 7) optional corner rest pass (task CR): the smaller ball
+                #    cuts only where the finish left more than min_rest mm
+                #    standing, working from the stock the finish exported.
+                #    Same gates as the finish: LNC post (program number
+                #    +2, rest tool number), probe_clcheck with the rest
+                #    ball diameter (0 below CL by >0.005 mm); the chained
+                #    zmap with --stock-in = the finish's --stock-out runs
+                #    in the judge chain.
+
+                # 7a) rest finish (neutral G-code): --tool is the previous
+                #     (finish) ball, --rest-tool the smaller ball that
+                #     does the cutting
+                rest_neutral = os.path.join(self.work, "rest_neutral.ngc")
+                rest_stats = os.path.join(self.work, "rest_stats.json")
+                argv_rest = [py, "-m", "engine.cli", "finish",
+                            "--stl", stl,
+                            "--out", rest_neutral,
+                            "--tool", "ball:%.4f" % values["tool_diameter"],
+                            "--rest-from", stock_fin_engine,
+                            "--rest-tool", "ball:%.4f" % rest["diameter_mm"],
+                            "--min-rest",
+                            "%.4f" % (values.get("min_rest") or 0.5),
+                            "--stock-from", rough_stock_out,
+                            "--stepover", "%.4f" % values["stepover"],
+                            "--stepdown", "%.4f" % values["stepdown"],
+                            "--slope-threshold",
+                            "%.2f" % values["slope_threshold"],
+                            "--floor", "%.4f" % floor,
+                            "--cut-feed", "%.1f" % values["feed"],
+                            "--ramp-feed", "%.1f" % values["ramp_feed"],
+                            "--ramp-angle-deg",
+                            "%.2f" % (values.get("ramp_angle_deg") or 2.0),
+                            "--spindle", str(int(values["rpm"])),
+                            "--post-grid-mm", post_grid,
+                            *tools_json,
+                            "--stats-json", rest_stats]
+                if rest["flute_mm"] is not None:
+                    argv_rest += ["--flute", "%.4f" % rest["flute_mm"]]
+                if rest["shank_diameter_mm"] is not None:
+                    argv_rest += ["--shank",
+                                  "%.4f" % rest["shank_diameter_mm"]]
+                if rest["stickout_mm"] is not None:
+                    argv_rest += ["--stickout", "%.4f" % rest["stickout_mm"]]
+                if rest["holder"]:
+                    argv_rest += ["--holder", rest["holder"]]
+                step("engine", "rest", argv_rest, *P["rest"], sink)
+
+                # 7b) post to LNC: program number +2, the rest tool's T/H;
+                #     the neutral header names the rest tool, so carry its
+                #     geometry; task UN: --metric only when mm is requested
+                #     (else G20)
+                argv_rp = [py, "-m", "engine.cli", "post",
+                          "--in", rest_neutral, "--out", rest_nc,
+                          "--program", str(int(values["program_number"]) + 2),
+                          "--op-name", "REST PASS (RUN AFTER FINISH)",
+                          "--tool-number", str(rest_number),
+                          "--tool-kind", "ball",
+                          "--dia", "%.4f" % rest["diameter_mm"],
+                          "--corner", "%.4f" % (rest["diameter_mm"] / 2.0)]
+                argv_rp += tools_json
+                argv_rp += _origin_flags(values)
+                if metric:
+                    argv_rp += ["--metric"]
+                step("engine", "post_rest", argv_rp, *P["post_rest"], sink)
+                posted["rest.nc"] = posted_units(rest_nc, values["units"])
+
+                # 7c) probe_clcheck on the posted rest output with the
+                #     rest ball (must be 0)
+                cl_rest_lines = []
+                step("engine", "clcheck_rest",
+                     [py, os.path.join(repo, "engine", "probe_clcheck.py"),
+                      rest_nc, stl, "%.4f" % rest["diameter_mm"]],
+                     *P["clcheck_rest"], sink, json_out=cl_rest_lines)
+                cl_rest = cl_rest_lines[-1] if cl_rest_lines else {}
+                if cl_rest.get("below_cl", 1) > 0:
+                    raise EngineError(
+                        "probe_clcheck: %d points below CL by >0.005 mm in "
+                        "the rest program (max %.3f mm) - run failed"
+                        % (cl_rest.get("below_cl", 1),
+                           cl_rest.get("max_depth_mm", 0.0)),
+                        code="clcheck", where={"program": "rest.nc"})
+
+            # the engine chain is complete: from here the progress text is
+            # CHECKING_FMT until the last judge returns
+            engine_done.set()
+            checking(prog_state["cur"] or 1)
+            if rest:
+                # the rest judge's program is accepted (its other inputs,
+                # finish.nc and the sidecar merge, are judge-chain work)
+                ev_rest.set()
+        except BaseException:
+            # round 1: the engine error wins - release the judge chain (it
+            # must not wait forever), join it, then re-raise the engine
+            # error. Failure/cancel hardening is round 2.
+            abort.set()
+            ev_rough.set()
+            ev_finish.set()
+            ev_rest.set()
+            judge_thread.join()
+            raise
+        judge_thread.join()
+        if judge_errors:
+            raise judge_errors[0]
+        check_r = judge_out["check_r"]
+        check_f = judge_out["check_f"]
+        check_s = judge_out.get("check_s")
 
         # 10) rest pass summary + combined check.json / result
         if rest:
