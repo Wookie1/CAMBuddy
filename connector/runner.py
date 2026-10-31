@@ -28,9 +28,10 @@ FINISH_ENGAGE_FACTOR = 1.5
 # chunk-order float sums in report-only keys; ~3-4 GB peak per CF judge)
 ZMAP_JOBS = 12
 # TASK SP-P3C-1: a judge that STARTS while the engine chain is still
-# running shares the machine with it -> fewer workers; a judge that starts
-# after the engine chain has finished gets the full ZMAP_JOBS again
-ZMAP_JOBS_OVERLAP = 6
+# running shares the machine with it; a judge that starts after the engine
+# chain has finished gets ZMAP_JOBS. Kept separate so it can be tuned:
+# 2026-10-31 CF chain, 12 beat 6 (wall 2496 s vs 2646 s, peak 14.2 GB)
+ZMAP_JOBS_OVERLAP = 12
 # TASK SP-P3C-1: the judge-chain progress text, defined in one place only
 CHECKING_FMT = "checking (%d of %d)"
 
@@ -539,6 +540,30 @@ class EngineRun:
     def cancel(self):
         self.cancelled = True
         self._kill_all()
+
+    def kill_all(self, sig=signal.SIGKILL):
+        """Connector shutdown backstop (SIGTERM path): send `sig` to every
+        live tracked process group, from any thread. SIGKILL is one pass
+        with no wait; SIGTERM runs _kill_all's TERM-then-KILL teardown."""
+        if sig == signal.SIGTERM:
+            self._kill_all()
+            return
+        with self._lock:
+            procs = [p for p in self._procs if p.poll() is None]
+        self._signal_groups(procs, sig)
+
+    def live_pgids(self):
+        """Connector shutdown backstop: a snapshot (taken under _lock) of
+        the process-group ids of every live tracked step."""
+        out = []
+        with self._lock:
+            for p in self._procs:
+                if p.poll() is None:
+                    try:
+                        out.append(os.getpgid(p.pid))
+                    except ProcessLookupError:
+                        pass
+        return out
 
     def _freshness(self):
         """engine.freshness (task HC): guards against stale build outputs."""

@@ -949,7 +949,9 @@ class TestJudgeJobs:
         engine chain still runs and ZMAP_JOBS for one that starts after
         it (the rest judge: its program is the engine chain's last step)."""
         assert runner_mod.ZMAP_JOBS == 12
-        assert runner_mod.ZMAP_JOBS_OVERLAP == 6
+        # the shipped overlap value equals ZMAP_JOBS (12, CF chain proof
+        # 2026-10-31); a distinct value here keeps the selection testable
+        monkeypatch.setattr(runner_mod, "ZMAP_JOBS_OVERLAP", 6)
         fake, rec = make_fake({"hf01": 0.01, "rough": 0.02, "tess": 0.05,
                                "finish": 0.05, "post": 0.05,
                                "clcheck": 0.05, "rest": 0.05,
