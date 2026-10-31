@@ -50,3 +50,44 @@ def test_furthest_sk1_column_fits_judge_grid(tool_r, box):
 
 def test_side_entry_off_no_margin():
     assert runner_mod._judge_margin_env({"stock": [0] * 6}, 6.35) == {}
+
+
+class _Stop(Exception):
+    pass
+
+
+def test_check_program_judge_grid_holds_sk1_columns(tmp_path, monkeypatch):
+    """check_program judges programs our roughs posted (with SK1 columns):
+    its judge heightfield gets the same MARGIN as the rough's own judge."""
+    import json
+    prog = tmp_path / "p.nc"
+    prog.write_text("%\nO1\nT20 M06\nG0 X0. Y0. Z10.\nM30\n%\n")
+    (tmp_path / "o.step").write_text("stub")   # hashed before the hf
+    seen = {}
+
+    def fake(self, argv, lo, hi, on_progress, json_out=None, extra_env=None):
+        a = list(argv)
+        if "engine.cli" in a and a[a.index("engine.cli") + 1] == "prepare":
+            d = a[a.index("--out-dir") + 1]
+            with open(os.path.join(d, "prepare.json"), "w") as fh:
+                json.dump({"step": str(tmp_path / "o.step"),
+                           "hf": str(tmp_path / "hf.npy"),
+                           "stock": [-10, 10, -10, 10, 0, 5],
+                           "bbox": [-9, 9, -9, 9, 1.0, 4.0]}, fh)
+            return None
+        if any(str(t).endswith("heightfield.py") for t in a):
+            seen.update(extra_env or {})
+            raise _Stop()
+        return None
+
+    monkeypatch.setattr(runner_mod.EngineRun, "_spawn", fake)
+    eng = runner_mod.EngineRun({"repo_root": REPO,
+                                "engine_python": sys.executable},
+                               str(tmp_path / "w"))
+    with pytest.raises(_Stop):
+        eng.run_check_program(str(prog), str(tmp_path / "m.step"),
+                              {"orientation": "as_modeled", "stock_xy": 1.0,
+                               "stock_top": 1.0, "stock_bottom": 0.0}, None)
+    tool_r = float(seen["TOOL_R"])
+    assert float(seen["MARGIN"]) == max(5.0, tool_r,
+                                        runner_mod.SK1_REACH_MM), seen

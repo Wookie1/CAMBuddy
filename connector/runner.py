@@ -982,7 +982,9 @@ class EngineRun:
                               "CELL": str(cell), "TESS_TOL": "0.01",
                               "STOCK_BOX": " ".join("%.4f" % v
                                                     for v in stock[:4]),
-                              "TOOL_R": "%.4f" % max_tool_r})
+                              "TOOL_R": "%.4f" % max_tool_r,
+                              # programs our roughs posted carry SK1 columns
+                              **_judge_margin_env(prep, max_tool_r)})
         try:
             fr.require_fresh(hf_zmap, step_sha256=step_sha, cell=cell,
                              tess_tol=0.01)
