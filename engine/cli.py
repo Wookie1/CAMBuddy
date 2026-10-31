@@ -155,8 +155,14 @@ def _run_prepare(a):
     from engine import freshness
     freshness.remove_stale(hf_out)
     hf_tol = 0.01
+    # SP-HF1: the grid covers the stock box + --tool-r (+ heightfield.py's
+    # default 5 mm margin), the same rule as the judge's heightfields; it was
+    # built over the part bbox only (the stock margins then copied the grid's
+    # edge cells into the rough's part model)
     env = dict(os.environ, STEP_IN=step_out, HF_OUT=hf_out,
-               CELL=str(a.cell), PAD="0", TESS_TOL=str(hf_tol))
+               CELL=str(a.cell), PAD="0", TESS_TOL=str(hf_tol),
+               STOCK_BOX=" ".join("%.6f" % v for v in stock[:4]),
+               TOOL_R="%.6f" % a.tool_r)
     r = subprocess.run([model.freecadcmd(),
                        os.path.join(repo, "verify", "heightfield.py")],
                       env=env, capture_output=True, text=True)
