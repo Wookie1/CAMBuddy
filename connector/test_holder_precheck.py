@@ -97,7 +97,8 @@ def test_tool_without_holder_fails_before_any_engine_spawn(conn):
     assert err["code"] == "tool_holder_missing"
     assert err["message"] == (
         "T3 (12.7 mm bull) has no holder or stick-out in your tool library. "
-        "Add them in the panel's tool library, then run again.")
+        "Ask Claude to add them, or use Edit a library tool (holder, "
+        "stickout_mm), then run again.")
 
 
 def test_complete_tool_still_reaches_the_engine(conn):
