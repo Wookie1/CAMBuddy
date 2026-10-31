@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import OrderedDict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -44,6 +45,10 @@ LAST_RUNS_MAX_BYTES = 8 * 1024   # event data stays under 8 kB
 # SHUTDOWN_KILL_JOIN + the queued-reject/"off" tail ~= 23 s < 30 s.
 SHUTDOWN_GRACE = 8.0         # s to wait for the worker after cancel()
 SHUTDOWN_KILL_JOIN = 4.0     # s more to wait after SIGKILLing the engine
+# PANELCANCEL6: ids cancelled between the worker's get() and the worker
+# making the engine active; bounded to the newest this-many (a cancel for
+# an unknown/finished id just sits there harmlessly until it ages out).
+PENDING_CANCEL_MAX = 64
 
 
 def _kill_engine_groups(engine):
@@ -206,6 +211,19 @@ class Connector:
         # loop thread touches it (cancels are handled on the loop thread
         # while the worker exists; direct callers are single-threaded).
         self._dropped = set()
+        # PANELCANCEL6: run ids cancelled in the window between the
+        # worker's queue.get() and `self.running = engine` - there the id
+        # is neither queued nor active, so the loop cannot act on it yet.
+        # self._cancel_lock makes the loop's whole cancel decision (test
+        # active / drop queued / else mark pending) atomic with the
+        # worker's "engine becomes active + consume pending" step in
+        # _run_job, so the cancel is never lost. A NEW lock on purpose:
+        # self._lock is held across HTTP report writes and would stall
+        # both the cancel answer and the worker's activation. Only
+        # _cancel_lock (briefly, never across engine.cancel() or I/O) and
+        # _queue.mutex are taken here; engine.cancel() runs outside it.
+        self._cancel_lock = threading.Lock()
+        self._pending_cancel = OrderedDict()
         # MENUBAR: <home>/status.json for the menu-bar app (secret-free).
         self.status_path = os.path.join(self.home, "status.json")
         self.commit = self._git_commit()
@@ -426,25 +444,47 @@ class Connector:
             if not ok:
                 return
             target = env.get("run")
-            if self.running and self.current_run == target:
-                self.running.cancel()
-                return
-            if target in self._dropped:
-                return          # second cancel for a dropped id: ignored
-            with self._queue.mutex:
-                for item in list(self._queue.queue):
-                    if item[1] == target:
-                        self._queue.queue.remove(item)
-                        self._dropped.add(target)
-                        break
+            # PANELCANCEL6: the active-run test, the queued drop and the
+            # pending marker are ONE decision under self._cancel_lock,
+            # atomic with the worker's "self.running = engine + consume
+            # pending" step in _run_job. A cancel arriving after the
+            # worker's get() and before that line finds the id neither
+            # active nor queued: it goes into the bounded
+            # self._pending_cancel and the worker acts on it the instant
+            # the engine becomes active. Unknown ids just sit there
+            # harmlessly (age out at PENDING_CANCEL_MAX).
+            engine = None
+            dropped = False
+            with self._cancel_lock:
+                if self.running and self.current_run == target:
+                    engine = self.running
+                elif target in self._dropped:
+                    return          # second cancel for a dropped id: ignored
                 else:
-                    return      # not queued (finished/unknown): ignored
-            try:
-                self._report(target, "received")
-                self._report(target, "cancelled",
-                             message="cancelled before it started")
-            except SteveError:
-                pass
+                    with self._queue.mutex:
+                        for item in list(self._queue.queue):
+                            if item[1] == target:
+                                self._queue.queue.remove(item)
+                                self._dropped.add(target)
+                                dropped = True
+                                break
+                    if not dropped:
+                        self._pending_cancel[target] = True
+                        while len(self._pending_cancel) > PENDING_CANCEL_MAX:
+                            self._pending_cancel.popitem(last=False)
+            # engine.cancel() takes the engine's own lock (which _spawn
+            # holds around Popen), so it runs OUTSIDE _cancel_lock: the
+            # worker's activation step must never wait behind it.
+            if engine is not None:
+                engine.cancel()
+                return
+            if dropped:
+                try:
+                    self._report(target, "received")
+                    self._report(target, "cancelled",
+                                 message="cancelled before it started")
+                except SteveError:
+                    pass
             return
         if not ok:
             if run_id is not None and code != "nonce_replayed":
@@ -752,7 +792,20 @@ class Connector:
         except SteveError:
             pass
         engine = EngineRun(self.cfg, work)
-        self.running = engine
+        # PANELCANCEL6: becoming the active run and consuming a pending
+        # cancel for this id are ONE step under self._cancel_lock (the
+        # loop's cancel decision takes the same lock), so a cancel that
+        # arrived while this id was off the queue but not yet active is
+        # never lost. engine.cancel() runs outside the lock: its
+        # cancelled flag makes the first _spawn raise Cancelled, so NO
+        # engine subprocess starts and the `except Cancelled` path below
+        # reports "cancelled" once; end_run() leaves status "idle".
+        with self._cancel_lock:
+            self.running = engine
+            was_pending = (self._pending_cancel.pop(run_id, None)
+                           is not None)
+        if was_pending:
+            engine.cancel()
         last = [-1.0, None]
 
         def on_progress(p, m):

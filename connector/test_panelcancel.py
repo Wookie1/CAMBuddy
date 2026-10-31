@@ -940,3 +940,136 @@ def test_kill_engine_groups_helper(tmp_path):
     eng = ShapeProc()
     kill(eng)
     assert eng.log == ["kill"], eng.log
+
+
+# =============== PANELCANCEL6 (appended; existing tests untouched) =========
+# The worker takes an item off self._queue, reports "received", builds the
+# EngineRun and only then sets self.running. A verified cancel arriving in
+# that window finds the id neither active nor queued and (before this
+# task) was silently ignored - the run then executed in full. Now the loop
+# marks the id in the bounded self._pending_cancel (under self._cancel_lock)
+# and _run_job, at `self.running = engine` under the SAME lock, consumes
+# the marker and calls engine.cancel() before anything can spawn.
+#
+# (a) test_cancel_in_dequeue_window: a launcher whose fake
+#     EngineRun.__init__ sleeps INIT_SLEEP (2 s) - exactly the window
+#     between "received" and self.running - and whose fake run raises
+#     Cancelled on entry when self.cancelled BEFORE recording a call
+#     (exactly what the real _spawn does before Popen). A call-count of 0
+#     therefore proves no engine subprocess would have started.
+#
+# MUTATION M5 (scratch copy only, run via PANELCANCEL6_CONNECTOR_DIR): the
+# pending check in _run_job skipped (was_pending always False) -> (a) red.
+# Result recorded in PANELCANCEL_RESULTS.md.
+
+INIT_SLEEP = 2.0   # s the fake EngineRun.__init__ holds the window open
+
+LAUNCHER_DEQUEUE_WINDOW = """import os, sys, time
+sys.path.insert(0, %(here)r)
+sys.path.insert(0, %(connector_dir)r)
+import runner
+from runner import Cancelled
+
+FAKE_STEP = b"STEPFAKE-PANELCANCEL"
+DURATION = %(duration)r
+INIT_SLEEP = 2.0        # == INIT_SLEEP here; widened by the fake __init__
+CALLS_FILE = os.environ.get("PC_CALLS_FILE")
+
+_REAL_INIT = runner.EngineRun.__init__
+
+
+def slow_init(self, cfg, work_dir):
+    _REAL_INIT(self, cfg, work_dir)
+    # This constructor call sits in _run_job right between the "received"
+    # report and `self.running = engine`: sleeping HERE widens EXACTLY
+    # the dequeue->activate window (item already off the queue).
+    time.sleep(INIT_SLEEP)
+
+
+def fake_run(self, step_path, values, on_progress=None):
+    # Exactly the real _spawn's first move (runner.py): a cancelled
+    # engine raises Cancelled BEFORE anything spawns. So the call file
+    # only ever sees a line if the engine was NOT yet cancelled when the
+    # run began - count 0 proves no subprocess would have started.
+    if self.cancelled:
+        raise Cancelled("cancelled")
+    with open(CALLS_FILE, "a") as fh:
+        fh.write("call\\n")
+    if on_progress:
+        on_progress(0.05, "faking")
+    deadline = time.time() + DURATION
+    while time.time() < deadline:
+        if self.cancelled:
+            raise Cancelled("cancelled")
+        time.sleep(0.05)
+    return {"files": []}, {}
+
+
+runner.EngineRun.__init__ = slow_init
+runner.EngineRun.run = fake_run
+
+import client as client_mod
+client_mod.SteveClient.download = lambda self, url, headers=None: FAKE_STEP
+
+import connector
+sys.exit(connector.main())
+"""
+
+
+def test_cancel_in_dequeue_window(tmp_path):
+    """(a) cancel arrives while the run is off the queue but not yet
+    active (fake EngineRun.__init__ holds that window open 2 s): the run
+    ends terminal "cancelled", its fake run is NEVER called past the
+    cancelled check (call count 0 - no engine subprocess would have
+    started), status.json ends "idle"."""
+    calls = tmp_path / "calls.txt"
+    mock = MockSteve()
+    base = mock.serve_forever()
+    proc = None
+    try:
+        proc, home = start_connector(
+            tmp_path, mock, LONG,
+            connector_dir=os.environ.get("PANELCANCEL6_CONNECTOR_DIR")
+            or CONNECTOR_DIR,
+            launcher_src=LAUNCHER_DEQUEUE_WINDOW,
+            extra_env={"PC_CALLS_FILE": str(calls)})
+        mock.enqueue_run(8501, action="adaptive_rough",
+                         inputs=dict(RUN_INPUTS))
+        # "received" is the LAST thing _run_job reports before building
+        # the EngineRun, so it marks the window opening; the fake
+        # __init__ then holds it open INIT_SLEEP = 2 s.
+        assert mock.wait_state(8501, "received", timeout=30), \
+            "job never reported received"
+        t0 = time.time()
+        mock.enqueue_cancel(8501)
+        # Why the cancel lands INSIDE the window: it is enqueued within
+        # <=0.1 s of observing "received" (wait_state's poll step) and
+        # the loop's long-poll wakes on the new message immediately, so
+        # handle_message sees an id that is neither queued (the worker
+        # already took it) nor active (self.running is still None - the
+        # constructor is asleep). The call count below proves it
+        # independently: a cancel after the window would find the fake
+        # run already entered (count 1); only the pending path keeps it 0.
+        term = mock.wait_terminal(8501, timeout=15)
+        elapsed = time.time() - t0
+        print("PANELCANCEL6 (a) MEASUREMENT: cancel %.3f s after "
+              "'received' (2 s fake-__init__ window) -> terminal %r after "
+              "%.2f s; fake-run calls=%d (job would have run %.0f s)"
+              % (0.0, term, elapsed, call_count(calls), LONG))
+        assert term == "cancelled", \
+            "no terminal 'cancelled' for the in-window cancel (got %r " \
+            "after %.1f s)" % (term, elapsed)
+        states = mock.states_for(8501)
+        assert states == ["received", "cancelled"], \
+            "unexpected states: %r" % states
+        assert call_count(calls) == 0, \
+            "the engine ran anyway: %d fake calls, expected 0" \
+            % call_count(calls)
+        assert wait_status(home, "idle") == "idle", \
+            "status.json did not return to idle after the cancel"
+        rc = shutdown(proc)
+        assert rc == 0, "measured exit code: %s" % rc
+        proc = None
+    finally:
+        shutdown(proc) if proc else None
+        mock.stop()

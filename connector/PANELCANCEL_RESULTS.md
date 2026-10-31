@@ -436,3 +436,81 @@ _spawn), everything foreground via slot_m4.sh, full connector/test_connector.py 
 launchctl; only self-started PIDs signalled, by exact PID. No G-code or large outputs
 printed. Scratch only under scratch/ (panelcancel_m4 + logs). opencode.json diff (26/4)
 pre-existing at session start, NOT part of this task. Nothing committed (per brief).
+
+## PANELCANCEL6
+Close the cancel window between the worker's queue.get() and `self.running = engine`
+(connector.py :754-755). Design: new dedicated `self._cancel_lock` (threading.Lock) +
+bounded `self._pending_cancel` (OrderedDict, newest PENDING_CANCEL_MAX=64 ids).
+NOT reusing self._lock: that RLock serializes status/event/report writes and is held
+across HTTP round trips (_report); the cancel branch must answer while a job reports,
+and the worker must never wait on an HTTP write to become the active run. self._lock
+would also let _spawn's engine-lock stall leak into report writes. New lock ordering:
+_cancel_lock -> _queue.mutex only (cancel branch); nothing takes _cancel_lock while
+holding _queue.mutex or self._lock, and engine.cancel() (which takes the engine's own
+lock, held around Popen) is called OUTSIDE _cancel_lock on both sides.
+(in progress - started 18:59 MST)
+
+### (a) test_cancel_in_dequeue_window - GREEN
+cmd: slot_m4.sh /opt/homebrew/bin/python3 -m pytest -q -p no:cacheprovider \
+       "connector/test_panelcancel.py::test_cancel_in_dequeue_window" -s
+exit 0, 1 passed in 3.84s (19:01 MST). Measurement: terminal 'cancelled' 1.95 s
+after the cancel (the remaining fake-__init__ sleep), fake-run call count 0
+(no spawn), states exactly [received, cancelled], status.json idle.
+Window guarantee: cancel enqueued <=0.1 s after observing "received" (the last
+report before the EngineRun is built) while the fake __init__ holds the window
+2 s; call count 0 is the independent proof - a cancel after the window would
+find fake_run already entered (count 1).
+
+### MUTATION M5 - RED as required
+Mutant: scratch/panelcancel_m6_m5x/connector/connector.py (copy of the fixed
+connector.py; _run_job's pending check replaced by `was_pending = False`).
+Scratch/verify symlink added so the copy's view.py resolves its repo parent.
+cmd: PANELCANCEL6_CONNECTOR_DIR=scratch/.../connector slot_m4.sh ...pytest -q \
+       "connector/test_panelcancel.py::test_cancel_in_dequeue_window" -s
+exit 1, 1 failed in 17.10s (19:03 MST). Measurement: terminal None after
+15.06 s, fake-run calls=1 -> without the pending check the in-window cancel
+is ignored and the run executes (the pre-fix behaviour). Log: scratch/m6_m5.log.
+
+### At-risk suites (all through slot_m4.sh, foreground; per-file exit codes)
+- connector/test_panelcancel.py (ALL, incl. the new test): exit 0 -
+  12 passed, 1 skipped (the pre-existing PANELCANCEL_MEASURE_MAIN skip), 68.35 s (19:04 MST)
+- connector/test_pidstatus.py (ALL): exit 0 - 5 passed, 2.99 s (19:04 MST)
+- connector/test_show3d.py (ALL): exit 0 - 27 passed, 14.60 s (19:05 MST)
+
+### What changed (git diff --numstat at finish: connector.py +72/-19,
+### test_panelcancel.py +133/-0, PANELCANCEL_RESULTS.md + this section;
+### opencode.json 26/4 pre-existing at session start, NOT part of this task)
+connector/connector.py:
+- PENDING_CANCEL_MAX = 64 constant; `from collections import OrderedDict`.
+- __init__: self._cancel_lock (new threading.Lock; NOT self._lock - see the
+  design note above: self._lock is held across HTTP report writes) and
+  self._pending_cancel = OrderedDict(), bounded to the newest 64 ids.
+- handle_message cancel branch: the active-run test, the PANELCANCEL4 queued
+  drop (semantics unchanged, incl. the _dropped double-cancel guard and the
+  one-shot received+cancelled reports) and the new pending marker are ONE
+  decision under self._cancel_lock; a verified cancel for an id that is
+  neither active nor queued is added to _pending_cancel (unknown ids sit
+  there harmlessly, age out at 64). engine.cancel() stays OUTSIDE the lock.
+- _run_job: `self.running = engine` and the test-and-remove of run_id from
+  _pending_cancel happen under the same lock; if it was pending,
+  engine.cancel() runs at once - the cancelled flag makes the first _spawn
+  raise Cancelled, the existing `except Cancelled` path reports "cancelled"
+  once and end_run() leaves status "idle". No engine subprocess starts.
+- Lock order: _cancel_lock -> _queue.mutex only, held for microseconds
+  (no I/O, no engine.cancel() inside); no path takes them in reverse, and
+  the PANELCANCEL3 rule (never in signal context) is untouched.
+- Tool actions: OUT OF SCOPE per brief - _run_tool_action never sets
+  self.running and tool cancels behave exactly as before.
+connector/test_panelcancel.py: appended PANELCANCEL6 section only
+(LAUNCHER_DEQUEUE_WINDOW + test_cancel_in_dequeue_window); no existing test,
+assertion or timeout touched.
+
+### Finished
+(a) green in 3.84 s (terminal "cancelled" 1.95 s after the in-window cancel,
+fake-run calls 0, status idle); M5 measured red (exit 1, terminal None after
+15.06 s, calls 1). All at-risk suites green (exit codes above). No Core Front,
+no real engine run (fake runs only), everything foreground through slot_m4.sh,
+full connector/test_connector.py NOT run (supervisor's). No lock files touched,
+no git state changes, nothing installed, no launchctl; only self-started PIDs
+signalled, by exact PID. No G-code or large outputs printed. Scratch only under
+scratch/ (panelcancel_m6_m5x + logs). Nothing committed (per brief).
