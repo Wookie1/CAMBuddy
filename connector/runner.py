@@ -339,6 +339,23 @@ def measure_result(bbox):
             "bbox_mm": {"min": lo, "max": hi}}
 
 
+# SK1 default (James, 2026-10-31): all four stock sides are clear; the vise /
+# fixture is avoided by HEIGHT - the jaws sit below the finished part's
+# bottom (tall stock, the excess is cut away after the flip), so a side
+# entry may descend in the air beside any face but never below the part's
+# lowest Z. A jaw-height job input would replace prep["bbox"][4] here.
+SIDE_ENTRY_FACES = "xneg,xpos,yneg,ypos"
+
+
+def _side_entry_args(prep):
+    """No part bottom known -> no height guard -> the class stays OFF."""
+    bbox = prep.get("bbox")
+    if not bbox or len(bbox) < 5:
+        return []
+    return ["--side-entry-clear", SIDE_ENTRY_FACES,
+            "--side-entry-min-z", "%.4f" % bbox[4]]
+
+
 def _rough_skins(path):
     """SKN: the rough's thin skins left standing (engine stats
     skin_skipped), [] when none or unreadable."""
@@ -709,6 +726,7 @@ class EngineRun:
         if metric:
             argv_r += ["--metric"]
         argv_r += self._load_limit_args(values)
+        argv_r += _side_entry_args(prep)
         self._spawn(argv_r, 0.2, 0.85, on_progress)
         posted = {"rough.nc": posted_units(nc, values["units"])}
         with open(stats_path) as fh:
@@ -1558,6 +1576,7 @@ class EngineRun:
             if metric:
                 argv += ["--metric"]
             argv += self._load_limit_args(values)
+            argv += _side_entry_args(prep)
             step("engine", "rough", argv, *P["rough"], sink)
             posted["rough.nc"] = posted_units(nc, values["units"])
 
