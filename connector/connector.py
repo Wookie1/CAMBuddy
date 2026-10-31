@@ -139,7 +139,12 @@ class Connector:
         self.current_run = None
         self._last_event = None
         self._last_keys_refresh = 0.0
-        self._stop = False
+        # PANELCANCEL3: the SIGTERM/SIGINT handler ONLY sets this Event
+        # (no cancel, no join, no I/O, no status write - it runs on the
+        # MAIN thread between bytecodes, possibly while that thread holds
+        # a non-reentrant lock). Every read is an is_set() check; the
+        # shutdown work happens in run_forever's tail, outside signals.
+        self._stop = threading.Event()
         # PANELCANCEL: jobs and tool actions run on ONE long-lived FIFO
         # worker while the message loop keeps polling (only "cancel" is
         # handled there). self._lock serializes status/event/report writes
@@ -269,7 +274,7 @@ class Connector:
             self._save()
 
     def get_token_blocking(self):
-        while not self._stop:
+        while not self._stop.is_set():
             try:
                 return self.client.get_token()  # token stays in memory only
             except SteveError as e:
@@ -399,11 +404,18 @@ class Connector:
             self._run_job(run_id, env, action)
 
     def _worker_loop(self):
-        while not self._stop:
+        while not self._stop.is_set():
             try:
                 item = self._queue.get(timeout=0.25)
             except queue.Empty:
                 continue
+            if self._stop.is_set():
+                # PANELCANCEL3: shutdown was requested while this item was
+                # already off the queue - put it BACK unrun; run_forever's
+                # tail rejects every still-queued item and nothing queued
+                # is ever executed.
+                self._queue.put(item)
+                break
             try:
                 self._exec(item)
             except Exception:
@@ -616,6 +628,29 @@ class Connector:
         except SteveError:
             pass
 
+    def _reject_queued(self):
+        """PANELCANCEL3 (supervisor review of 6e9c2ca): handle_message
+        _remember_run's a run BEFORE queueing and the loop saves the cursor
+        past its message, but the worker exits on shutdown WITHOUT running
+        what is still queued - those runs were never run, never reported
+        and never redelivered. At shutdown every job/tool item still in
+        self._queue gets exactly ONE terminal "rejected" report (code
+        "connector_stopping", _safe_reject-style). Nothing queued is
+        executed."""
+        while True:
+            try:
+                _kind, run_id, _env, _action = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self._report(
+                    run_id, "rejected",
+                    error=errors.make_error(
+                        "connector_stopping",
+                        "connector shut down before this run started"))
+            except SteveError:
+                pass
+
     def _run_job(self, run_id, env, action):
         self.current_run = run_id
         work = os.path.join(self.home, "runs", str(run_id))
@@ -773,14 +808,58 @@ class Connector:
             pass
 
     # ---------------------------------------------------------------- loop --
+    def _handle_signal(self, *_):
+        """PANELCANCEL3: the SIGTERM/SIGINT handler. A Python signal handler
+        runs on the MAIN thread between bytecodes - possibly exactly while
+        that thread is inside EngineRun._spawn's `with self._lock:` (the
+        same non-reentrant lock cancel() takes: calling it here deadlocks),
+        and the other thread's teardown can keep cancel() busy for seconds.
+        So the handler ONLY sets the Event: no cancel, no join, no I/O, no
+        status write. run_forever's tail performs the shutdown outside
+        signal context."""
+        self._stop.set()
+
     def stop(self, *_):
-        self._stop = True
-        if self.running:
-            self.running.cancel()
+        """Programmatic shutdown request (same as a signal): ONLY sets the
+        Event; the loop's tail cancels the active job and stops the worker.
+        Safe to call from any thread; never does work itself."""
+        self._stop.set()
+
+    POLL_INTERRUPT = 1.0   # s: longest single GET /messages wait while idle
+
+    def _poll_messages(self):
+        """PANELCANCEL3: one poll_wait-long fetch taken in slices of at most
+        POLL_INTERRUPT seconds, so a shutdown request is seen within
+        ~POLL_INTERRUPT s of idle wait instead of a full poll_wait (default
+        30 s). Chosen over a watcher thread: the loop thread is the one
+        that must run the shutdown tail anyway (no second thread racing the
+        message handling / cursor save), and a watcher could not interrupt
+        an in-flight HTTP read either - slicing bounds it instead. Returns
+        the first response that carries messages, else the last (empty) one
+        once poll_wait elapsed or shutdown was requested. SteveError and
+        OSError propagate to the loop's unchanged handlers."""
+        wait_total = int(self.cfg["poll_wait"])
+        deadline = time.time() + wait_total
+        while True:
+            if self._stop.is_set():
+                wait = 0                      # asked to stop: a 0 s poll is
+            else:                             # a plain immediate fetch
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    wait = 0
+                else:
+                    wait = min(wait_total, int(self.POLL_INTERRUPT))
+                    if remaining < wait:
+                        wait = max(1, int(remaining))  # final short slice
+            out = self.client.messages(self.state.get("cursor", 0), wait)
+            if out.get("messages") or self._stop.is_set():
+                return out
+            if wait == 0 or time.time() >= deadline:
+                return out
 
     def run_forever(self):
-        signal.signal(signal.SIGTERM, self.stop)
-        signal.signal(signal.SIGINT, self.stop)
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
         self._write_status("starting")
         # PANELCANCEL: the long-lived FIFO worker (jobs + tool actions) so
         # the loop below keeps polling and can read a cancel mid-job.
@@ -791,13 +870,12 @@ class Connector:
         self.get_token_blocking()
         self.publish_catalog_and_panel()
         self.emit_state("idle")
-        while not self._stop:
+        while not self._stop.is_set():
             if time.time() - self._last_keys_refresh >= 60:
                 self.refresh_steve_keys()
                 self._last_keys_refresh = time.time()
             try:
-                out = self.client.messages(self.state.get("cursor", 0),
-                                         int(self.cfg["poll_wait"]))
+                out = self._poll_messages()
             except SteveError as e:
                 if e.code == "token_invalid":
                     self.get_token_blocking()
@@ -807,9 +885,12 @@ class Connector:
             except OSError:
                 time.sleep(1)
                 continue
+            # PANELCANCEL3: the WHOLE fetched batch is handled (no mid-
+            # batch break on shutdown): every message is remembered and
+            # queued here, so the tail below can give every item that
+            # never ran a terminal report instead of the saved cursor
+            # silently swallowing it.
             for msg in out.get("messages", []):
-                if self._stop:
-                    break
                 try:
                     self.handle_message(msg)
                 except Exception:
@@ -818,13 +899,17 @@ class Connector:
             if cursor != self.state.get("cursor"):
                 self.state["cursor"] = cursor
                 self._save()
-        # PANELCANCEL: stop()/SIGTERM - cancel the active job, let the
-        # worker finish it (it drains NOTHING new: the get() poll sees
-        # _stop and exits), join it bounded, then "off" and exit 0.
+        # PANELCANCEL3: the signal handler only set the Event; everything
+        # from here on runs OUTSIDE signal context: cancel the active job,
+        # let the worker finish it (it drains NOTHING new: the get() poll
+        # sees the Event and exits, an item taken in flight goes back
+        # unrun), join it bounded, reject every still-queued item, then
+        # "off" - main() releases the pidfile and exits 0.
         if self.running:
             self.running.cancel()
         if self._worker is not None:
             self._worker.join(timeout=60)
+        self._reject_queued()
         self._write_status("off")
 
 

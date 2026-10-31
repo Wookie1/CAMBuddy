@@ -124,3 +124,113 @@ Untracked added by me: connector/test_panelcancel.py (360 lines),
 connector/PANELCANCEL_RESULTS.md, scratch/panelcancel_m1/ + scratch/panelcancel_main/
 (M1 / main-comparison copies + panel symlink, kept for the supervisor; scratch/ per brief).
 Not committed (per brief). No lane stuck, no locks touched.
+
+---
+
+## PANELCANCEL3
+
+Session start: `Fri Oct 30 18:39 MST 2026` (branch panel-cancel @ f8ccf71). Budget 45 min, hard stop ~19:49.
+Baseline `git diff --numstat` at start: `26 4 opencode.json` (pre-existing, NOT part of this task).
+Plan: (1) SIGTERM/SIGINT handler ONLY sets a threading.Event; loop + shutdown tail do cancel/join/reject/"off"
+outside signal context; (2) queued items rejected "connector_stopping" at shutdown; (3) main-measure test
+skip unless PANELCANCEL_MEASURE_MAIN=1. New tests (a) test_sigterm_while_spawn_holds_lock,
+(c) test_queued_job_rejected_on_shutdown; M2 mutation in scratch copy only. All tests via
+`/Users/James/ai-sandbox/stevecam-ops/slot_m4.sh`, foreground, targeted only.
+
+### Log (append after every run: command, EXIT, date)
+- 18:40 `slot_m4.sh ... -m py_compile connector/connector.py` -> EXIT=0.
+- 18:41 `... pytest connector/test_panelcancel.py::test_queued_job_rejected_on_shutdown` -> **EXIT=0**,
+  1 passed 3.95s. (c) MEASURED: SIGTERM with A running + B queued -> **exit 0 after 0.56 s**;
+  A terminal "cancelled", B exactly ["rejected"] code connector_stopping, pidfile gone, status "off".
+- 18:41 `... pytest connector/test_panelcancel.py::test_sigterm_while_spawn_holds_lock` -> **EXIT=0**,
+  1 passed 4.83s. (a) MEASURED: SIGTERM while the run's self._lock is held (3.0 s) -> **exit 0 after
+  2.98 s** (N = SIGTERM_N = **10.0 s** hard bound via proc.wait); pidfile removed, status "off", job cancelled.
+Current `git diff --numstat` (18:41): connector.py +79/-16-ish (see Final), test file appended (+~190 lines).
+- 18:42 MUTATION M2 (scratch/panelcancel_m2/connector.py = my fixed file with _handle_signal
+  changed to call self.running.cancel() DIRECTLY and never set the Event):
+  `PANELCANCEL_CONNECTOR_DIR=$PWD/scratch/panelcancel_m2 slot_m4.sh ... pytest \
+   connector/test_panelcancel.py::test_sigterm_while_spawn_holds_lock` -> **EXIT=1, 1 failed in 36.68s**
+  = **HANG**: `subprocess.TimeoutExpired: ... timed out after 10.0 seconds` (proc.wait's hard
+  SIGTERM_N bound - never an infinite wait; teardown then SIGTERMs again, still ignored, hard-kills).
+  The handler blocks on the held lock IN signal context and the loop never learns to stop: SIGTERM
+  effectively ignored. Mutation killed by test (a).
+
+### What changed (connector/connector.py +101 / -16; connector/test_panelcancel.py +207 / -0, append + 1 decorator)
+
+**Item 1 - handler ONLY sets an Event; shutdown work outside signal context.**
+`self._stop` is now a `threading.Event` (:147). New `_handle_signal` (:811-820) is the
+SIGTERM/SIGINT handler registered by run_forever: its entire body is `self._stop.set()` -
+no cancel, no join, no I/O, no status write (docstring states why: handler runs on the MAIN
+thread between bytecodes, possibly inside `_spawn`'s `with self._lock:`, the same
+non-reentrant lock `EngineRun.cancel()` takes; the other thread's teardown can keep
+cancel() busy for seconds). `stop()` kept as a programmatic request - also ONLY sets the
+Event. All `_stop` reads are `is_set()` checks (:277 get_token_blocking, :407/:412 worker,
+:873 loop). run_forever tail (:901-912, outside signal context): cancel active job ->
+worker join(timeout=60, bounded) -> `_reject_queued()` -> `_write_status("off")` -> return
+-> main() releases pidfile, exit 0.
+**Long-poll choice: loop-based slicing, NO watcher thread** (`_poll_messages`, :830-857):
+the poll_wait-long fetch is taken in slices of <= POLL_INTERRUPT = 1.0 s; when the Event is
+set the next fetch asks wait=0 (immediate). Chosen because the loop thread must run the
+shutdown tail anyway (a watcher would race the message handling / cursor save, and could
+not interrupt an in-flight HTTP read either - slicing bounds it instead). Worst-case
+shutdown wait beyond the tail itself = one poll slice ~= 1 s (measured total 0.56 s in (c),
+which included the cancel round-trip); with the old code it was a full poll_wait (default
+30 s). With the tests' poll_wait=1 the request pattern is unchanged (one GET /messages per
+iteration); with poll_wait=30 idle it costs one extra GET per second - idempotent by
+protocol (ledger dedupes), the price of a bounded shutdown.
+
+**Item 2 - queued items rejected at shutdown.** `_reject_queued` (:631-652): after the
+worker stopped, every job/tool item still in `self._queue` gets ONE `report "rejected"`
+with `errors.make_error("connector_stopping", "connector shut down before this run
+started")`, SteveError swallowed (_safe_reject-style); nothing queued is executed.
+`_worker_loop` (:406-418) re-checks the Event AFTER `get()` and puts a just-taken item
+BACK unrun (so it cannot slip through the drain and get executed at shutdown). The loop's
+mid-batch `if self._stop: break` is REMOVED (:886-898): the whole fetched batch is handled
+(every run remembered + queued), so the cursor save can never silently swallow a message -
+anything not run is in the queue and gets its terminal "connector_stopping" report.
+NOTE (SCOPE: connector.py only): `connector_stopping` is therefore NOT added to
+errors.CODES / docs - `make_error` gives it `next_step: ""`; registering the code is a
+follow-up outside this task's scope (test_track2's CODES-vs-guide check is untouched).
+
+**Item 3 - main-measure test opt-in.** `test_cancel_mid_job_fails_on_main_connector` got a
+`pytest.mark.skipif(os.environ.get("PANELCANCEL_MEASURE_MAIN") != "1", ...)` decorator ONLY
+(+6 lines, body and assertions byte-identical). Recorded run WITH the env var (18:43):
+**EXIT=0, 1 passed 12.04s** - `PANELCANCEL MAIN MEASUREMENT: cancel for the ACTIVE run ->
+terminal=None after 10.0 s ... not cancelled within N=10.0 s` (main still fails to cancel).
+
+**New tests (appended; existing tests untouched).** `SIGTERM_N = 10.0` s hard bound
+(proc.wait timeout) in both; `LAUNCHER_LOCKHOLD` fake holds `self._lock` (the exact lock
+cancel() takes) for `LOCK_HOLD = 3.0` s on the WORKER thread, checking nothing inside -
+honest-equivalence note in `start_connector_lockhold` (main never runs a job under the
+worker design; the property proven is that the handler does no work, so it cannot block or
+deadlock on the held lock, and the lock-waiting cancel runs later, outside signal context).
+- (a) `test_sigterm_while_spawn_holds_lock`: **PASS, exit 0 after 2.98 s, N = 10.0 s**;
+  pidfile removed, status "off", job terminal "cancelled", no hang.
+- (c) `test_queued_job_rejected_on_shutdown`: **PASS**; A "cancelled", B exactly
+  ["rejected"] code `connector_stopping` / message "connector shut down before this run
+  started" (never "received"/"running"), exit 0 after 0.56 s, pidfile removed, status "off".
+- M2 (scratch copy only, see log): **HANG measured** - TimeoutExpired after SIGTERM_N=10 s,
+  EXIT=1 -> mutation killed by (a).
+
+### AT-RISK suites (all via the lane, exit codes)
+- 18:42 `... pytest connector/test_panelcancel.py` (default env) -> **EXIT=0**, 6 passed,
+  1 skipped (the main-measure test now skips by design) in 36.62s.
+- 18:43 `... pytest connector/test_pidstatus.py` (all 5, incl. test_sigterm_exits_zero) ->
+  **EXIT=0**, 5 passed in 2.99s.
+- 18:43 `... pytest connector/test_show3d.py` -> **EXIT=0**, 27 passed in 14.46s.
+
+### Finished
+`date` at finish: Fri Oct 30 18:44 MST 2026 (~5 min of the 45-min budget; hard stop not
+approached). Final `git diff --numstat`:
+```
+109	0	connector/PANELCANCEL_RESULTS.md   (this file; its own count is from the moment of writing)
+101	16	connector/connector.py
+207	0	connector/test_panelcancel.py
+26	4	opencode.json        <- pre-existing at session start, NOT part of this task
+```
+Untracked: scratch/panelcancel_m2/connector.py (M2 mutation copy + panel symlink, kept for
+the supervisor). Not committed (per brief). No Core Front, no real engine run (fake spawns
+only), everything foreground through slot_m4.sh, no lock files touched, no git state
+changes, only my own child PIDs signalled. No existing test body/assertion/timeout deleted
+or rewritten (only the supervisor-requested skipif decorator added).
+- 18:44 final `git diff --numstat` pasted above; results file complete. Stopping (no commit).

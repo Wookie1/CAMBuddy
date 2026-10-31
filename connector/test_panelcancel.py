@@ -224,6 +224,11 @@ def test_cancel_mid_job(tmp_path):
         mock.stop()
 
 
+@pytest.mark.skipif(os.environ.get("PANELCANCEL_MEASURE_MAIN") != "1",
+                    reason="permanently asserts 2da9125's broken behaviour "
+                           "and costs ~12 s per run; set "
+                           "PANELCANCEL_MEASURE_MAIN=1 to measure it "
+                           "(PANELCANCEL3 item 3; body unchanged)")
 def test_cancel_mid_job_fails_on_main_connector(tmp_path):
     """(a)-main-measurement: the same scenario against the UNMODIFIED
     connector.py of 2da9125 (git show into a scratch copy): the cancel
@@ -355,6 +360,208 @@ def test_second_job_waits(tmp_path):
             "9002 was reported before 9001 ended: %r" % reps
         assert reps[first_9002][1] == "received"
         assert wait_status(home, "idle") == "idle"
+    finally:
+        shutdown(proc) if proc else None
+        mock.stop()
+
+
+# =============== PANELCANCEL3 (appended; existing tests untouched) =========
+# SIGTERM handler ONLY sets a threading.Event; cancel + join + queued-job
+# rejection happen in run_forever's tail, outside signal context.
+#
+# (a) test_sigterm_while_spawn_holds_lock: SIGTERM while the EngineRun's
+#     non-reentrant self._lock (the one cancel() takes, held by the real
+#     _spawn around Popen) is HELD by a running job.
+# (c) test_queued_job_rejected_on_shutdown: a job still queued at shutdown
+#     gets ONE terminal "rejected" report, code "connector_stopping".
+#
+# MUTATION M2 (scratch copy only, run via PANELCANCEL_CONNECTOR_DIR): the
+# handler calls cancel() directly -> test (a) hangs / times out (measured,
+# recorded in PANELCANCEL_RESULTS.md; the hard bound is proc.wait's
+# SIGTERM_N timeout - never an infinite wait).
+
+SIGTERM_N = 10.0   # N: seconds allowed for exit 0 after SIGTERM in (a)/(c)
+LOCK_HOLD = 3.0    # s the fake job holds the EngineRun's self._lock
+
+LAUNCHER_LOCKHOLD = """import sys, time
+sys.path.insert(0, %(here)r)
+sys.path.insert(0, %(connector_dir)r)
+import runner
+from runner import Cancelled
+
+FAKE_STEP = b"STEPFAKE-PANELCANCEL"
+DURATION = %(duration)r
+HOLD = %(hold)r
+
+
+def fake_run(self, step_path, values, on_progress=None):
+    if on_progress:
+        on_progress(0.05, "faking")
+    # The EXACT lock EngineRun.cancel() must take, held the way the real
+    # _spawn holds it around Popen (here: HOLD s of sleep instead of a
+    # fork/exec). Nothing inside checks self.cancelled - while this is
+    # held, any cancel() call blocks on the lock.
+    with self._lock:
+        hold_until = time.time() + HOLD
+        while time.time() < hold_until:
+            time.sleep(0.05)
+    deadline = time.time() + DURATION
+    while time.time() < deadline:
+        if self.cancelled:
+            raise Cancelled("cancelled")
+        time.sleep(0.05)
+    return {"files": []}, {}
+
+
+runner.EngineRun.run = fake_run
+
+import client as client_mod
+client_mod.SteveClient.download = lambda self, url, headers=None: FAKE_STEP
+
+import connector
+sys.exit(connector.main())
+"""
+
+
+def start_connector_lockhold(tmp_path, mock, duration, hold):
+    """start_connector with the lock-holding fake (LAUNCHER_LOCKHOLD): the
+    job reports "running", then holds the EngineRun's own non-reentrant
+    self._lock for `hold` s.
+
+    Honest-equivalence note (brief (a)): with the worker design jobs run
+    on the FIFO WORKER thread, so the thread a signal can interrupt (the
+    MAIN thread) is never inside _spawn's `with self._lock:`. The property
+    under test is what the HANDLER must guarantee: it does no work at all
+    (only Event.set()), so it cannot block or deadlock on the held lock;
+    the cancel that must wait for that lock runs later, on the loop
+    thread, outside signal context. Holding the lock on the worker thread
+    while SIGTERM arrives still forces every shutdown path except the
+    handler to face the blocked-cancel situation, which is exactly the
+    failure a cancel()-calling handler would have hit (deadlock-prone,
+    seconds of teardown in signal context)."""
+    cdir = CONNECTOR_DIR
+    if not os.path.isdir(os.path.join(cdir, "panel")):
+        os.symlink(os.path.join(HERE, "panel"),
+                   os.path.join(cdir, "panel"))
+    home = tmp_path / "home"
+    home.mkdir()
+    with open(home / "config.toml", "w") as fh:
+        fh.write('base_url = "%s"\npairing_code = "PAIR-1234"\n'
+                 'poll_wait = 1\ntoken_retry = 1\n'
+                 'programs_dir = "%s"\nrepo_root = "%s"\n'
+                 % (mock.base_url, tmp_path / "programs", REPO))
+    launcher = tmp_path / "launch_lockhold.py"
+    with open(launcher, "w") as fh:
+        fh.write(LAUNCHER_LOCKHOLD % {"here": HERE, "connector_dir": cdir,
+                                      "duration": duration, "hold": hold})
+    env = dict(os.environ)
+    env["STEVE_BASE_URL"] = mock.base_url
+    env.pop("STEVECAM_HOME", None)
+    proc = subprocess.Popen([PY, str(launcher), "--home", str(home)],
+                            cwd=REPO, env=env,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    try:
+        assert mock.wait_enroll(30), "connector never enrolled"
+        mock.confirm()
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            assert proc.poll() is None, "connector died before idle"
+            if status_state(home) == "idle":
+                return proc, home
+            time.sleep(0.1)
+        raise AssertionError("connector never reached idle")
+    except Exception:
+        shutdown(proc)
+        raise
+
+
+def test_sigterm_while_spawn_holds_lock(tmp_path):
+    """(a) SIGTERM while the run's self._lock is HELD (fake job holds it
+    LOCK_HOLD s on the worker thread - the closest honest equivalent under
+    the worker design, see start_connector_lockhold). The handler only
+    sets the Event; the loop sees it within one <=1 s poll slice, then the
+    shutdown tail cancels (blocking on the held lock OUTSIDE signal
+    context), joins the worker, writes status "off", main() releases the
+    pidfile and exits 0. Hard bound SIGTERM_N (measured); no hang."""
+    mock = MockSteve()
+    base = mock.serve_forever()
+    proc = None
+    try:
+        proc, home = start_connector_lockhold(tmp_path, mock, LONG,
+                                              LOCK_HOLD)
+        mock.enqueue_run(7301, action="adaptive_rough",
+                         inputs=dict(RUN_INPUTS))
+        assert mock.wait_state(7301, "running", timeout=30), \
+            "job never reported running"
+        # "running" is reported BEFORE the fake takes the lock, and the
+        # hold lasts LOCK_HOLD s: SIGTERM lands while the lock is held.
+        t0 = time.time()
+        os.kill(proc.pid, signal.SIGTERM)     # the exact PID we started
+        rc = proc.wait(timeout=SIGTERM_N)     # hard timeout: never infinite
+        elapsed = time.time() - t0
+        print("PANELCANCEL3 (a) MEASUREMENT: SIGTERM while the run lock is "
+              "held -> exit %s after %.2f s (N=%s s; lock held %.1f s, the "
+              "fake job would run %.0f s)"
+              % (rc, elapsed, SIGTERM_N, LOCK_HOLD, LONG))
+        assert rc == 0, "measured exit code: %s" % rc
+        proc = None
+        assert not (home / "connector.pid").exists(), "pidfile not removed"
+        assert wait_status(home, "off", timeout=2.0) == "off", \
+            "status.json did not say 'off'"
+        assert mock.wait_terminal(7301, timeout=5.0) == "cancelled", \
+            "the held-lock job was not cancelled"
+    finally:
+        shutdown(proc) if proc else None
+        mock.stop()
+
+
+def test_queued_job_rejected_on_shutdown(tmp_path):
+    """(c) job A (long fake) runs, job B enqueued behind it (remembered +
+    queued, no reports yet); SIGTERM: A ends "cancelled"; B gets exactly
+    ONE "rejected" report, error code "connector_stopping", message
+    "connector shut down before this run started"; B never reaches
+    "running" (never executed at all); exit 0; pidfile removed; status
+    "off"."""
+    mock = MockSteve()
+    base = mock.serve_forever()
+    proc = None
+    try:
+        proc, home = start_connector(tmp_path, mock, LONG)
+        mock.enqueue_run(7401, action="adaptive_rough",
+                         inputs=dict(RUN_INPUTS))
+        assert mock.wait_state(7401, "running", timeout=30), \
+            "job A never reported running"
+        mock.enqueue_run(7402, action="adaptive_rough",
+                         inputs=dict(RUN_INPUTS))
+        time.sleep(1.5)               # the loop reads 7402 while 7401 runs
+        assert mock.states_for(7402) == [], \
+            "the queued job started while A still ran"
+        t0 = time.time()
+        os.kill(proc.pid, signal.SIGTERM)   # the exact PID we started
+        rc = proc.wait(timeout=SIGTERM_N)   # hard timeout
+        print("PANELCANCEL3 (c) MEASUREMENT: SIGTERM with A running + B "
+              "queued -> exit %s after %.2f s" % (rc, time.time() - t0))
+        assert rc == 0, "measured exit code: %s" % rc
+        proc = None
+        assert not (home / "connector.pid").exists(), "pidfile not removed"
+        assert wait_status(home, "off", timeout=2.0) == "off", \
+            "status.json did not say 'off'"
+        states_a = mock.states_for(7401)
+        assert states_a[-1] == "cancelled", \
+            "active job A did not end 'cancelled': %r" % states_a
+        states_b = mock.states_for(7402)
+        assert states_b == ["rejected"], \
+            "queued job B did not get exactly one 'rejected': %r" % states_b
+        assert "running" not in states_b and "received" not in states_b, \
+            "the queued job was executed: %r" % states_b
+        with mock.lock:
+            body_b = [r["body"] for r in mock.reports
+                      if str(r["run_id"]) == "7402"]
+        err = body_b[0].get("error") or {}
+        assert err.get("code") == "connector_stopping", err
+        assert err.get("message") == \
+            "connector shut down before this run started", err
     finally:
         shutdown(proc) if proc else None
         mock.stop()
