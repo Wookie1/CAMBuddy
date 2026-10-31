@@ -234,3 +234,112 @@ only), everything foreground through slot_m4.sh, no lock files touched, no git s
 changes, only my own child PIDs signalled. No existing test body/assertion/timeout deleted
 or rewritten (only the supervisor-requested skipif decorator added).
 - 18:44 final `git diff --numstat` pasted above; results file complete. Stopping (no commit).
+
+---
+
+## PANELCANCEL4
+
+Session start: Fri Oct 30 2026, worktree /Users/James/ai-sandbox/stevecam-pc @ 62e9739
+(branch panel-cancel). Brief connector/TASK_PANELCANCEL4.md. Budget 40 min, hard stop 60 min.
+
+### Plan
+1. connector.py: verified cancel for a QUEUED run removes it from self._queue (under
+   self._queue.mutex) and reports "received" then "cancelled" once
+   ("cancelled before it started"); second cancel for a dropped id ignored; a
+   set self._dropped (loop-thread only) tracks dropped ids. POLL_INTERRUPT 1.0 -> 10.0.
+2. test_panelcancel.py::test_cancel_other_id_ignored: queued-id part (8002) asserts the
+   new behaviour (coordinator-approved single test change); unknown-id + active-job parts
+   untouched.
+3. errors.py: add "connector_stopping" code; regenerate only the codes table in
+   docs/agent_guide.md (python3 connector/errors.py).
+4. New tests test_cancel_queued_job_dropped, test_double_cancel_queued_reports_once
+   (appended) + M3 mutation in scratch copy.
+
+### Log
+- (init) results section created; no test run yet. `git diff --numstat`: 26 4 opencode.json
+  (pre-existing, not this task).
+- 18:46 item 3 done: errors.CODES + "connector_stopping" (error) after input_digest_mismatch;
+  `slot_m4.sh ... python3 connector/errors.py` -> EXIT=0 (guide +1 line only);
+  guide == render_code_table() verified ("IN SYNC").
+- 18:46 `slot_m4.sh ... pytest -q -p no:cacheprovider connector/test_track2.py::test_f_codes_table_and_guide_in_sync`
+  -> **EXIT=0**, 1 passed in 0.14s.
+- connector.py edited (items 1+4): cancel branch drops queued ids under self._queue.mutex,
+  reports received+cancelled once, self._dropped guards double cancels; POLL_INTERRUPT=10.0.
+- 18:47 item 2 done: test_cancel_other_id_ignored queued-id part now asserts the drop.
+  BEFORE (lines 281-282 docstring, 293, 297-298):
+    (b) cancels for a QUEUED run id and an UNKNOWN id are ignored: the
+        active job completes "succeeded" (and so does the queued one).
+    mock.enqueue_cancel(8002)       # queued id -> ignored
+    assert mock.wait_terminal(8002, timeout=30) == "succeeded"
+    assert "cancelled" not in mock.states_for(8002)
+  AFTER:
+    (b) PANELCANCEL4: a cancel for a QUEUED run id drops it (it never
+        runs); one for an UNKNOWN id is ignored: ... ends ["received", "cancelled"]
+    mock.enqueue_cancel(8002)       # queued id -> dropped, never runs
+    assert mock.wait_terminal(8002, timeout=30) == "cancelled"
+    assert mock.states_for(8002) == ["received", "cancelled"], \
+        "the queued run was not dropped with exactly one report pair"
+  Unknown-id (99999) line and both 8001 assertions unchanged; name kept.
+- 18:47 new tests appended: test_cancel_queued_job_dropped,
+  test_double_cancel_queued_reports_once (+ LAUNCHER_COUNTED calls-counting launcher,
+  start_connector gained optional launcher_src/extra_env, defaults = old behaviour).
+- 18:47 `slot_m4.sh ... pytest -q -p no:cacheprovider ::test_cancel_other_id_ignored
+  ::test_cancel_queued_job_dropped ::test_double_cancel_queued_reports_once`
+  -> **EXIT=0**, 3 passed in 27.70s.
+  `git diff --numstat`: 31/0 RESULTS.md, 42/5 connector.py, 3/0 errors.py,
+  169/10 test_panelcancel.py, 1/0 agent_guide.md, 26/4 opencode.json (pre-existing).
+- 18:48 `slot_m4.sh ... pytest -q -p no:cacheprovider -s connector/test_panelcancel.py` (ALL,
+  with POLL_INTERRUPT=10.0) -> **EXIT=0**, 8 passed, 1 skipped in 52.68s
+  (the 1 skip = test_cancel_mid_job_fails_on_main_connector, opt-in by design).
+  Item 4 measurements (both use poll_wait=1, so POLL_INTERRUPT 1.0 -> 10.0 cannot change
+  them - min(poll_wait, POLL_INTERRUPT) stays 1 s - and they did not change):
+  - test_sigterm_while_spawn_holds_lock: SIGTERM-to-exit measured **2.98 s**, exit 0
+    (bounded by the 3.0 s held lock, not by the poll slice).
+  - test_queued_job_rejected_on_shutdown: SIGTERM-to-exit measured **0.60 s**, exit 0.
+  - (context) test_cancel_mid_job: terminal 'cancelled' 0.11 s after the cancel.
+- 18:48 `slot_m4.sh ... pytest -q -p no:cacheprovider connector/test_pidstatus.py` (all)
+  -> **EXIT=0**, 5 passed in 3.01s.
+- 18:48 `slot_m4.sh ... pytest -q -p no:cacheprovider connector/test_show3d.py`
+  -> **EXIT=0**, 27 passed in 14.47s.
+
+### MUTATION M3 (scratch copy only) - measured
+scratch/panelcancel_m3/connector.py = this connector.py with ONLY the queued-drop block
+removed from handle_message's cancel branch (a queued-id cancel reports nothing and leaves
+B queued); panel/ symlinked by the test helper; run via PANELCANCEL_CONNECTOR_DIR.
+- 18:49 `PANELCANCEL_CONNECTOR_DIR=.../scratch/panelcancel_m3 slot_m4.sh ... pytest -q
+  -p no:cacheprovider "connector/test_panelcancel.py::test_cancel_queued_job_dropped"`
+  -> **EXIT=1**, 1 failed in 18.63s: wait_terminal(8202, timeout=15) returned None - with
+  the drop removed B gets NO "cancelled" (A still runs its 12 s, B only starts afterwards),
+  so test (a) is red. Mutation detected. Copy kept in scratch/panelcancel_m3/ for the
+  supervisor.
+
+### Summary of changes (git diff --numstat at finish, see below)
+- connector/connector.py: +42/-5 - self._dropped set in __init__; cancel branch drops a
+  QUEUED id under self._queue.mutex (the lock queue.Queue.get()/put() take - chosen over a
+  private lock so the worker can never pick the item off between check and removal) and
+  reports ONCE "received" then "cancelled" ("cancelled before it started") via the locked
+  _report; second cancel for a dropped id ignored; unknown/finished ids still ignored, no
+  report; active-run cancel and the ledger/nonce handling unchanged; POLL_INTERRUPT
+  1.0 -> 10.0 (item 4, nothing else in _poll_messages touched).
+- connector/errors.py: +3 - "connector_stopping" (kind "error") next to the other
+  pre-run rejection codes.
+- docs/agent_guide.md: +1 - codes table regenerated by `python3 connector/errors.py`
+  (equals render_code_table(); test_track2.py::test_f_codes_table_and_guide_in_sync EXIT=0).
+- connector/test_panelcancel.py: +169/-10 - the ONE approved test change (item 2 above) +
+  appended PANELCANCEL4 section (2 new tests + counted launcher helper; start_connector
+  gained launcher_src/extra_env kwargs, defaults preserve old behaviour exactly).
+- connector/PANELCANCEL_RESULTS.md: this section.
+
+### Finished
+No Core Front, no real engine run (fake spawns only), all runs foreground through
+slot_m4.sh, full connector/test_connector.py NOT run (supervisor's). No lock files touched,
+no git state changes, no installs; only self-started child PIDs signalled (test shutdowns).
+No G-code or large outputs printed. opencode.json diff (26/4) pre-existing at session
+start, NOT part of this task. Nothing committed (per brief).
+102	0	connector/PANELCANCEL_RESULTS.md
+42	5	connector/connector.py
+3	0	connector/errors.py
+169	10	connector/test_panelcancel.py
+1	0	docs/agent_guide.md
+26	4	opencode.json
+Fri Oct 30 18:49:32 MST 2026

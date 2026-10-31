@@ -93,9 +93,13 @@ sys.exit(connector.main())
 """
 
 
-def start_connector(tmp_path, mock, duration, connector_dir=None):
+def start_connector(tmp_path, mock, duration, connector_dir=None,
+                    launcher_src=None, extra_env=None):
     """MockSteve (already serving) + a connector subprocess in its message
-    loop: enrolled, confirmed, status.json says "idle". Returns (proc, home)."""
+    loop: enrolled, confirmed, status.json says "idle". Returns (proc, home).
+    PANELCANCEL4: launcher_src picks another launcher template (same
+    %(here)s/%(connector_dir)s/%(duration)s keys) and extra_env is merged
+    into the child's environment; both default to the old behaviour."""
     cdir = connector_dir or CONNECTOR_DIR
     if not os.path.isdir(os.path.join(cdir, "panel")):
         # publish_catalog_and_panel() reads panel/ next to ITS connector.py
@@ -110,12 +114,15 @@ def start_connector(tmp_path, mock, duration, connector_dir=None):
                  % (mock.base_url, tmp_path / "programs", REPO))
     launcher = tmp_path / "launch.py"
     with open(launcher, "w") as fh:
-        fh.write(LAUNCHER % {"here": HERE,
-                             "connector_dir": connector_dir or CONNECTOR_DIR,
-                             "duration": duration})
+        fh.write((launcher_src or LAUNCHER) % {
+            "here": HERE,
+            "connector_dir": connector_dir or CONNECTOR_DIR,
+            "duration": duration})
     env = dict(os.environ)
     env["STEVE_BASE_URL"] = mock.base_url
     env.pop("STEVECAM_HOME", None)
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.Popen([PY, str(launcher), "--home", str(home)],
                             cwd=REPO, env=env,
                             stdout=subprocess.DEVNULL,
@@ -277,8 +284,9 @@ def test_cancel_mid_job_fails_on_main_connector(tmp_path):
 # ------------------------------------------------------- (b) other id ------
 
 def test_cancel_other_id_ignored(tmp_path):
-    """(b) cancels for a QUEUED run id and an UNKNOWN id are ignored: the
-    active job completes "succeeded" (and so does the queued one)."""
+    """(b) PANELCANCEL4: a cancel for a QUEUED run id drops it (it never
+    runs); one for an UNKNOWN id is ignored: the active job completes
+    "succeeded" and the queued one ends ["received", "cancelled"]."""
     mock = MockSteve()
     base = mock.serve_forever()
     proc = None
@@ -290,12 +298,13 @@ def test_cancel_other_id_ignored(tmp_path):
         mock.enqueue_run(8002, action="adaptive_rough",
                          inputs=dict(RUN_INPUTS))
         time.sleep(1.5)                 # the loop reads 8002 while 8001 runs
-        mock.enqueue_cancel(8002)       # queued id -> ignored
+        mock.enqueue_cancel(8002)       # queued id -> dropped, never runs
         mock.enqueue_cancel(99999)      # unknown id -> ignored
         assert mock.wait_terminal(8001, timeout=30) == "succeeded"
         assert "cancelled" not in mock.states_for(8001)
-        assert mock.wait_terminal(8002, timeout=30) == "succeeded"
-        assert "cancelled" not in mock.states_for(8002)
+        assert mock.wait_terminal(8002, timeout=30) == "cancelled"
+        assert mock.states_for(8002) == ["received", "cancelled"], \
+            "the queued run was not dropped with exactly one report pair"
         assert wait_status(home, "idle") == "idle"
     finally:
         shutdown(proc) if proc else None
@@ -562,6 +571,156 @@ def test_queued_job_rejected_on_shutdown(tmp_path):
         assert err.get("code") == "connector_stopping", err
         assert err.get("message") == \
             "connector shut down before this run started", err
+    finally:
+        shutdown(proc) if proc else None
+        mock.stop()
+
+
+# =============== PANELCANCEL4 (appended; existing tests untouched) =========
+# A verified cancel whose env["run"] matches a QUEUED item removes that
+# item from self._queue (under self._queue.mutex) and reports it ONCE
+# "received" then "cancelled" ("cancelled before it started"); its fake
+# run is never called. The ledger/nonce stay recorded, so a redelivery of
+# that run message is still never acted on.
+#
+# (a) test_cancel_queued_job_dropped: A (long fake) runs, B queued behind
+#     it; cancel(B) -> B exactly ["received", "cancelled"], never "running"
+#     (fake-run call count proves it never ran), A ends "succeeded"
+#     unaffected, a duplicate of B's message later changes nothing.
+# (b) test_double_cancel_queued_reports_once: cancel(B) twice -> B's
+#     states exactly ["received", "cancelled"] (one of each).
+#
+# MUTATION M3 (scratch copy only, run via PANELCANCEL_CONNECTOR_DIR): the
+# queued-drop removed from the cancel branch (report nothing, leave B
+# queued) -> (a) red. Result recorded in PANELCANCEL_RESULTS.md.
+
+LAUNCHER_COUNTED = """import os, sys, time
+sys.path.insert(0, %(here)r)
+sys.path.insert(0, %(connector_dir)r)
+import runner
+from runner import Cancelled
+
+FAKE_STEP = b"STEPFAKE-PANELCANCEL"
+DURATION = %(duration)r
+CALLS_FILE = os.environ.get("PC_CALLS_FILE")
+
+
+def fake_run(self, step_path, values, on_progress=None):
+    if CALLS_FILE:
+        with open(CALLS_FILE, "a") as fh:
+            fh.write("call\\n")
+    if on_progress:
+        on_progress(0.05, "faking")
+    deadline = time.time() + DURATION
+    while time.time() < deadline:
+        if self.cancelled:
+            raise Cancelled("cancelled")
+        time.sleep(0.05)
+    return {"files": []}, {}
+
+
+runner.EngineRun.run = fake_run
+
+import client as client_mod
+client_mod.SteveClient.download = lambda self, url, headers=None: FAKE_STEP
+
+import connector
+sys.exit(connector.main())
+"""
+
+
+def call_count(calls_file):
+    try:
+        with open(str(calls_file)) as fh:
+            return sum(1 for line in fh if line.strip())
+    except OSError:
+        return 0
+
+
+def test_cancel_queued_job_dropped(tmp_path):
+    """(a) job A (long fake, A_DUR) runs, job B queued behind it (remembered
+    + queued, no reports yet); cancel(B): B's states are exactly
+    ["received", "cancelled"] (never "running"), the "cancelled" message is
+    "cancelled before it started", and B's fake run is NEVER called (call
+    count stays 1 = A only). A ends "succeeded" unaffected. A later
+    redelivery-like duplicate of B's run message (same run id) is not run
+    and reported nothing more."""
+    a_dur = 12.0
+    calls = tmp_path / "calls.txt"
+    mock = MockSteve()
+    base = mock.serve_forever()
+    proc = None
+    try:
+        proc, home = start_connector(tmp_path, mock, a_dur,
+                                     launcher_src=LAUNCHER_COUNTED,
+                                     extra_env={"PC_CALLS_FILE": str(calls)})
+        mock.enqueue_run(8201, action="adaptive_rough",
+                         inputs=dict(RUN_INPUTS))
+        assert mock.wait_state(8201, "running", timeout=30), \
+            "job A never reported running"
+        mock.enqueue_run(8202, action="adaptive_rough",
+                         inputs=dict(RUN_INPUTS))
+        time.sleep(1.5)               # the loop reads 8202 while 8201 runs
+        assert mock.states_for(8202) == [], \
+            "the queued job started while A still ran"
+        mock.enqueue_cancel(8202)     # queued id -> dropped, never runs
+        assert mock.wait_terminal(8202, timeout=15) == "cancelled", \
+            "the queued job never got its terminal 'cancelled'"
+        states_b = mock.states_for(8202)
+        assert states_b == ["received", "cancelled"], \
+            "B's states are not exactly [received, cancelled]: %r" % states_b
+        assert "running" not in states_b, "the queued run started: %r" % states_b
+        with mock.lock:
+            body_b = [r["body"] for r in mock.reports
+                      if str(r["run_id"]) == "8202"]
+        assert body_b[-1].get("message") == "cancelled before it started", \
+            body_b[-1]
+        assert call_count(calls) == 1, \
+            "B's fake run ran: %d calls, expected only A's" % call_count(calls)
+        # A unaffected: it runs to its end and succeeds
+        assert mock.wait_terminal(8201, timeout=30) == "succeeded"
+        states_a = mock.states_for(8201)
+        assert "cancelled" not in states_a and states_a[-1] == "succeeded"
+        # redelivery-like duplicate of B's message (same run id, fresh
+        # nonce): the ledger still refuses to act on it twice
+        mock.enqueue_run(8202, action="adaptive_rough",
+                         inputs=dict(RUN_INPUTS))
+        time.sleep(2.5)               # the loop has read it (poll_wait=1)
+        assert mock.states_for(8202) == ["received", "cancelled"], \
+            "a redelivered B was acted on: %r" % mock.states_for(8202)
+        assert call_count(calls) == 1, \
+            "a redelivered B ran: %d fake calls" % call_count(calls)
+        assert wait_status(home, "idle") == "idle"
+        rc = shutdown(proc)
+        assert rc == 0, "measured exit code: %s" % rc
+        proc = None
+    finally:
+        shutdown(proc) if proc else None
+        mock.stop()
+
+
+def test_double_cancel_queued_reports_once(tmp_path):
+    """(b) cancel(B) twice for the same queued run -> B's states exactly
+    ["received", "cancelled"] (one of each); the second cancel is ignored."""
+    mock = MockSteve()
+    base = mock.serve_forever()
+    proc = None
+    try:
+        proc, home = start_connector(tmp_path, mock, 6.0)
+        mock.enqueue_run(8301, action="adaptive_rough",
+                         inputs=dict(RUN_INPUTS))
+        assert mock.wait_state(8301, "running", timeout=30), \
+            "job A never reported running"
+        mock.enqueue_run(8302, action="adaptive_rough",
+                         inputs=dict(RUN_INPUTS))
+        time.sleep(1.5)               # the loop reads 8302 while 8301 runs
+        mock.enqueue_cancel(8302)
+        mock.enqueue_cancel(8302)     # second cancel for the dropped id
+        assert mock.wait_terminal(8302, timeout=15) == "cancelled"
+        states_b = mock.states_for(8302)
+        assert states_b == ["received", "cancelled"], \
+            "B's states are not exactly one received + one cancelled: %r" \
+            % states_b
     finally:
         shutdown(proc) if proc else None
         mock.stop()

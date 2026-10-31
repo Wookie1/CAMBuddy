@@ -23,6 +23,9 @@ CODES = {
                        "the catalog)."),
     "input_digest_mismatch": ("error", "Send the run again: the downloaded "
                               "file did not match its sha256/size."),
+    "connector_stopping": ("error", "The SteveCAM connector was shutting "
+                           "down; start it again (menu bar: Start) and "
+                           "re-run."),
     # --- tool library / jobs ---
     "unknown_tool": ("error", "Use a tool_id from tools.list."),
     "duplicate_t": ("error", "Pick a T no other tool uses in this job "

@@ -153,6 +153,11 @@ class Connector:
         self._queue = queue.Queue()
         self._worker = None
         self._lock = threading.RLock()
+        # PANELCANCEL4: run ids dropped from the queue by a cancel, so a
+        # second cancel for the same id reports nothing twice. Only the
+        # loop thread touches it (cancels are handled on the loop thread
+        # while the worker exists; direct callers are single-threaded).
+        self._dropped = set()
         # MENUBAR: <home>/status.json for the menu-bar app (secret-free).
         self.status_path = os.path.join(self.home, "status.json")
         self.commit = self._git_commit()
@@ -355,15 +360,43 @@ class Connector:
         if kind == "cancel":
             # PANELCANCEL: a cancel is acted on ONLY when its envelope
             # verifies (a forged/expired/unknown-kid one is ignored
-            # silently, no report) and it names the ACTIVE job's run id;
-            # one for any other id (queued, finished, unknown) is ignored.
-            # The worker's `except Cancelled` path reports "cancelled"
-            # once and ends the run (status.json ends "idle").
+            # silently, no report).
+            # PANELCANCEL4: it names either the ACTIVE run (unchanged: the
+            # worker's `except Cancelled` path reports "cancelled" once and
+            # ends the run, status.json ends "idle") or a QUEUED one: that
+            # item is removed from the FIFO queue under self._queue.mutex
+            # (the very lock queue.Queue.get()/put() take, so the worker
+            # cannot pick the item off between our check and our removal)
+            # and reported ONCE "received" then "cancelled" (STEVE's state
+            # machine, mirrored in mock_steve.NEXT_OK, only allows
+            # "received"/"rejected" as a run's first report and
+            # "cancelled" only after "received"). Its engine/tool action
+            # never starts; the ledger/nonce stay recorded, so a
+            # redelivery of that run is never acted on again. A cancel for
+            # any other id (finished, unknown, or already dropped) is
+            # ignored, no report.
             if not ok:
                 return
             target = env.get("run")
             if self.running and self.current_run == target:
                 self.running.cancel()
+                return
+            if target in self._dropped:
+                return          # second cancel for a dropped id: ignored
+            with self._queue.mutex:
+                for item in list(self._queue.queue):
+                    if item[1] == target:
+                        self._queue.queue.remove(item)
+                        self._dropped.add(target)
+                        break
+                else:
+                    return      # not queued (finished/unknown): ignored
+            try:
+                self._report(target, "received")
+                self._report(target, "cancelled",
+                             message="cancelled before it started")
+            except SteveError:
+                pass
             return
         if not ok:
             if run_id is not None and code != "nonce_replayed":
@@ -825,7 +858,11 @@ class Connector:
         Safe to call from any thread; never does work itself."""
         self._stop.set()
 
-    POLL_INTERRUPT = 1.0   # s: longest single GET /messages wait while idle
+    # PANELCANCEL4 (supervisor review of 7f89867): 1.0 s made an idle
+    # connector GET /messages once a second (30x the old rate); 10.0 s
+    # keeps shutdown bounded well inside launchd's default 20 s
+    # ExitTimeOut (our plist sets none).
+    POLL_INTERRUPT = 10.0  # s: longest single GET /messages wait while idle
 
     def _poll_messages(self):
         """PANELCANCEL3: one poll_wait-long fetch taken in slices of at most
