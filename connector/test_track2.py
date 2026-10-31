@@ -691,3 +691,20 @@ def test_tl2_nothing_to_cut_blocks_the_run(tmp_path, monkeypatch):
     result, _ = runner_mod.EngineRun(cfg, str(tmp_path / "ok")).run(
         STEP, dict(ROUGH_VALUES))
     assert result["n_moves"] == 1
+
+
+# ------------------------------------- DOCSTR: model.document as a string --
+
+@pytest.mark.parametrize("doc", ["doc-str", {"id": "doc-str"}])
+def test_docstr_document_fallback_applies_renumber(home, doc):
+    """A run that omits document_id gets the model's STEVE document, whether
+    the file input names it as an id string or as {"id": ...}; the job's
+    renumbering then reaches the run's tool table (measured: T5)."""
+    toollib.renumber(home, REPO, "doc-str", "flat-12.686", 5)
+    ok, code, v = connector_mod.prepare_values(
+        {"model": {"document": doc, "revision": 1}}, catalog_mod.ACTION)
+    assert ok, (code, v)
+    assert v.get("document_id") == "doc-str"
+    tab = toollib.effective_table(home, REPO, v.get("document_id"))
+    t = [x for x in tab["tools"] if x.get("tool_id") == "flat-12.686"][0]
+    assert t["number"] == 5
