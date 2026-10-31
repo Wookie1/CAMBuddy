@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(REPO, "verify"))
 
 import catalog as catalog_mod  # noqa: E402
 import connector as connector_mod  # noqa: E402
+import runner as runner_mod  # noqa: E402
 import toollib  # noqa: E402
 import zmap  # noqa: E402
 from test_holder_precheck import RUN_INPUTS, _run, conn  # noqa: E402,F401
@@ -110,3 +111,29 @@ def test_diameter_differing_from_repo_still_refused(conn):
     assert err["code"] == "tool_geometry_mismatch" and not spawns, err
     assert (err["field"], err["got"], err["allowed"]) == \
         ("diameter_mm", 12.0, 12.7)
+
+
+@pytest.mark.parametrize("key", ["flute_mm", "diameter_mm"])
+def test_library_may_not_fill_a_null_geometry_field(tmp_path, key):
+    """The fill is limited to holder/stickout_mm: a repo row with a null
+    geometry field (synthetic repo table) and a library value for it stay
+    refused. Catches a fill-any-null check, which today's repo table (no
+    null geometry) cannot."""
+    repo = tmp_path / "repo"
+    (repo / "tools").mkdir(parents=True)
+    table = toollib._read(toollib.repo_table_path(REPO))
+    lib_value = next(t for t in table["tools"]
+                     if t["tool_id"] == T3)[key]
+    home = tmp_path / "home"
+    home.mkdir()
+    toollib.write_json(str(home / "tools.json"), table)   # library: filled
+    next(t for t in table["tools"] if t["tool_id"] == T3)[key] = None
+    toollib.write_json(toollib.repo_table_path(str(repo)), table)
+    eng = runner_mod.EngineRun({"home": str(home), "repo_root": str(repo)},
+                               str(tmp_path))
+    eng._load_tools({})
+    with pytest.raises(runner_mod.EngineError) as e:
+        eng._check_library_geometry([3])
+    err = e.value.as_error()
+    assert (err["code"], err["field"], err["got"], err.get("allowed")) == \
+        ("tool_geometry_mismatch", key, lib_value, None)
