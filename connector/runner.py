@@ -471,12 +471,16 @@ class EngineRun:
             r = repo.get(e.get("tool_id"))
             for key in _GEOMETRY_KEYS if r is not None else ():
                 a, b = e.get(key), r.get(key)
+                if b is None and key in ("holder", "stickout_mm"):
+                    continue   # TOOL-STICKOUT: the library may fill these
+                    # where the repo row is null (the engine and judges read
+                    # the run's effective table via --tools-json)
                 if not (abs(a - b) <= toollib.TOL if isinstance(
                         a, (int, float)) and isinstance(b, (int, float))
                         else a == b):
                     raise EngineError(
-                        "tool %s: the library has %s %r but the engine and "
-                        "judges read %r from tools/x7_tools.json"
+                        "tool %s: the library has %s %r but the repo tool "
+                        "table tools/x7_tools.json has %r"
                         % (e.get("tool_id"), key, a, b),
                         code="tool_geometry_mismatch", field=key, got=a,
                         allowed=b)

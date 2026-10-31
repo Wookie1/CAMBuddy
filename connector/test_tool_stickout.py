@@ -63,3 +63,50 @@ def test_bad_stickout_refused(conn, bad):
                       {"tool_id": T3, "changes": {"stickout_mm": bad}})
     assert e.value.code == "invalid_field"
     assert e.value.detail["field"] == "stickout_mm"
+
+
+# ------------------------------- library fills the repo table's nulls ----
+
+def test_precheck_and_geometry_pass_after_update(conn):
+    """T3's repo row has holder/stickout null: the library may fill them
+    (the engine and judges read the run's effective table), so T3 now
+    reaches the engine. Before: tool_geometry_mismatch on holder."""
+    c, mock, home, spawns = conn
+    rep = _run(c, mock, 9401, **T3_RUN)
+    assert rep["error"]["code"] == "tool_holder_missing" and not spawns
+    c.tool_action(catalog_mod.TOOLS_UPDATE,
+                  {"tool_id": T3, "changes": dict(FIX)})
+    rep = _run(c, mock, 9402, **T3_RUN)
+    print("TOOL-STICKOUT: T3 after update -> %r, engine spawns %d"
+          % (rep["error"]["code"], len(spawns)))
+    assert rep["error"]["code"] not in ("tool_holder_missing",
+                                        "tool_geometry_mismatch"), rep["error"]
+    assert len(spawns) >= 1, rep["error"]   # reached the engine
+
+
+def test_holder_differing_from_repo_still_refused(conn):
+    """T13's repo holder is BT30-ER32-70: a different library holder is a
+    real difference and stays refused."""
+    c, mock, home, spawns = conn
+    c.tool_action(catalog_mod.TOOLS_UPDATE,
+                  {"tool_id": "flat-12.686",
+                   "changes": {"holder": "BT30-ER20-60"}})
+    err = _run(c, mock, 9403)["error"]
+    assert err["code"] == "tool_geometry_mismatch" and not spawns
+    assert (err["field"], err["got"], err["allowed"]) == \
+        ("holder", "BT30-ER20-60", "BT30-ER32-70")
+    assert err["message"] == (
+        "tool flat-12.686: the library has holder 'BT30-ER20-60' but the "
+        "repo tool table tools/x7_tools.json has 'BT30-ER32-70'")
+
+
+def test_diameter_differing_from_repo_still_refused(conn):
+    """Only holder/stickout_mm may fill a null; geometry differences stay
+    refused (here T3 also gets a holder + stick-out, so only dia differs)."""
+    c, mock, home, spawns = conn
+    c.tool_action(catalog_mod.TOOLS_UPDATE,
+                  {"tool_id": T3, "changes": dict(FIX, dia_mm=12.0)})
+    err = _run(c, mock, 9404, **dict(T3_RUN, tool_diameter=12.0))["error"]
+    assert err["code"] == "tool_geometry_mismatch" and not spawns, err
+    assert (err["field"], err["got"], err["allowed"]) == \
+        ("diameter_mm", 12.0, 12.7)
