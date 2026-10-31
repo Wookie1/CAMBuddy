@@ -168,8 +168,12 @@ def prepare_values(values_in, action):
     if takes_doc and not values_in.get("document_id"):
         doc = (values_in.get("model") or {}).get("document") \
             if isinstance(values_in.get("model"), dict) else None
-        if isinstance(doc, dict) and doc.get("id"):
-            values_in = dict(values_in, document_id=str(doc["id"]))
+        # STEVE's file input names its document as an id string or as a
+        # {"id": ...} reference: accept both
+        if isinstance(doc, dict):
+            doc = doc.get("id")
+        if isinstance(doc, (str, int)) and str(doc):
+            values_in = dict(values_in, document_id=str(doc))
     ok, out = catalog_mod.validate(values_in, action, raw=raw)
     if not ok:
         return False, out["code"], out  # out = the agent error (task f)
