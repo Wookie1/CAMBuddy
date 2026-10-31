@@ -339,7 +339,8 @@ class EngineRun:
         self.cfg = cfg
         self.work = work_dir
         os.makedirs(work_dir, exist_ok=True)
-        self._proc = None
+        self._procs = set()      # live Popen objects (task SP-P3C-2: two
+                                 # chains can run children at once)
         self._lock = threading.Lock()
         self.cancelled = False
         self.tools = None        # effective tool table (see _load_tools)
@@ -482,15 +483,62 @@ class EngineRun:
                     code="tool_not_in_table", field="tool_id",
                     got=e.get("tool_id"), allowed=sorted(repo))
 
+    @staticmethod
+    def _group_alive(proc):
+        """True while the step's process group still has a process. Every
+        _spawn uses start_new_session=True, so the whole group (zmap's fork
+        Pool, the engine's island pool, any grandchildren) is reachable
+        with killpg. A zombie the owning chain has not reaped yet still
+        counts as alive; its _spawn thread reaps it within milliseconds."""
+        try:
+            os.killpg(os.getpgid(proc.pid), 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True     # cannot probe: assume alive, keep retrying
+
+    def _signal_groups(self, procs, sig):
+        """`sig` to every listed step's process group, keeping the old
+        ProcessLookupError/PermissionError fallback to terminate()/kill().
+        A group that dies between poll() and killpg is already gone."""
+        for proc in procs:
+            try:
+                os.killpg(os.getpgid(proc.pid), sig)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    if sig == signal.SIGTERM:
+                        proc.terminate()
+                    else:
+                        proc.kill()
+                except OSError:
+                    pass
+
+    def _kill_all(self):
+        """SIGTERM every live tracked process group; a group that starts
+        while this tears down is SIGTERMed too (the other chain can be
+        between its stop-flag check and its Popen), so re-scan each round.
+        After up to 5 s, SIGKILL every group still alive."""
+        deadline = time.time() + 5.0
+        seen = []
+        while True:
+            with self._lock:
+                procs = [p for p in self._procs
+                         if p.poll() is None and p not in seen]
+            if procs:
+                self._signal_groups(procs, signal.SIGTERM)
+                seen.extend(procs)
+            alive = [p for p in seen if self._group_alive(p)]
+            if not alive:
+                return
+            if time.time() >= deadline:
+                self._signal_groups(alive, signal.SIGKILL)
+                return
+            time.sleep(0.05)
+
     def cancel(self):
         self.cancelled = True
-        with self._lock:
-            proc = self._proc
-        if proc and proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                proc.terminate()
+        self._kill_all()
 
     def _freshness(self):
         """engine.freshness (task HC): guards against stale build outputs."""
@@ -511,7 +559,7 @@ class EngineRun:
                 argv, cwd=self.cfg["repo_root"], env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 start_new_session=True)
-            self._proc = proc
+            self._procs.add(proc)
         err_lines = []
 
         def drain():
@@ -522,27 +570,33 @@ class EngineRun:
         t = threading.Thread(target=drain, daemon=True)
         t.start()
         last = [None]
-        for line in proc.stdout:
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                continue
-            if json_out is not None:
-                json_out.append(obj)
-            if "progress" not in obj:
-                continue
-            p = stage_lo + (stage_hi - stage_lo) * float(obj["progress"])
-            msg = obj.get("message", "")
-            if last[0] is None or p - last[0] >= 0.02 or msg != last[1]:
-                last = [p, msg]
-                if on_progress:
-                    on_progress(p, msg)
-            if self.cancelled:
-                self.cancel()
-        proc.wait()
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if json_out is not None:
+                    json_out.append(obj)
+                if "progress" not in obj:
+                    continue
+                p = stage_lo + (stage_hi - stage_lo) * float(obj["progress"])
+                msg = obj.get("message", "")
+                if last[0] is None or p - last[0] >= 0.02 or msg != last[1]:
+                    last = [p, msg]
+                    if on_progress:
+                        on_progress(p, msg)
+                if self.cancelled:
+                    self.cancel()
+            proc.wait()
+        finally:
+            # task SP-P3C-2: the step's process is only live while this
+            # chain waits for it; cancel() kills exactly the live groups
+            with self._lock:
+                self._procs.discard(proc)
         t.join(timeout=2)
         if self.cancelled:
             raise Cancelled("cancelled")
@@ -1103,6 +1157,26 @@ class EngineRun:
         total_judges = 3 if rest else 2
         steps_log = os.path.join(self.work, "steps.log")
 
+        # TASK SP-P3C-2: failure propagation. The FIRST failure (its
+        # exception object + which chain raised it) is recorded under
+        # first_lock; every later failure is ignored, so the error that
+        # reaches the caller is always the first one, unchanged. A dead
+        # judge stops the engine before its next step (stop_engine); a
+        # failed engine stops the judges the same way (abort, round 1).
+        # Whichever chain fails first also kills the other chain's live
+        # process group(s) at once; cancel() kills every live group.
+        first_error = {}
+        first_lock = threading.Lock()
+        stop_engine = threading.Event()
+
+        def record_first(exc, chain):
+            with first_lock:
+                if "exc" not in first_error:
+                    first_error["exc"] = exc
+                    first_error["chain"] = chain
+                    return True
+            return False
+
         def emit(p, msg):
             # the run's single on_progress sink; prog_lock must be held.
             # values never decrease.
@@ -1135,6 +1209,16 @@ class EngineRun:
         def step(chain, name, argv, lo, hi, prog=None, **kw):
             # one _spawn plus its steps.log line, written under prog_lock:
             # "<step> <start epoch s> <end epoch s> <chain>"
+            # task SP-P3C-2: neither chain starts another step once the
+            # other has failed (or the run is cancelled): the stop raises
+            # Cancelled, which is NEVER reported in place of the first
+            # error - the error paths below re-raise the recorded first.
+            if self.cancelled:
+                raise Cancelled("cancelled")
+            if chain == "engine" and stop_engine.is_set():
+                raise Cancelled("judge chain failed")
+            if chain == "judge" and abort.is_set():
+                raise Cancelled("engine chain failed")
             t0 = time.time()
             try:
                 return self._spawn(argv, lo, hi, prog, **kw)
@@ -1353,12 +1437,22 @@ class EngineRun:
                     _check_zmap_gates(judge_out["check_s"])
             except BaseException as e:  # noqa: BLE001
                 # a judge failure is never swallowed by the thread: it is
-                # stored and re-raised in the main thread after the join
+                # recorded (first error wins) and, as the first failure,
+                # cancels the engine chain at once - stop_engine keeps it
+                # from starting another step and _kill_all() kills its
+                # running process group now. When the engine failed first
+                # this handler only sees the kill of its own judge step:
+                # the record is ignored and the stop flag is inert (the
+                # engine chain is already in its error path).
                 judge_errors.append(e)
+                record_first(e, "judge")
+                stop_engine.set()
+                self._kill_all()
             finally:
                 judge_done.set()
 
-        judge_thread = threading.Thread(target=judge_chain, daemon=True)
+        judge_thread = threading.Thread(target=judge_chain, daemon=True,
+                                        name="judge-chain")
         judge_thread.start()
 
         try:
@@ -1578,19 +1672,34 @@ class EngineRun:
                 # the rest judge's program is accepted (its other inputs,
                 # finish.nc and the sidecar merge, are judge-chain work)
                 ev_rest.set()
-        except BaseException:
-            # round 1: the engine error wins - release the judge chain (it
-            # must not wait forever), join it, then re-raise the engine
-            # error. Failure/cancel hardening is round 2.
+        except BaseException as e:  # noqa: BLE001
+            # task SP-P3C-2: record the first error (an engine failure, a
+            # cancel, or the internal Cancelled of a chain the OTHER one
+            # stopped), release the judge chain (it must not wait forever:
+            # abort + every pending Event), kill every live process group
+            # of both chains, join the judge thread - only then raise.
+            # cancel() always ends as Cancelled; an internal stop caused
+            # by the other chain's failure re-raises THAT first error
+            # unchanged (same type, message, code, where).
+            record_first(e, "engine")
             abort.set()
             ev_rough.set()
             ev_finish.set()
             ev_rest.set()
+            self._kill_all()
             judge_thread.join()
+            if self.cancelled:
+                raise Cancelled("cancelled")
+            if first_error.get("chain") not in (None, "engine"):
+                raise first_error["exc"]
             raise
         judge_thread.join()
-        if judge_errors:
-            raise judge_errors[0]
+        if self.cancelled:
+            raise Cancelled("cancelled")
+        if first_error.get("chain") == "judge":
+            # only the judge chain can have failed on this path: re-raise
+            # its first error in the main thread, unchanged
+            raise first_error["exc"]
         check_r = judge_out["check_r"]
         check_f = judge_out["check_f"]
         check_s = judge_out.get("check_s")
