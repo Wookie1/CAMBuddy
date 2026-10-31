@@ -88,6 +88,7 @@ rewrites this table; a test fails when it drifts).
 | `gouges` | blocker | Check orientation, tool size and stepdown at the spot in `where`, then run again. |
 | `rapid_collisions` | blocker | Check floor_z and the stock sizes; the first offending line is in `where`. |
 | `over_flute` | blocker | Use a longer-flute or necked tool, or split the depth. |
+| `tool_holder_missing` | blocker | Add the tool's holder and stick-out in the panel's tool library (tools.update), then run again. |
 | `holder_unknown` | blocker | Give the tool a holder and stick-out in the library (tools.update), or pick a tool that has one. |
 | `holder_hits` | blocker | Use more stick-out or a slimmer holder; the first line is in `where`. |
 | `axial_plunges` | blocker | Raise floor_z or use a ramp-capable entry; the first line is in `where`. |
