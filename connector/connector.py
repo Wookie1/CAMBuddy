@@ -38,6 +38,54 @@ PANEL_NAME = catalog_mod.ACTION
 RUN_ID_MAX = 128             # view.load run_id length cap (STEVE's id format is not assumed)
 LAST_RUNS_MAX = 10           # the last_runs event lists at most this many
 LAST_RUNS_MAX_BYTES = 8 * 1024   # event data stays under 8 kB
+# PANELCANCEL5: bounded shutdown tail (launchd ExitTimeOut 30 s in the
+# plist). Worst case from SIGTERM to exit: one in-flight poll slice
+# (Connector.POLL_INTERRUPT = 10 s) + cancel + SHUTDOWN_GRACE +
+# SHUTDOWN_KILL_JOIN + the queued-reject/"off" tail ~= 23 s < 30 s.
+SHUTDOWN_GRACE = 8.0         # s to wait for the worker after cancel()
+SHUTDOWN_KILL_JOIN = 4.0     # s more to wait after SIGKILLing the engine
+
+
+def _kill_engine_groups(engine):
+    """PANELCANCEL5: SIGKILL every live process group of an EngineRun, so a
+    child that ignores cancel()'s SIGTERM cannot outlive a SIGKILLed
+    connector (engine children run in their own sessions, so a plain
+    killpg of the connector's group would miss them). Works with every
+    runner shape without editing runner.py, trying in this order:
+    public live_pgids() -> killpg each with SIGKILL; else public kill_all
+    -> kill_all(signal.SIGKILL); else the private _procs (a set of Popen);
+    else the private _proc (one Popen); a Popen is live when poll() is
+    None. For a Popen shape a failed killpg (ProcessLookupError /
+    PermissionError) falls back to p.kill(); any other OSError is ignored -
+    this runs in the shutdown tail and must never raise."""
+    live_pgids = getattr(engine, "live_pgids", None)
+    if callable(live_pgids):
+        for pgid in live_pgids():
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+        return
+    kill_all = getattr(engine, "kill_all", None)
+    if callable(kill_all):
+        kill_all(signal.SIGKILL)
+        return
+    procs = getattr(engine, "_procs", None)
+    if procs is None:
+        proc = getattr(engine, "_proc", None)
+        procs = [proc] if proc is not None else []
+    for proc in list(procs):
+        if proc is None or proc.poll() is not None:
+            continue
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------- pidfile --
@@ -860,8 +908,8 @@ class Connector:
 
     # PANELCANCEL4 (supervisor review of 7f89867): 1.0 s made an idle
     # connector GET /messages once a second (30x the old rate); 10.0 s
-    # keeps shutdown bounded well inside launchd's default 20 s
-    # ExitTimeOut (our plist sets none).
+    # keeps shutdown bounded well inside the plist's ExitTimeOut 30
+    # (PANELCANCEL5).
     POLL_INTERRUPT = 10.0  # s: longest single GET /messages wait while idle
 
     def _poll_messages(self):
@@ -942,10 +990,19 @@ class Connector:
         # sees the Event and exits, an item taken in flight goes back
         # unrun), join it bounded, reject every still-queued item, then
         # "off" - main() releases the pidfile and exits 0.
-        if self.running:
-            self.running.cancel()
+        # PANELCANCEL5: the join is bounded by SHUTDOWN_GRACE (was 60 s -
+        # far beyond launchd's ExitTimeOut). If the worker is still alive
+        # after it, the active job's child ignored cancel()'s SIGTERM:
+        # SIGKILL its process group(s) and give the worker SHUTDOWN_KILL_JOIN
+        # more; the queued rejects and "off" then run regardless.
+        engine = self.running
+        if engine:
+            engine.cancel()
         if self._worker is not None:
-            self._worker.join(timeout=60)
+            self._worker.join(timeout=SHUTDOWN_GRACE)
+            if self._worker.is_alive() and engine is not None:
+                _kill_engine_groups(engine)
+                self._worker.join(timeout=SHUTDOWN_KILL_JOIN)
         self._reject_queued()
         self._write_status("off")
 

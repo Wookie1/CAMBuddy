@@ -724,3 +724,219 @@ def test_double_cancel_queued_reports_once(tmp_path):
     finally:
         shutdown(proc) if proc else None
         mock.stop()
+
+
+# =============== PANELCANCEL5 (appended; existing tests untouched) =========
+# Bounded shutdown tail: after the active job's cancel() the loop joins the
+# worker for SHUTDOWN_GRACE (8 s, was 60); if it is still alive the job's
+# child ignored cancel()'s SIGTERM, so _kill_engine_groups SIGKILLs every
+# live process group of that EngineRun and the join gets SHUTDOWN_KILL_JOIN
+# (4 s) more; queued rejects and "off" run regardless. Worst case from
+# SIGTERM to exit < 30 s (10 poll + 8 grace + 4 kill-join + ~1 tail).
+#
+# (b) test_shutdown_kills_child_ignoring_sigterm: a REAL connector
+#     subprocess whose fake run starts, THROUGH THE REAL runner._spawn, a
+#     child /bin/sh -c 'trap "" TERM; sleep 120' - cancel's SIGTERM is
+#     ignored, only the SIGKILL backstop can end the job. SIGTERM: exit 0
+#     within SHUTDOWN5_N s (measured), the child PID is gone, pidfile
+#     removed, status "off". Our own child is killed by exact PID in a
+#     finally.
+# (d) test_engine_kill_hook_exists: the REAL runner.EngineRun exposes at
+#     least one of live_pgids / kill_all / _procs / _proc (a rename of all
+#     four must fail loudly, not silently drop the SIGKILL backstop);
+#     test_kill_engine_groups_helper drives the helper with one fake engine
+#     per shape and checks which path was used.
+#
+# MUTATION M4 (scratch copy only, run via PANELCANCEL_CONNECTOR_DIR): the
+# SIGKILL step dropped from run_forever's tail -> (b) red: the connector
+# waits out grace + kill-join and exits, the child survives (measured in
+# PANELCANCEL_RESULTS.md).
+
+SHUTDOWN5_N = 25.0   # s allowed for exit 0 after SIGTERM in (b)
+
+LAUNCHER_STUBBORN = """import os, sys, time
+sys.path.insert(0, %(here)r)
+sys.path.insert(0, %(connector_dir)r)
+import runner
+
+FAKE_STEP = b"STEPFAKE-PANELCANCEL"
+DURATION = %(duration)r
+CHILD_PID_FILE = os.environ.get("PC_CHILD_PID_FILE")
+
+
+def fake_run(self, step_path, values, on_progress=None):
+    if on_progress:
+        on_progress(0.05, "faking")
+    # THE REAL _spawn (start_new_session=True: the child gets its own
+    # process group, exactly like a real engine child). The shell reports
+    # its own PID ($$ == the Popen pid) into CHILD_PID_FILE and IGNORES
+    # SIGTERM, so EngineRun.cancel()'s killpg SIGTERM cannot end it - only
+    # the shutdown tail's SIGKILL backstop can. (The pid must come from
+    # the child: _spawn only returns once the child is already gone.)
+    cmd = ('echo $$ > "%%s"; trap "" TERM; sleep %%s'
+           %% (CHILD_PID_FILE, int(DURATION)))
+    self._spawn(["/bin/sh", "-c", cmd], 0.05, 0.95, on_progress)
+    return {"files": []}, {}
+
+
+runner.EngineRun.run = fake_run
+
+import client as client_mod
+client_mod.SteveClient.download = lambda self, url, headers=None: FAKE_STEP
+
+import connector
+sys.exit(connector.main())
+"""
+
+
+def read_child_pid(pid_file, timeout=10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with open(str(pid_file)) as fh:
+                return int(fh.read().strip())
+        except (OSError, ValueError):
+            time.sleep(0.1)
+    return None
+
+
+def test_shutdown_kills_child_ignoring_sigterm(tmp_path):
+    """(b) SIGTERM a connector whose active job's REAL-_spawn child ignores
+    SIGTERM: the SIGKILL backstop ends the job, the connector exits 0 well
+    inside 30 s (measured), the child is GONE, pidfile removed, status
+    "off"."""
+    child_pid_file = tmp_path / "child.pid"
+    child_pid = None
+    mock = MockSteve()
+    base = mock.serve_forever()
+    proc = None
+    try:
+        proc, home = start_connector(
+            tmp_path, mock, 120.0,
+            connector_dir=os.environ.get("PANELCANCEL5_CONNECTOR_DIR")
+            or CONNECTOR_DIR,
+            launcher_src=LAUNCHER_STUBBORN,
+            extra_env={"PC_CHILD_PID_FILE": str(child_pid_file)})
+        mock.enqueue_run(7501, action="adaptive_rough",
+                         inputs=dict(RUN_INPUTS))
+        assert mock.wait_state(7501, "running", timeout=30), \
+            "job never reported running"
+        child_pid = read_child_pid(child_pid_file)
+        assert child_pid, "the stubborn child never started"
+        t0 = time.time()
+        os.kill(proc.pid, signal.SIGTERM)     # the exact PID we started
+        rc = proc.wait(timeout=SHUTDOWN5_N)   # hard timeout: never infinite
+        elapsed = time.time() - t0
+        print("PANELCANCEL5 (b) MEASUREMENT: SIGTERM with a SIGTERM-ignoring "
+              "_spawn child -> exit %s after %.2f s (N=%s s; child would "
+              "sleep 120 s)" % (rc, elapsed, SHUTDOWN5_N))
+        assert rc == 0, "measured exit code: %s" % rc
+        assert elapsed < SHUTDOWN5_N
+        proc = None
+        # the child must be gone (SIGKILLed by the shutdown tail): poll a
+        # little so a not-yet-reaped zombie cannot fail the check
+        gone_at = None
+        deadline = time.time() + 5.0
+        while time.time() < deadline and gone_at is None:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                gone_at = time.time() - t0
+            else:
+                time.sleep(0.1)
+        assert gone_at is not None, \
+            "child pid %d survived the shutdown (still alive after %.1f s)" \
+            % (child_pid, time.time() - t0)
+        print("PANELCANCEL5 (b) MEASUREMENT: stubborn child pid %d gone "
+              "%.2f s after SIGTERM" % (child_pid, gone_at))
+        assert not (home / "connector.pid").exists(), "pidfile not removed"
+        assert wait_status(home, "off", timeout=2.0) == "off", \
+            "status.json did not say 'off'"
+    finally:
+        if child_pid:
+            try:
+                os.kill(child_pid, signal.SIGKILL)   # our own child, exact PID
+            except (ProcessLookupError, PermissionError):
+                pass
+        shutdown(proc) if proc else None
+        mock.stop()
+
+
+def test_engine_kill_hook_exists(tmp_path):
+    """(d) the REAL runner.EngineRun (no monkeypatch) exposes at least one
+    of the four shapes connector._kill_engine_groups understands - a future
+    rename of all four must fail HERE, loudly, not silently drop the
+    SIGKILL backstop."""
+    import importlib
+    runner_mod = importlib.import_module("runner")
+    run = runner_mod.EngineRun({"engine_python": PY, "repo_root": REPO},
+                               str(tmp_path))
+    hooks = [name for name in ("live_pgids", "kill_all", "_procs", "_proc")
+             if hasattr(run, name)]
+    assert hooks, ("runner.EngineRun exposes NONE of live_pgids / kill_all "
+                   "/ _procs / _proc - connector._kill_engine_groups would "
+                   "silently do nothing on shutdown")
+
+
+def test_kill_engine_groups_helper(tmp_path):
+    """(d, unit) _kill_engine_groups with ONE fake engine per supported
+    shape; each fake records which path was used. No real signal is sent:
+    the Popen fakes carry the pid of an already-reaped child of THIS test,
+    so the real os.killpg() hits nothing and the ProcessLookupError ->
+    p.kill() fallback is what the fakes record."""
+    import importlib
+    connector_mod = importlib.import_module("connector")
+    kill = connector_mod._kill_engine_groups
+
+    gone = subprocess.Popen([PY, "-c", "pass"])
+    gone.wait()
+    dead_pid = gone.pid        # reaped: killpg(getpgid(...)) -> ProcessLookupError
+
+    class FakeProc:
+        def __init__(self, log):
+            self.log = log
+            self.pid = dead_pid
+
+        def poll(self):
+            return None        # "live"
+
+        def kill(self):
+            self.log.append("kill")
+
+    class ShapePgids:
+        def __init__(self):
+            self.log = []
+
+        def live_pgids(self):
+            self.log.append("live_pgids")
+            return []          # nothing real to killpg
+
+    class ShapeKillAll:
+        def __init__(self):
+            self.log = []
+
+        def kill_all(self, sig):
+            self.log.append(("kill_all", sig))
+
+    class ShapeProcs:
+        def __init__(self):
+            self.log = []
+            self._procs = {FakeProc(self.log)}
+
+    class ShapeProc:
+        def __init__(self):
+            self.log = []
+            self._proc = FakeProc(self.log)
+
+    eng = ShapePgids()
+    kill(eng)
+    assert eng.log == ["live_pgids"], eng.log
+    eng = ShapeKillAll()
+    kill(eng)
+    assert eng.log == [("kill_all", signal.SIGKILL)], eng.log
+    eng = ShapeProcs()
+    kill(eng)
+    assert eng.log == ["kill"], eng.log     # killpg dead -> p.kill()
+    eng = ShapeProc()
+    kill(eng)
+    assert eng.log == ["kill"], eng.log
