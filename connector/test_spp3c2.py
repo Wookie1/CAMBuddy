@@ -212,10 +212,11 @@ class TestEngineFailureStopsJudges:
 # --------------------------------------------------------------------------
 # first error wins
 # --------------------------------------------------------------------------
-class TestFirstErrorWins:
+class TestSerialOrderWinner:
     def test_engine_first_judge_second(self, tmp_path, monkeypatch):
-        """Both chains fail on their own: the engine one failed first and
-        is the error the caller sees, unchanged."""
+        """Both chains fail on their own: the reported error is the one
+        whose step comes first in the serial order (clcheck before
+        zmap_rough), unchanged."""
         boom_e = EngineError("engine boom", code="engine_first")
         boom_j = EngineError("judge boom", code="judge_second")
         spawn, rec = make_spawn(
@@ -238,7 +239,7 @@ class TestFirstErrorWins:
         """The judge fails first; the engine chain must stop BEFORE its
         next step (post): the post fake never runs, its programmed failure
         never fires, and the internal Cancelled is never reported in place
-        of the judge's error."""
+        of the judge's error (an internal stop never ranks)."""
         boom_j = EngineError("judge first", code="judge_first")
         boom_e = EngineError("engine second", code="engine_second")
         spawn, rec = make_spawn(
@@ -255,6 +256,32 @@ class TestFirstErrorWins:
         s = spans(rec)
         assert "post" not in s            # stopped before the next step
         assert "clcheck" not in s and "rest" not in s
+        assert_not_busy(run)
+
+
+    @pytest.mark.parametrize("order", ["tess_first", "judge_first"])
+    def test_stale_stl_beats_judge_file_error(self, tmp_path, monkeypatch,
+                                              order):
+        """The exact race behind test_stale_model_stl_fails_run: tess fails
+        on its own (stale STL) and the judge's zmap_rough fails with a
+        FileNotFoundError. In EITHER timing order the caller gets the tess
+        error, because tess comes first in the serial order."""
+        boom_t = EngineError("build produced no non-empty STL x",
+                             code="stale_artifact")
+        boom_j = FileNotFoundError("check_rough.json")
+        if order == "tess_first":
+            dur = {"hf01": 0.01, "rough": 0.05, "tess": 0.01,
+                   "zmap_rough": 0.4}
+        else:
+            dur = {"hf01": 0.01, "rough": 0.05, "tess": 0.4,
+                   "zmap_rough": 0.01}
+        spawn, rec = make_spawn(durations=dur,
+                                fail={"tess": boom_t, "zmap_rough": boom_j})
+        monkeypatch.setattr(runner_mod.EngineRun, "_spawn", spawn)
+        run = runner_mod.EngineRun(_cfg(), str(tmp_path / "work"))
+        with pytest.raises(EngineError) as ei:
+            run.run_slope_split_finish(STEP, dict(SLOPE_GOOD_INPUTS))
+        assert ei.value is boom_t and ei.value.code == "stale_artifact"
         assert_not_busy(run)
 
 

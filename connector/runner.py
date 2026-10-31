@@ -34,6 +34,12 @@ ZMAP_JOBS = 12
 ZMAP_JOBS_OVERLAP = 12
 # TASK SP-P3C-1: the judge-chain progress text, defined in one place only
 CHECKING_FMT = "checking (%d of %d)"
+# SP-P3C: when both chains fail, the reported error is the failure whose
+# step comes first in the serial runner's order (today's behaviour)
+SERIAL_STEP_RANK = {n: i for i, n in enumerate((
+    "prepare", "hf01", "rough", "tess", "finish", "post", "clcheck",
+    "zmap_rough", "zmap_finish", "rest", "post_rest", "clcheck_rest",
+    "zmap_rest"))}
 
 # ---------------------------------------------------------------------------
 # Task RR1b: T20 ball rest-rough defaults (parameters + defaults only).
@@ -634,7 +640,11 @@ class EngineRun:
                                               "".join(err_lines)))
             except OSError:
                 pass
-            raise _engine_error(proc.returncode, "".join(err_lines[-25:]))
+            err = _engine_error(proc.returncode, "".join(err_lines[-25:]))
+            # SP-P3C: a step killed by a signal (cancel / the other chain's
+            # failure) is an internal stop, never a ranked step failure
+            err.killed_by_signal = proc.returncode < 0
+            raise err
         return proc
 
     def run(self, step_path, values, on_progress=None):
@@ -1193,14 +1203,24 @@ class EngineRun:
         first_error = {}
         first_lock = threading.Lock()
         stop_engine = threading.Event()
+        cur_step = {"engine": "prepare", "judge": "hf01"}
+        failures = []          # (serial rank, exc, chain): real failures
 
         def record_first(exc, chain):
+            # every failure stops the other chain at once (callers). The
+            # REPORTED error is deterministic: among real step failures the
+            # one whose step comes first in the serial order wins; internal
+            # stops (Cancelled, a step killed by a signal) never rank.
             with first_lock:
                 if "exc" not in first_error:
                     first_error["exc"] = exc
                     first_error["chain"] = chain
-                    return True
-            return False
+                if not (isinstance(exc, Cancelled)
+                        or getattr(exc, "killed_by_signal", False)):
+                    failures.append((SERIAL_STEP_RANK[cur_step[chain]],
+                                     exc, chain))
+                    winner = min(failures, key=lambda f: f[0])
+                    first_error["exc"], first_error["chain"] = winner[1:]
 
         def emit(p, msg):
             # the run's single on_progress sink; prog_lock must be held.
@@ -1244,6 +1264,7 @@ class EngineRun:
                 raise Cancelled("judge chain failed")
             if chain == "judge" and abort.is_set():
                 raise Cancelled("engine chain failed")
+            cur_step[chain] = name
             t0 = time.time()
             try:
                 return self._spawn(argv, lo, hi, prog, **kw)
@@ -1526,7 +1547,6 @@ class EngineRun:
             argv += self._load_limit_args(values)
             step("engine", "rough", argv, *P["rough"], sink)
             posted["rough.nc"] = posted_units(nc, values["units"])
-            ev_rough.set()
 
             # 3) tessellate the oriented model (finish input + clcheck
             #    probe); stale model.stl removed first, fresh non-empty
@@ -1542,6 +1562,10 @@ class EngineRun:
                 fr.require_stl(stl)
             except OSError as e:
                 raise EngineError(str(e), code="stale_artifact")
+            # the rough judge starts only once tess (a ~2 s model check
+            # that comes before it in the serial order) has passed, so a
+            # model-validation failure is never pre-empted by a judge
+            ev_rough.set()
 
             # 4) slope-split finishing (neutral G-code). PQ: the engine
             #    snaps the emitted points to the output grid matching this
