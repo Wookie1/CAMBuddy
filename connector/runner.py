@@ -356,6 +356,22 @@ def _side_entry_args(prep):
             "--side-entry-min-z", "%.4f" % bbox[4]]
 
 
+# SK1 descent columns lie inside the engine's tracked stock field
+# (engine/stock.py StockField: reach 8 mm in whole 0.5 mm cells, plus up to
+# one cell of width rounding past the max faces) - for EVERY tool: a tool
+# whose R + rapid margin exceeds that gets no column at all. The judge grid
+# must hold those footprints: MARGIN >= this, never below heightfield.py's
+# default max(5, tool_r). test_sk1_judge_margin pins the parity.
+SK1_REACH_MM = 8.5
+
+
+def _judge_margin_env(prep, tool_r):
+    """MARGIN env for a rough's judge heightfield when side entry is on."""
+    if not _side_entry_args(prep):
+        return {}
+    return {"MARGIN": "%.4f" % max(5.0, float(tool_r), SK1_REACH_MM)}
+
+
 def _rough_skins(path):
     """SKN: the rough's thin skins left standing (engine stats
     skin_skipped), [] when none or unreadable."""
@@ -759,7 +775,9 @@ class EngineRun:
                               "CELL": str(cell), "TESS_TOL": "0.01",
                               "STOCK_BOX": " ".join("%.4f" % v
                                                     for v in stock[:4]),
-                              "TOOL_R": "%.4f" % (values["tool_diameter"] / 2.0)})
+                              "TOOL_R": "%.4f" % (values["tool_diameter"] / 2.0),
+                              **_judge_margin_env(
+                                  prep, values["tool_diameter"] / 2.0)})
         try:
             fr.require_fresh(hf_zmap, step_sha256=step_sha, cell=cell,
                              tess_tol=0.01)
@@ -1450,7 +1468,8 @@ class EngineRun:
                                 "CELL": "0.1", "TESS_TOL": "0.01",
                                 "STOCK_BOX": " ".join("%.4f" % v
                                                       for v in stock[:4]),
-                                "TOOL_R": "%.4f" % max_tool_r})
+                                "TOOL_R": "%.4f" % max_tool_r,
+                                **_judge_margin_env(prep, max_tool_r)})
                 try:
                     fr.require_fresh(hf01, step_sha256=step_sha, cell=0.1,
                                      tess_tol=0.01)
