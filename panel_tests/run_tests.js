@@ -896,7 +896,8 @@ test("dev.html harness: loads network-free, answers every method, rough and fini
   await env.waitEnabled("#rough-btn");
   await env.panel.click("#rough-btn");
   await env.waitText("#rough-state", /^Done$/, 8000);
-  assert.match(await env.text("#rough-results"), /Ready to run/);
+  // "Done" paints at once; #rough-results fills only after showResults() awaits the run.file(check.json) round trip.
+  await env.waitText("#rough-results", /Ready to run/, 8000);
   await env.page.selectOption("#outcome", "needs_review");
   await env.panel.click("#rough-btn");
   await env.waitText("#rough-results", /Please review \(2\)/, 8000);
