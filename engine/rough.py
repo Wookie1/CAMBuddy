@@ -63,6 +63,7 @@ mandatory flag so it can never be skipped.
 import copy
 import math
 import os
+import sys
 import time
 
 import numpy as np
@@ -1183,6 +1184,52 @@ def _dense_line(a, b, step=0.4):
             for t in range(n + 1)]
 
 
+class _SkinEntry(Exception):
+    """SKN: an armed region entry found only a 'wide' straight plunge."""
+
+
+def _skin_band(res, stock, stock_box, tool_r, z):
+    """SKN: is region `res` at level z a true thin skin? Its material (live
+    stock above z, not part, under the tool disk swept along its cutting
+    paths) must all lie within tool_r inside some stock face. Returns
+    {"faces", "area_mm2", "max_thickness_mm"} for a skin, else None."""
+    cell = stock.cell
+    rc = int(math.ceil(tool_r / cell))
+    di, dj = np.meshgrid(np.arange(-rc, rc + 1), np.arange(-rc, rc + 1))
+    disk = (di * cell) ** 2 + (dj * cell) ** 2 <= tool_r ** 2
+    mask = np.zeros(stock.top.shape, dtype=bool)
+    for (kind, pts) in res["paths"]:
+        if kind != "cutting" or not pts:
+            continue
+        for a, b in zip(pts[:1] + pts[:-1], pts):
+            for (x, y) in _dense_line(a, b, step=cell):
+                i, j = stock._ci(x), stock._cj(y)
+                i0, j0 = max(i - rc, 0), max(j - rc, 0)
+                i1 = min(i + rc + 1, stock.nx)
+                j1 = min(j + rc + 1, stock.ny)
+                if i0 >= i1 or j0 >= j1:
+                    continue
+                mask[j0:j1, i0:i1] |= disk[j0 - (j - rc):j1 - (j - rc),
+                                           i0 - (i - rc):i1 - (i - rc)]
+    mat = mask & stock.inb & (stock.top > z + 1e-6)
+    if stock.part is not None:
+        mat &= ~(stock.part > z + 1e-6)
+    jj, ii = np.nonzero(mat)
+    if not len(ii):
+        return {"faces": [], "area_mm2": 0.0, "max_thickness_mm": 0.0}
+    xs = stock.x0 + (ii + 0.5) * cell
+    ys = stock.y0 + (jj + 0.5) * cell
+    d = np.stack([xs - stock_box[0], stock_box[1] - xs,
+                  ys - stock_box[2], stock_box[3] - ys])
+    dmin = d.min(axis=0)
+    if dmin.max() > tool_r:
+        return None
+    names = ("xneg", "xpos", "yneg", "ypos")
+    return {"faces": sorted({names[f] for f in d.argmin(axis=0)}),
+            "area_mm2": round(len(ii) * cell * cell, 2),
+            "max_thickness_mm": round(float(dmin.max()) + cell / 2, 3)}
+
+
 def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           stepover=0.16, cut_feed=3429.0, ramp_feed=1270.0,
           clearance_z=None, lift=1.9, wl_sampling=None, threads=8,
@@ -1304,10 +1351,12 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
              "n_reentry_descends": 0, "reentry_feed_mm": 0.0,
              "n_side_entries": 0, "side_entry_feed_mm": 0.0,
              "credit_fallback": [],  # BS1a4c: every credit fallback at emit
+             "skin_skipped": [],     # SKN: thin skins left standing
              "b2_rej": 0, "b2_exhausted": 0,  # FI1: helix-entry B2 refusals
              "a2d_spnf": 0, "a2d_dropped_outers": [],  # BS1d: counted drops
              "mandatory_levels": sorted(round(z, 3) for z in mand)}
     helix_n = [0]   # BS1a4c: successful entry helices emitted (f3f2165)
+    skin_arm = [None]   # SKN: (x, y, z) of the region entry being probed
     # RP0 diagnosis (engine/TASK_RP0.md): env-gated instrumentation only, no
     # behavior change when RT_RP is unset.
     _RP = bool(os.environ.get("RT_RP"))
@@ -1804,6 +1853,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             if off is not None:
                 offset_down(x, y, z, off)
                 return
+        if wide_fail and skin_arm[0] == (x, y, z):
+            raise _SkinEntry()
         if wide_fail:
             # RT2: neither a full-size helix nor a verified-clear column was
             # available where the judge's disk sees stock above Z - a straight
@@ -2421,8 +2472,45 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             h0 = helix_n[0]
             sn9 = copy.deepcopy(stats) if res.get("replan0") else None
             ts9 = stock.top.copy() if sn9 is not None else None
-            enter_at(round(entry[0], 4), round(entry[1], 4), z, res["helix"],
-                     side=bool(rp2_flag), bore=res.get("bore"))
+            # SKN: a region whose cutting centres all sit within tool_r of a
+            # stock face may be a thin skin: probe its entry, and if the only
+            # way in is a 'wide' straight plunge AND its material is a band
+            # <= tool_r inside the faces, leave it standing (warned) instead
+            # of failing the run. Anything else re-enters exactly as before.
+            ex, ey = round(entry[0], 4), round(entry[1], 4)
+            snap = None
+            if all(min(p[0] - stock_box[0], stock_box[1] - p[0],
+                       p[1] - stock_box[2], stock_box[3] - p[1]) <= tool_r
+                   for (kk, pp) in res["paths"] if kk == "cutting"
+                   for p in pp):
+                snap = (stock.top.copy(), copy.deepcopy(stats))
+                skin_arm[0] = (ex, ey, z)
+            try:
+                enter_at(ex, ey, z, res["helix"], side=bool(rp2_flag),
+                         bore=res.get("bore"))
+            except _SkinEntry:
+                skin_arm[0] = None
+                band = _skin_band(res, stock, stock_box, tool_r, z)
+                stock.top[:] = snap[0]
+                del moves[i0m:]
+                prev[0], prev[1], prev[2] = pxy0 + (pz0,)
+                helix_n[0] = h0
+                stats.clear()
+                stats.update(snap[1])
+                if band is not None:
+                    band.update({"x": ex, "y": ey, "z": round(z, 3)})
+                    stats["skin_skipped"].append(band)
+                    print("WARNING: thin skin left standing at Z%.3f on %s: "
+                          "%.1f mm2, max %.2f mm thick (only a straight "
+                          "plunge reaches it)" % (z, "/".join(band["faces"]),
+                                                  band["area_mm2"],
+                                                  band["max_thickness_mm"]),
+                          file=sys.stderr)
+                    nreg -= 1
+                    continue
+                enter_at(ex, ey, z, res["helix"], side=bool(rp2_flag),
+                         bore=res.get("bore"))
+            skin_arm[0] = None
             de = descend_feed(pxy0 + (pz0,), i0m)
             # BS1a4c (f3f2165): a credited BAND start is backed at emit only
             # by an emitted helix or live-clear disk; else credit-0 re-check,
@@ -2891,11 +2979,13 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # height (the next level's enter_at plans its own link from there);
         # full clearance only when the column itself demands it.
         px, py = prev[0], prev[1]
-        req = stock.link_top_max([(px, py), (px, py)], tool_r + rapid_margin)
-        h = clearance_z if req <= -1e8 else min(clearance_z,
-                                                max(req + rapid_margin,
-                                                    prev[2]))
-        emit({"g": 0, "x": px, "y": py, "z": round(h, 4)})
+        if px is not None:   # SKN: None when every region so far was a skin
+            req = stock.link_top_max([(px, py), (px, py)],
+                                     tool_r + rapid_margin)
+            h = clearance_z if req <= -1e8 else min(clearance_z,
+                                                    max(req + rapid_margin,
+                                                        prev[2]))
+            emit({"g": 0, "x": px, "y": py, "z": round(h, 4)})
         stats["levels"].append({"z": round(z, 3), "skipped": False,
                                  "region_mm2": round(area_mm2, 1),
                                  "n_islands": len(islands),
