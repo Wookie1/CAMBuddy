@@ -63,6 +63,7 @@ rewrites this table; a test fails when it drifts).
 | `input_out_of_range` | error | Use a value inside `allowed` (in the units you sent) for `field`, then run again. |
 | `action_unknown` | error | Use one of the connector's actions (see the catalog). |
 | `input_digest_mismatch` | error | Send the run again: the downloaded file did not match its sha256/size. |
+| `connector_stopping` | error | The SteveCAM connector was shutting down; start it again (menu bar: Start) and re-run. |
 | `unknown_tool` | error | Use a tool_id from tools.list. |
 | `duplicate_t` | error | Pick a T no other tool uses in this job (job.get / tools.list show the T numbers in use), or renumber the other tool first. |
 | `out_of_range` | error | Use a T inside `allowed` (job.renumber: 1..pockets; tools.update: 1..999); tools.update {pockets} changes the pocket count. |

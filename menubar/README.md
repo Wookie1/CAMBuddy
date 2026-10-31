@@ -28,7 +28,8 @@ It refuses (with a message) while `~/.stevecam/connector.pid` names a live
 `/opt/homebrew/bin/python3 <repo>/connector/connector.py` from the repo
 root, logging to `~/.stevecam/connector.log`, `RunAtLoad`, `KeepAlive
 SuccessfulExit=false` (a clean exit 0 — e.g. a refusal or a SIGTERM stop —
-is not respawned), `ThrottleInterval 10`.
+is not respawned), `ThrottleInterval 10`. `ExitTimeOut 45` gives the
+connector 45 s to shut down cleanly before launchd SIGKILLs it.
 
 ## Menu items
 

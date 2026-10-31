@@ -12,11 +12,14 @@ import datetime
 import hashlib
 import json
 import os
+import queue
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
+from collections import OrderedDict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -36,6 +39,59 @@ PANEL_NAME = catalog_mod.ACTION
 RUN_ID_MAX = 128             # view.load run_id length cap (STEVE's id format is not assumed)
 LAST_RUNS_MAX = 10           # the last_runs event lists at most this many
 LAST_RUNS_MAX_BYTES = 8 * 1024   # event data stays under 8 kB
+# PANELCANCEL5: bounded shutdown tail (launchd ExitTimeOut 45 s in the
+# plist). Worst case from SIGTERM to exit: one in-flight poll slice
+# (Connector.POLL_INTERRUPT = 10 s) + cancel (up to 5 s with sp-p3c's
+# _kill_all) + SHUTDOWN_GRACE + SHUTDOWN_KILL_JOIN + the queued-reject/
+# "off" tail: 10 + 5 + 8 + 4 + ~1 ~= 28 s < 45 s.
+SHUTDOWN_GRACE = 8.0         # s to wait for the worker after cancel()
+SHUTDOWN_KILL_JOIN = 4.0     # s more to wait after SIGKILLing the engine
+# PANELCANCEL6: ids cancelled between the worker's get() and the worker
+# making the engine active; bounded to the newest this-many (a cancel for
+# an unknown/finished id just sits there harmlessly until it ages out).
+PENDING_CANCEL_MAX = 64
+
+
+def _kill_engine_groups(engine):
+    """PANELCANCEL5: SIGKILL every live process group of an EngineRun, so a
+    child that ignores cancel()'s SIGTERM cannot outlive a SIGKILLed
+    connector (engine children run in their own sessions, so a plain
+    killpg of the connector's group would miss them). Works with every
+    runner shape without editing runner.py, trying in this order:
+    public live_pgids() -> killpg each with SIGKILL; else public kill_all
+    -> kill_all(signal.SIGKILL); else the private _procs (a set of Popen);
+    else the private _proc (one Popen); a Popen is live when poll() is
+    None. For a Popen shape a failed killpg (ProcessLookupError /
+    PermissionError) falls back to p.kill(); any other OSError is ignored -
+    this runs in the shutdown tail and must never raise."""
+    live_pgids = getattr(engine, "live_pgids", None)
+    if callable(live_pgids):
+        for pgid in live_pgids():
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+        return
+    kill_all = getattr(engine, "kill_all", None)
+    if callable(kill_all):
+        kill_all(signal.SIGKILL)
+        return
+    procs = getattr(engine, "_procs", None)
+    if procs is None:
+        proc = getattr(engine, "_proc", None)
+        procs = [proc] if proc is not None else []
+    for proc in list(procs):
+        if proc is None or proc.poll() is not None:
+            continue
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------- pidfile --
@@ -137,7 +193,38 @@ class Connector:
         self.current_run = None
         self._last_event = None
         self._last_keys_refresh = 0.0
-        self._stop = False
+        # PANELCANCEL3: the SIGTERM/SIGINT handler ONLY sets this Event
+        # (no cancel, no join, no I/O, no status write - it runs on the
+        # MAIN thread between bytecodes, possibly while that thread holds
+        # a non-reentrant lock). Every read is an is_set() check; the
+        # shutdown work happens in run_forever's tail, outside signals.
+        self._stop = threading.Event()
+        # PANELCANCEL: jobs and tool actions run on ONE long-lived FIFO
+        # worker while the message loop keeps polling (only "cancel" is
+        # handled there). self._lock serializes status/event/report writes
+        # between the worker and the loop; the worker exists only while
+        # run_forever runs - direct handle_message callers stay inline.
+        self._queue = queue.Queue()
+        self._worker = None
+        self._lock = threading.RLock()
+        # PANELCANCEL4: run ids dropped from the queue by a cancel, so a
+        # second cancel for the same id reports nothing twice. Only the
+        # loop thread touches it (cancels are handled on the loop thread
+        # while the worker exists; direct callers are single-threaded).
+        self._dropped = set()
+        # PANELCANCEL6: run ids cancelled in the window between the
+        # worker's queue.get() and `self.running = engine` - there the id
+        # is neither queued nor active, so the loop cannot act on it yet.
+        # self._cancel_lock makes the loop's whole cancel decision (test
+        # active / drop queued / else mark pending) atomic with the
+        # worker's "engine becomes active + consume pending" step in
+        # _run_job, so the cancel is never lost. A NEW lock on purpose:
+        # self._lock is held across HTTP report writes and would stall
+        # both the cancel answer and the worker's activation. Only
+        # _cancel_lock (briefly, never across engine.cancel() or I/O) and
+        # _queue.mutex are taken here; engine.cancel() runs outside it.
+        self._cancel_lock = threading.Lock()
+        self._pending_cancel = OrderedDict()
         # MENUBAR: <home>/status.json for the menu-bar app (secret-free).
         self.status_path = os.path.join(self.home, "status.json")
         self.commit = self._git_commit()
@@ -168,17 +255,19 @@ class Connector:
         """Atomic <home>/status.json: {pid, state, action, progress,
         updated (UTC ISO), fingerprint, connector_name, commit, last_run}.
         NEVER carries keys, steve_keys, tokens, identity or the pairing
-        code. Never raises into the run loop."""
+        code. Never raises into the run loop. PANELCANCEL: serialized by
+        self._lock (worker vs loop; RLock so emit_state may nest)."""
         try:
-            data = {"pid": os.getpid(), "state": state, "action": action,
-                    "progress": progress, "updated": self._utc_now(),
-                    "fingerprint": self.fingerprint,
-                    "connector_name": self.cfg["connector_name"],
-                    "commit": self.commit, "last_run": self.last_run}
-            tmp = self.status_path + ".tmp"
-            with open(tmp, "w") as fh:
-                json.dump(data, fh, sort_keys=True)
-            os.replace(tmp, self.status_path)
+            with self._lock:
+                data = {"pid": os.getpid(), "state": state, "action": action,
+                        "progress": progress, "updated": self._utc_now(),
+                        "fingerprint": self.fingerprint,
+                        "connector_name": self.cfg["connector_name"],
+                        "commit": self.commit, "last_run": self.last_run}
+                tmp = self.status_path + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(data, fh, sort_keys=True)
+                os.replace(tmp, self.status_path)
         except Exception:
             pass
 
@@ -257,7 +346,7 @@ class Connector:
             self._save()
 
     def get_token_blocking(self):
-        while not self._stop:
+        while not self._stop.is_set():
             try:
                 return self.client.get_token()  # token stays in memory only
             except SteveError as e:
@@ -288,14 +377,24 @@ class Connector:
         data = {"state": state, "action": action, "progress": progress}
         # MENUBAR: status.json is refreshed on EVERY call, even when the
         # event is unchanged or the post below fails.
-        self._write_status(state, action, progress)
-        if data == self._last_event:
-            return
-        self._last_event = data
-        try:
-            self.client.post_event(catalog_mod.EVENT, data)
-        except SteveError:
-            pass
+        # PANELCANCEL: the _last_event check/update, the status write and
+        # the post are ONE critical section (worker vs loop).
+        with self._lock:
+            self._write_status(state, action, progress)
+            if data == self._last_event:
+                return
+            self._last_event = data
+            try:
+                self.client.post_event(catalog_mod.EVENT, data)
+            except SteveError:
+                pass
+
+    def _report(self, run_id, state, **kw):
+        """PANELCANCEL: client.report_run serialized against the other
+        thread's writes (same self._lock; exception behaviour unchanged -
+        SteveError propagates to the caller's existing handlers)."""
+        with self._lock:
+            return self.client.report_run(run_id, state, **kw)
 
     # ----------------------------------------------------------- messages --
     def verify_envelope(self, msg):
@@ -326,9 +425,67 @@ class Connector:
         run_id = env.get("id")
         kind = msg.get("kind")
         if kind == "cancel":
+            # PANELCANCEL: a cancel is acted on ONLY when its envelope
+            # verifies (a forged/expired/unknown-kid one is ignored
+            # silently, no report).
+            # PANELCANCEL4: it names either the ACTIVE run (unchanged: the
+            # worker's `except Cancelled` path reports "cancelled" once and
+            # ends the run, status.json ends "idle") or a QUEUED one: that
+            # item is removed from the FIFO queue under self._queue.mutex
+            # (the very lock queue.Queue.get()/put() take, so the worker
+            # cannot pick the item off between our check and our removal)
+            # and reported ONCE "received" then "cancelled" (STEVE's state
+            # machine, mirrored in mock_steve.NEXT_OK, only allows
+            # "received"/"rejected" as a run's first report and
+            # "cancelled" only after "received"). Its engine/tool action
+            # never starts; the ledger/nonce stay recorded, so a
+            # redelivery of that run is never acted on again. A cancel for
+            # any other id (finished, unknown, or already dropped) is
+            # ignored, no report.
+            if not ok:
+                return
             target = env.get("run")
-            if self.running and self.current_run == target:
-                self.running.cancel()
+            # PANELCANCEL6: the active-run test, the queued drop and the
+            # pending marker are ONE decision under self._cancel_lock,
+            # atomic with the worker's "self.running = engine + consume
+            # pending" step in _run_job. A cancel arriving after the
+            # worker's get() and before that line finds the id neither
+            # active nor queued: it goes into the bounded
+            # self._pending_cancel and the worker acts on it the instant
+            # the engine becomes active. Unknown ids just sit there
+            # harmlessly (age out at PENDING_CANCEL_MAX).
+            engine = None
+            dropped = False
+            with self._cancel_lock:
+                if self.running and self.current_run == target:
+                    engine = self.running
+                elif target in self._dropped:
+                    return          # second cancel for a dropped id: ignored
+                else:
+                    with self._queue.mutex:
+                        for item in list(self._queue.queue):
+                            if item[1] == target:
+                                self._queue.queue.remove(item)
+                                self._dropped.add(target)
+                                dropped = True
+                                break
+                    if not dropped:
+                        self._pending_cancel[target] = True
+                        while len(self._pending_cancel) > PENDING_CANCEL_MAX:
+                            self._pending_cancel.popitem(last=False)
+            # engine.cancel() takes the engine's own lock (which _spawn
+            # holds around Popen), so it runs OUTSIDE _cancel_lock: the
+            # worker's activation step must never wait behind it.
+            if engine is not None:
+                engine.cancel()
+                return
+            if dropped:
+                try:
+                    self._report(target, "received")
+                    self._report(target, "cancelled",
+                                 message="cancelled before it started")
+                except SteveError:
+                    pass
             return
         if not ok:
             if run_id is not None and code != "nonce_replayed":
@@ -346,9 +503,45 @@ class Connector:
             return
         self._remember_run(run_id)
         if action in catalog_mod.TOOL_ACTIONS:
-            self._run_tool_action(run_id, env, action)
+            self._dispatch(("tool", run_id, env, action))
             return
-        self._run_job(run_id, env, action)
+        self._dispatch(("job", run_id, env, action))
+
+    # ------------------------------------------------------------- worker --
+    def _dispatch(self, item):
+        """PANELCANCEL: while run_forever is up, jobs and tool actions go
+        to the FIFO worker (arrival order, one at a time - exactly today's
+        ordering) and the loop keeps polling; without a worker (direct
+        callers, e.g. tests) they run inline as before."""
+        if self._worker is not None:
+            self._queue.put(item)
+        else:
+            self._exec(item)
+
+    def _exec(self, item):
+        kind, run_id, env, action = item
+        if kind == "tool":
+            self._run_tool_action(run_id, env, action)
+        else:
+            self._run_job(run_id, env, action)
+
+    def _worker_loop(self):
+        while not self._stop.is_set():
+            try:
+                item = self._queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if self._stop.is_set():
+                # PANELCANCEL3: shutdown was requested while this item was
+                # already off the queue - put it BACK unrun; run_forever's
+                # tail rejects every still-queued item and nothing queued
+                # is ever executed.
+                self._queue.put(item)
+                break
+            try:
+                self._exec(item)
+            except Exception:
+                pass  # one bad job must not kill the worker
 
     def tool_action(self, action, values):
         """Track 2: tools.list / tools.update / job.get / job.renumber on
@@ -416,7 +609,7 @@ class Connector:
             err = errors.make_error("no_view", "no 3D view for that run",
                                     field="run_id")
             try:
-                self.client.report_run(
+                self._report(
                     run_id, "failed", error=err,
                     result=envelope.for_failure(catalog_mod.VIEW_ACTION,
                                                 err))
@@ -431,7 +624,7 @@ class Connector:
                       "files": [n for n, _p, _m in src]}
             result = dict(result, **envelope.for_tool_action(
                 catalog_mod.VIEW_ACTION, result))
-            self.client.report_run(run_id, "succeeded", result=result,
+            self._report(run_id, "succeeded", result=result,
                                    message="done")
         except SteveError:
             pass
@@ -461,15 +654,17 @@ class Connector:
         except OSError:
             pass
         # MENUBAR: refresh last_run (and status.json) with the new entry.
-        self.last_run = self._newest_run()
-        ev = self._last_event or {}
-        self._write_status(ev.get("state", "idle"), ev.get("action"),
-                           ev.get("progress"))
-        try:
-            self.client.post_event(catalog_mod.LAST_RUNS_EVENT,
-                                   self._last_runs_data())
-        except SteveError:
-            pass
+        # PANELCANCEL: same lock as emit_state's status/event writes.
+        with self._lock:
+            self.last_run = self._newest_run()
+            ev = self._last_event or {}
+            self._write_status(ev.get("state", "idle"), ev.get("action"),
+                               ev.get("progress"))
+            try:
+                self.client.post_event(catalog_mod.LAST_RUNS_EVENT,
+                                       self._last_runs_data())
+            except SteveError:
+                pass
 
     def _last_runs_data(self):
         """The newest <= LAST_RUNS_MAX recorded runs, newest first, always
@@ -507,15 +702,15 @@ class Connector:
 
     def _run_tool_action(self, run_id, env, action):
         try:
-            self.client.report_run(run_id, "received")
+            self._report(run_id, "received")
         except SteveError:
             pass
         ok, values = catalog_mod.validate(env.get("inputs", {}), action)
         try:
             if not ok:
-                self.client.report_run(run_id, "rejected", error=values)
+                self._report(run_id, "rejected", error=values)
                 return
-            self.client.report_run(run_id, "running", progress=0.5,
+            self._report(run_id, "running", progress=0.5,
                                    message=action)
             if action == catalog_mod.VIEW_ACTION:
                 return self._run_view_load(run_id, values)
@@ -529,10 +724,10 @@ class Connector:
             else:
                 result = dict(result, **envelope.for_tool_action(action,
                                                                  result))
-                self.client.report_run(run_id, "succeeded", result=result,
+                self._report(run_id, "succeeded", result=result,
                                        message="done")
                 return
-            self.client.report_run(run_id, "failed", error=err,
+            self._report(run_id, "failed", error=err,
                                    result=envelope.for_failure(action, err))
         except SteveError:
             pass
@@ -550,10 +745,33 @@ class Connector:
 
     def _safe_reject(self, run_id, code):
         try:
-            self.client.report_run(run_id, "rejected",
+            self._report(run_id, "rejected",
                                   error=errors.make_error(code, code))
         except SteveError:
             pass
+
+    def _reject_queued(self):
+        """PANELCANCEL3 (supervisor review of 6e9c2ca): handle_message
+        _remember_run's a run BEFORE queueing and the loop saves the cursor
+        past its message, but the worker exits on shutdown WITHOUT running
+        what is still queued - those runs were never run, never reported
+        and never redelivered. At shutdown every job/tool item still in
+        self._queue gets exactly ONE terminal "rejected" report (code
+        "connector_stopping", _safe_reject-style). Nothing queued is
+        executed."""
+        while True:
+            try:
+                _kind, run_id, _env, _action = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self._report(
+                    run_id, "rejected",
+                    error=errors.make_error(
+                        "connector_stopping",
+                        "connector shut down before this run started"))
+            except SteveError:
+                pass
 
     def _run_job(self, run_id, env, action):
         self.current_run = run_id
@@ -571,18 +789,31 @@ class Connector:
 
         self.emit_state("busy", action, 0.0)
         try:
-            self.client.report_run(run_id, "received")
+            self._report(run_id, "received")
         except SteveError:
             pass
         engine = EngineRun(self.cfg, work)
-        self.running = engine
+        # PANELCANCEL6: becoming the active run and consuming a pending
+        # cancel for this id are ONE step under self._cancel_lock (the
+        # loop's cancel decision takes the same lock), so a cancel that
+        # arrived while this id was off the queue but not yet active is
+        # never lost. engine.cancel() runs outside the lock: its
+        # cancelled flag makes the first _spawn raise Cancelled, so NO
+        # engine subprocess starts and the `except Cancelled` path below
+        # reports "cancelled" once; end_run() leaves status "idle".
+        with self._cancel_lock:
+            self.running = engine
+            was_pending = (self._pending_cancel.pop(run_id, None)
+                           is not None)
+        if was_pending:
+            engine.cancel()
         last = [-1.0, None]
 
         def on_progress(p, m):
             if p - last[0] >= 0.02 or m != last[1]:
                 last[0], last[1] = p, m
                 try:
-                    self.client.report_run(run_id, "running", progress=round(p, 3),
+                    self._report(run_id, "running", progress=round(p, 3),
                                          message=m)
                 except SteveError:
                     pass
@@ -610,7 +841,7 @@ class Connector:
                 data = self.client.download(inp["url"], inp.get("headers"))
                 digest = hashlib.sha256(data).hexdigest()
                 if digest != inp.get("sha256") or len(data) != inp.get("bytes"):
-                    self.client.report_run(
+                    self._report(
                         run_id, "rejected",
                         error=errors.make_error(
                             "input_digest_mismatch",
@@ -634,7 +865,7 @@ class Connector:
                     fh.write(data)
             ok, code, values = prepare_values(env.get("inputs", {}), action)
             if not ok:
-                self.client.report_run(run_id, "rejected", error=values)
+                self._report(run_id, "rejected", error=values)
                 rejected = True
                 end_run()
                 return
@@ -672,12 +903,12 @@ class Connector:
                 if fname.endswith(".nc"):
                     self._copy_program(path, values["program_number"],
                                        fname[:-3])
-            self.client.report_run(run_id, "succeeded", result=result,
+            self._report(run_id, "succeeded", result=result,
                                  message="done")
             end_run()
         except Cancelled:
             try:
-                self.client.report_run(run_id, "cancelled",
+                self._report(run_id, "cancelled",
                                      message="cancelled")
             except SteveError:
                 pass
@@ -691,7 +922,7 @@ class Connector:
                     "internal_error", "%s: %s" % (type(e).__name__,
                                                   str(e)[:200]))
             try:
-                self.client.report_run(
+                self._report(
                     run_id, "failed", error=err,
                     result=envelope.for_failure(action, err))
             except SteveError:
@@ -712,26 +943,78 @@ class Connector:
             pass
 
     # ---------------------------------------------------------------- loop --
+    def _handle_signal(self, *_):
+        """PANELCANCEL3: the SIGTERM/SIGINT handler. A Python signal handler
+        runs on the MAIN thread between bytecodes - possibly exactly while
+        that thread is inside EngineRun._spawn's `with self._lock:` (the
+        same non-reentrant lock cancel() takes: calling it here deadlocks),
+        and the other thread's teardown can keep cancel() busy for seconds.
+        So the handler ONLY sets the Event: no cancel, no join, no I/O, no
+        status write. run_forever's tail performs the shutdown outside
+        signal context."""
+        self._stop.set()
+
     def stop(self, *_):
-        self._stop = True
-        if self.running:
-            self.running.cancel()
+        """Programmatic shutdown request (same as a signal): ONLY sets the
+        Event; the loop's tail cancels the active job and stops the worker.
+        Safe to call from any thread; never does work itself."""
+        self._stop.set()
+
+    # PANELCANCEL4 (supervisor review of 7f89867): 1.0 s made an idle
+    # connector GET /messages once a second (30x the old rate); 10.0 s
+    # keeps shutdown bounded well inside the plist's ExitTimeOut 45
+    # (PANELCANCEL5).
+    POLL_INTERRUPT = 10.0  # s: longest single GET /messages wait while idle
+
+    def _poll_messages(self):
+        """PANELCANCEL3: one poll_wait-long fetch taken in slices of at most
+        POLL_INTERRUPT seconds, so a shutdown request is seen within
+        ~POLL_INTERRUPT s of idle wait instead of a full poll_wait (default
+        30 s). Chosen over a watcher thread: the loop thread is the one
+        that must run the shutdown tail anyway (no second thread racing the
+        message handling / cursor save), and a watcher could not interrupt
+        an in-flight HTTP read either - slicing bounds it instead. Returns
+        the first response that carries messages, else the last (empty) one
+        once poll_wait elapsed or shutdown was requested. SteveError and
+        OSError propagate to the loop's unchanged handlers."""
+        wait_total = int(self.cfg["poll_wait"])
+        deadline = time.time() + wait_total
+        while True:
+            if self._stop.is_set():
+                wait = 0                      # asked to stop: a 0 s poll is
+            else:                             # a plain immediate fetch
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    wait = 0
+                else:
+                    wait = min(wait_total, int(self.POLL_INTERRUPT))
+                    if remaining < wait:
+                        wait = max(1, int(remaining))  # final short slice
+            out = self.client.messages(self.state.get("cursor", 0), wait)
+            if out.get("messages") or self._stop.is_set():
+                return out
+            if wait == 0 or time.time() >= deadline:
+                return out
 
     def run_forever(self):
-        signal.signal(signal.SIGTERM, self.stop)
-        signal.signal(signal.SIGINT, self.stop)
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
         self._write_status("starting")
+        # PANELCANCEL: the long-lived FIFO worker (jobs + tool actions) so
+        # the loop below keeps polling and can read a cancel mid-job.
+        self._worker = threading.Thread(target=self._worker_loop,
+                                        daemon=True)
+        self._worker.start()
         self.enroll()
         self.get_token_blocking()
         self.publish_catalog_and_panel()
         self.emit_state("idle")
-        while not self._stop:
+        while not self._stop.is_set():
             if time.time() - self._last_keys_refresh >= 60:
                 self.refresh_steve_keys()
                 self._last_keys_refresh = time.time()
             try:
-                out = self.client.messages(self.state.get("cursor", 0),
-                                         int(self.cfg["poll_wait"]))
+                out = self._poll_messages()
             except SteveError as e:
                 if e.code == "token_invalid":
                     self.get_token_blocking()
@@ -741,9 +1024,12 @@ class Connector:
             except OSError:
                 time.sleep(1)
                 continue
+            # PANELCANCEL3: the WHOLE fetched batch is handled (no mid-
+            # batch break on shutdown): every message is remembered and
+            # queued here, so the tail below can give every item that
+            # never ran a terminal report instead of the saved cursor
+            # silently swallowing it.
             for msg in out.get("messages", []):
-                if self._stop:
-                    break
                 try:
                     self.handle_message(msg)
                 except Exception:
@@ -752,6 +1038,26 @@ class Connector:
             if cursor != self.state.get("cursor"):
                 self.state["cursor"] = cursor
                 self._save()
+        # PANELCANCEL3: the signal handler only set the Event; everything
+        # from here on runs OUTSIDE signal context: cancel the active job,
+        # let the worker finish it (it drains NOTHING new: the get() poll
+        # sees the Event and exits, an item taken in flight goes back
+        # unrun), join it bounded, reject every still-queued item, then
+        # "off" - main() releases the pidfile and exits 0.
+        # PANELCANCEL5: the join is bounded by SHUTDOWN_GRACE (was 60 s -
+        # far beyond launchd's ExitTimeOut). If the worker is still alive
+        # after it, the active job's child ignored cancel()'s SIGTERM:
+        # SIGKILL its process group(s) and give the worker SHUTDOWN_KILL_JOIN
+        # more; the queued rejects and "off" then run regardless.
+        engine = self.running
+        if engine:
+            engine.cancel()
+        if self._worker is not None:
+            self._worker.join(timeout=SHUTDOWN_GRACE)
+            if self._worker.is_alive() and engine is not None:
+                _kill_engine_groups(engine)
+                self._worker.join(timeout=SHUTDOWN_KILL_JOIN)
+        self._reject_queued()
         self._write_status("off")
 
 
