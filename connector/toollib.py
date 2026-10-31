@@ -27,9 +27,10 @@ TOL = 0.001
 FIELDS = {"t": "number", "name": "description", "type": "type",
           "dia_mm": "diameter_mm", "corner_r_mm": "corner_radius_mm",
           "flute_len_mm": "flute_mm", "reach_mm": "reach_mm",
-          "holder": "holder", "rpm": "rpm", "feed_mm_min": "feed_mm_min",
-          "plunge_mm_min": "plunge_mm_min"}
-_POSITIVE = ("flute_mm", "reach_mm", "rpm", "feed_mm_min", "plunge_mm_min")
+          "stickout_mm": "stickout_mm", "holder": "holder", "rpm": "rpm",
+          "feed_mm_min": "feed_mm_min", "plunge_mm_min": "plunge_mm_min"}
+_POSITIVE = ("flute_mm", "reach_mm", "stickout_mm", "rpm", "feed_mm_min",
+             "plunge_mm_min")
 
 
 class ToolLibError(Exception):
@@ -117,7 +118,7 @@ def list_entry(t):
             "dia_mm": t.get("diameter_mm"),
             "corner_r_mm": t.get("corner_radius_mm"),
             "flute_len_mm": t.get("flute_mm"), "reach_mm": t.get("reach_mm"),
-            "holder": t.get("holder"), "rpm": t.get("rpm"),
+            "stickout_mm": t.get("stickout_mm"), "holder": t.get("holder"), "rpm": t.get("rpm"),
             "feed_mm_min": t.get("feed_mm_min"),
             "plunge_mm_min": t.get("plunge_mm_min")}
 
