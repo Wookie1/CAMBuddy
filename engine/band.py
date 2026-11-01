@@ -221,6 +221,11 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None,
     if i0 >= i1 or j0 >= j1:
         return []
     stand = stock.top[j0:j1, i0:i1] > z + eps
+    H, W = stand.shape
+    oj = np.array([o[0] for o in offs], dtype=np.int64)
+    oi = np.array([o[1] for o in offs], dtype=np.int64)
+    disk = np.zeros((2 * k + 1, 2 * k + 1), dtype=bool)
+    disk[oj + k, oi + k] = True
     bx, by = (bore_xy[:2] if bore_xy else path[0][:2])
     ci, cj = stock._ci(bx) - i0, stock._cj(by) - j0
     # BS1a4d6c: pre-clear only the emitted entry's footprint (see entry).
@@ -249,13 +254,21 @@ def _simulate(path, stock, z, tool_r, cell, bore_r, ends=None, *, bore_xy=None,
                     acc_len = 0.0    # kept neighbour after the loop
             pdir = d
         ci, cj = stock._ci(x) - i0, stock._cj(y) - j0
-        removed = 0
-        for dj, di in offs:
-            a, b = ci + di, cj + dj
-            if 0 <= a < stand.shape[1] and 0 <= b < stand.shape[0] \
-                    and stand[b, a]:
-                removed += 1
-                stand[b, a] = False
+        # SP4-PY: the disk stamp vectorised - same cells cleared, same count
+        if k <= ci < W - k and k <= cj < H - k:
+            sub = stand[cj - k:cj + k + 1, ci - k:ci + k + 1]
+            hit = sub & disk
+            removed = int(np.count_nonzero(hit))
+            if removed:
+                sub[hit] = False
+        else:
+            a, b = ci + oi, cj + oj
+            v = (a >= 0) & (a < W) & (b >= 0) & (b < H)
+            a, b = a[v], b[v]
+            hit = stand[b, a]
+            removed = int(np.count_nonzero(hit))
+            if removed:
+                stand[b[hit], a[hit]] = False
         area = removed * cell * cell
         acc_area += area
         acc_len += step_len
