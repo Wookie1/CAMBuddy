@@ -10,7 +10,11 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MAINREPO=$(cd "$ROOT" && cd "$(git rev-parse --git-common-dir)/.." && pwd)
 SHA=$(git -C "$ROOT" rev-parse --short HEAD); MSHA=$(git -C "$ROOT" rev-parse --short main)
 LOG=${GATE_LOG:-$ROOT/scratch/gate_$SHA}; mkdir -p "$LOG"
-fixtures() { [ -d "$1/out" ] || cp -c -R "$MAINREPO/out" "$1/out"; }   # untracked fixtures, APFS clone
+# untracked fixtures (git-ignored out/): stage every top-level file the main
+# checkout has and the worktree lacks (APFS clone, never overwrite) - also when
+# out/ already exists from an engine run; check_fixtures.py verifies them next
+fixtures() { mkdir -p "$1/out"; for f in "$MAINREPO"/out/*; do
+  [ -f "$f" ] && [ ! -e "$1/out/${f##*/}" ] && cp -c "$f" "$1/out/"; done; return 0; }
 run_engine() {   # $1 root, $2 test file, $3 log -> rc
   (cd "$1" && ENGINE_WORKERS=4 "$VPY" "$2" > "$3" 2>&1); }
 run_conn() {     # $1 root, $2 log, [$3 node id] -> rc

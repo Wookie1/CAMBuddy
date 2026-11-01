@@ -339,6 +339,39 @@ def measure_result(bbox):
             "bbox_mm": {"min": lo, "max": hi}}
 
 
+# SK1 default (James, 2026-10-31): all four stock sides are clear; the vise /
+# fixture is avoided by HEIGHT - the jaws sit below the finished part's
+# bottom (tall stock, the excess is cut away after the flip), so a side
+# entry may descend in the air beside any face but never below the part's
+# lowest Z. A jaw-height job input would replace prep["bbox"][4] here.
+SIDE_ENTRY_FACES = "xneg,xpos,yneg,ypos"
+
+
+def _side_entry_args(prep):
+    """No part bottom known -> no height guard -> the class stays OFF."""
+    bbox = prep.get("bbox")
+    if not bbox or len(bbox) < 5:
+        return []
+    return ["--side-entry-clear", SIDE_ENTRY_FACES,
+            "--side-entry-min-z", "%.4f" % bbox[4]]
+
+
+# SK1 descent columns lie inside the engine's tracked stock field
+# (engine/stock.py StockField: reach 8 mm in whole 0.5 mm cells, plus up to
+# one cell of width rounding past the max faces) - for EVERY tool: a tool
+# whose R + rapid margin exceeds that gets no column at all. The judge grid
+# must hold those footprints: MARGIN >= this, never below heightfield.py's
+# default max(5, tool_r). test_sk1_judge_margin pins the parity.
+SK1_REACH_MM = 8.5
+
+
+def _judge_margin_env(prep, tool_r):
+    """MARGIN env for a rough's judge heightfield when side entry is on."""
+    if not _side_entry_args(prep):
+        return {}
+    return {"MARGIN": "%.4f" % max(5.0, float(tool_r), SK1_REACH_MM)}
+
+
 def _rough_skins(path):
     """SKN: the rough's thin skins left standing (engine stats
     skin_skipped), [] when none or unreadable."""
@@ -713,6 +746,7 @@ class EngineRun:
         if metric:
             argv_r += ["--metric"]
         argv_r += self._load_limit_args(values)
+        argv_r += _side_entry_args(prep)
         self._spawn(argv_r, 0.2, 0.85, on_progress)
         posted = {"rough.nc": posted_units(nc, values["units"])}
         with open(stats_path) as fh:
@@ -745,7 +779,9 @@ class EngineRun:
                               "CELL": str(cell), "TESS_TOL": "0.01",
                               "STOCK_BOX": " ".join("%.4f" % v
                                                     for v in stock[:4]),
-                              "TOOL_R": "%.4f" % (values["tool_diameter"] / 2.0)})
+                              "TOOL_R": "%.4f" % (values["tool_diameter"] / 2.0),
+                              **_judge_margin_env(
+                                  prep, values["tool_diameter"] / 2.0)})
         try:
             fr.require_fresh(hf_zmap, step_sha256=step_sha, cell=cell,
                              tess_tol=0.01)
@@ -950,7 +986,9 @@ class EngineRun:
                               "CELL": str(cell), "TESS_TOL": "0.01",
                               "STOCK_BOX": " ".join("%.4f" % v
                                                     for v in stock[:4]),
-                              "TOOL_R": "%.4f" % max_tool_r})
+                              "TOOL_R": "%.4f" % max_tool_r,
+                              # programs our roughs posted carry SK1 columns
+                              **_judge_margin_env(prep, max_tool_r)})
         try:
             fr.require_fresh(hf_zmap, step_sha256=step_sha, cell=cell,
                              tess_tol=0.01)
@@ -1436,7 +1474,8 @@ class EngineRun:
                                 "CELL": "0.1", "TESS_TOL": "0.01",
                                 "STOCK_BOX": " ".join("%.4f" % v
                                                       for v in stock[:4]),
-                                "TOOL_R": "%.4f" % max_tool_r})
+                                "TOOL_R": "%.4f" % max_tool_r,
+                                **_judge_margin_env(prep, max_tool_r)})
                 try:
                     fr.require_fresh(hf01, step_sha256=step_sha, cell=0.1,
                                      tess_tol=0.01)
@@ -1562,6 +1601,7 @@ class EngineRun:
             if metric:
                 argv += ["--metric"]
             argv += self._load_limit_args(values)
+            argv += _side_entry_args(prep)
             step("engine", "rough", argv, *P["rough"], sink)
             posted["rough.nc"] = posted_units(nc, values["units"])
 

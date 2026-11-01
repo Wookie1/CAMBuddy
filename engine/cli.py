@@ -20,6 +20,86 @@ def parse_tool(spec):
     return kind, dia, corner
 
 
+def _log_table_fallback(tool_number, kind, dia, path, e):
+    """SK1/M2: the exact tool number is not in the table - say which entry
+    the type + diameter fallback took (or that none matched)."""
+    print("warning: tool T%s not in %s; %s" % (
+        tool_number, path,
+        "using the %s %.3f mm entry T%s" % (kind, dia, e.get("number"))
+        if isinstance(e, dict) else
+        "no %s %.3f mm entry either" % (kind, dia)), file=sys.stderr)
+
+
+def table_flute(kind, dia, tool_number=None, tools_json=None):
+    """SK1: flute length (mm) for the rough air-column load check, read from
+    the tool table the way finish reads it: by --tool-number when given,
+    else by tool type + diameter. Returns None when no entry carries a
+    flute_mm (the SK1 air-column class is then OFF)."""
+    path = tools_json or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), os.pardir,
+        "tools", "x7_tools.json")
+    try:
+        with open(path) as fh:
+            entries = json.load(fh).get("tools", [])
+    except (IOError, OSError, ValueError):
+        return None
+    e = None
+    if tool_number is not None:
+        e = next((t for t in entries if t.get("number") == tool_number),
+                 None)
+    if e is None:
+        e = next((t for t in entries
+                  if t.get("type") == kind
+                  and abs(float(t.get("diameter_mm", -1.0)) - dia) <= 0.001),
+                 None)
+        if tool_number is not None:
+            _log_table_fallback(tool_number, kind, dia, path, e)
+    fl = e.get("flute_mm") if isinstance(e, dict) else None
+    try:
+        return float(fl) if fl is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def table_holder(kind, dia, tool_number=None, tools_json=None):
+    """M2: (holder max radius mm, stick-out mm) for the SK1 holder-clearance
+    check, read from the same tool table entry and holder outline the
+    judge's holder check reads ("holder" + "stickout_mm", holders[name]
+    ["segments"] = [z_lo, z_hi, r_lo, r_hi] above the nose). None when the
+    tool has no holder, stick-out or outline: SK1 then refuses side entry."""
+    path = tools_json or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), os.pardir,
+        "tools", "x7_tools.json")
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (IOError, OSError, ValueError):
+        return None
+    entries = data.get("tools", [])
+    e = None
+    if tool_number is not None:
+        e = next((t for t in entries if t.get("number") == tool_number),
+                 None)
+    if e is None:
+        e = next((t for t in entries
+                  if t.get("type") == kind
+                  and abs(float(t.get("diameter_mm", -1.0)) - dia) <= 0.001),
+                 None)
+        if tool_number is not None:
+            _log_table_fallback(tool_number, kind, dia, path, e)
+    if not isinstance(e, dict) or not e.get("holder") \
+            or e.get("stickout_mm") is None:
+        return None
+    h = data.get("holders", {}).get(e["holder"])
+    if not isinstance(h, dict) or not h.get("segments"):
+        return None
+    try:
+        r = max(max(float(sg[2]), float(sg[3])) for sg in h["segments"])
+        return r, float(e["stickout_mm"])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
 def stock_box(bbox, sx, sy, top, bottom):
     """Stock box = part bbox plus per-axis stock allowances (mm): the box
     is bbox extended by sx per side in X, sy per side in Y, top above and
@@ -486,6 +566,21 @@ def main(argv=None):
                        '{"progress":0.4,"message":"level 3/7"} for callers')
     r.add_argument("--tools-json", dest="tools_json", default=None,
                    help="tool table JSON for every tool lookup of this call")
+    r.add_argument("--side-entry-clear", dest="side_entry_clear", default=None,
+                   help="SK1: comma list of OPEN faces (xneg,xpos,yneg,ypos) "
+                        "allowing thin side-skin entries that descend in the "
+                        "air outside the stock; default NONE: the class is "
+                        "OFF (workholding: vise jaws and clamps sit outside "
+                        "the stock and the engine has no fixture model)")
+    r.add_argument("--side-entry-min-z", dest="side_entry_min_z", type=float,
+                   default=None,
+                   help="SK1: lowest Z at which an air-column descent may "
+                        "start (default none = down to the floor)")
+    r.add_argument("--flute", type=float, default=None,
+                   help="SK1: flute length mm for the air-column feed-in "
+                        "load check; default: read from --tools-json (or "
+                        "tools/x7_tools.json) by --tool-number / tool type + "
+                        "diameter; no flute known -> the class is OFF")
 
     pp = sub.add_parser("post", help="post neutral/engine moves to LNC G-code")
     pp.add_argument("--in", dest="inp", required=True,
@@ -764,6 +859,11 @@ def main(argv=None):
                 "message": "level %d/%d" % (zi, n)}), flush=True)
 
     workers = a.workers if a.workers is not None else int(os.environ.get("ENGINE_WORKERS", 4))  # 4: keeps local oMLX under its memory watermark
+    # SK1: flute length for the air-column feed-in load check: --flute
+    # override, else the tools-json/--tool-number entry the way finish does;
+    # with no flute known the air-column class is OFF.
+    flute = a.flute if a.flute is not None else \
+        table_flute(kind, dia, a.tool_number, a.tools_json)
     moves, stats = roughmod.rough(surf, tuple(a.stock), dia / 2.0, a.floor,
                                   leave=a.leave, stepdown=a.stepdown,
                                   stepover=stepover,
@@ -778,7 +878,19 @@ def main(argv=None):
                                   rapid_margin=a.rapid_margin,
                                   keep_tool_down=a.keep_tool_down,
                                    progress=prog, stock_out=a.stock_out,
-                                    ramp_angle_deg=a.ramp_angle_deg)
+                                    ramp_angle_deg=a.ramp_angle_deg,
+                                    side_entry_faces=a.side_entry_clear,
+                                    side_entry_min_z=a.side_entry_min_z,
+                                    flute_mm=flute,
+                                    side_entry_holder=table_holder(
+                                        kind, dia, a.tool_number,
+                                        a.tools_json))
+    # SK1: report the air-column feed-in maxima (absent when the class is off)
+    if stats.get("sk1_feedin"):
+        print("sk1: air-column feed-ins=%d max_ae=%.3f mm max_load=%.3f "
+              "max_a=%.3f mm" % (len(stats["sk1_feedin"]),
+                                 stats["sk1_max_ae"], stats["sk1_max_load"],
+                                 stats["sk1_max_a"]), flush=True)
     # SP-K1B: which stamping kernel the load-limit replay will use
     from engine import load_limit as _load_limit
     stats["stamp_kernel"] = ("c" if _load_limit._CKERN is not None
