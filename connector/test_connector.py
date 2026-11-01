@@ -3252,13 +3252,37 @@ class TestTl2CheckOriginE2E:
 class TestNothingToCutE2E:
     """Item 5 E2E: the plain exterior box (box_off_centre.step) roughs to
     an empty program: the run fails with a nothing_to_cut blocker
-    (verdict failed), and no .nc is uploaded or copied anywhere."""
+    (verdict failed), and no .nc is uploaded or copied anywhere.
+    Expectation changed 2026-10-31: HF1 + all-sides side entry (James) make the 1 mm skin real cuttable stock."""
 
     def test_exterior_box_fails_nothing_to_cut(self, live):
         mock, home, programs = live
         mock.enqueue_run(1901, inputs=dict(
             GOOD_INPUTS, model=box_input(mock), program_number=1901))
         final, body = _final_body(mock, 1901, timeout=900)
+        assert final == "succeeded", body
+        work = os.path.join(home, "runs", "1901")
+        with open(os.path.join(work, "stats.json")) as fh:
+            st = json.load(fh)
+        assert st["n_axial_plunge"] == 0
+        assert st["n_moves"] > 0 and st.get("skin_skipped", []) == []
+        with open(os.path.join(work, "check.json")) as fh:
+            chk = json.load(fh)
+        for g in ("gouges", "rapid_collisions", "axial_plunges",
+                  "holder_hits", "over_flute", "plunge_over_flute",
+                  "below_stock_bottom", "outside_grid"):
+            if isinstance(chk.get(g), dict):
+                assert chk[g]["count"] == 0, (g, chk[g])
+
+    def test_zero_margin_box_fails_nothing_to_cut(self, live):
+        """Stock equal to the part bbox (no side, top or bottom margin):
+        nothing to cut - the run fails with a nothing_to_cut blocker
+        (verdict failed), and no .nc is uploaded or copied anywhere."""
+        mock, home, programs = live
+        mock.enqueue_run(1902, inputs=dict(
+            GOOD_INPUTS, model=box_input(mock), program_number=1902,
+            stock_xy=0.0, stock_top=0.0, stock_bottom=0.0))
+        final, body = _final_body(mock, 1902, timeout=900)
         assert final == "failed", body
         err = body["error"]
         assert err["code"] == "nothing_to_cut"
@@ -3268,8 +3292,8 @@ class TestNothingToCutE2E:
         assert [a["code"] for a in r["attention"]] == ["nothing_to_cut"]
         assert r["attention"][0]["severity"] == "blocker"
         assert r["attention"][0]["next_step"]
-        assert mock.file_names(1901) == []
-        assert not list(programs.glob("O1901*"))
+        assert mock.file_names(1902) == []
+        assert not list(programs.glob("O1902*"))
 
 
 class TestTl2OriginHeaderE2E:

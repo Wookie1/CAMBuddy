@@ -1184,6 +1184,41 @@ def _dense_line(a, b, step=0.4):
             for t in range(n + 1)]
 
 
+def holder_clears(stock, pts, z, holder_r, stickout):
+    """M2: the holder nose (tool tip z + stick-out) stays 1 mm above the
+    live stock within the holder's radius + 1 mm (the judge's holder
+    envelope) at every point of `pts` (an SK1 descent column and its whole
+    sideways feed-in: the holder travels with the tool)."""
+    return stock.link_top_max(list(pts), holder_r + 1.0) \
+        <= z + stickout - 1.0
+
+
+def vise_height_guard(moves, stock_box, tool_r, min_z, stats=None):
+    """M1 (vise avoidance by height): with side entry on, the vise jaws sit
+    beside the stock below min_z (the finished part's bottom). EVERY move -
+    G0 and G1, cutting, links, entries - whose tool footprint (centre +-
+    tool_r) is not wholly inside the stock XY while below min_z fails the
+    run; nothing is clamped or dropped. Endpoints suffice: a straight move
+    between two footprints inside the (convex) stock box stays inside."""
+    sx0, sx1, sy0, sy1 = stock_box[:4]
+    bad = [i for i, mv in enumerate(moves)
+           if mv["z"] < min_z - 1e-6
+           and not (sx0 + tool_r <= mv["x"] <= sx1 - tool_r
+                    and sy0 + tool_r <= mv["y"] <= sy1 - tool_r)]
+    if stats is not None:
+        stats["vise_guard"] = {"min_z": round(float(min_z), 4),
+                               "checked": len(moves), "offenders": len(bad)}
+    if bad:
+        mv = moves[bad[0]]
+        err = RuntimeError(
+            "rough vise-height guard FAILED: %d move(s) outside the stock "
+            "below the part bottom (Z%.3f); first: move %d G%d X%.3f Y%.3f "
+            "Z%.3f" % (len(bad), min_z, bad[0], mv["g"], mv["x"], mv["y"],
+                       mv["z"]))
+        err.stats = stats
+        raise err
+
+
 class _SkinEntry(Exception):
     """SKN: an armed region entry found only a 'wide' straight plunge."""
 
@@ -1238,7 +1273,9 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           corner_r=0.127, part_hf=None, stock_cell=0.5, stepup=1.905,
           min_rest=1.0, min_level_area=20.0, rapid_margin=1.0,
           clip_bridge_mm=5.0, feed_link_max=40.0,
-          progress=None, stock_out=None, ramp_angle_deg=2.0):
+          progress=None, stock_out=None, ramp_angle_deg=2.0,
+          side_entry_faces=None, side_entry_min_z=None, flute_mm=None,
+          side_entry_holder=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -1275,6 +1312,17 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
       heightfield (engine/stock.py model after all levels, NaN outside the
       tracked box) with a .json sidecar {x0,y0,cell} so finishing can verify
       rapids against it (finish --stock-from, S3b).
+    SK1 (thin side-skin entry from the air outside the stock): when a level's
+      region is a thin skin ring, no in-box descent column and no helix fits
+      and today's code counts an axial plunge. With side_entry_faces (comma
+      list or set of OPEN faces: xneg,xpos,yneg,ypos) AND a known flute_mm,
+      feed_down may instead descend in the AIR beyond a listed face and feed
+      in sideways (flank engagement through the standing skin, load-checked
+      like the bands). WORKHOLDING: the descent is exactly where vise jaws
+      or clamps sit and the engine has no fixture model, so the class is
+      OFF unless the job lists faces, and side_entry_min_z (default none =
+      down to the floor) never descends below that Z. flute_mm comes from
+      the tools-json entry; with no flute known the class is OFF.
     """
     sxmin, sxmax, symin, symax, szmin, szmax = stock_box
     # RT2a: the ramp angle is the parameter the generator honors (helix pitch
@@ -1282,6 +1330,29 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     if ramp_angle_deg <= 0:
         raise ValueError("ramp angle must be > 0 deg")
     ramp_angle_deg = min(max(float(ramp_angle_deg), 0.5), 15.0)
+    # SK1: air-column side entries (thin skin rings). WORKHOLDING fail-closed
+    # gates: an air descent goes down OUTSIDE the stock, exactly where vise
+    # jaws or clamps sit (no fixture model in the engine), and a flank
+    # feed-in deeper than the flute would rub the shank. The class is OFF
+    # unless the job lists OPEN faces AND a flute length is known.
+    _sk1_faces = set()
+    if side_entry_faces:
+        _sk1_faces = {str(f).strip().lower()
+                      for f in (side_entry_faces.split(",")
+                                if isinstance(side_entry_faces, str)
+                                else side_entry_faces)
+                      if str(f).strip()}
+        _sk1_bad = _sk1_faces - {"xneg", "xpos", "yneg", "ypos"}
+        if _sk1_bad:
+            raise ValueError("side_entry_faces: unknown face(s) %s "
+                             "(xneg,xpos,yneg,ypos)" % sorted(_sk1_bad))
+    _sk1_flute = float(flute_mm) if flute_mm else None
+    _sk1_min_z = None if side_entry_min_z is None else float(side_entry_min_z)
+    _sk1_on = bool(_sk1_faces) and _sk1_flute is not None
+    # M2: (holder max radius, stick-out) of the cutting tool; None = unknown,
+    # and an air column is then never used (fail closed)
+    _sk1_holder = side_entry_holder
+    sk1_block = [None]   # why the last SK1 search found no column
     if clearance_z is None:
         clearance_z = szmax + 2.0
     axl = leave if axial_leave is None else axial_leave
@@ -1468,6 +1539,144 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 if v > mx:
                     mx = float(v)
         return mx
+
+    # SK1: air-column candidate class for find_shift (thin side-skin entry
+    # from the air outside the stock). OFF unless faces are listed and a
+    # flute is known (_sk1_on); nothing here runs when the class is off.
+    _sk1_r_foot = tool_r + rapid_margin
+    if _sk1_on:
+        _k_tr = int(math.ceil(tool_r / c_sc))
+        _sk1_offs_tr = [(dj, di) for dj in range(-_k_tr, _k_tr + 1)
+                        for di in range(-_k_tr, _k_tr + 1)
+                        if (dj * dj + di * di) * c_sc * c_sc
+                        <= tool_r * tool_r]
+
+    def _find_shift_air(x, y, z):
+        """SK1: find an AIR COLUMN to descend beside the stock: a point
+        whose ENTIRE tool footprint (centre +- (tool_r + rapid_margin))
+        lies outside the stock box in X or Y, beyond a LISTED open face and
+        not beyond any unlisted one (workholding: an unlisted face may hold
+        jaws or clamps), inside the grid the engine models. Searched along
+        today's (dist, 16 directions) pattern plus straight out through the
+        nearest stock face. Every check that applies to today's candidates
+        still applies (judge-disk-clear descent, isl_ok3 segment legality
+        of the whole feed path, hf_gouge_violation on the feed path, the
+        rapid-clear G0 descent at the column); the flank feed-in through the
+        standing skin replaces SE2's link_clear with the bands' engagement
+        simulation on the LIVE stock (engine.band._simulate, the call
+        lnk_cut_ok uses, eps=0.0): every 1 mm window ae <= SPIKE_MM, ZE2
+        load <= LOAD_MAX (load_limit's rule ae*a*F/(2.032*19.05*Fcut)) and
+        the engaged axial depth a <= the flute length. Nothing under the
+        flat bottom may stand above z + AXIAL_FLOOR: flank engagement only,
+        never the bottom. Per accepted feed-in the max ae / load / a go to
+        stats["sk1_feedin"] (+ running maxima)."""
+        if not _sk1_on or (_sk1_min_z is not None
+                           and z < _sk1_min_z - 1e-9):
+            return None
+        if _sk1_holder is None:
+            sk1_block[0] = "holder unknown"
+            return None      # M2: no holder/stick-out known -> no side entry
+        holder_r, stickout = _sk1_holder
+        from engine.band import _simulate, SPIKE_MM
+        from engine.load_limit import DESIGN_AE, DESIGN_STEPDOWN, LOAD_MAX
+        cands = []
+        for dist in (2.0, 3.5, 5.0, 7.0, 9.0, 11.0, 13.0):
+            for q in range(16):
+                a = q * math.pi / 8.0
+                cands.append((round(x + dist * math.cos(a), 4),
+                              round(y + dist * math.sin(a), 4)))
+        # plus the direction straight out through the nearest stock face,
+        # rung by rung out to the edge of the tracked grid:
+        faces_xy = {"xneg": (stock_box[0], -1.0, 0.0, x - stock_box[0]),
+                    "xpos": (stock_box[1], 1.0, 0.0, stock_box[1] - x),
+                    "yneg": (stock_box[2], 0.0, -1.0, y - stock_box[2]),
+                    "ypos": (stock_box[3], 0.0, 1.0, stock_box[3] - y)}
+        near = min(faces_xy, key=lambda f: faces_xy[f][3])
+        edge, ux, uy, _d0 = faces_xy[near]
+        g1 = (stock.x0 + stock.nx * stock.cell) if ux \
+            else (stock.y0 + stock.ny * stock.cell)
+        g0 = stock.x0 if ux else stock.y0
+        lim = (g1 - edge) if (ux > 0 or uy > 0) else (edge - g0)
+        kk0 = max(0, int(math.ceil((_sk1_r_foot - 1e-9) / 0.25)))
+        for kk in range(kk0, int(max(lim, 0.0) / 0.25) + 1):
+            off = 0.25 * kk
+            if ux:
+                cands.append((round(edge + ux * off, 4), round(y, 4)))
+            else:
+                cands.append((round(x, 4), round(edge + uy * off, 4)))
+        for (sx, sy) in cands:
+            beyond = set()
+            if sx >= stock_box[1] + _sk1_r_foot:
+                beyond.add("xpos")
+            if sx <= stock_box[0] - _sk1_r_foot:
+                beyond.add("xneg")
+            if sy >= stock_box[3] + _sk1_r_foot:
+                beyond.add("ypos")
+            if sy <= stock_box[2] - _sk1_r_foot:
+                beyond.add("yneg")
+            if not beyond or beyond - _sk1_faces:
+                continue     # whole footprint beyond a LISTED face only
+            if not (0 <= stock._ci(sx) < stock.nx
+                    and 0 <= stock._cj(sy) < stock.ny):
+                continue     # inside the grid the engine models
+            if disk_top(sx, sy, offs_wide) > z + 0.04:
+                continue     # judge-disk-clear descent (no axial removal)
+            n = max(2, int(math.dist((sx, sy), (x, y)) / 0.4))
+            path = [(round(sx + (x - sx) * t / n, 4),
+                     round(sy + (y - sy) * t / n, 4))
+                    for t in range(n + 1)]
+            # Island legality of the whole feed path. The final point is THIS
+            # level's region entry point the engine itself picked (a ring-skin
+            # entry sits at the flange's big-cutter offset, exactly the loop
+            # the strict self-pick oracle 0.03 can never accept as an
+            # endpoint): the path is validated at isl_ok3 up to it and the
+            # endpoint at isl_ok (0.01), the oracle every emitted cutting point
+            # must meet anyway. hf_gouge_violation below is the exact backstop.
+            nseg = max(1, int(math.ceil(math.dist((sx, sy), (x, y))
+                                       / 0.25 - 1e-9)))
+            ptsl = [(sx + (x - sx) * t / nseg, sy + (y - sy) * t / nseg)
+                    for t in range(nseg + 1)]
+            if not all(isl_ok3(ptsl[:-1])) or not isl_ok([ptsl[-1]])[0]:
+                continue     # CL1: segment legality of the whole feed path
+            if hf_gouge_violation([(px, py, z) for (px, py) in path],
+                                  stock, tool_r) is not None:
+                continue     # feed-in would take the flank over the part
+            if stock.link_top_max(path,
+                                  max(tool_r - corner_r - 0.5, 0.1)) \
+                    > z + AXIAL_FLOOR:
+                continue     # something stands under the flat bottom: this
+                             # entry must engage with the flank only
+            if stock.link_top_max([(sx, sy), (sx, sy)],
+                                  tool_r + rapid_margin) > z + 0.05:
+                continue     # the G0 descent at the column must be clear
+            if not holder_clears(stock, [(sx, sy)] + path, z, holder_r,
+                                 stickout):
+                sk1_block[0] = "holder would hit stock"
+                continue     # M2: descent AND whole feed-in keep the holder
+                             # 1 mm over the stock (holder_clears)
+            wins = _simulate(path, stock, z, tool_r, stock.cell, 0.0,
+                             entry="link", eps=0.0)
+            ae = max(wins) if wins else 0.0
+            if ae > SPIKE_MM:
+                continue     # a window over the judge's overload bar
+            top = -1e9
+            for (px, py) in path:
+                v = disk_top(px, py, _sk1_offs_tr)
+                if v > top:
+                    top = v
+            a = max(0.0, top - z) if top > -1e8 else 0.0
+            load = (ae * a * max(cut_feed, 1e-9)
+                    / (DESIGN_AE * DESIGN_STEPDOWN * max(cut_feed, 1e-9)))
+            if load > LOAD_MAX or a > _sk1_flute:
+                continue     # ZE2 load / flute-length gates
+            stats.setdefault("sk1_feedin", []).append(
+                {"ae": round(ae, 4), "load": round(load, 4),
+                 "a": round(a, 4), "z": round(z, 3), "col": [sx, sy]})
+            stats["sk1_max_ae"] = max(stats.get("sk1_max_ae", 0.0), ae)
+            stats["sk1_max_load"] = max(stats.get("sk1_max_load", 0.0), load)
+            stats["sk1_max_a"] = max(stats.get("sk1_max_a", 0.0), a)
+            return (sx, sy)
+        return None
 
     def helix_entry(x, y, z, hc, centred=False, bore=None):
         """RT: bore down to cutting depth on a helix instead of axially
@@ -1706,7 +1915,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             stats[key + "_cvt"] = stats.get(key + "_cvt", 0) + 1
         return ok
 
-    def find_shift(x, y, z, force=False, flank=False):
+    def find_shift(x, y, z, force=False, flank=False, air=False):
         """RT item 1: when the descent column at (x, y) has tall material in
         its R5 pad ring beside it (long feed stretch), find a nearby point
         whose FULL pad column is clear down to just above Z. The tool G0s
@@ -1720,6 +1929,11 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         island legality of the whole feed path, and the part heightfield
         backstop (hf_gouge_violation) so the flank never crosses finished
         geometry; only the live-stock floor test is replaced by the part test.
+        SK1 air=True: when no in-box candidate passes, also search the
+        AIR-COLUMN class (_find_shift_air: descent entirely outside the
+        stock, beyond a LISTED open face). Only feed_down's two axial-plunge
+        sites ever pass air=True; the class is off unless the job lists
+        faces and a flute is known.
         """
         req = disk_top(x, y, offs_rt)
         if not force and not flank and req <= z + 3.0:
@@ -1778,6 +1992,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     # 0.5 mm ring link_top_max's eroded radius never sees)
                     # must be simulated through the live stock and in limits
                 return (sx, sy)
+        if air:   # SK1: the air-column class (off unless faces + flute)
+            off = _find_shift_air(x, y, z)
+            if off is not None:
+                return off
         return None
 
     def offset_down(x, y, z, off):
@@ -1831,6 +2049,17 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                            bore=bore):
                 helix_n[0] += 1   # BS1a4c: this helix backs an entry credit
                 return
+            if side and prev[2] is not None:
+                # SK1: this is where today's code would count an axial
+                # plunge - before counting it, try an air-column side entry
+                # (find_shift's air class; OFF unless the job lists open
+                # faces and a flute length is known).
+                off = find_shift(x, y, z, force=True, flank=True, air=True)
+                if off is not None:
+                    offset_down(x, y, z, off)
+                    stats["n_side_entries"] += 1
+                    stats["side_entry_feed_mm"] += math.dist(off, (x, y))
+                    return
             if ax_hard:
                 stats["n_axial_plunge"] += 1
                 stats.setdefault("axial_pts", []).append(
@@ -1853,9 +2082,20 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             if off is not None:
                 offset_down(x, y, z, off)
                 return
-        if wide_fail and skin_arm[0] == (x, y, z):
-            raise _SkinEntry()
         if wide_fail:
+            # SK1: the last stop before counting the axial plunge: an
+            # air-column side entry (find_shift's air class; off unless the
+            # job lists open faces and a flute length is known).
+            if prev[2] is not None:
+                off = find_shift(x, y, z, force=True, flank=True, air=True)
+                if off is not None:
+                    offset_down(x, y, z, off)
+                    stats["n_side_entries"] += 1
+                    stats["side_entry_feed_mm"] += math.dist(off, (x, y))
+                    return
+            # SKN: after SK1's air entry (listed open faces) had its chance
+            if skin_arm[0] == (x, y, z):
+                raise _SkinEntry()
             # RT2: neither a full-size helix nor a verified-clear column was
             # available where the judge's disk sees stock above Z - a straight
             # feed-down here WOULD be an axial plunge. Count it (the run
@@ -2485,6 +2725,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                    for p in pp):
                 snap = (stock.top.copy(), copy.deepcopy(stats))
                 skin_arm[0] = (ex, ey, z)
+                sk1_block[0] = None
             try:
                 enter_at(ex, ey, z, res["helix"], side=bool(rp2_flag),
                          bore=res.get("bore"))
@@ -2498,7 +2739,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 stats.clear()
                 stats.update(snap[1])
                 if band is not None:
-                    band.update({"x": ex, "y": ey, "z": round(z, 3)})
+                    band.update({"x": ex, "y": ey, "z": round(z, 3),
+                                 "reason": sk1_block[0] if sk1_block[0]
+                                 == "holder would hit stock" else
+                                 "only a straight plunge reaches it"})
                     stats["skin_skipped"].append(band)
                     print("WARNING: thin skin left standing at Z%.3f on %s: "
                           "%.1f mm2, max %.2f mm thick (only a straight "
@@ -3037,11 +3281,15 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         # Task RT item 3: axial plunging into stock is forbidden - every
         # straight feed-down must enter cleared ground; anything that would
         # cut stock axially under the flat bottom must be a helix/ramp.
-        raise RuntimeError(
+        err = RuntimeError(
             "rough axial-plunge FAILED: %d straight feed-down move(s) would "
             "cut stock axially under the flat bottom disk and no helix/ramp "
             "entry was possible; points: %s"
             % (stats["n_axial_plunge"], stats.get("axial_pts", [])[:12]))
+        err.stats = stats   # SK1: the abort keeps its stats for callers
+        raise err
+    if _sk1_min_z is not None:
+        vise_height_guard(moves, stock_box, tool_r, _sk1_min_z, stats)
     if stock_out:
         # S3b: the engine's own final stock heightfield (after all levels),
         # for finish --stock-from rapid verification
