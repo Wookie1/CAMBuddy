@@ -137,5 +137,30 @@ def test_vectorised_simulate_matches_reference():
     print("PASS sp4_py simulate: 300 random cases identical")
 
 
+
+
+def test_island_clear_single_point_matches_batch():
+    """rough.island_clear_fn: the single-point fast path answers exactly
+    what the batched path answers for the same point."""
+    from engine import model  # noqa: F401  (puts area on the path)
+    from engine.rough import island_clear_fn
+    rng = random.Random(7)
+    for t in range(40):
+        isl = []
+        for _ in range(rng.randint(1, 4)):
+            cx, cy, r = rng.uniform(-30, 30), rng.uniform(-30, 30), rng.uniform(2, 9)
+            m = rng.randint(3, 40)
+            isl.append([(cx + r * math.cos(2 * math.pi * i / m) * rng.uniform(0.7, 1.0),
+                         cy + r * math.sin(2 * math.pi * i / m) * rng.uniform(0.7, 1.0))
+                        for i in range(m)])
+        f = island_clear_fn(isl, rng.choice([0.0, 0.381, 3.0, 6.724]))
+        pts = [(rng.uniform(-40, 40), rng.uniform(-40, 40)) for _ in range(200)]
+        batch = f(pts + [(999.0, 999.0)])[:-1]     # force the batched path
+        single = [f([p])[0] for p in pts]
+        assert batch == single, (t, [i for i, (a, b) in enumerate(zip(batch, single)) if a != b][:5])
+    print("PASS sp4_py island_clear: single == batch on 8000 points")
+
+
 if __name__ == "__main__":
     test_vectorised_simulate_matches_reference()
+    test_island_clear_single_point_matches_batch()
