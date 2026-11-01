@@ -1184,6 +1184,32 @@ def _dense_line(a, b, step=0.4):
             for t in range(n + 1)]
 
 
+def vise_height_guard(moves, stock_box, tool_r, min_z, stats=None):
+    """M1 (vise avoidance by height): with side entry on, the vise jaws sit
+    beside the stock below min_z (the finished part's bottom). EVERY move -
+    G0 and G1, cutting, links, entries - whose tool footprint (centre +-
+    tool_r) is not wholly inside the stock XY while below min_z fails the
+    run; nothing is clamped or dropped. Endpoints suffice: a straight move
+    between two footprints inside the (convex) stock box stays inside."""
+    sx0, sx1, sy0, sy1 = stock_box[:4]
+    bad = [i for i, mv in enumerate(moves)
+           if mv["z"] < min_z - 1e-6
+           and not (sx0 + tool_r <= mv["x"] <= sx1 - tool_r
+                    and sy0 + tool_r <= mv["y"] <= sy1 - tool_r)]
+    if stats is not None:
+        stats["vise_guard"] = {"min_z": round(float(min_z), 4),
+                               "checked": len(moves), "offenders": len(bad)}
+    if bad:
+        mv = moves[bad[0]]
+        err = RuntimeError(
+            "rough vise-height guard FAILED: %d move(s) outside the stock "
+            "below the part bottom (Z%.3f); first: move %d G%d X%.3f Y%.3f "
+            "Z%.3f" % (len(bad), min_z, bad[0], mv["g"], mv["x"], mv["y"],
+                       mv["z"]))
+        err.stats = stats
+        raise err
+
+
 class _SkinEntry(Exception):
     """SKN: an armed region entry found only a 'wide' straight plunge."""
 
@@ -3235,6 +3261,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             % (stats["n_axial_plunge"], stats.get("axial_pts", [])[:12]))
         err.stats = stats   # SK1: the abort keeps its stats for callers
         raise err
+    if _sk1_min_z is not None:
+        vise_height_guard(moves, stock_box, tool_r, _sk1_min_z, stats)
     if stock_out:
         # S3b: the engine's own final stock heightfield (after all levels),
         # for finish --stock-from rapid verification
