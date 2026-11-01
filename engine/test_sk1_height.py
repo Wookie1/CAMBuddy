@@ -53,10 +53,12 @@ def _rough(td, stock_bottom, floor_below_part):
         return json.load(fh), err.getvalue(), zpart, floor
 
 
-def _skip_if_no_freecad():
-    if not os.path.exists(model.freecadcmd()):
-        import pytest
-        pytest.skip("VibeCAD freecadcmd missing")
+def _require_freecad():
+    """Gate test: a missing VibeCAD freecadcmd is a FAILURE, never a skip."""
+    assert os.path.exists(model.freecadcmd()), (
+        "test_sk1_height needs VibeCAD's freecadcmd at %s - run with "
+        "/Applications/VibeCAD.app/Contents/Resources/bin/python"
+        % model.freecadcmd())
 
 
 def _no_descent_below(stats, zpart):
@@ -69,7 +71,7 @@ def _no_descent_below(stats, zpart):
 def test_sk1_height_b_skins_cut_by_side_entry():
     """(b) floor at the part bottom: the 1 mm skins are cut by side entry
     (no skin_skipped, 0 plunges), no descent below the part bottom."""
-    _skip_if_no_freecad()
+    _require_freecad()
     with tempfile.TemporaryDirectory() as td:
         stats, err, zpart, _f = _rough(td, 0, False)
         feeds = _no_descent_below(stats, zpart)
@@ -87,7 +89,7 @@ def test_sk1_height_c_nothing_below_part_bottom():
     no level below the part bottom cuts, no side entry descends below it,
     and no skin below it is reported (the part heightfield floors at the
     part's lowest Z, so that stock is never in a roughing region)."""
-    _skip_if_no_freecad()
+    _require_freecad()
     with tempfile.TemporaryDirectory() as td:
         stats, err, zpart, floor = _rough(td, 3, True)
         assert floor < zpart - 2.9

@@ -26,15 +26,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, "/Applications/VibeCAD.app/Contents/Resources/lib")
 
 try:
-    import area
-    HAVE_AREA = True
-except ImportError:
-    try:
-        import pytest
-        pytest.importorskip("area")
-    except ImportError:
-        pass
-    HAVE_AREA = False
+    import area  # noqa: F401
+except ImportError as e:   # gate test: a missing area module FAILS, never skips
+    raise ImportError(
+        "test_sk1 needs VibeCAD's area module - run with "
+        "/Applications/VibeCAD.app/Contents/Resources/bin/python (%s)" % e)
+HAVE_AREA = True
 
 from engine.rough import rough  # noqa: E402
 from engine.gcode import moves_to_gcode  # noqa: E402

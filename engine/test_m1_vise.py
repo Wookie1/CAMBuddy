@@ -19,7 +19,7 @@ from engine import test_sk1_height as H  # noqa: E402
 def test_m1_a_box_scenes_zero_offenders():
     """(a) every move of the b (floor at the part bottom, skins cut by side
     entry) and c (floor 3 mm below it) scenes is scanned: 0 offenders."""
-    H._skip_if_no_freecad()
+    H._require_freecad()
     for sb, below in ((0, False), (3, True)):
         with tempfile.TemporaryDirectory() as td:
             stats, _err, zpart, _f = H._rough(td, sb, below)
