@@ -49,6 +49,43 @@ def table_flute(kind, dia, tool_number=None, tools_json=None):
         return None
 
 
+def table_holder(kind, dia, tool_number=None, tools_json=None):
+    """M2: (holder max radius mm, stick-out mm) for the SK1 holder-clearance
+    check, read from the same tool table entry and holder outline the
+    judge's holder check reads ("holder" + "stickout_mm", holders[name]
+    ["segments"] = [z_lo, z_hi, r_lo, r_hi] above the nose). None when the
+    tool has no holder, stick-out or outline: SK1 then refuses side entry."""
+    path = tools_json or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), os.pardir,
+        "tools", "x7_tools.json")
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (IOError, OSError, ValueError):
+        return None
+    entries = data.get("tools", [])
+    e = None
+    if tool_number is not None:
+        e = next((t for t in entries if t.get("number") == tool_number),
+                 None)
+    if e is None:
+        e = next((t for t in entries
+                  if t.get("type") == kind
+                  and abs(float(t.get("diameter_mm", -1.0)) - dia) <= 0.001),
+                 None)
+    if not isinstance(e, dict) or not e.get("holder") \
+            or e.get("stickout_mm") is None:
+        return None
+    h = data.get("holders", {}).get(e["holder"])
+    if not isinstance(h, dict) or not h.get("segments"):
+        return None
+    try:
+        r = max(max(float(sg[2]), float(sg[3])) for sg in h["segments"])
+        return r, float(e["stickout_mm"])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
 def stock_box(bbox, sx, sy, top, bottom):
     """Stock box = part bbox plus per-axis stock allowances (mm): the box
     is bbox extended by sx per side in X, sy per side in Y, top above and
@@ -830,7 +867,10 @@ def main(argv=None):
                                     ramp_angle_deg=a.ramp_angle_deg,
                                     side_entry_faces=a.side_entry_clear,
                                     side_entry_min_z=a.side_entry_min_z,
-                                    flute_mm=flute)
+                                    flute_mm=flute,
+                                    side_entry_holder=table_holder(
+                                        kind, dia, a.tool_number,
+                                        a.tools_json))
     # SK1: report the air-column feed-in maxima (absent when the class is off)
     if stats.get("sk1_feedin"):
         print("sk1: air-column feed-ins=%d max_ae=%.3f mm max_load=%.3f "

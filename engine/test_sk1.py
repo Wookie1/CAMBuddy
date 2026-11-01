@@ -82,7 +82,15 @@ def _synth_stl():
     return path
 
 
+# M2: SK1 needs the tool's holder; the synthetic runs use T13's table
+# holder (BT30-ER32-70, max radius 27) at its 71.6 mm stick-out, which
+# clears this 19 mm part everywhere (test_m2_holder covers the limit).
+SYN_HOLDER = (27.0, 71.6)
+
+
 def _synth_rough(mod=None, **kw):
+    if mod is None:
+        kw.setdefault("side_entry_holder", SYN_HOLDER)
     from opencamlib import ocl
     stl = _synth_stl()
     surf = ocl.STLSurf()

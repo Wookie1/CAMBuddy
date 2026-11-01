@@ -1184,6 +1184,15 @@ def _dense_line(a, b, step=0.4):
             for t in range(n + 1)]
 
 
+def holder_clears(stock, pts, z, holder_r, stickout):
+    """M2: the holder nose (tool tip z + stick-out) stays 1 mm above the
+    live stock within the holder's radius + 1 mm (the judge's holder
+    envelope) at every point of `pts` (an SK1 descent column and its whole
+    sideways feed-in: the holder travels with the tool)."""
+    return stock.link_top_max(list(pts), holder_r + 1.0) \
+        <= z + stickout - 1.0
+
+
 def vise_height_guard(moves, stock_box, tool_r, min_z, stats=None):
     """M1 (vise avoidance by height): with side entry on, the vise jaws sit
     beside the stock below min_z (the finished part's bottom). EVERY move -
@@ -1265,7 +1274,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           min_rest=1.0, min_level_area=20.0, rapid_margin=1.0,
           clip_bridge_mm=5.0, feed_link_max=40.0,
           progress=None, stock_out=None, ramp_angle_deg=2.0,
-          side_entry_faces=None, side_entry_min_z=None, flute_mm=None):
+          side_entry_faces=None, side_entry_min_z=None, flute_mm=None,
+          side_entry_holder=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -1339,6 +1349,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     _sk1_flute = float(flute_mm) if flute_mm else None
     _sk1_min_z = None if side_entry_min_z is None else float(side_entry_min_z)
     _sk1_on = bool(_sk1_faces) and _sk1_flute is not None
+    # M2: (holder max radius, stick-out) of the cutting tool; None = unknown,
+    # and an air column is then never used (fail closed)
+    _sk1_holder = side_entry_holder
+    sk1_block = [None]   # why the last SK1 search found no column
     if clearance_z is None:
         clearance_z = szmax + 2.0
     axl = leave if axial_leave is None else axial_leave
@@ -1559,6 +1573,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         if not _sk1_on or (_sk1_min_z is not None
                            and z < _sk1_min_z - 1e-9):
             return None
+        if _sk1_holder is None:
+            sk1_block[0] = "holder unknown"
+            return None      # M2: no holder/stick-out known -> no side entry
+        holder_r, stickout = _sk1_holder
         from engine.band import _simulate, SPIKE_MM
         from engine.load_limit import DESIGN_AE, DESIGN_STEPDOWN, LOAD_MAX
         cands = []
@@ -1631,6 +1649,11 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             if stock.link_top_max([(sx, sy), (sx, sy)],
                                   tool_r + rapid_margin) > z + 0.05:
                 continue     # the G0 descent at the column must be clear
+            if not holder_clears(stock, [(sx, sy)] + path, z, holder_r,
+                                 stickout):
+                sk1_block[0] = "holder would hit stock"
+                continue     # M2: descent AND whole feed-in keep the holder
+                             # 1 mm over the stock (holder_clears)
             wins = _simulate(path, stock, z, tool_r, stock.cell, 0.0,
                              entry="link", eps=0.0)
             ae = max(wins) if wins else 0.0
@@ -2702,6 +2725,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                    for p in pp):
                 snap = (stock.top.copy(), copy.deepcopy(stats))
                 skin_arm[0] = (ex, ey, z)
+                sk1_block[0] = None
             try:
                 enter_at(ex, ey, z, res["helix"], side=bool(rp2_flag),
                          bore=res.get("bore"))
@@ -2715,7 +2739,10 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 stats.clear()
                 stats.update(snap[1])
                 if band is not None:
-                    band.update({"x": ex, "y": ey, "z": round(z, 3)})
+                    band.update({"x": ex, "y": ey, "z": round(z, 3),
+                                 "reason": sk1_block[0] if sk1_block[0]
+                                 == "holder would hit stock" else
+                                 "only a straight plunge reaches it"})
                     stats["skin_skipped"].append(band)
                     print("WARNING: thin skin left standing at Z%.3f on %s: "
                           "%.1f mm2, max %.2f mm thick (only a straight "
