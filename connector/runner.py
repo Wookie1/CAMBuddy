@@ -339,6 +339,16 @@ def measure_result(bbox):
             "bbox_mm": {"min": lo, "max": hi}}
 
 
+def _rough_skins(path):
+    """SKN: the rough's thin skins left standing (engine stats
+    skin_skipped), [] when none or unreadable."""
+    try:
+        with open(path) as fh:
+            return json.load(fh).get("skin_skipped", [])
+    except (OSError, ValueError):
+        return []
+
+
 class EngineRun:
     """Runs one roughing job; .cancel() stops the active subprocess."""
 
@@ -761,6 +771,9 @@ class EngineRun:
             check = json.load(fh)
         _check_zmap_gates(check)
         check["tools_table"] = self._table_record()
+        skins = _rough_skins(stats_path)
+        if skins:   # SKN: key present only when a skin was left standing
+            check["left_for_hole_op_or_another_setup"] = {"rough": skins}
         with open(check_path, "w") as fh:
             json.dump(check, fh, indent=2)
 
@@ -1811,6 +1824,9 @@ class EngineRun:
             "finish": _skips(fin_stats),
             "rest": _skips(rest_stats) if rest else [],
         }
+        skins = _rough_skins(os.path.join(self.work, "rough_stats.json"))
+        if skins:   # SKN: key present only when a skin was left standing
+            check["left_for_hole_op_or_another_setup"]["rough"] = skins
         with open(os.path.join(self.work, "check.json"), "w") as fh:
             json.dump(check, fh, indent=2)
 

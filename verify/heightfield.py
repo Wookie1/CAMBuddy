@@ -13,7 +13,7 @@ covers a larger machine stock; cells with no geometry keep the fill value
 (shape ZMin) exactly like unpadded empty columns.
 When STOCK_BOX="xmin xmax ymin ymax" is given, the grid covers the union
 of the part bbox and the stock box expanded by TOOL_R + MARGIN (default
-5.0 mm) on every side, cell-aligned: the grid always judges the whole
+max(5 mm, TOOL_R), see judge_margin) on every side, cell-aligned: the grid always judges the whole
 stock plus the largest tool footprint, never a tight part bbox. Outer
 cells are part-free (zmin floor), exactly like PAD cells; PAD keeps
 working for old callers. The sidecar records stock_box, tool_r, margin,
@@ -141,8 +141,18 @@ def rasterize(shape, cell=0.5, tol=0.01, pad=0.0, stock_box=None,
     return hf, meta
 
 
+def judge_margin(margin, tool_r):
+    """HF1: engine centres may pass a stock face by up to tool_r, so with no
+    MARGIN / --margin given the grid margin must hold a whole footprint
+    there: max(margin, tool_r). An explicit margin keeps its meaning."""
+    if "--margin" in sys.argv or os.environ.get("MARGIN") is not None:
+        return margin
+    return max(margin, tool_r)
+
+
 def main():
     step, out, cell, pad, stock_box, tool_r, margin = get_args()
+    margin = judge_margin(margin, tool_r)
     shape = Part.read(step)
     tol = float(os.environ.get("TESS_TOL", 0.01))  # 0.01 = the engine STL tolerance
     hf, meta = rasterize(shape, cell=cell, tol=tol, pad=pad,
