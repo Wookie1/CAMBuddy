@@ -1085,8 +1085,26 @@ def _a2d_new(tool_r, leave, stepover, tolerance, keep_tool_down, helix_dia):
     return a2d
 
 
+def _outer_dropped(job):
+    """BS1d test for one outer, run ALONE at the primary helix (fresh
+    instance): True when it hits StartPointNotFound and yields no cutting
+    path. Module level so a spawn pool can run it (polygons in, bool out)."""
+    o, holes, islands, tool_r, leave, stepover, tolerance, keep_tool_down, \
+        helix_dia = job
+    CT = area.AdaptiveMotionType.Cutting
+    alone = _a2d_new(tool_r, leave, stepover, tolerance, keep_tool_down,
+                     helix_dia).Execute([o], [o] + holes + islands, [],
+                                        lambda tp: False)
+    return not (any(not getattr(r, "StartPointNotFound", False)
+                    and r.AdaptivePaths and any(pth[0] == CT and pth[1]
+                                                for pth in r.AdaptivePaths)
+                    for r in alone)
+                or not any(getattr(r, "StartPointNotFound", False)
+                           for r in alone))
+
+
 def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
-             keep_tool_down, helix_dia, z, stats):
+             keep_tool_down, helix_dia, z, stats, pool_get=None):
     """One level's Adaptive2d run; returns plain picklable region dicts.
     BS1d: every StartPointNotFound of the primary call is counted into
     stats["a2d_spnf"]; an outer that yields no region when run ALONE at the
@@ -1102,15 +1120,16 @@ def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
     stats["a2d_spnf"] += n_spnf
     CT = area.AdaptiveMotionType.Cutting
     if n_spnf:
-        for o in outers:
-            alone = _a2d_new(tool_r, leave, stepover, tolerance,
-                             keep_tool_down, helix_dia).Execute(
-                [o], [o] + holes + islands, [], lambda tp: False)
-            if any(not getattr(r, "StartPointNotFound", False)
-                   and r.AdaptivePaths and any(pth[0] == CT and pth[1]
-                                               for pth in r.AdaptivePaths)
-                   for r in alone) or not any(
-                    getattr(r, "StartPointNotFound", False) for r in alone):
+        # SP4-DIAG: the per-outer "alone" re-runs only fill stats; they run in
+        # a spawn pool (pool_get) when given, else serially - same test, same
+        # outer order, so stats and regions are identical either way.
+        jobs = [(o, holes, islands, tool_r, leave, stepover, tolerance,
+                 keep_tool_down, helix_dia) for o in outers]
+        pool = pool_get() if pool_get is not None else None
+        drops = list(pool.map(_outer_dropped, jobs)) if pool is not None \
+            else [_outer_dropped(j) for j in jobs]
+        for o, dropped in zip(outers, drops):
+            if not dropped:
                 continue    # runs alone, or nothing to clear (no SPNF)
             stats["a2d_dropped_outers"].append(
                 {"z": round(z, 3),
@@ -1404,6 +1423,21 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             stl_path, order, tool_r, leave, corner_r, Zg, gxs, gys, axl)
         stats["island_pool_s"] = round(time.time() - t0, 3)
         stats["t_islands"] += time.time() - t0
+
+    # SP4-DIAG: one lazy spawn pool for the BS1d per-outer re-runs, created
+    # at the first StartPointNotFound and reused for every level (the island
+    # pool above has already closed, so the two never compete for cores).
+    _diag_pool = [None]
+
+    def _diag_pool_get():
+        if os.environ.get("STEVECAM_NO_A2D_DIAG_POOL") == "1":
+            return None
+        if _diag_pool[0] is None:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            _diag_pool[0] = ProcessPoolExecutor(
+                max(1, ISLAND_POOL), mp_context=mp.get_context("spawn"))
+        return _diag_pool[0]
 
     moves = []
     prev = [None, None, clearance_z]
@@ -2339,7 +2373,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             continue
         t0 = time.time()
         regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
-                           tolerance, keep_tool_down, helix_dia, z, stats)
+                           tolerance, keep_tool_down, helix_dia, z, stats,
+                           pool_get=_diag_pool_get)
         n_a2d = len(regions)  # HR1: everything from here on is hug rings
         if _RP:
             rp["a2d_cut_len_mm"] = round(sum(
@@ -3099,4 +3134,6 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 "remaining_if_only_closed_helix_mm": remaining,
                 "levels": rp2_lv_sum,
                 "regions": rp2_regions}, fh)
+    if _diag_pool[0] is not None:
+        _diag_pool[0].shutdown()
     return moves, stats
