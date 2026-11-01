@@ -30,6 +30,7 @@ import toollib                 # noqa: E402
 import envelope                # noqa: E402
 import errors                  # noqa: E402
 from client import SteveClient, SteveError  # noqa: E402
+import runner as runner_mod    # noqa: E402
 from runner import EngineRun, EngineError, Cancelled  # noqa: E402
 
 VERSION = "1.0.0"
@@ -177,6 +178,58 @@ def prepare_values(values_in, action):
     if not ok:
         return False, out["code"], out  # out = the agent error (task f)
     return True, "", out
+
+
+def _run_tool_numbers(cfg, action, values, tools):
+    """HOLDER-PRECHECK: the T numbers a rough/slope run will use, picked by
+    the runner's own rules on the run's effective table. A tool the runner
+    itself refuses (no finish ball in the table) is left to the runner."""
+    if action == catalog_mod.ACTION:
+        return [runner_mod._tool_number(cfg, values, tools)]
+    rough = runner_mod._tool_number(cfg, {
+        "tool_type": values["rough_tool_type"],
+        "tool_diameter": values["rough_tool_diameter"],
+        "corner_radius": values["rough_corner_radius"]}, tools)
+    nums = [rough]
+    probe = type("_P", (), {"cfg": cfg, "tools": {"tools": tools}})()
+    try:
+        nums.append(EngineRun._finish_tool_number(probe, values))
+    except EngineError:
+        pass
+    if values.get("rest_tool_number"):
+        nums.append(int(values["rest_tool_number"]))
+    return nums
+
+
+def precheck_holders(cfg, action, values):
+    """HOLDER-PRECHECK: before any engine work, every tool a rough/slope run
+    uses must have the holder and stick-out zmap's holder check needs (same
+    test as verify/zmap.py resolve_holder: a named holder with segments and a
+    stick-out). Otherwise the run fails at once with tool_holder_missing
+    instead of 'holder unknown' after the whole rough. Nothing is defaulted."""
+    if action not in (catalog_mod.ACTION, catalog_mod.SLOPE_ACTION):
+        return
+    try:
+        tab = toollib.effective_table(cfg.get("home"), cfg["repo_root"],
+                                      values.get("document_id"))
+    except (toollib.ToolLibError, OSError, ValueError):
+        return  # the runner reports a broken library with its own code
+    tools = tab.get("tools", [])
+    holders = tab.get("holders", {})
+    for n in _run_tool_numbers(cfg, action, values, tools):
+        e = next((t for t in tools if t.get("number") == n), None)
+        if e is None:
+            continue  # unknown number: the runner's own refusal applies
+        h = holders.get(e.get("holder")) if e.get("holder") else None
+        if isinstance(h, dict) and h.get("segments") \
+                and e.get("stickout_mm") is not None:
+            continue
+        shape = "%g mm %s" % (e.get("diameter_mm") or 0, e.get("type") or "tool")
+        raise EngineError(
+            "T%d (%s) has no holder or stick-out in your tool library. Ask "
+            "Claude to add them, or use Edit a library tool (holder, "
+            "stickout_mm), then run again." % (n, shape),
+            code="tool_holder_missing", field="tool_number", got=n)
 
 
 class Connector:
@@ -874,6 +927,7 @@ class Connector:
                 end_run()
                 return
             doc_id = values.get("document_id") or doc_id
+            precheck_holders(self.cfg, action, values)
 
             if action == catalog_mod.ACTION:
                 result, files = engine.run(step_path, values, on_progress)

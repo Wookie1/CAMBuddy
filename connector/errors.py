@@ -78,6 +78,9 @@ CODES = {
                          "first offending line is in `where`."),
     "over_flute": ("blocker", "Use a longer-flute or necked tool, or split "
                    "the depth."),
+    "tool_holder_missing": ("blocker", "Add the tool's holder and "
+                            "stick-out with tools.update (holder, "
+                            "stickout_mm), then run again."),
     "holder_unknown": ("blocker", "Give the tool a holder and stick-out in "
                        "the library (tools.update), or pick a tool that "
                        "has one."),
