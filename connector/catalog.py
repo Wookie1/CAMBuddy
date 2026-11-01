@@ -402,13 +402,15 @@ TOOL_ACTION_SPECS = [
      "confirm": False,
      "inputs": {"type": "object", "properties": {}},
      "result": "{tools: [{tool_id, t, h, d, name, type, dia_mm, "
-               "corner_r_mm, flute_len_mm, reach_mm, holder, rpm, "
-               "feed_mm_min, plunge_mm_min}], pockets}"},
+               "corner_r_mm, flute_len_mm, reach_mm, stickout_mm, holder, "
+               "rpm, feed_mm_min, plunge_mm_min}], pockets}"},
     {"name": TOOLS_UPDATE, "title": "Edit a library tool",
      "description": "Changes one tool in the library (never the repo "
                     "table): changes is {field: value} over t, name, type, "
-                    "dia_mm, corner_r_mm, flute_len_mm, reach_mm, holder, "
-                    "rpm, feed_mm_min, plunge_mm_min (h and d follow t). "
+                    "dia_mm, corner_r_mm, flute_len_mm, reach_mm, "
+                    "stickout_mm (holder nose above the tip, which the "
+                    "holder check needs with holder), holder, rpm, "
+                    "feed_mm_min, plunge_mm_min (h and d follow t). "
                     "pockets sets the pocket count.",
      "confirm": False,
      "inputs": {"type": "object", "properties": {

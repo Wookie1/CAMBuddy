@@ -226,8 +226,9 @@ def precheck_holders(cfg, action, values):
             continue
         shape = "%g mm %s" % (e.get("diameter_mm") or 0, e.get("type") or "tool")
         raise EngineError(
-            "T%d (%s) has no holder or stick-out in your tool library. Add "
-            "them in the panel's tool library, then run again." % (n, shape),
+            "T%d (%s) has no holder or stick-out in your tool library. Ask "
+            "Claude to add them, or use Edit a library tool (holder, "
+            "stickout_mm), then run again." % (n, shape),
             code="tool_holder_missing", field="tool_number", got=n)
 
 

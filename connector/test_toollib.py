@@ -27,8 +27,8 @@ ROUGH = "flat-12.686"   # library T13
 DOC = "doc-renum"
 
 LIST_KEYS = {"tool_id", "t", "h", "d", "name", "type", "dia_mm",
-             "corner_r_mm", "flute_len_mm", "reach_mm", "holder", "rpm",
-             "feed_mm_min", "plunge_mm_min"}
+             "corner_r_mm", "flute_len_mm", "reach_mm", "stickout_mm",
+             "holder", "rpm", "feed_mm_min", "plunge_mm_min"}
 
 SLOPE = {
     "orientation": "as_modeled", "stock_xy": 1.0, "stock_top": 0.4,
