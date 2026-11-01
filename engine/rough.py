@@ -1198,13 +1198,36 @@ def vise_height_guard(moves, stock_box, tool_r, min_z, stats=None):
     beside the stock below min_z (the finished part's bottom). EVERY move -
     G0 and G1, cutting, links, entries - whose tool footprint (centre +-
     tool_r) is not wholly inside the stock XY while below min_z fails the
-    run; nothing is clamped or dropped. Endpoints suffice: a straight move
-    between two footprints inside the (convex) stock box stays inside."""
+    run; nothing is clamped or dropped. Each straight move is clipped to its
+    part below min_z and both ends of that part are checked (the region of
+    centres whose footprint is inside the stock is convex), so a diagonal
+    move crossing min_z outside the stock is caught mid-segment."""
     sx0, sx1, sy0, sy1 = stock_box[:4]
-    bad = [i for i, mv in enumerate(moves)
-           if mv["z"] < min_z - 1e-6
-           and not (sx0 + tool_r <= mv["x"] <= sx1 - tool_r
-                    and sy0 + tool_r <= mv["y"] <= sy1 - tool_r)]
+
+    def inside(x, y):
+        return (sx0 + tool_r - 1e-9 <= x <= sx1 - tool_r + 1e-9
+                and sy0 + tool_r - 1e-9 <= y <= sy1 - tool_r + 1e-9)
+
+    lim = min_z - 1e-6
+    bad, p0 = [], None
+    for i, mv in enumerate(moves):
+        p1 = (mv["x"], mv["y"], mv["z"])
+        a = p0 if p0 is not None else p1
+        p0 = p1
+        if a[2] >= lim and p1[2] >= lim:
+            continue
+        # the part of the straight move below min_z: [ta, tb] of a -> p1;
+        # the inside-the-stock region is convex, so its two ends decide it
+        dz = p1[2] - a[2]
+        if abs(dz) < 1e-12:
+            ta, tb = 0.0, 1.0
+        else:
+            tc = min(max((lim - a[2]) / dz, 0.0), 1.0)
+            ta, tb = (tc, 1.0) if dz < 0 else (0.0, tc)
+        ends = [(a[0] + (p1[0] - a[0]) * t, a[1] + (p1[1] - a[1]) * t)
+                for t in (ta, tb)]
+        if not all(inside(x, y) for x, y in ends):
+            bad.append(i)
     if stats is not None:
         stats["vise_guard"] = {"min_z": round(float(min_z), 4),
                                "checked": len(moves), "offenders": len(bad)}

@@ -20,6 +20,16 @@ def parse_tool(spec):
     return kind, dia, corner
 
 
+def _log_table_fallback(tool_number, kind, dia, path, e):
+    """SK1/M2: the exact tool number is not in the table - say which entry
+    the type + diameter fallback took (or that none matched)."""
+    print("warning: tool T%s not in %s; %s" % (
+        tool_number, path,
+        "using the %s %.3f mm entry T%s" % (kind, dia, e.get("number"))
+        if isinstance(e, dict) else
+        "no %s %.3f mm entry either" % (kind, dia)), file=sys.stderr)
+
+
 def table_flute(kind, dia, tool_number=None, tools_json=None):
     """SK1: flute length (mm) for the rough air-column load check, read from
     the tool table the way finish reads it: by --tool-number when given,
@@ -42,6 +52,8 @@ def table_flute(kind, dia, tool_number=None, tools_json=None):
                   if t.get("type") == kind
                   and abs(float(t.get("diameter_mm", -1.0)) - dia) <= 0.001),
                  None)
+        if tool_number is not None:
+            _log_table_fallback(tool_number, kind, dia, path, e)
     fl = e.get("flute_mm") if isinstance(e, dict) else None
     try:
         return float(fl) if fl is not None else None
@@ -73,6 +85,8 @@ def table_holder(kind, dia, tool_number=None, tools_json=None):
                   if t.get("type") == kind
                   and abs(float(t.get("diameter_mm", -1.0)) - dia) <= 0.001),
                  None)
+        if tool_number is not None:
+            _log_table_fallback(tool_number, kind, dia, path, e)
     if not isinstance(e, dict) or not e.get("holder") \
             or e.get("stickout_mm") is None:
         return None
