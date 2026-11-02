@@ -667,6 +667,8 @@ def island_clear_fn(islands, req):
               for kk, vv in strips.items()}
 
     def f(pts):
+        if len(pts) == 1:
+            return [_one(pts[0])]
         P = np.asarray(pts, dtype=float)
         n = len(P)
         bad = np.zeros(n, dtype=bool)
@@ -704,6 +706,28 @@ def island_clear_fn(islands, req):
                 tot[sub] += hit.sum(axis=1)
         ins = (tot % 2) == 1
         return [bool(not a and not b) for a, b in zip(bad, ins)]
+
+    def _one(pt):
+        # SP4-PY: f for ONE point (most of its ~330k CF calls) - the same
+        # bucket / strip tests on the same arrays, without the grouping dicts
+        P = np.asarray([pt], dtype=float)
+        x, y = P[0, 0], P[0, 1]
+        seg = buckets.get((int(np.floor(x)), int(np.floor(y))))
+        if seg is not None and \
+                (_pt_seg_dist_np(P, A[seg], B[seg]) < req).any():
+            return False
+        ed = strips.get(int(np.floor(y)))
+        if ed is None:
+            return True
+        cx, cy, cnx, cny = ex[ed], ey[ed], exn[ed], eyn[ed]
+        py = P[:, 1][:, None]
+        cross = (cy[None, :] > py) != (cny[None, :] > py)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            xint = cx[None, :] + (py - cy[None, :]) \
+                   * (cnx[None, :] - cx[None, :]) \
+                   / (cny[None, :] - cy[None, :])
+        hit = cross & (P[:, 0][:, None] < xint)
+        return bool(hit.sum() % 2 == 0)
     return f
 
 
