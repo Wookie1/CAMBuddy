@@ -11,7 +11,8 @@
     precomputed outer) -> the loop must discard the pooled result, run the
     level inline, and the program must equal the pool-off program;
 (d) a pooled job that raises in the worker -> inline, same program;
-(e) F1 a pooled result labelled with another level's z -> fallback.
+(e) F1 a pooled result labelled with another level's z -> fallback;
+(f) F2 the pool failing to start / submit failing -> inline, same program.
 
 Small synthetic/TB scenes only; runnable directly with the VibeCAD python
 (opencamlib + area) or under pytest."""
@@ -275,13 +276,58 @@ def test_pl1_result_of_other_level_falls_back():
     print("PASS pl1 other-level result: fallback, byte-identical to pool-off")
 
 
+class _NoPool:
+    """_pl1_pool stand-in: creation raises (F2)."""
+    def __init__(self, *a, **k):
+        raise OSError("pl1 test: spawn failed")
+
+
+class _BrokenSubmit:
+    """_pl1_pool stand-in: submit raises (F2)."""
+    def __init__(self, *a, **k):
+        pass
+
+    def submit(self, *a, **k):
+        from concurrent.futures.process import BrokenProcessPool
+        raise BrokenProcessPool("pl1 test: pool broken")
+
+    def shutdown(self, *a, **k):
+        pass
+
+
+def test_pl1_pool_start_failure_runs_inline():
+    """(f) F2: the opener pool failing to start, or submit() failing, never
+    fails the rough: every level inline, error counted, a stderr line,
+    program == pool-off."""
+    import contextlib
+    import io
+    from engine import rough as roughmod
+    ref_moves, _ref = _bs1d_rough(0, stepdown=8.0)
+    orig = roughmod._pl1_pool
+    for fake, msg in ((_NoPool, "opener pool not started"),
+                      (_BrokenSubmit, "not submitted")):
+        roughmod._pl1_pool = fake
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                moves, st = _bs1d_rough(1, stepdown=8.0)
+        finally:
+            roughmod._pl1_pool = orig
+        assert st["pl1"]["error"] == 1 and st["pl1"]["precomputed"] == 0 \
+            and st["pl1"]["used"] == 0, (fake.__name__, st["pl1"])
+        assert msg in err.getvalue(), (fake.__name__, err.getvalue()[-500:])
+        assert json.dumps(moves) == json.dumps(ref_moves), fake.__name__
+    print("PASS pl1 pool start/submit failure: inline, byte-identical")
+
+
 if __name__ == "__main__":
     fails = 0
     for fn in (test_pl1_pass_opener_rule, test_pl1_bs1d_pool_on_off,
                test_pl1_synth_pool_on_off,
                test_pl1_fallback_uses_inline_result,
                test_pl1_worker_failure_falls_back,
-               test_pl1_result_of_other_level_falls_back):
+               test_pl1_result_of_other_level_falls_back,
+               test_pl1_pool_start_failure_runs_inline):
         t0 = time.time()
         try:
             fn()

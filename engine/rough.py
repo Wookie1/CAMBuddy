@@ -1198,6 +1198,13 @@ def _a2d_pool_job(job):
     return regions, st["a2d_spnf"], st["a2d_dropped_outers"], z
 
 
+def _pl1_pool(n):
+    """PL1: the opener pool (one spawn ProcessPoolExecutor of n workers)."""
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+    return ProcessPoolExecutor(n, mp_context=mp.get_context("spawn"))
+
+
 def _pl1_same(a, b):
     """PL1 R4: the pooled-result equality check; any exception (e.g. numpy
     arrays in the inputs) counts as different -> fallback, never a crash."""
@@ -2737,26 +2744,37 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     a2d_pre = {}
     a2d_futs = {}
     a2d_ex = None
+    pl1_err = 0
     if a2d_on and a2d_openers:
-        import multiprocessing as mp
-        from concurrent.futures import ProcessPoolExecutor
-        a2d_ex = ProcessPoolExecutor(
-            min(len(a2d_openers), ISLAND_POOL),
-            mp_context=mp.get_context("spawn"))
-        if _pl1_held is not None:
+        try:   # F2: a pool that cannot start never fails the rough
+            a2d_ex = _pl1_pool(min(len(a2d_openers), ISLAND_POOL))
+        except Exception as e:   # noqa: BLE001
+            print("rough PL1: opener pool not started (%s: %s); every level "
+                  "runs inline" % (type(e).__name__, e), file=sys.stderr)
+            a2d_ex = None
+            pl1_err += 1
+        if a2d_ex is not None and _pl1_held is not None:
             _pl1_held.append((a2d_ex, a2d_futs))
-        for zo in a2d_openers:
+        for zo in (a2d_openers if a2d_ex is not None else ()):
             skip, inp = _level_a2d_inputs(zo)
             if skip is not None or inp is None:
                 continue
             job = (inp["outers"], inp["holes"], inp["isl_in"], tool_r,
                    leave, stepover, tolerance, keep_tool_down, helix_dia,
                    zo)
+            try:   # F2: e.g. BrokenProcessPool -> that opener runs inline
+                fut = a2d_ex.submit(_a2d_pool_job, job)
+            except Exception as e:   # noqa: BLE001
+                print("rough PL1: opener Z%.3f not submitted (%s: %s); it "
+                      "runs inline" % (zo, type(e).__name__, e),
+                      file=sys.stderr)
+                pl1_err += 1
+                continue
             a2d_pre[zo] = job[:3]
-            a2d_futs[zo] = a2d_ex.submit(_a2d_pool_job, job)
+            a2d_futs[zo] = fut
     stats["pl1"] = {"openers": len(a2d_openers),
                     "precomputed": len(a2d_futs), "used": 0, "fallback": 0,
-                    "error": 0, "t_wait_s": 0.0}
+                    "error": pl1_err, "t_wait_s": 0.0}
 
     zi = 0
     for z in order:
