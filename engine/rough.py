@@ -1397,7 +1397,8 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           clip_bridge_mm=5.0, feed_link_max=40.0,
           progress=None, stock_out=None, ramp_angle_deg=2.0,
           side_entry_faces=None, side_entry_min_z=None, flute_mm=None,
-          side_entry_holder=None, a2d_pool=None, _pl1_held=None):
+          side_entry_holder=None, a2d_pool=None, _pl1_held=None,
+          air_descent_g0=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -1474,6 +1475,13 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     # M2: (holder max radius, stick-out) of the cutting tool; None = unknown,
     # and an air column is then never used (fail closed)
     _sk1_holder = side_entry_holder
+    # LVA (lever A): a helix entry starts at its own column's clear height
+    # (G0 down to it) instead of spiralling at ramp feed from the link plane
+    # through ground earlier levels already cleared. Default OFF.
+    if air_descent_g0 is not None:
+        _lva_on = bool(air_descent_g0)
+    else:
+        _lva_on = int(os.environ.get("ENGINE_AIR_G0", "0")) != 0
     sk1_block = [None]   # why the last SK1 search found no column
     if clearance_z is None:
         clearance_z = szmax + 2.0
@@ -1919,6 +1927,32 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # verified-clear bump), descend from the ACTUAL height: otherwise
             # the first helix segment bridges the lift at ~90 deg - a plunge.
             zt = prev[2] if (prev[2] is not None and prev[2] > zh) else zh
+            if _lva_on and _sk1_holder is not None and zt > z + 0.3 + 1e-6:
+                # LVA: the helix sweeps r + tool_r about (cx, cy); start it
+                # rapid_margin over the highest stock/part in that disk (+
+                # rapid_margin pad), and never with the holder nose less than
+                # 1 mm over stock/part within holder_r + 1 at the G0 column
+                # s (holder_clears, M2). emit() still R5-checks the G0.
+                zc = stock.link_top_max([(cx, cy), (cx, cy)],
+                                        r + tool_r + rapid_margin)
+                zs = max(zc + rapid_margin, z + 0.3) if zc > -1e8 \
+                    else z + 0.3
+                h_r, h_so = _sk1_holder
+                zhd = stock.link_top_max([(s[0], s[1]), (s[0], s[1])],
+                                         h_r + 1.0)
+                if zhd > -1e8:
+                    zs = max(zs, zhd - h_so + 1.0)
+                zs = round(zs, 4)
+                if zs < zt - 1e-6 and holder_clears(
+                        stock, [(s[0], s[1])], zs, h_r, h_so):
+                    z_from = prev[2]
+                    emit({"g": 0, "x": s[0], "y": s[1], "z": zs})
+                    zt = prev[2]
+                    stats["lva"]["g0"] += 1
+                    stats["lva"]["g0_mm"] += z_from - zt
+                    if len(stats["lva"]["log"]) < 500:   # for test_lva
+                        stats["lva"]["log"].append(
+                            (cx, cy, r, s[0], s[1], zt, z))
             hx, hy, hz = s[0], s[1], zt
             for hv in _helix_moves(cx, cy, s[0], s[1], zt, z, ramp_feed, r,
                                   ramp_angle_deg):
@@ -2752,6 +2786,8 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                    zo)
             a2d_pre[zo] = job[:3]
             a2d_futs[zo] = a2d_ex.submit(_a2d_pool_job, job)
+    stats["lva"] = {"on": int(_lva_on and _sk1_holder is not None),
+                    "g0": 0, "g0_mm": 0.0, "log": []}
     stats["pl1"] = {"openers": len(a2d_openers),
                     "precomputed": len(a2d_futs), "used": 0, "fallback": 0,
                     "error": 0, "t_wait_s": 0.0}
