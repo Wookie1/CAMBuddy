@@ -527,6 +527,10 @@ def main(argv=None):
                   help="parallel waterline workers (default $ENGINE_WORKERS or 4)")
     r.add_argument("--tolerance", type=float, default=ROUGH_A2D_TOLERANCE,
                   help="Adaptive2d path tolerance mm")
+    r.add_argument("--a2d-pool", dest="a2d_pool", type=int, default=None,
+                   help="pass-opener Adaptive2d pre-run pool: 0 off "
+                        "(byte-identical all-inline path), 1 on (default; "
+                        "env ENGINE_A2D_POOL=0 also turns it off)")
     r.add_argument("--keep-tool-down", dest="keep_tool_down", type=float,
                    default=3.0,
                    help="a2d keepToolDownDistRatio: max link length (x tool "
@@ -882,6 +886,7 @@ def main(argv=None):
                                     side_entry_faces=a.side_entry_clear,
                                     side_entry_min_z=a.side_entry_min_z,
                                     flute_mm=flute,
+                                    a2d_pool=a.a2d_pool,
                                     side_entry_holder=table_holder(
                                         kind, dia, a.tool_number,
                                         a.tools_json))

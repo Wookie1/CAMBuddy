@@ -1184,6 +1184,65 @@ def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
     return regions
 
 
+def _a2d_pool_job(job):
+    """PL1: one pass-opener level's Adaptive2d in a pool worker: _run_a2d on
+    a private stats dict; returns (regions, a2d_spnf delta,
+    a2d_dropped_outers list) - the parent applies those to its stats when
+    (and only when) the result is used."""
+    (outers, holes, isl_in, tool_r, leave, stepover, tolerance,
+     keep_tool_down, helix_dia, z) = job
+    st = {"a2d_spnf": 0, "a2d_dropped_outers": []}
+    regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
+                       tolerance, keep_tool_down, helix_dia, z, st)
+    return regions, st["a2d_spnf"], st["a2d_dropped_outers"]
+
+
+def _pl1_same(a, b):
+    """PL1 R4: the pooled-result equality check; any exception (e.g. numpy
+    arrays in the inputs) counts as different -> fallback, never a crash."""
+    try:
+        return bool(a == b)
+    except Exception:   # noqa: BLE001
+        return False
+
+
+def _pl1_close(ex, futs):
+    """PL1 R2: cancel every opener future not yet taken (skipped or never
+    reached) and shut the pool down; a future already running finishes
+    (cancel cannot stop it). Idempotent."""
+    for f in futs.values():
+        f.cancel()
+    ex.shutdown(wait=True, cancel_futures=True)
+
+
+def rough(*args, **kw):
+    """Plan the rest-aware roughing toolpath: see _rough. PL1 R2: wraps it so
+    the pass-opener pool is always closed, also when _rough raises (a gate,
+    a panel cancel through `progress`, any error)."""
+    held = []
+    try:
+        return _rough(*args, _pl1_held=held, **kw)
+    finally:
+        for ex, futs in held:
+            _pl1_close(ex, futs)
+
+
+def _pass_openers(order):
+    """PL1: the pass-opener levels AFTER the first - a level whose Z is
+    lower than every level before it in `order`. Every earlier level cut
+    only ABOVE a pass opener, so its live-stock Adaptive2d inputs equal the
+    inputs built from the initial stock (its a2d can run ahead of time)."""
+    out = []
+    if not order:
+        return out
+    zmin = order[0]
+    for z in order[1:]:
+        if z < zmin:
+            out.append(z)
+            zmin = z
+    return out
+
+
 def mandatory_flat_levels(flat_zs, axl, final, stock_zmax, min_gap=0.5):
     """Task R2 item 3: every up-facing flat floor F of the part (STL
     flat-face Zs) gets a level at F + axial leave that the rest/skip logic
@@ -1328,7 +1387,7 @@ def _skin_band(res, stock, stock_box, tool_r, z):
             "max_thickness_mm": round(float(dmin.max()) + cell / 2, 3)}
 
 
-def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
+def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           stepover=0.16, cut_feed=3429.0, ramp_feed=1270.0,
           clearance_z=None, lift=1.9, wl_sampling=None, threads=8,
           tolerance=0.05, keep_tool_down=3.0, stl_path=None, workers=None,
@@ -1338,7 +1397,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           clip_bridge_mm=5.0, feed_link_max=40.0,
           progress=None, stock_out=None, ramp_angle_deg=2.0,
           side_entry_faces=None, side_entry_min_z=None, flute_mm=None,
-          side_entry_holder=None):
+          side_entry_holder=None, a2d_pool=None, _pl1_held=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -2378,18 +2437,26 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             return True
         return False
 
-    zi = 0
-    for z in order:
-        del hf_pts[:]
+    def _level_a2d_inputs(z):
+        """PL1 item 1 (pure refactor): one level's Adaptive2d inputs, built
+        exactly as the loop body built them: live-stock region mask -> area
+        check -> dilate -> contours -> island cache (or level_islands) ->
+        isl_ok/isl_ok3 -> isl_in -> rp2_open/RP diagnostics -> corridor_ok ->
+        outer and hole filters. NO side effects on stock, moves, prev or
+        stats: the loop keeps every stats append (skipped-level entries,
+        t_islands, rp diagnostics) and every continue exactly where and in
+        the order it was. Returns (skip, data): skip is the stats["levels"]
+        payload of a skipped level (None otherwise; data is None when the
+        level was skipped before its islands were computed), data carries
+        everything the rest of the loop body uses."""
         mandatory = round(z, 4) in mand
         mask = stock.region_mask(z, axl, 0.0 if mandatory else min_rest,
                                 leave_margin=leave + 0.4)
         area_mm2 = stock.region_area(mask)
         if area_mm2 < min_level_area and not mandatory:
-            stats["levels"].append({"z": round(z, 3), "skipped": True,
-                                   "region_mm2": round(area_mm2, 1),
-                                   "n_regions": 0, "n_clip_breaks": 0})
-            continue
+            return {"z": round(z, 3), "skipped": True,
+                    "region_mm2": round(area_mm2, 1),
+                    "n_regions": 0, "n_clip_breaks": 0}, None
         grown = stock.dilate(mask, tool_r + leave + 0.5)
         # Task RS: territory (and with it the Adaptive2d outers and the
         # hug-ring filter) is clipped to the stock box + tool radius, so no
@@ -2410,7 +2477,6 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             level_islands(surf, cutter_big, Zg, gxs, gys, z, axl,
                           threads=threads)
         t_isl = time.time() - t0
-        stats["t_islands"] += t_isl
         # ground-truth clearance oracle for THIS level: the refined forbidden
         # loops (centres must stay OUTSIDE them; they never under-cover F) -
         # the hf model can under-report steep walls by ~1 cell
@@ -2483,6 +2549,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
 
         # ---- RP0 instrumentation (RT_RP=1): safe region vs Adaptive2d input
         rp = None
+        rp_cat = rp_poly = None
         if _RP:
             c_sc0 = stock.cell
             xs_s = stock.x0 + (np.arange(stock.nx) + 0.5) * c_sc0
@@ -2635,14 +2702,108 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         if _RP:
             rp["dropped_holes"] = len(holes) - len(keep_holes)
         holes = keep_holes
+        skip = None
         if not outers:
-            stats["levels"].append({"z": round(z, 3), "skipped": True,
-                                   "region_mm2": round(area_mm2, 1),
-                                   "n_regions": 0, "n_clip_breaks": 0})
+            skip = {"z": round(z, 3), "skipped": True,
+                    "region_mm2": round(area_mm2, 1),
+                    "n_regions": 0, "n_clip_breaks": 0}
+        return skip, {"mandatory": mandatory, "mask": mask,
+                      "area_mm2": area_mm2, "grown": grown,
+                      "outers": outers, "holes": holes,
+                      "islands": islands, "t_isl": t_isl,
+                      "isl_ok": isl_ok, "isl_ok3": isl_ok3,
+                      "isl_in": isl_in, "rp": rp, "rp_cat": rp_cat,
+                      "rp_poly": rp_poly, "rp2_open": rp2_open,
+                      "corridor_ok": corridor_ok}
+
+    # PL1: run the pass-opener levels' Adaptive2d AHEAD of time in ONE small
+    # spawn pool while the loop works through the earlier levels (the island
+    # pool has closed above). A pass opener's Z is lower than every level
+    # before it, so every earlier level cut only above it: its live-stock
+    # inputs equal the inputs built here on the untouched stock. At the
+    # level, the pooled result is used ONLY if the inputs the loop builds
+    # are EXACTLY equal (==) to the precomputed ones; otherwise it is
+    # discarded and the level runs inline exactly as before
+    # (verify-and-fallback). This only changes WHEN Adaptive2d runs for
+    # opener levels, never what it is given. With the pool off
+    # (--a2d-pool 0 / ENGINE_A2D_POOL=0) the path is today's, byte for byte.
+    if a2d_pool is not None:
+        a2d_on = bool(a2d_pool)
+    else:
+        a2d_on = int(os.environ.get("ENGINE_A2D_POOL", "1")) != 0
+    a2d_openers = _pass_openers(order)
+    a2d_pre = {}
+    a2d_futs = {}
+    a2d_ex = None
+    if a2d_on and a2d_openers:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+        a2d_ex = ProcessPoolExecutor(
+            min(len(a2d_openers), ISLAND_POOL),
+            mp_context=mp.get_context("spawn"))
+        if _pl1_held is not None:
+            _pl1_held.append((a2d_ex, a2d_futs))
+        for zo in a2d_openers:
+            skip, inp = _level_a2d_inputs(zo)
+            if skip is not None or inp is None:
+                continue
+            job = (inp["outers"], inp["holes"], inp["isl_in"], tool_r,
+                   leave, stepover, tolerance, keep_tool_down, helix_dia,
+                   zo)
+            a2d_pre[zo] = job[:3]
+            a2d_futs[zo] = a2d_ex.submit(_a2d_pool_job, job)
+    stats["pl1"] = {"openers": len(a2d_openers),
+                    "precomputed": len(a2d_futs), "used": 0, "fallback": 0,
+                    "error": 0, "t_wait_s": 0.0}
+
+    zi = 0
+    for z in order:
+        del hf_pts[:]
+        skip, inp = _level_a2d_inputs(z)
+        if inp is not None:
+            stats["t_islands"] += inp["t_isl"]
+        if skip is not None:
+            stats["levels"].append(skip)
             continue
+        mandatory = inp["mandatory"]
+        mask = inp["mask"]
+        area_mm2 = inp["area_mm2"]
+        grown = inp["grown"]
+        outers = inp["outers"]
+        holes = inp["holes"]
+        islands = inp["islands"]
+        t_isl = inp["t_isl"]
+        isl_ok = inp["isl_ok"]
+        isl_ok3 = inp["isl_ok3"]
+        isl_in = inp["isl_in"]
+        rp = inp["rp"]
+        rp_cat = inp["rp_cat"]
+        rp_poly = inp["rp_poly"]
+        rp2_open = inp["rp2_open"]
+        corridor_ok = inp["corridor_ok"]
         t0 = time.time()
-        regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
-                           tolerance, keep_tool_down, helix_dia, z, stats)
+        regions = None
+        fut = a2d_futs.pop(z, None)
+        if fut is not None and _pl1_same((outers, holes, isl_in), a2d_pre[z]):
+            # PL1: the loop's inputs are exactly the precomputed ones - take
+            # the pooled result and apply its stats deltas where the inline
+            # call would have.
+            try:
+                pooled = fut.result()
+            except Exception:   # noqa: BLE001  R1: never fails the rough
+                stats["pl1"]["error"] += 1
+            else:
+                regions, spnf_d, drops_l = pooled
+                stats["a2d_spnf"] += spnf_d
+                stats["a2d_dropped_outers"].extend(drops_l)
+                stats["pl1"]["used"] += 1
+            stats["pl1"]["t_wait_s"] += time.time() - t0
+        elif fut is not None:   # inputs differ: never use that result
+            fut.cancel()
+            stats["pl1"]["fallback"] += 1
+        if regions is None:
+            regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
+                               tolerance, keep_tool_down, helix_dia, z, stats)
         n_a2d = len(regions)  # HR1: everything from here on is hug rings
         if _RP:
             rp["a2d_cut_len_mm"] = round(sum(
@@ -3321,6 +3482,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         zi += 1
         if progress:
             progress(zi, z, islands, nreg, stats)
+    if a2d_ex is not None:
+        _pl1_close(a2d_ex, a2d_futs)   # PL1: opener pool down before the gates
     if prev[0] is not None:
         emit({"g": 0, "x": prev[0], "y": prev[1], "z": clearance_z})
     if allowance_check:
