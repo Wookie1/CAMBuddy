@@ -1292,6 +1292,27 @@ def holder_clears(stock, pts, z, holder_r, stickout):
         <= z + stickout - 1.0
 
 
+def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder):
+    """LVA (lever A): the lowest height a helix entry may start at, G0 down
+    the column at its start point s. The helix sweeps r + tool_r about
+    (cx, cy): start margin over the highest stock/part (link_top_max) in that
+    disk + margin, never under z + 0.3, and never with the holder nose less
+    than 1 mm over stock/part within holder_r + 1 at s (holder_clears, M2).
+    None when the holder is unknown (today's start stays)."""
+    if holder is None:
+        return None
+    zc = stock.link_top_max([(cx, cy), (cx, cy)], r + tool_r + margin)
+    zs = max(zc + margin, z + 0.3) if zc > -1e8 else z + 0.3
+    h_r, h_so = holder
+    zhd = stock.link_top_max([(s[0], s[1]), (s[0], s[1])], h_r + 1.0)
+    if zhd > -1e8:
+        zs = max(zs, zhd - h_so + 1.0)
+    zs = round(zs, 4)
+    # a zero-length segment: link_top_max reads segments, not lone points
+    return zs if holder_clears(stock, [(s[0], s[1]), (s[0], s[1])], zs, h_r,
+                               h_so) else None
+
+
 def vise_height_guard(moves, stock_box, tool_r, min_z, stats=None):
     """M1 (vise avoidance by height): with side entry on, the vise jaws sit
     beside the stock below min_z (the finished part's bottom). EVERY move -
@@ -1927,32 +1948,15 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # verified-clear bump), descend from the ACTUAL height: otherwise
             # the first helix segment bridges the lift at ~90 deg - a plunge.
             zt = prev[2] if (prev[2] is not None and prev[2] > zh) else zh
-            if _lva_on and _sk1_holder is not None and zt > z + 0.3 + 1e-6:
-                # LVA: the helix sweeps r + tool_r about (cx, cy); start it
-                # rapid_margin over the highest stock/part in that disk (+
-                # rapid_margin pad), and never with the holder nose less than
-                # 1 mm over stock/part within holder_r + 1 at the G0 column
-                # s (holder_clears, M2). emit() still R5-checks the G0.
-                zc = stock.link_top_max([(cx, cy), (cx, cy)],
-                                        r + tool_r + rapid_margin)
-                zs = max(zc + rapid_margin, z + 0.3) if zc > -1e8 \
-                    else z + 0.3
-                h_r, h_so = _sk1_holder
-                zhd = stock.link_top_max([(s[0], s[1]), (s[0], s[1])],
-                                         h_r + 1.0)
-                if zhd > -1e8:
-                    zs = max(zs, zhd - h_so + 1.0)
-                zs = round(zs, 4)
-                if zs < zt - 1e-6 and holder_clears(
-                        stock, [(s[0], s[1])], zs, h_r, h_so):
-                    z_from = prev[2]
-                    emit({"g": 0, "x": s[0], "y": s[1], "z": zs})
-                    zt = prev[2]
-                    stats["lva"]["g0"] += 1
-                    stats["lva"]["g0_mm"] += z_from - zt
-                    if len(stats["lva"]["log"]) < 500:   # for test_lva
-                        stats["lva"]["log"].append(
-                            (cx, cy, r, s[0], s[1], zt, z))
+            zs = _lva_start(stock, cx, cy, r, s, z, tool_r, rapid_margin,
+                            _sk1_holder) if _lva_on else None
+            if zs is not None and zs < zt - 1e-6:
+                # LVA: G0 down the column to zs (emit() still R5-checks it)
+                z_from = prev[2]
+                emit({"g": 0, "x": s[0], "y": s[1], "z": zs})
+                zt = prev[2]
+                stats["lva"]["g0"] += 1
+                stats["lva"]["g0_mm"] += z_from - zt
             hx, hy, hz = s[0], s[1], zt
             for hv in _helix_moves(cx, cy, s[0], s[1], zt, z, ramp_feed, r,
                                   ramp_angle_deg):
@@ -2787,7 +2791,7 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             a2d_pre[zo] = job[:3]
             a2d_futs[zo] = a2d_ex.submit(_a2d_pool_job, job)
     stats["lva"] = {"on": int(_lva_on and _sk1_holder is not None),
-                    "g0": 0, "g0_mm": 0.0, "log": []}
+                    "g0": 0, "g0_mm": 0.0}
     stats["pl1"] = {"openers": len(a2d_openers),
                     "precomputed": len(a2d_futs), "used": 0, "fallback": 0,
                     "error": 0, "t_wait_s": 0.0}
