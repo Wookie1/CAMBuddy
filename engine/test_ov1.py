@@ -5,7 +5,9 @@ engine/test_sp_hf1b.py, rough in-process through engine.cli.main):
     worker result;
 (b) the worker given moves that differ from what rough returns -> fallback,
     program == off;
-(c) the worker raising -> inline, program == off.
+(c) the worker raising -> inline, program == off;
+(d) a heavy scene where the limiter really slows feeds: on == off, and a
+    raising worker yields the LIMITED program (never the unlimited one).
 Runnable directly or under pytest from VibeCAD python."""
 import contextlib
 import io
@@ -38,18 +40,21 @@ def _prepare(td):
         return json.load(fh)
 
 
-def _rough(prep, td, tag, overlap):
+def _rough(prep, td, tag, overlap, heavy=False, limit=True):
     out = os.path.join(td, "ov_%s.ngc" % tag)
     sj = os.path.join(td, "ov_%s.json" % tag)
     with contextlib.redirect_stdout(io.StringIO()):
         cli.main(["rough", "--step", STEP, "--stock",
                   *[str(v) for v in prep["stock"]], "--tool", "flat:6.0",
                   "--out", out, "--floor", "3.0", "--leave", "0.381",
-                  "--axial-leave", "0.381", "--stepdown", "4.0",
-                  "--stepup", "1.905", "--optimal-load-mm", "2.0",
+                  "--axial-leave", "0.381",
+                  "--stepdown", "8.0" if heavy else "4.0",
+                  "--stepup", "1.905",
+                  "--optimal-load-mm", "6.0" if heavy else "2.0",
                   "--tolerance", "0.05", "--min-rest", "0.5",
                   "--stock-cell", "0.5", "--hf", prep["hf"],
-                  "--stats-json", sj, "--load-limit",
+                  "--stats-json", sj,
+                  "--load-limit" if limit else "--no-load-limit",
                   "--stock-out", os.path.join(td, "ov_%s.npy" % tag),
                   "--ll-overlap", str(overlap)])
     with open(out, "rb") as fh, open(sj) as fj:
@@ -104,5 +109,37 @@ def test_ov1_overlap():
           "fallback, worker error -> inline")
 
 
+def test_ov1_limiter_acts():
+    """(d) a scene where the limiter really slows feeds (optimal load 6.0,
+    stepdown 8.0): the limited program differs from the unlimited one in F
+    words; overlap on == off; a worker that raises -> the inline limiter's
+    program (never the unlimited one) == off."""
+    from engine import load_limit
+    with tempfile.TemporaryDirectory() as td:
+        prep = _prepare(td)
+        ngc_off, st_off = _rough(prep, td, "hoff", 0, heavy=True)
+        ngc_un, _st = _rough(prep, td, "hun", 0, heavy=True, limit=False)
+        a, b = ngc_off.splitlines(), ngc_un.splitlines()
+        assert len(a) == len(b), (len(a), len(b))
+        n_f = sum(1 for x, y in zip(a, b) if x != y)
+        assert n_f > 0, "the limiter slowed nothing in the heavy scene"
+        ngc_on, st_on = _rough(prep, td, "hon", 1, heavy=True)
+        assert st_on["ll_overlap"]["used"] == 1, st_on["ll_overlap"]
+        assert ngc_on == ngc_off, "heavy: overlap on != off"
+        origp = load_limit.limit_feeds_pickled
+        load_limit.limit_feeds_pickled = _boom
+        try:
+            ngc_c, st_c = _rough(prep, td, "hc", 1, heavy=True)
+        finally:
+            load_limit.limit_feeds_pickled = origp
+        assert st_c["ll_overlap"]["error"] >= 1, st_c["ll_overlap"]
+        n_c = sum(1 for x, y in zip(ngc_c.splitlines(), a) if x != y)
+        assert ngc_c == ngc_off, \
+            "heavy worker error: %d lines differ from the limited program" % n_c
+    print("PASS ov1 (d): limiter slows %d lines in the heavy scene; on == "
+          "off; worker error -> inline limiter, == off" % n_f)
+
+
 if __name__ == "__main__":
     test_ov1_overlap()
+    test_ov1_limiter_acts()
