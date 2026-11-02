@@ -161,6 +161,52 @@ def test_island_clear_single_point_matches_batch():
     print("PASS sp4_py island_clear: single == batch on 8000 points")
 
 
+def test_simulate_standing_stock_on_grid_edges():
+    """Edge branch: standing stock in grid column 0, row 0 and the last
+    column (the whole grid standing, pad included), paths hugging each edge
+    - every cell the disk reaches there counts, as in the reference."""
+    box = (0.0, 30.0, 0.0, 20.0, 0.0, 20.0)
+    sf = StockField(box, cell=0.5)
+    gx1, gy1 = sf.x0 + sf.nx * sf.cell, sf.y0 + sf.ny * sf.cell
+    paths = [[(sf.x0 + 0.3, sf.y0 + 4.0 + i) for i in range(12)],     # col 0
+             [(sf.x0 + 4.0 + i, sf.y0 + 0.3) for i in range(12)],     # row 0
+             [(gx1 - 0.3, sf.y0 + 4.0 + i) for i in range(12)],        # last col
+             [(sf.x0 + 4.0 + i, gy1 - 0.3) for i in range(12)]]        # last row
+    for n, path in enumerate(paths):
+        sf.top = np.full((sf.ny, sf.nx), 15.0)
+        e1, e2 = [], []
+        a = _simulate(path, sf, 5.0, 6.343, sf.cell, 0.0, e1, entry="link",
+                      eps=0.0)
+        sf.top = np.full((sf.ny, sf.nx), 15.0)
+        b = _simulate_ref(path, sf, 5.0, 6.343, sf.cell, 0.0, e2,
+                          entry="link", eps=0.0)
+        assert a == b and e1 == e2, (n, a[:4], b[:4])
+    print("PASS sp4_py simulate edges: column 0, row 0, last column/row")
+
+
+def test_island_clear_exact_boundaries():
+    """island_clear_fn single == batched on exact-boundary points of an
+    axis-aligned square island (integer coordinates, exact distances):
+    vertices, points exactly req from an edge, and vertex Y values."""
+    from engine import model  # noqa: F401  (puts area on the path)
+    from engine.rough import island_clear_fn
+    sq = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+    for req in (0.0, 1.0, 2.0, 3.5):
+        f = island_clear_fn([sq], req)
+        pts = [v for v in sq]                                     # vertices
+        pts += [(5.0, -req), (5.0, 10.0 + req), (-req, 5.0),        # exactly
+                 (10.0 + req, 5.0)]                                 # req away
+        pts += [(x, y) for y in (0.0, 10.0)                         # vertex y
+                for x in (-req - 1.0, -req, 5.0, 10.0 + req, 10.0 + req + 1.0)]
+        batch = f(pts + [(999.0, 999.0)])[:-1]
+        single = [f([p])[0] for p in pts]
+        assert batch == single, (req, [(p, a, b) for p, a, b
+                                       in zip(pts, batch, single) if a != b])
+    print("PASS sp4_py island_clear boundaries: single == batch")
+
+
 if __name__ == "__main__":
     test_vectorised_simulate_matches_reference()
     test_island_clear_single_point_matches_batch()
+    test_simulate_standing_stock_on_grid_edges()
+    test_island_clear_exact_boundaries()
