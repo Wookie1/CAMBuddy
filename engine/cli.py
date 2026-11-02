@@ -957,12 +957,16 @@ def main(argv=None):
             try:
                 if pickle.dumps(moves, protocol=pickle.HIGHEST_PROTOCOL) \
                         == ov["data"]:
-                    res = ov["fut"].result()
+                    res = ov["fut"].result(timeout=roughmod._pool_timeout())
                     stats_ov["used"] = 1
                 else:
                     stats_ov["fallback"] = 1
-            except Exception:   # noqa: BLE001  OV1: worker failure -> inline
+            except Exception as e:   # noqa: BLE001  OV1: worker failure -> inline
+                print("load_limit overlap: worker failed (%s: %s); limiter "
+                      "runs inline" % (type(e).__name__, e), file=sys.stderr)
                 stats_ov["error"] += 1
+                if isinstance(e, TimeoutError):   # FU2: a hung worker
+                    roughmod._pool_kill(ov["ex"])
             ov["ex"].shutdown(wait=True, cancel_futures=True)
         if res is None:
             res = load_limit.limit_feeds(

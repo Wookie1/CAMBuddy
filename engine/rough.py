@@ -1214,6 +1214,25 @@ def _pl1_same(a, b):
         return False
 
 
+def _pool_timeout():
+    """FU2: how long a pooled result may be waited for, in seconds
+    (ENGINE_POOL_TIMEOUT_S, default 900 - far beyond any normal part)."""
+    return float(os.environ.get("ENGINE_POOL_TIMEOUT_S", "900"))
+
+
+def _pool_kill(ex):
+    """FU2: stop a pool whose worker hangs. cancel() cannot stop a running
+    future, so terminate the worker processes, then shut the pool down."""
+    # ponytail: ProcessPoolExecutor._processes is private; Python 3.14 has
+    # terminate_workers() - switch when the VibeCAD python moves to it
+    procs = list((getattr(ex, "_processes", None) or {}).values())
+    for p in procs:
+        p.terminate()
+    for p in procs:
+        p.join(5)
+    ex.shutdown(wait=False, cancel_futures=True)
+
+
 def _pl1_close(ex, futs):
     """PL1 R2: cancel every opener future not yet taken (skipped or never
     reached) and shut the pool down; a future already running finishes
@@ -2809,12 +2828,14 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # the pooled result and apply its stats deltas where the inline
             # call would have.
             try:
-                pooled = fut.result()
+                pooled = fut.result(timeout=_pool_timeout())
             except Exception as e:   # noqa: BLE001  R1: never fails the rough
                 print("rough PL1: opener Z%.3f worker failed (%s: %s); level "
                       "runs inline" % (z, type(e).__name__, e),
                       file=sys.stderr)
                 stats["pl1"]["error"] += 1
+                if isinstance(e, TimeoutError):   # FU2: a hung worker
+                    _pool_kill(a2d_ex)
             else:
                 if pooled[3] != z:   # F1: a result from another level
                     print("rough PL1: opener Z%.3f got the result of Z%.3f; "

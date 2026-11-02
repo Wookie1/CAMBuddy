@@ -7,7 +7,9 @@ engine/test_sp_hf1b.py, rough in-process through engine.cli.main):
     program == off;
 (c) the worker raising -> inline, program == off;
 (d) a heavy scene where the limiter really slows feeds: on == off, and a
-    raising worker yields the LIMITED program (never the unlimited one).
+    raising worker yields the LIMITED program (never the unlimited one);
+(e) FU2 a worker hanging past ENGINE_POOL_TIMEOUT_S -> inline, == off, no
+    worker process left.
 Runnable directly or under pytest from VibeCAD python."""
 import contextlib
 import io
@@ -140,6 +142,49 @@ def test_ov1_limiter_acts():
           "off; worker error -> inline limiter, == off" % n_f)
 
 
+def _sleepy_ll(*a, **k):
+    """Worker stand-in (by name): hangs 60 s, then the real limiter."""
+    import time
+    time.sleep(60.0)
+    from engine.load_limit import limit_feeds_pickled
+    return limit_feeds_pickled(*a, **k)
+
+
+def test_ov1_hung_worker_times_out():
+    """(e) FU2: a limiter worker hanging past ENGINE_POOL_TIMEOUT_S (3 s
+    here): the limiter runs inline, program == off, the rough does not wait
+    out the worker's 60 s sleep, and no worker process is left."""
+    import multiprocessing as mp
+    import time
+    from engine import load_limit
+    with tempfile.TemporaryDirectory() as td:
+        prep = _prepare(td)
+        ngc_off, _st = _rough(prep, td, "toff", 0)
+        orig = load_limit.limit_feeds_pickled
+        old = os.environ.get("ENGINE_POOL_TIMEOUT_S")
+        load_limit.limit_feeds_pickled = _sleepy_ll
+        os.environ["ENGINE_POOL_TIMEOUT_S"] = "3"
+        try:
+            t0 = time.time()
+            ngc_t, st_t = _rough(prep, td, "ton", 1)
+            dt = time.time() - t0
+        finally:
+            load_limit.limit_feeds_pickled = orig
+            if old is None:
+                os.environ.pop("ENGINE_POOL_TIMEOUT_S", None)
+            else:
+                os.environ["ENGINE_POOL_TIMEOUT_S"] = old
+        left = [c for c in mp.active_children()]
+        assert st_t["ll_overlap"]["error"] >= 1 \
+            and st_t["ll_overlap"]["used"] == 0, st_t["ll_overlap"]
+        assert ngc_t == ngc_off, "hung worker: program differs from off"
+        assert dt < 45.0, "rough waited %.1f s for a hung worker" % dt
+        assert not left, "worker processes left: %r" % left
+    print("PASS ov1 (e): hung worker timed out, inline, == off, %.1f s, no "
+          "workers left" % dt)
+
+
 if __name__ == "__main__":
     test_ov1_overlap()
     test_ov1_limiter_acts()
+    test_ov1_hung_worker_times_out()
