@@ -1085,6 +1085,18 @@ def _a2d_new(tool_r, leave, stepover, tolerance, keep_tool_down, helix_dia):
     return a2d
 
 
+def _results_dropped(results):
+    """BS1d verdict on one outer's Execute results: StartPointNotFound and
+    not a single cutting path."""
+    CT = area.AdaptiveMotionType.Cutting
+    return not (any(not getattr(r, "StartPointNotFound", False)
+                    and r.AdaptivePaths and any(pth[0] == CT and pth[1]
+                                                for pth in r.AdaptivePaths)
+                    for r in results)
+                or not any(getattr(r, "StartPointNotFound", False)
+                           for r in results))
+
+
 def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
              keep_tool_down, helix_dia, z, stats):
     """One level's Adaptive2d run; returns plain picklable region dicts.
@@ -1102,15 +1114,19 @@ def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
     stats["a2d_spnf"] += n_spnf
     CT = area.AdaptiveMotionType.Cutting
     if n_spnf:
-        for o in outers:
-            alone = _a2d_new(tool_r, leave, stepover, tolerance,
-                             keep_tool_down, helix_dia).Execute(
-                [o], [o] + holes + islands, [], lambda tp: False)
-            if any(not getattr(r, "StartPointNotFound", False)
-                   and r.AdaptivePaths and any(pth[0] == CT and pth[1]
-                                               for pth in r.AdaptivePaths)
-                   for r in alone) or not any(
-                    getattr(r, "StartPointNotFound", False) for r in alone):
+        # SP4-DIAG: with one outer its "alone" run IS the primary run (same
+        # outer, same holes + islands, fresh instance): judge the primary
+        # results instead of running it again (41.6 s on CF). Several outers
+        # still re-run alone; the verdicts only fill stats.
+        if len(outers) == 1:
+            drops = [_results_dropped(results)]
+        else:
+            drops = [_results_dropped(_a2d_new(
+                tool_r, leave, stepover, tolerance, keep_tool_down,
+                helix_dia).Execute([o], [o] + holes + islands, [],
+                                   lambda tp: False)) for o in outers]
+        for o, dropped in zip(outers, drops):
+            if not dropped:
                 continue    # runs alone, or nothing to clear (no SPNF)
             stats["a2d_dropped_outers"].append(
                 {"z": round(z, 3),
