@@ -1197,6 +1197,36 @@ def _a2d_pool_job(job):
     return regions, st["a2d_spnf"], st["a2d_dropped_outers"]
 
 
+def _pl1_same(a, b):
+    """PL1 R4: the pooled-result equality check; any exception (e.g. numpy
+    arrays in the inputs) counts as different -> fallback, never a crash."""
+    try:
+        return bool(a == b)
+    except Exception:   # noqa: BLE001
+        return False
+
+
+def _pl1_close(ex, futs):
+    """PL1 R2: cancel every opener future not yet taken (skipped or never
+    reached) and shut the pool down; a future already running finishes
+    (cancel cannot stop it). Idempotent."""
+    for f in futs.values():
+        f.cancel()
+    ex.shutdown(wait=True, cancel_futures=True)
+
+
+def rough(*args, **kw):
+    """Plan the rest-aware roughing toolpath: see _rough. PL1 R2: wraps it so
+    the pass-opener pool is always closed, also when _rough raises (a gate,
+    a panel cancel through `progress`, any error)."""
+    held = []
+    try:
+        return _rough(*args, _pl1_held=held, **kw)
+    finally:
+        for ex, futs in held:
+            _pl1_close(ex, futs)
+
+
 def _pass_openers(order):
     """PL1: the pass-opener levels AFTER the first - a level whose Z is
     lower than every level before it in `order`. Every earlier level cut
@@ -1357,7 +1387,7 @@ def _skin_band(res, stock, stock_box, tool_r, z):
             "max_thickness_mm": round(float(dmin.max()) + cell / 2, 3)}
 
 
-def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
+def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           stepover=0.16, cut_feed=3429.0, ramp_feed=1270.0,
           clearance_z=None, lift=1.9, wl_sampling=None, threads=8,
           tolerance=0.05, keep_tool_down=3.0, stl_path=None, workers=None,
@@ -1367,7 +1397,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           clip_bridge_mm=5.0, feed_link_max=40.0,
           progress=None, stock_out=None, ramp_angle_deg=2.0,
           side_entry_faces=None, side_entry_min_z=None, flute_mm=None,
-          side_entry_holder=None, a2d_pool=None):
+          side_entry_holder=None, a2d_pool=None, _pl1_held=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -2711,6 +2741,8 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         a2d_ex = ProcessPoolExecutor(
             min(len(a2d_openers), ISLAND_POOL),
             mp_context=mp.get_context("spawn"))
+        if _pl1_held is not None:
+            _pl1_held.append((a2d_ex, a2d_futs))
         for zo in a2d_openers:
             skip, inp = _level_a2d_inputs(zo)
             if skip is not None or inp is None:
@@ -2722,7 +2754,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             a2d_futs[zo] = a2d_ex.submit(_a2d_pool_job, job)
     stats["pl1"] = {"openers": len(a2d_openers),
                     "precomputed": len(a2d_futs), "used": 0, "fallback": 0,
-                    "t_wait_s": 0.0}
+                    "error": 0, "t_wait_s": 0.0}
 
     zi = 0
     for z in order:
@@ -2750,20 +2782,26 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         rp2_open = inp["rp2_open"]
         corridor_ok = inp["corridor_ok"]
         t0 = time.time()
+        regions = None
         fut = a2d_futs.pop(z, None)
-        if fut is not None and (outers, holes, isl_in) == a2d_pre[z]:
+        if fut is not None and _pl1_same((outers, holes, isl_in), a2d_pre[z]):
             # PL1: the loop's inputs are exactly the precomputed ones - take
             # the pooled result and apply its stats deltas where the inline
             # call would have.
-            regions, spnf_d, drops_l = fut.result()
-            stats["a2d_spnf"] += spnf_d
-            stats["a2d_dropped_outers"].extend(drops_l)
+            try:
+                pooled = fut.result()
+            except Exception:   # noqa: BLE001  R1: never fails the rough
+                stats["pl1"]["error"] += 1
+            else:
+                regions, spnf_d, drops_l = pooled
+                stats["a2d_spnf"] += spnf_d
+                stats["a2d_dropped_outers"].extend(drops_l)
+                stats["pl1"]["used"] += 1
             stats["pl1"]["t_wait_s"] += time.time() - t0
-            stats["pl1"]["used"] += 1
-        else:
-            if fut is not None:   # inputs differ: never use that result
-                fut.cancel()
-                stats["pl1"]["fallback"] += 1
+        elif fut is not None:   # inputs differ: never use that result
+            fut.cancel()
+            stats["pl1"]["fallback"] += 1
+        if regions is None:
             regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
                                tolerance, keep_tool_down, helix_dia, z, stats)
         n_a2d = len(regions)  # HR1: everything from here on is hug rings
@@ -3445,7 +3483,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         if progress:
             progress(zi, z, islands, nreg, stats)
     if a2d_ex is not None:
-        a2d_ex.shutdown(wait=True)   # PL1: opener pool down before the gates
+        _pl1_close(a2d_ex, a2d_futs)   # PL1: opener pool down before the gates
     if prev[0] is not None:
         emit({"g": 0, "x": prev[0], "y": prev[1], "z": clearance_z})
     if allowance_check:

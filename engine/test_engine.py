@@ -3803,7 +3803,9 @@ def test_hr1_rings_after_a2d():
                                   3.0, 6.0, leave=0.381, axial_leave=0.381,
                                   stepdown=4.0, stepup=10.0, stepover=2.0 / 6.0,
                                   tolerance=0.05, threads=4, stock_cell=0.5,
-                                  min_rest=0.5, corner_r=0.0, stl_path=stl)
+                                  min_rest=0.5, corner_r=0.0, stl_path=stl,
+                                  # PL1: this test instruments _run_a2d in-process; pool-on equivalence is test_pl1 + CF/TB cmp
+                                  a2d_pool=0)
         finally:
             R._run_a2d, R.hug_regions = orig_a2d, orig_hug
         zs = [lv["z"] for lv in stats["levels"] if not lv.get("skipped")]

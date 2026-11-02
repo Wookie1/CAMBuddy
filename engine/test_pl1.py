@@ -9,7 +9,8 @@
     result where the scene has a second opener;
 (c) fallback: a precomputed input made to differ (a point dropped from a
     precomputed outer) -> the loop must discard the pooled result, run the
-    level inline, and the program must equal the pool-off program.
+    level inline, and the program must equal the pool-off program;
+(d) a pooled job that raises in the worker -> inline, same program.
 
 Small synthetic/TB scenes only; runnable directly with the VibeCAD python
 (opencamlib + area) or under pytest."""
@@ -133,9 +134,10 @@ def test_pl1_synth_pool_on_off():
     """(b) synth_pocket: pool off (env and --a2d-pool 0) is the all-inline
     path, byte-identical programs; pool on keeps the gates (no axial plunge,
     clcheck 0) and uses the pooled result (the scene has a second opener)."""
-    if not os.path.exists(model.freecadcmd()):
-        import pytest
-        pytest.skip("VibeCAD freecadcmd missing")
+    assert os.path.exists(model.freecadcmd()), (
+        "test_pl1 needs VibeCAD's freecadcmd at %s - run with "
+        "/Applications/VibeCAD.app/Contents/Resources/bin/python"
+        % model.freecadcmd())
     with tempfile.TemporaryDirectory() as td:
         prep = _prepare(td)
         ngc_off, st_off = _rough_cli(prep, td, "off", "0")
@@ -210,11 +212,40 @@ def test_pl1_fallback_uses_inline_result():
           "result byte-identical to pool-off")
 
 
+def _boom(job):
+    """Stands in for _a2d_pool_job inside the spawned worker (pickled by
+    name): every pooled job raises."""
+    raise RuntimeError("pl1 test: worker failure")
+
+
+def test_pl1_worker_failure_falls_back():
+    """(d) R1: a pooled job that raises in the worker must not fail the
+    rough: the level runs inline (error counted, nothing used) and the
+    program equals the pool-off program byte for byte."""
+    from engine import rough as roughmod
+    ref_moves, _ref_st = _bs1d_rough(0, stepdown=8.0)
+    orig = roughmod._a2d_pool_job
+    roughmod._a2d_pool_job = _boom
+    try:
+        moves, st = _bs1d_rough(1, stepdown=8.0)
+    finally:
+        roughmod._a2d_pool_job = orig
+    assert st["pl1"]["precomputed"] == 1, st["pl1"]
+    assert st["pl1"]["error"] >= 1 and st["pl1"]["used"] == 0, st["pl1"]
+    assert json.dumps(moves) == json.dumps(ref_moves), \
+        "worker-failure program differs from the pool-off program"
+    assert st.get("clcheck_violations", 0) == 0
+    assert st.get("n_axial_plunge", 0) == 0
+    print("PASS pl1 worker failure: inline fallback, byte-identical to "
+          "pool-off")
+
+
 if __name__ == "__main__":
     fails = 0
     for fn in (test_pl1_pass_opener_rule, test_pl1_bs1d_pool_on_off,
                test_pl1_synth_pool_on_off,
-               test_pl1_fallback_uses_inline_result):
+               test_pl1_fallback_uses_inline_result,
+               test_pl1_worker_failure_falls_back):
         t0 = time.time()
         try:
             fn()
