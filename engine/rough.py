@@ -1397,7 +1397,8 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           clip_bridge_mm=5.0, feed_link_max=40.0,
           progress=None, stock_out=None, ramp_angle_deg=2.0,
           side_entry_faces=None, side_entry_min_z=None, flute_mm=None,
-          side_entry_holder=None, a2d_pool=None, _pl1_held=None):
+          side_entry_holder=None, a2d_pool=None, _pl1_held=None,
+           on_moves=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -3486,6 +3487,10 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         _pl1_close(a2d_ex, a2d_futs)   # PL1: opener pool down before the gates
     if prev[0] is not None:
         emit({"g": 0, "x": prev[0], "y": prev[1], "z": clearance_z})
+    if on_moves is not None:
+        # OV1: the final move list, before the closing gates (the caller may
+        # start work on it that the gates do not change, e.g. the load limiter)
+        on_moves(moves)
     if allowance_check:
         # R2 item 2: independent CLCHECK gate - exact one-sided drop-cutter
         # with the ACTUAL cutter on every cutting move (separate code path
