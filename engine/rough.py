@@ -2354,18 +2354,26 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             return True
         return False
 
-    zi = 0
-    for z in order:
-        del hf_pts[:]
+    def _level_a2d_inputs(z):
+        """PL1 item 1 (pure refactor): one level's Adaptive2d inputs, built
+        exactly as the loop body built them: live-stock region mask -> area
+        check -> dilate -> contours -> island cache (or level_islands) ->
+        isl_ok/isl_ok3 -> isl_in -> rp2_open/RP diagnostics -> corridor_ok ->
+        outer and hole filters. NO side effects on stock, moves, prev or
+        stats: the loop keeps every stats append (skipped-level entries,
+        t_islands, rp diagnostics) and every continue exactly where and in
+        the order it was. Returns (skip, data): skip is the stats["levels"]
+        payload of a skipped level (None otherwise; data is None when the
+        level was skipped before its islands were computed), data carries
+        everything the rest of the loop body uses."""
         mandatory = round(z, 4) in mand
         mask = stock.region_mask(z, axl, 0.0 if mandatory else min_rest,
                                 leave_margin=leave + 0.4)
         area_mm2 = stock.region_area(mask)
         if area_mm2 < min_level_area and not mandatory:
-            stats["levels"].append({"z": round(z, 3), "skipped": True,
-                                   "region_mm2": round(area_mm2, 1),
-                                   "n_regions": 0, "n_clip_breaks": 0})
-            continue
+            return {"z": round(z, 3), "skipped": True,
+                    "region_mm2": round(area_mm2, 1),
+                    "n_regions": 0, "n_clip_breaks": 0}, None
         grown = stock.dilate(mask, tool_r + leave + 0.5)
         # Task RS: territory (and with it the Adaptive2d outers and the
         # hug-ring filter) is clipped to the stock box + tool radius, so no
@@ -2386,7 +2394,6 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             level_islands(surf, cutter_big, Zg, gxs, gys, z, axl,
                           threads=threads)
         t_isl = time.time() - t0
-        stats["t_islands"] += t_isl
         # ground-truth clearance oracle for THIS level: the refined forbidden
         # loops (centres must stay OUTSIDE them; they never under-cover F) -
         # the hf model can under-report steep walls by ~1 cell
@@ -2459,6 +2466,7 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
 
         # ---- RP0 instrumentation (RT_RP=1): safe region vs Adaptive2d input
         rp = None
+        rp_cat = rp_poly = None
         if _RP:
             c_sc0 = stock.cell
             xs_s = stock.x0 + (np.arange(stock.nx) + 0.5) * c_sc0
@@ -2611,11 +2619,45 @@ def rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         if _RP:
             rp["dropped_holes"] = len(holes) - len(keep_holes)
         holes = keep_holes
+        skip = None
         if not outers:
-            stats["levels"].append({"z": round(z, 3), "skipped": True,
-                                   "region_mm2": round(area_mm2, 1),
-                                   "n_regions": 0, "n_clip_breaks": 0})
+            skip = {"z": round(z, 3), "skipped": True,
+                    "region_mm2": round(area_mm2, 1),
+                    "n_regions": 0, "n_clip_breaks": 0}
+        return skip, {"mandatory": mandatory, "mask": mask,
+                      "area_mm2": area_mm2, "grown": grown,
+                      "outers": outers, "holes": holes,
+                      "islands": islands, "t_isl": t_isl,
+                      "isl_ok": isl_ok, "isl_ok3": isl_ok3,
+                      "isl_in": isl_in, "rp": rp, "rp_cat": rp_cat,
+                      "rp_poly": rp_poly, "rp2_open": rp2_open,
+                      "corridor_ok": corridor_ok}
+
+    zi = 0
+    for z in order:
+        del hf_pts[:]
+        skip, inp = _level_a2d_inputs(z)
+        if inp is not None:
+            stats["t_islands"] += inp["t_isl"]
+        if skip is not None:
+            stats["levels"].append(skip)
             continue
+        mandatory = inp["mandatory"]
+        mask = inp["mask"]
+        area_mm2 = inp["area_mm2"]
+        grown = inp["grown"]
+        outers = inp["outers"]
+        holes = inp["holes"]
+        islands = inp["islands"]
+        t_isl = inp["t_isl"]
+        isl_ok = inp["isl_ok"]
+        isl_ok3 = inp["isl_ok3"]
+        isl_in = inp["isl_in"]
+        rp = inp["rp"]
+        rp_cat = inp["rp_cat"]
+        rp_poly = inp["rp_poly"]
+        rp2_open = inp["rp2_open"]
+        corridor_ok = inp["corridor_ok"]
         t0 = time.time()
         regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
                            tolerance, keep_tool_down, helix_dia, z, stats)
