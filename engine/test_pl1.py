@@ -10,7 +10,8 @@
 (c) fallback: a precomputed input made to differ (a point dropped from a
     precomputed outer) -> the loop must discard the pooled result, run the
     level inline, and the program must equal the pool-off program;
-(d) a pooled job that raises in the worker -> inline, same program.
+(d) a pooled job that raises in the worker -> inline, same program;
+(e) F1 a pooled result labelled with another level's z -> fallback.
 
 Small synthetic/TB scenes only; runnable directly with the VibeCAD python
 (opencamlib + area) or under pytest."""
@@ -153,6 +154,11 @@ def test_pl1_synth_pool_on_off():
             assert st.get("n_axial_plunge", 0) == 0
         assert st_on["pl1"]["used"] >= 1, \
             "pool on never used a precomputed result: %r" % (st_on["pl1"],)
+        # F1: every precomputed opener is used at its own level (a result
+        # swapped between openers is caught by the z check -> fallback)
+        assert st_on["pl1"]["used"] == st_on["pl1"]["precomputed"] \
+            and st_on["pl1"]["fallback"] == 0 \
+            and st_on["pl1"]["error"] == 0, st_on["pl1"]
         assert st_on.get("clcheck_violations", 0) == 0
         assert st_on.get("n_axial_plunge", 0) == 0
         same = ngc_off == ngc_on
@@ -240,12 +246,42 @@ def test_pl1_worker_failure_falls_back():
           "pool-off")
 
 
+def _wrong_z(job):
+    """Worker stand-in (by name): the real result labelled with another Z."""
+    from engine.rough import _a2d_pool_job
+    r = _a2d_pool_job(job)
+    return r[:3] + (r[3] + 1.0,)
+
+
+def test_pl1_result_of_other_level_falls_back():
+    """(e) F1: a pooled result whose z is not the level's must not be used:
+    fallback counted, a stderr line, program == pool-off."""
+    import contextlib
+    import io
+    from engine import rough as roughmod
+    ref_moves, _ref = _bs1d_rough(0, stepdown=8.0)
+    orig = roughmod._a2d_pool_job
+    roughmod._a2d_pool_job = _wrong_z
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            moves, st = _bs1d_rough(1, stepdown=8.0)
+    finally:
+        roughmod._a2d_pool_job = orig
+    assert st["pl1"]["precomputed"] == 1 and st["pl1"]["used"] == 0 \
+        and st["pl1"]["fallback"] == 1, st["pl1"]
+    assert "got the result of" in err.getvalue(), err.getvalue()[-500:]
+    assert json.dumps(moves) == json.dumps(ref_moves)
+    print("PASS pl1 other-level result: fallback, byte-identical to pool-off")
+
+
 if __name__ == "__main__":
     fails = 0
     for fn in (test_pl1_pass_opener_rule, test_pl1_bs1d_pool_on_off,
                test_pl1_synth_pool_on_off,
                test_pl1_fallback_uses_inline_result,
-               test_pl1_worker_failure_falls_back):
+               test_pl1_worker_failure_falls_back,
+               test_pl1_result_of_other_level_falls_back):
         t0 = time.time()
         try:
             fn()

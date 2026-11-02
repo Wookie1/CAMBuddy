@@ -1187,14 +1187,15 @@ def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
 def _a2d_pool_job(job):
     """PL1: one pass-opener level's Adaptive2d in a pool worker: _run_a2d on
     a private stats dict; returns (regions, a2d_spnf delta,
-    a2d_dropped_outers list) - the parent applies those to its stats when
-    (and only when) the result is used."""
+    a2d_dropped_outers list, z) - the parent applies those to its stats when
+    (and only when) the result is used; z lets it check the result belongs
+    to the level it is used at (F1)."""
     (outers, holes, isl_in, tool_r, leave, stepover, tolerance,
      keep_tool_down, helix_dia, z) = job
     st = {"a2d_spnf": 0, "a2d_dropped_outers": []}
     regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
                        tolerance, keep_tool_down, helix_dia, z, st)
-    return regions, st["a2d_spnf"], st["a2d_dropped_outers"]
+    return regions, st["a2d_spnf"], st["a2d_dropped_outers"], z
 
 
 def _pl1_same(a, b):
@@ -2791,16 +2792,27 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # call would have.
             try:
                 pooled = fut.result()
-            except Exception:   # noqa: BLE001  R1: never fails the rough
+            except Exception as e:   # noqa: BLE001  R1: never fails the rough
+                print("rough PL1: opener Z%.3f worker failed (%s: %s); level "
+                      "runs inline" % (z, type(e).__name__, e),
+                      file=sys.stderr)
                 stats["pl1"]["error"] += 1
             else:
-                regions, spnf_d, drops_l = pooled
-                stats["a2d_spnf"] += spnf_d
-                stats["a2d_dropped_outers"].extend(drops_l)
-                stats["pl1"]["used"] += 1
+                if pooled[3] != z:   # F1: a result from another level
+                    print("rough PL1: opener Z%.3f got the result of Z%.3f; "
+                          "level runs inline" % (z, pooled[3]),
+                          file=sys.stderr)
+                    stats["pl1"]["fallback"] += 1
+                else:
+                    regions, spnf_d, drops_l = pooled[:3]
+                    stats["a2d_spnf"] += spnf_d
+                    stats["a2d_dropped_outers"].extend(drops_l)
+                    stats["pl1"]["used"] += 1
             stats["pl1"]["t_wait_s"] += time.time() - t0
         elif fut is not None:   # inputs differ: never use that result
             fut.cancel()
+            print("rough PL1: opener Z%.3f inputs differ from the "
+                  "precomputed ones; level runs inline" % z, file=sys.stderr)
             stats["pl1"]["fallback"] += 1
         if regions is None:
             regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
