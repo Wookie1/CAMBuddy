@@ -1292,11 +1292,11 @@ def holder_clears(stock, pts, z, holder_r, stickout):
         <= z + stickout - 1.0
 
 
-def _cut_top_max(stock, x, y, rad, leave):
-    """A1b: highest CUTTABLE stock within rad of (x, y): cells whose live top
-    stands more than leave + 0.1 over the part there (stock over the part
-    cut down to its leave is the part's own skin, not cuttable). -inf when
-    none."""
+def _cut_top_max(stock, x, y, rad, z):
+    """A1b: highest stock within rad of (x, y) that a helix legal at level z
+    can reach: cells whose part is at or below z. A cell whose part stands
+    above z is island at z (and, for a heightfield, at every higher Z), so
+    whatever stock sits on it is out of the helix's reach. -inf when none."""
     c = stock.cell
     k = int(math.ceil(rad / c)) + 1
     i0, j0 = stock._ci(x), stock._cj(y)
@@ -1309,17 +1309,18 @@ def _cut_top_max(stock, x, y, rad, leave):
     ys = stock.y0 + (np.arange(ja, jb) + 0.5) * c
     m = ((xs[None, :] - x) ** 2 + (ys[:, None] - y) ** 2) <= rad * rad
     if stock.part is not None:
-        m &= t > stock.part[ja:jb, ia:ib] + leave + 0.1
+        m &= ~(stock.part[ja:jb, ia:ib] > z)
     m &= np.isfinite(t)
     return float(t[m].max()) if m.any() else -np.inf
 
 
-def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder, leave=0.381):
+def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder):
     """LVA (lever A, A1b rule): the lowest height a helix entry may start at,
     G0 down the column at its start point s. Never under z + 0.3, and:
-    - margin over the highest CUTTABLE stock in the helix's swept disk
-      (r + tool_r + margin about (cx, cy)): the first turns must not side-cut
-      standing stock. The PART in that disk is not counted: the helix circle
+    - margin over the highest stock in the helix's swept disk (r + tool_r +
+      margin about (cx, cy)) standing on cells whose part is at or below z:
+      the first turns must not side-cut it. The PART in that disk, and stock
+      sitting on part above z, are not counted: the helix circle
       is island-legal at its level (try_cand validates it with isl_ok), and
       for a 3-axis heightfield the island at any higher Z is a subset of the
       island at the level, so the descending helix cannot reach the part;
@@ -1330,7 +1331,7 @@ def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder, leave=0.381):
     None when the holder is unknown (today's start stays)."""
     if holder is None:
         return None
-    zc = max(_cut_top_max(stock, cx, cy, r + tool_r + margin, leave),
+    zc = max(_cut_top_max(stock, cx, cy, r + tool_r + margin, z),
              stock.link_top_max([(s[0], s[1]), (s[0], s[1])],
                                 tool_r + margin))
     zs = max(zc + margin, z + 0.3) if zc > -1e8 else z + 0.3
@@ -1983,7 +1984,7 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 assert circ is not None and all(isl_ok(circ)), \
                     "LVA: helix circle not island-legal at Z"
             zs = _lva_start(stock, cx, cy, r, s, z, tool_r, rapid_margin,
-                            _sk1_holder, leave) if _lva_on else None
+                            _sk1_holder) if _lva_on else None
             if zs is not None and zs < zt - 1e-6:
                 # LVA: G0 down the column to zs (emit() still R5-checks it)
                 z_from = prev[2]

@@ -68,6 +68,14 @@ def test_lva_start_values():
     zs_s = _start(_field(stock=[blk]))
     assert zs_s is not None and abs(zs_s - 16.0) < 1e-6, \
         "stock in the helix disk: %r" % zs_s
+    # stock terrace sitting ON the part where the part stands above Z (part 8,
+    # stock top 12, Z 5) inside the helix disk: island at Z, out of reach
+    terr = _field([(9.5, 12.0, -3.0, 3.0, 8.0)])
+    m = terr.part > -np.inf
+    terr.top[m] = 12.0
+    zs_t = _start(terr)
+    assert zs_t is not None and abs(zs_t - 11.0) < 1e-6, \
+        "stock on the part island: %r" % zs_t
     # a part wall within tool_r + margin of the G0 column s (R5 term):
     # x -12..-9.5 is 6.3..8.8 from s (-3.17, 0) -> inside 7.343
     wall_s = (-12.0, -9.5, -3.0, 3.0, 18.0)
@@ -85,9 +93,9 @@ def test_lva_start_values():
     assert zs_l is not None and abs(zs_l - 11.0) < 1e-6, zs_l
     assert _start(_field(), holder=None) is None
     print("PASS lva start (A1b): open %.3f, part wall in helix disk %.3f, "
-          "stock in helix disk %.3f, part at the column %.3f, holder %.3f "
-          "(long stick-out %.3f), unknown holder None"
-          % (zs, zs_w, zs_s, zs_r, zs_h, zs_l))
+          "stock in helix disk %.3f, stock on the part island %.3f, part at "
+          "the column %.3f, holder %.3f (long stick-out %.3f), unknown "
+          "holder None" % (zs, zs_w, zs_s, zs_t, zs_r, zs_h, zs_l))
 
 
 def test_lva_off_byte_identical():
