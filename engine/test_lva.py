@@ -228,6 +228,34 @@ def test_lva_default_on_and_off_switches():
                                        a[i - 1:i + 2])
     assert all(mv["g"] == 1 for mv in mid[1:]), "more than one G0 in the span"
     assert all(mv["g"] == 1 for mv in b[i:len(b) - t]), "off span has a G0"
+    # A2 (panel, MF1b): the on-span's helix is the off-span's helix entered
+    # lower. _helix_moves descends over a WHOLE number of turns at a uniform
+    # rate, so a shorter descent has fewer turns and a shallower pitch: the
+    # Z values differ, but move k of both spans is the same point of the
+    # same circle (same centre, radius, start angle, segments per turn), the
+    # feed is identical, the helix's closing move is shared, and the descent
+    # is uniform and never steeper than the off helix.
+    on_g1, off_g1 = mid[1:], b[i:len(b) - t]
+    assert 0 < len(on_g1) <= len(off_g1), (len(on_g1), len(off_g1))
+    for k, (p, q) in enumerate(zip(on_g1, off_g1)):
+        assert abs(p["x"] - q["x"]) <= 1e-6 and \
+            abs(p["y"] - q["y"]) <= 1e-6, ("helix point", k, p, q)
+        assert p.get("f") == q.get("f"), ("helix feed", k, p, q)
+    # the helix's last move (back over its start point at the bottom) is
+    # the first move both programs share again
+    end = a[len(a) - t]
+    assert t > 0 and end == b[len(b) - t] and end["g"] == 1 and \
+        abs(end["x"] - mid[0]["x"]) <= 1e-6 and \
+        abs(end["y"] - mid[0]["y"]) <= 1e-6 and \
+        end.get("f") == on_g1[0].get("f") and \
+        end["z"] < on_g1[-1]["z"], (end, mid[0], on_g1[-1])
+
+    def drops(seq, z0):
+        zs = [z0] + [mv["z"] for mv in seq]
+        return [zs[j] - zs[j + 1] for j in range(len(seq))]
+    d_on, d_off = drops(on_g1, mid[0]["z"]), drops(off_g1, a[i - 1]["z"])
+    assert max(d_on) - min(d_on) <= 2e-4 and min(d_on) > 0, d_on
+    assert max(d_on) <= min(d_off) + 2e-4, (max(d_on), min(d_off))
     assert sd.get("clcheck_violations") == 0 and \
         sd.get("n_axial_plunge", 0) == 0, (sd.get("clcheck_violations"),
                                            sd.get("n_axial_plunge"))
