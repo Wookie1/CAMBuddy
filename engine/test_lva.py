@@ -99,9 +99,10 @@ def test_lva_start_values():
 
 
 def test_lva_margin_band():
-    """(a') the scan band between the helix's swept disk and the +margin
-    scan radius: a part>Z cell with a tall terrace must NOT lift the start;
-    a part<=Z cell under tall stock MUST lift it."""
+    """(a') the scan band just outside the helix's swept disk: a part>Z
+    cell with a tall terrace must NOT lift the start; a part<=Z cell under
+    tall stock MUST lift it within r + R + h (h = half a cell diagonal) and
+    must NOT beyond it (A2)."""
     # boundary band: cells between the swept disk (r + R = 9.513) and the
     # scan radius (+ margin = 10.513), at x 9.8..10.4 (cell centre 10.25)
     band = (9.8, 10.4, -1.0, 1.0)
@@ -112,14 +113,51 @@ def test_lva_margin_band():
     zs_bi = _start(bi)
     assert zs_bi is not None and abs(zs_bi - 11.0) < 1e-6, \
         "terrace on part > Z in the margin band: %r" % zs_bi
-    # (ii) part at/below Z there (part 3) under tall stock: MUST lift it
-    bii = _field([band + (3.0,)])
+    # (ii) A2 (coordinator-approved): the scan reaches r + R + h only,
+    # h = cell * sqrt(2) / 2 = 0.354 (grid discretisation): r + R + h =
+    # 9.867. A part<=Z cell (part 3) under tall stock whose centre is in
+    # (r + R, r + R + h] MUST lift it (centres x 9.75, |y| <= 0.75: 9.753 ..
+    # 9.779); the same cell beyond r + R + h (centre x 10.25) must NOT.
+    near = (9.6, 9.9, -1.0, 1.0)
+    bii = _field([near + (3.0,)])
     bii.top[bii.part > -np.inf] = 15.0
     zs_bii = _start(bii)
     assert zs_bii is not None and abs(zs_bii - 16.0) < 1e-6, \
-        "stock on part <= Z in the margin band: %r" % zs_bii
-    print("PASS lva margin band: part>Z terrace %.3f, part<=Z stock %.3f"
-          % (zs_bi, zs_bii))
+        "stock on part <= Z within r + R + h: %r" % zs_bii
+    far = (10.0, 10.4, -1.0, 1.0)
+    biii = _field([far + (3.0,)])
+    biii.top[biii.part > -np.inf] = 15.0
+    zs_biii = _start(biii)
+    assert zs_biii is not None and abs(zs_biii - 11.0) < 1e-6, \
+        "stock on part <= Z beyond r + R + h: %r" % zs_biii
+    print("PASS lva margin band: part>Z terrace %.3f, part<=Z stock within "
+          "h %.3f, beyond h %.3f" % (zs_bi, zs_bii, zs_biii))
+
+
+def _zmap_judge(moves):
+    """zmap (verify/, independent of the engine) on a BS1d program: the part
+    grid is the scene's boxes sampled at cell centres."""
+    from verify import zmap
+    cell, x0, y0 = 0.5, -48.0, -38.0
+    nx, ny = 192, 152
+    xs = x0 + (np.arange(nx) + 0.5) * cell
+    ys = y0 + (np.arange(ny) + 0.5) * cell
+    X, Y = np.meshgrid(xs, ys)
+    part = np.where((np.abs(X) <= 40) & (np.abs(Y) <= 30), 0.0, -1.0)
+    tall = ((X <= -30) | (X >= 30) | (Y <= -25) | (Y >= 25)) | \
+        ((np.abs(X) <= 11) & (np.abs(Y) <= 6))
+    part = np.where(tall & (np.abs(X) <= 40) & (np.abs(Y) <= 30), 14.0, part)
+    lines = ["G21 G90"]
+    for mv in moves:
+        w = ["G0" if mv["g"] == 0 else "G1"]
+        w += ["%s%.4f" % (k.upper(), mv[k]) for k in ("x", "y", "z")
+              if mv.get(k) is not None]
+        if mv["g"] == 1 and mv.get("f"):
+            w.append("F%.1f" % mv["f"])
+        lines.append(" ".join(w))
+    return zmap.simulate(zmap.parse_gcode("\n".join(lines) + "\n"), part,
+                         cell, x0, y0, (-40.0, 40.0, -30.0, 30.0, -1.0, 14.0),
+                         dia=12.686)
 
 
 class _Parsed(Exception):
@@ -131,8 +169,9 @@ class _Parsed(Exception):
 def test_lva_default_on_and_off_switches():
     """(b) LVA is ON by default (stats lva.on == 1 with no flag or env);
     explicit off (air_descent_g0=0) and ENGINE_AIR_G0=0 both turn it off and
-    give the same program; on the BS1d scene (no G0 fires) default == off
-    byte for byte. Also: engine.cli parses --no-air-descent-g0 to 0."""
+    give the same program; on the BS1d scene exactly one LVA G0 fires and
+    default differs from off only in that entry's span, judged clean by
+    zmap (A2). Also: engine.cli parses --no-air-descent-g0 to 0."""
     from opencamlib import ocl
     from engine import cli
     from engine.rough import rough
@@ -141,7 +180,7 @@ def test_lva_default_on_and_off_switches():
     tris = (bt(-40, 40, -30, 30, -1, 0) + bt(-40, -30, -30, 30, 0, 14)
             + bt(30, 40, -30, 30, 0, 14) + bt(-30, 30, -30, -25, 0, 14)
             + bt(-30, 30, 25, 30, 0, 14) + bt(-11, 11, -6, 6, 0, 14))
-    out, ons = {}, {}
+    out, ons, raw, sts = {}, {}, {}, {}
     old = os.environ.pop("ENGINE_AIR_G0", None)
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -163,13 +202,38 @@ def test_lva_default_on_and_off_switches():
                               side_entry_holder=(25.0, 71.6),
                               air_descent_g0=flag)
                 out[tag], ons[tag] = json.dumps(m), st["lva"]["on"]
+                raw[tag], sts[tag] = m, st
     finally:
         os.environ.pop("ENGINE_AIR_G0", None)
         if old is not None:
             os.environ["ENGINE_AIR_G0"] = old
     assert ons == {"default": 1, "off": 0, "env0": 0}, ons
     assert out["off"] == out["env0"], "explicit off != ENGINE_AIR_G0=0"
-    assert out["default"] == out["off"], "BS1d: no G0 fires, yet on != off"
+    # A2 (coordinator-approved edit, replaces default == off byte for byte):
+    # with the r + R + h scan exactly one LVA G0 fires on this scene; the
+    # programs share a common prefix and suffix and differ only in the one
+    # span that starts with that vertical G0; the engine's checks hold and
+    # the independent judge (zmap) sees no rapid collision and no entry
+    # under standing stock (ZH1) in the default program.
+    a, b, sd = raw["default"], raw["off"], sts["default"]
+    assert sd["lva"]["g0"] == 1, sd["lva"]
+    i = next(k for k in range(min(len(a), len(b))) if a[k] != b[k])
+    t = 0
+    while t < min(len(a), len(b)) - i and a[-1 - t] == b[-1 - t]:
+        t += 1
+    mid = a[i:len(a) - t]
+    assert mid and mid[0]["g"] == 0 and i > 0 and \
+        (mid[0]["x"], mid[0]["y"]) == (a[i - 1]["x"], a[i - 1]["y"]) and \
+        mid[0]["z"] < a[i - 1]["z"], ("span does not start with the LVA G0",
+                                       a[i - 1:i + 2])
+    assert all(mv["g"] == 1 for mv in mid[1:]), "more than one G0 in the span"
+    assert all(mv["g"] == 1 for mv in b[i:len(b) - t]), "off span has a G0"
+    assert sd.get("clcheck_violations") == 0 and \
+        sd.get("n_axial_plunge", 0) == 0, (sd.get("clcheck_violations"),
+                                           sd.get("n_axial_plunge"))
+    zr = _zmap_judge(a)
+    assert zr["rapid_collisions"]["count"] == 0, zr["rapid_collisions"]
+    assert zr["entry_stock"]["count"] == 0, zr["entry_stock"]
     # the parser: --no-air-descent-g0 -> 0, nothing -> None (= default ON)
     import argparse
     orig = argparse.ArgumentParser.parse_args
