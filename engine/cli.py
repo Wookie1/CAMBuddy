@@ -533,6 +533,11 @@ def main(argv=None):
                         "height (G0 down to it) instead of the link plane: 1 "
                         "on, 0 off (default; env ENGINE_AIR_G0=1 also turns "
                         "it on); needs a known holder")
+    r.add_argument("--ll-overlap", dest="ll_overlap", type=int, default=None,
+                   help="run the --load-limit feed limiter in a worker while "
+                        "rough's closing clcheck runs: 0 off (all-inline), 1 "
+                        "on (default; env ENGINE_LL_OVERLAP=0 also turns it "
+                        "off); the program is identical either way")
     r.add_argument("--a2d-pool", dest="a2d_pool", type=int, default=None,
                    help="pass-opener Adaptive2d pre-run pool: 0 off "
                         "(byte-identical all-inline path), 1 on (default; "
@@ -874,6 +879,42 @@ def main(argv=None):
     # with no flute known the air-column class is OFF.
     flute = a.flute if a.flute is not None else \
         table_flute(kind, dia, a.tool_number, a.tools_json)
+    # OV1: the limiter only rewrites F words and the closing clcheck only
+    # reads XYZ, so the limiter can start on the final moves (on_moves) in a
+    # spawn worker while rough's gates run. Its result is used only if the
+    # returned moves pickle to the same bytes as the moves it was given;
+    # otherwise (or on any worker error) it runs inline as before.
+    one = bool(a.stock_out) and \
+        os.environ.get("STEVECAM_FORCE_REPLAY") != "1"
+    if a.ll_overlap is not None:
+        ov_on = bool(a.ll_overlap)
+    else:
+        ov_on = int(os.environ.get("ENGINE_LL_OVERLAP", "1")) != 0
+    ov = {}
+    stats_ov = {"started": 0, "used": 0, "fallback": 0, "error": 0}
+
+    def _ll_start(mv):
+        import multiprocessing as mp
+        import pickle
+        from concurrent.futures import ProcessPoolExecutor
+        from engine import load_limit
+        ov["data"] = pickle.dumps(mv, protocol=pickle.HIGHEST_PROTOCOL)
+        ov["ex"] = ProcessPoolExecutor(1, mp_context=mp.get_context("spawn"))
+        ov["fut"] = ov["ex"].submit(
+            load_limit.limit_feeds_pickled, ov["data"], dia, corner, a.stock,
+            a.stock[5], a.cut_feed, return_stock=one)
+        stats_ov["started"] = 1
+
+    def _ll_start_safe(mv):
+        try:
+            _ll_start(mv)
+        except Exception:   # noqa: BLE001  OV1: never fails the rough
+            if "ex" in ov:
+                ov["ex"].shutdown(wait=False, cancel_futures=True)
+            ov.clear()
+            stats_ov["error"] += 1
+    # ponytail: a rough that raises after on_moves leaves the limiter worker
+    # to finish (<= ~70 s on CF) before the process exits
     moves, stats = roughmod.rough(surf, tuple(a.stock), dia / 2.0, a.floor,
                                   leave=a.leave, stepdown=a.stepdown,
                                   stepover=stepover,
@@ -896,7 +937,9 @@ def main(argv=None):
                                     air_descent_g0=a.air_descent_g0,
                                     side_entry_holder=table_holder(
                                         kind, dia, a.tool_number,
-                                        a.tools_json))
+                                        a.tools_json),
+                                    on_moves=(_ll_start_safe if a.load_limit
+                                              and ov_on else None))
     # SK1: report the air-column feed-in maxima (absent when the class is off)
     if stats.get("sk1_feedin"):
         print("sk1: air-column feed-ins=%d max_ae=%.3f mm max_load=%.3f "
@@ -915,11 +958,29 @@ def main(argv=None):
         from engine import load_limit
         # SP-P1A: limit_feeds already replays the final stock; reuse it
         # (STEVECAM_FORCE_REPLAY=1 keeps the separate replay, for proofs)
-        one = bool(a.stock_out) and \
-            os.environ.get("STEVECAM_FORCE_REPLAY") != "1"
-        moves, lst, *ll_stock = load_limit.limit_feeds(
-            moves, dia, corner, a.stock, a.stock[5], a.cut_feed,
-            return_stock=one)
+        res = None
+        if "fut" in ov:
+            import pickle
+            try:
+                if pickle.dumps(moves, protocol=pickle.HIGHEST_PROTOCOL) \
+                        == ov["data"]:
+                    res = ov["fut"].result(timeout=roughmod._pool_timeout())
+                    stats_ov["used"] = 1
+                else:
+                    stats_ov["fallback"] = 1
+            except Exception as e:   # noqa: BLE001  OV1: worker failure -> inline
+                print("load_limit overlap: worker failed (%s: %s); limiter "
+                      "runs inline" % (type(e).__name__, e), file=sys.stderr)
+                stats_ov["error"] += 1
+                if isinstance(e, TimeoutError):   # FU2: a hung worker
+                    roughmod._pool_kill(ov["ex"])
+            ov["ex"].shutdown(wait=True, cancel_futures=True)
+        if res is None:
+            res = load_limit.limit_feeds(
+                moves, dia, corner, a.stock, a.stock[5], a.cut_feed,
+                return_stock=one)
+        moves, lst, *ll_stock = res
+        stats["ll_overlap"] = stats_ov
         print("load_limit: windows_slowed=%d mm_slowed=%.1f min_feed=%.0f "
               "floor_bound=%d" % (lst["windows_slowed"], lst["mm_slowed"],
                                   lst["min_feed"] or 0.0,

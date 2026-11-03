@@ -10,7 +10,10 @@
 (c) fallback: a precomputed input made to differ (a point dropped from a
     precomputed outer) -> the loop must discard the pooled result, run the
     level inline, and the program must equal the pool-off program;
-(d) a pooled job that raises in the worker -> inline, same program.
+(d) a pooled job that raises in the worker -> inline, same program;
+(e) F1 a pooled result labelled with another level's z -> fallback;
+(f) F2 the pool failing to start / submit failing -> inline, same program;
+(g) FU2 a hung worker -> timeout, inline, same program, no worker left.
 
 Small synthetic/TB scenes only; runnable directly with the VibeCAD python
 (opencamlib + area) or under pytest."""
@@ -153,6 +156,11 @@ def test_pl1_synth_pool_on_off():
             assert st.get("n_axial_plunge", 0) == 0
         assert st_on["pl1"]["used"] >= 1, \
             "pool on never used a precomputed result: %r" % (st_on["pl1"],)
+        # F1: every precomputed opener is used at its own level (a result
+        # swapped between openers is caught by the z check -> fallback)
+        assert st_on["pl1"]["used"] == st_on["pl1"]["precomputed"] \
+            and st_on["pl1"]["fallback"] == 0 \
+            and st_on["pl1"]["error"] == 0, st_on["pl1"]
         assert st_on.get("clcheck_violations", 0) == 0
         assert st_on.get("n_axial_plunge", 0) == 0
         same = ngc_off == ngc_on
@@ -240,12 +248,126 @@ def test_pl1_worker_failure_falls_back():
           "pool-off")
 
 
+def _wrong_z(job):
+    """Worker stand-in (by name): the real result labelled with another Z."""
+    from engine.rough import _a2d_pool_job
+    r = _a2d_pool_job(job)
+    return r[:3] + (r[3] + 1.0,)
+
+
+def test_pl1_result_of_other_level_falls_back():
+    """(e) F1: a pooled result whose z is not the level's must not be used:
+    fallback counted, a stderr line, program == pool-off."""
+    import contextlib
+    import io
+    from engine import rough as roughmod
+    ref_moves, _ref = _bs1d_rough(0, stepdown=8.0)
+    orig = roughmod._a2d_pool_job
+    roughmod._a2d_pool_job = _wrong_z
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            moves, st = _bs1d_rough(1, stepdown=8.0)
+    finally:
+        roughmod._a2d_pool_job = orig
+    assert st["pl1"]["precomputed"] == 1 and st["pl1"]["used"] == 0 \
+        and st["pl1"]["fallback"] == 1, st["pl1"]
+    assert "got the result of" in err.getvalue(), err.getvalue()[-500:]
+    assert json.dumps(moves) == json.dumps(ref_moves)
+    print("PASS pl1 other-level result: fallback, byte-identical to pool-off")
+
+
+class _NoPool:
+    """_pl1_pool stand-in: creation raises (F2)."""
+    def __init__(self, *a, **k):
+        raise OSError("pl1 test: spawn failed")
+
+
+class _BrokenSubmit:
+    """_pl1_pool stand-in: submit raises (F2)."""
+    def __init__(self, *a, **k):
+        pass
+
+    def submit(self, *a, **k):
+        from concurrent.futures.process import BrokenProcessPool
+        raise BrokenProcessPool("pl1 test: pool broken")
+
+    def shutdown(self, *a, **k):
+        pass
+
+
+def test_pl1_pool_start_failure_runs_inline():
+    """(f) F2: the opener pool failing to start, or submit() failing, never
+    fails the rough: every level inline, error counted, a stderr line,
+    program == pool-off."""
+    import contextlib
+    import io
+    from engine import rough as roughmod
+    ref_moves, _ref = _bs1d_rough(0, stepdown=8.0)
+    orig = roughmod._pl1_pool
+    for fake, msg in ((_NoPool, "opener pool not started"),
+                      (_BrokenSubmit, "not submitted")):
+        roughmod._pl1_pool = fake
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                moves, st = _bs1d_rough(1, stepdown=8.0)
+        finally:
+            roughmod._pl1_pool = orig
+        assert st["pl1"]["error"] == 1 and st["pl1"]["precomputed"] == 0 \
+            and st["pl1"]["used"] == 0, (fake.__name__, st["pl1"])
+        assert msg in err.getvalue(), (fake.__name__, err.getvalue()[-500:])
+        assert json.dumps(moves) == json.dumps(ref_moves), fake.__name__
+    print("PASS pl1 pool start/submit failure: inline, byte-identical")
+
+
+def _sleepy(job):
+    """Worker stand-in (by name): hangs 60 s before doing the real job."""
+    time.sleep(60.0)
+    from engine.rough import _a2d_pool_job
+    return _a2d_pool_job(job)
+
+
+def test_pl1_hung_worker_times_out():
+    """(g) FU2: an opener worker that hangs past ENGINE_POOL_TIMEOUT_S (3 s
+    here): the level runs inline (error counted), the program == pool-off,
+    the rough does not wait for the worker (well under its 60 s sleep) and
+    no worker process is left afterwards."""
+    import multiprocessing as mp
+    from engine import rough as roughmod
+    ref_moves, _ref = _bs1d_rough(0, stepdown=8.0)
+    orig = roughmod._a2d_pool_job
+    old = os.environ.get("ENGINE_POOL_TIMEOUT_S")
+    roughmod._a2d_pool_job = _sleepy
+    os.environ["ENGINE_POOL_TIMEOUT_S"] = "3"
+    try:
+        t0 = time.time()
+        moves, st = _bs1d_rough(1, stepdown=8.0)
+        dt = time.time() - t0
+    finally:
+        roughmod._a2d_pool_job = orig
+        if old is None:
+            os.environ.pop("ENGINE_POOL_TIMEOUT_S", None)
+        else:
+            os.environ["ENGINE_POOL_TIMEOUT_S"] = old
+    left = [c for c in mp.active_children()]
+    assert st["pl1"]["error"] == 1 and st["pl1"]["used"] == 0, st["pl1"]
+    assert json.dumps(moves) == json.dumps(ref_moves)
+    assert dt < 45.0, "rough waited %.1f s for a hung worker" % dt
+    assert not left, "worker processes left: %r" % left
+    print("PASS pl1 hung worker: timed out, inline, byte-identical, %.1f s, "
+          "no workers left" % dt)
+
+
 if __name__ == "__main__":
     fails = 0
     for fn in (test_pl1_pass_opener_rule, test_pl1_bs1d_pool_on_off,
                test_pl1_synth_pool_on_off,
                test_pl1_fallback_uses_inline_result,
-               test_pl1_worker_failure_falls_back):
+               test_pl1_worker_failure_falls_back,
+               test_pl1_result_of_other_level_falls_back,
+               test_pl1_pool_start_failure_runs_inline,
+               test_pl1_hung_worker_times_out):
         t0 = time.time()
         try:
             fn()

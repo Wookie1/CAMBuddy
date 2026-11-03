@@ -178,6 +178,12 @@ def _windows(recs):
     return windows
 
 
+def limit_feeds_pickled(data, *args, **kw):
+    """OV1: limit_feeds on a pickled move list, for a pool worker."""
+    import pickle
+    return limit_feeds(pickle.loads(data), *args, **kw)
+
+
 def limit_feeds(moves, dia, corner, box, top_z, cut_feed, fine=FINE,
                 return_stock=False):
     """Slow the feed on over-loaded ZE2 windows of an emitted rough move
