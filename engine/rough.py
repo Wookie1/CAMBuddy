@@ -2011,9 +2011,10 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # verified-clear bump), descend from the ACTUAL height: otherwise
             # the first helix segment bridges the lift at ~90 deg - a plunge.
             zt = prev[2] if (prev[2] is not None and prev[2] > zh) else zh
-            if _lva_on:   # A1b relies on the helix circle being island-legal
-                assert circ is not None and all(isl_ok(circ)), \
-                    "LVA: helix circle not island-legal at Z"
+            if _lva_on and (circ is None or not all(isl_ok(circ))):
+                # A1b relies on the helix circle being island-legal; an
+                # explicit raise (not assert) so it also holds under -O
+                raise RuntimeError("LVA: helix circle not island-legal at Z")
             zs = _lva_start(stock, cx, cy, r, s, z, tool_r, rapid_margin,
                             _sk1_holder) if _lva_on else None
             if zs is not None and zs < zt - 1e-6:
