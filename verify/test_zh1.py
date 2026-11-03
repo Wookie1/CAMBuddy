@@ -7,7 +7,8 @@ FreeCAD, no engine imports. Values are known from the grid:
     measured 4.0 mm (bar = max(pitch 1.0, 0.5));
 (c) offset side entry: G0 down a cleared column, horizontal feed-in into the
     wall at depth -> 0 (the run is the landing disk only);
-(d) serial == --jobs."""
+(d) serial == --jobs; (e) a ball is judged at its surface, not its tip; (f) a level traverse G0
+to a helix start is an entry."""
 import math
 import os
 import sys
@@ -83,6 +84,38 @@ def test_offset_side_entry_passes():
     assert abs(es["records"][0][5] - (-1.0)) < 1e-9, es
 
 
+def test_ball_judged_at_its_surface():
+    """(e) ball / flat on the same stock: a bowl standing 0.3 mm under a
+    6 mm ball's surface at the landing point (and 5 mm deep elsewhere). The
+    ball reads -0.3 (pass); a flat tool reads the rise at the outermost grid cell - 0.3 over
+    its tip (fail) - the rim stock a ball never touches only fails a flat."""
+    d = np.hypot(C[None, :] - 0.0, C[:, None] - 0.0)
+    rise = zmap.tool_dz("ball", 6.0, 3.0)(np.minimum(d, 3.0))
+    st = np.where(d <= 3.0 + 1e-9, 6.0 + rise - 0.3, 5.0)
+    lines = ["G0 X0 Y0 Z20", "G0 X0 Y0 Z6", "G1 X0 Y0 Z5.5 F100"]
+    moves = zmap.parse_gcode("G21 G90\n" + "\n".join(lines) + "\n")
+    out = {}
+    for tool, corner in (("ball", 3.0), ("flat", 0.0)):
+        r = zmap.simulate(moves, PART, CELL, X0, Y0, STOCK, tool=tool,
+                          dia=6.0, corner=corner, stock_init=st)
+        out[tool] = r["entry_stock"]
+    assert out["ball"]["count"] == 0, out["ball"]
+    assert abs(out["ball"]["max_mm"] - (-0.3)) < 1e-9, out["ball"]
+    assert out["flat"]["count"] == 1, out["flat"]
+    want = float(rise[d <= 3.0 + 1e-9].max()) - 0.3   # the grid's outermost cell
+    assert abs(out["flat"]["max_mm"] - want) < 1e-4, (want, out["flat"])
+
+
+def test_level_traverse_then_helix_is_judged():
+    """(f) a level G0 straight to the helix start (no descent G0) is an
+    entry too: the same inj3 shape reached by a traverse at Z6 fails."""
+    lines = ["G0 X3 Y0 Z6"] + helix(0, 0, 3, 6, 3)
+    r = run(lines, column_cleared(3, 0, 3.5, 5.0))
+    es = r["entry_stock"]
+    assert es["entries"] == 1 and es["count"] == 1, es
+    assert abs(es["records"][0][5] - 4.0) < 1e-9, es
+
+
 def test_parallel_equals_serial():
     lines = (["G0 X0 Y0 Z20", "G0 X3 Y0 Z11"] + helix(0, 0, 3, 11, 8)
              + ["G1 X0 Y0 Z8 F500", "G0 X0 Y0 Z20", "G0 X13 Y0 Z20",
@@ -97,6 +130,7 @@ def test_parallel_equals_serial():
 
 if __name__ == "__main__":
     for t in (test_helix_over_stock_passes, test_helix_under_standing_stock_fails,
-              test_offset_side_entry_passes, test_parallel_equals_serial):
+              test_offset_side_entry_passes, test_ball_judged_at_its_surface,
+              test_level_traverse_then_helix_is_judged, test_parallel_equals_serial):
         t()
         print("PASS", t.__name__)
