@@ -1187,14 +1187,22 @@ def _run_a2d(outers, holes, islands, tool_r, leave, stepover, tolerance,
 def _a2d_pool_job(job):
     """PL1: one pass-opener level's Adaptive2d in a pool worker: _run_a2d on
     a private stats dict; returns (regions, a2d_spnf delta,
-    a2d_dropped_outers list) - the parent applies those to its stats when
-    (and only when) the result is used."""
+    a2d_dropped_outers list, z) - the parent applies those to its stats when
+    (and only when) the result is used; z lets it check the result belongs
+    to the level it is used at (F1)."""
     (outers, holes, isl_in, tool_r, leave, stepover, tolerance,
      keep_tool_down, helix_dia, z) = job
     st = {"a2d_spnf": 0, "a2d_dropped_outers": []}
     regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
                        tolerance, keep_tool_down, helix_dia, z, st)
-    return regions, st["a2d_spnf"], st["a2d_dropped_outers"]
+    return regions, st["a2d_spnf"], st["a2d_dropped_outers"], z
+
+
+def _pl1_pool(n):
+    """PL1: the opener pool (one spawn ProcessPoolExecutor of n workers)."""
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+    return ProcessPoolExecutor(n, mp_context=mp.get_context("spawn"))
 
 
 def _pl1_same(a, b):
@@ -1204,6 +1212,25 @@ def _pl1_same(a, b):
         return bool(a == b)
     except Exception:   # noqa: BLE001
         return False
+
+
+def _pool_timeout():
+    """FU2: how long a pooled result may be waited for, in seconds
+    (ENGINE_POOL_TIMEOUT_S, default 900 - far beyond any normal part)."""
+    return float(os.environ.get("ENGINE_POOL_TIMEOUT_S", "900"))
+
+
+def _pool_kill(ex):
+    """FU2: stop a pool whose worker hangs. cancel() cannot stop a running
+    future, so terminate the worker processes, then shut the pool down."""
+    # ponytail: ProcessPoolExecutor._processes is private; Python 3.14 has
+    # terminate_workers() - switch when the VibeCAD python moves to it
+    procs = list((getattr(ex, "_processes", None) or {}).values())
+    for p in procs:
+        p.terminate()
+    for p in procs:
+        p.join(5)
+    ex.shutdown(wait=False, cancel_futures=True)
 
 
 def _pl1_close(ex, futs):
@@ -1397,7 +1424,8 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           clip_bridge_mm=5.0, feed_link_max=40.0,
           progress=None, stock_out=None, ramp_angle_deg=2.0,
           side_entry_faces=None, side_entry_min_z=None, flute_mm=None,
-          side_entry_holder=None, a2d_pool=None, _pl1_held=None):
+          side_entry_holder=None, a2d_pool=None, _pl1_held=None,
+           on_moves=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -2735,26 +2763,37 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     a2d_pre = {}
     a2d_futs = {}
     a2d_ex = None
+    pl1_err = 0
     if a2d_on and a2d_openers:
-        import multiprocessing as mp
-        from concurrent.futures import ProcessPoolExecutor
-        a2d_ex = ProcessPoolExecutor(
-            min(len(a2d_openers), ISLAND_POOL),
-            mp_context=mp.get_context("spawn"))
-        if _pl1_held is not None:
+        try:   # F2: a pool that cannot start never fails the rough
+            a2d_ex = _pl1_pool(min(len(a2d_openers), ISLAND_POOL))
+        except Exception as e:   # noqa: BLE001
+            print("rough PL1: opener pool not started (%s: %s); every level "
+                  "runs inline" % (type(e).__name__, e), file=sys.stderr)
+            a2d_ex = None
+            pl1_err += 1
+        if a2d_ex is not None and _pl1_held is not None:
             _pl1_held.append((a2d_ex, a2d_futs))
-        for zo in a2d_openers:
+        for zo in (a2d_openers if a2d_ex is not None else ()):
             skip, inp = _level_a2d_inputs(zo)
             if skip is not None or inp is None:
                 continue
             job = (inp["outers"], inp["holes"], inp["isl_in"], tool_r,
                    leave, stepover, tolerance, keep_tool_down, helix_dia,
                    zo)
+            try:   # F2: e.g. BrokenProcessPool -> that opener runs inline
+                fut = a2d_ex.submit(_a2d_pool_job, job)
+            except Exception as e:   # noqa: BLE001
+                print("rough PL1: opener Z%.3f not submitted (%s: %s); it "
+                      "runs inline" % (zo, type(e).__name__, e),
+                      file=sys.stderr)
+                pl1_err += 1
+                continue
             a2d_pre[zo] = job[:3]
-            a2d_futs[zo] = a2d_ex.submit(_a2d_pool_job, job)
+            a2d_futs[zo] = fut
     stats["pl1"] = {"openers": len(a2d_openers),
                     "precomputed": len(a2d_futs), "used": 0, "fallback": 0,
-                    "error": 0, "t_wait_s": 0.0}
+                    "error": pl1_err, "t_wait_s": 0.0}
 
     zi = 0
     for z in order:
@@ -2789,17 +2828,30 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # the pooled result and apply its stats deltas where the inline
             # call would have.
             try:
-                pooled = fut.result()
-            except Exception:   # noqa: BLE001  R1: never fails the rough
+                pooled = fut.result(timeout=_pool_timeout())
+            except Exception as e:   # noqa: BLE001  R1: never fails the rough
+                print("rough PL1: opener Z%.3f worker failed (%s: %s); level "
+                      "runs inline" % (z, type(e).__name__, e),
+                      file=sys.stderr)
                 stats["pl1"]["error"] += 1
+                if isinstance(e, TimeoutError):   # FU2: a hung worker
+                    _pool_kill(a2d_ex)
             else:
-                regions, spnf_d, drops_l = pooled
-                stats["a2d_spnf"] += spnf_d
-                stats["a2d_dropped_outers"].extend(drops_l)
-                stats["pl1"]["used"] += 1
+                if pooled[3] != z:   # F1: a result from another level
+                    print("rough PL1: opener Z%.3f got the result of Z%.3f; "
+                          "level runs inline" % (z, pooled[3]),
+                          file=sys.stderr)
+                    stats["pl1"]["fallback"] += 1
+                else:
+                    regions, spnf_d, drops_l = pooled[:3]
+                    stats["a2d_spnf"] += spnf_d
+                    stats["a2d_dropped_outers"].extend(drops_l)
+                    stats["pl1"]["used"] += 1
             stats["pl1"]["t_wait_s"] += time.time() - t0
         elif fut is not None:   # inputs differ: never use that result
             fut.cancel()
+            print("rough PL1: opener Z%.3f inputs differ from the "
+                  "precomputed ones; level runs inline" % z, file=sys.stderr)
             stats["pl1"]["fallback"] += 1
         if regions is None:
             regions = _run_a2d(outers, holes, isl_in, tool_r, leave, stepover,
@@ -3486,6 +3538,10 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         _pl1_close(a2d_ex, a2d_futs)   # PL1: opener pool down before the gates
     if prev[0] is not None:
         emit({"g": 0, "x": prev[0], "y": prev[1], "z": clearance_z})
+    if on_moves is not None:
+        # OV1: the final move list, before the closing gates (the caller may
+        # start work on it that the gates do not change, e.g. the load limiter)
+        on_moves(moves)
     if allowance_check:
         # R2 item 2: independent CLCHECK gate - exact one-sided drop-cutter
         # with the ACTUAL cutter on every cutting move (separate code path
