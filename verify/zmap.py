@@ -1126,16 +1126,20 @@ def _zh1_start(resolved, szmax):
     return [xy[0], xy[1], fz]
 
 
-def zh1_entries(resolved, cur, xs, ys, R, cell):
+def zh1_entries(resolved, cur, xs, ys, R, cell, dzf):
     """Task ZH1: every descent entry of the program, from geometry only.
 
-    An entry is a G0 whose end Z is below its start Z, followed directly by
-    a feed move (G1/G2/G3). Its run is that feed move and the consecutive
+    An entry is any G0 followed directly by a feed move (G1/G2/G3): a
+    descent G0 onto a feed, or a traverse G0 to a helix / ramp start. Its
+    run is that feed move and the consecutive
     descending feed moves after it (the helix / ramp / straight feed-down);
     a first feed move that does not descend (side / offset feed-in, a link
     at depth) makes a run of the G0 end point alone. The run's footprint is
     every grid cell whose centre lies within R of any zmap sample of the
-    run (the same samples and the same d <= R test the cut uses). The bar
+    run (the same samples and the same d <= R test the cut uses); each
+    cell is judged against the tool SURFACE at the run's closest approach to
+    it (dzf(d_min): 0 for a flat bottom, the sphere / corner rise for a
+    ball / bull), so a ball's rim never counts stock it cannot touch. The bar
     is max(pitch, ZH1_MIN_BAR): the measured helix pitch of the run's
     points (None for a ramp / straight feed). Keyed by the global index of
     the first feed move; simulate() measures the live stock there."""
@@ -1162,18 +1166,19 @@ def zh1_entries(resolved, cur, xs, ys, R, cell):
         ihi = min(len(xs), int(np.searchsorted(xs, P[:, 0].max() + R + cell)))
         jlo = max(0, int(np.searchsorted(ys, P[:, 1].min() - R - cell)))
         jhi = min(len(ys), int(np.searchsorted(ys, P[:, 1].max() + R + cell)))
-        m = np.zeros((max(0, jhi - jlo), max(0, ihi - ilo)), dtype=bool)
+        dmin = np.full((max(0, jhi - jlo), max(0, ihi - ilo)), np.inf)
         gx, gy = xs[ilo:ihi], ys[jlo:jhi]
         for (sx, sy) in P[:, :2]:
-            m |= np.hypot((gx - sx)[None, :], (gy - sy)[:, None]) <= R + 1e-9
-        return (jlo, jhi, ilo, ihi, m)
+            np.minimum(dmin, np.hypot((gx - sx)[None, :], (gy - sy)[:, None]),
+                       out=dmin)
+        m = dmin <= R + 1e-9
+        return (jlo, jhi, ilo, ihi, m, dzf(np.minimum(dmin[m], R)))
 
     out = {}
     for i in range(len(resolved) - 1):
         j = i + 1
         if ends[i] is None or resolved[i]["motion"] != "G0" or \
-                ends[i][1][2] >= ends[i][0][2] - 1e-6 or ends[j] is None \
-                or resolved[j]["motion"] not in feed:
+                ends[j] is None or resolved[j]["motion"] not in feed:
             continue
         e = ends[i][1]
         pts, smp, k = [e], [e], j
@@ -1192,10 +1197,11 @@ def zh1_entries(resolved, cur, xs, ys, R, cell):
 
 
 def _zh1_measure(e, stock):
-    """Max live stock above the entry tip in a footprint (-inf if none)."""
+    """Max live stock above the entry's tool surface in a footprint, mm
+    over the tip height (-inf if none)."""
     def top(b):
-        jlo, jhi, ilo, ihi, m = b
-        v = stock[jlo:jhi, ilo:ihi][m]
+        jlo, jhi, ilo, ihi, m, lift = b
+        v = stock[jlo:jhi, ilo:ihi][m] - lift
         return float(v.max()) - e["z"] if v.size else -math.inf
     return top(e["col"]), top(e["disk"])
 
@@ -1683,7 +1689,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     else:
         cur = [0.0, 0.0, float(szmax)]
     if zh1 is None:
-        zh1 = zh1_entries(resolved, list(cur), xs, ys, R, cell)
+        zh1 = zh1_entries(resolved, list(cur), xs, ys, R, cell, dz)
     zh1_recs = []
     rapid_collisions = 0
     first_rapid_line = None
@@ -2382,7 +2388,8 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
     ny_, nx_ = part.shape   # task ZH1: entries from the FULL program
     zh1 = zh1_entries(moves, _zh1_start(moves, stock_box[5]),
                       x0 + (np.arange(nx_) + 0.5) * cell,
-                      y0 + (np.arange(ny_) + 0.5) * cell, dia / 2.0, cell)
+                      y0 + (np.arange(ny_) + 0.5) * cell, dia / 2.0, cell,
+                      tool_dz(tool, dia, corner))
     per = int(math.ceil(n / float(jobs)))
     for c in range(0, n, per):
         spans.append(slice(c, min(n, c + per)))
