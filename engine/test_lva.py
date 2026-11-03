@@ -98,6 +98,30 @@ def test_lva_start_values():
           "holder None" % (zs, zs_w, zs_s, zs_t, zs_r, zs_h, zs_l))
 
 
+def test_lva_margin_band():
+    """(a') the scan band between the helix's swept disk and the +margin
+    scan radius: a part>Z cell with a tall terrace must NOT lift the start;
+    a part<=Z cell under tall stock MUST lift it."""
+    # boundary band: cells between the swept disk (r + R = 9.513) and the
+    # scan radius (+ margin = 10.513), at x 9.8..10.4 (cell centre 10.25)
+    band = (9.8, 10.4, -1.0, 1.0)
+    # (i) part ABOVE Z there with a tall terrace on it: island at Z, must
+    # NOT lift the start
+    bi = _field([band + (8.0,)])
+    bi.top[bi.part > -np.inf] = 25.0
+    zs_bi = _start(bi)
+    assert zs_bi is not None and abs(zs_bi - 11.0) < 1e-6, \
+        "terrace on part > Z in the margin band: %r" % zs_bi
+    # (ii) part at/below Z there (part 3) under tall stock: MUST lift it
+    bii = _field([band + (3.0,)])
+    bii.top[bii.part > -np.inf] = 15.0
+    zs_bii = _start(bii)
+    assert zs_bii is not None and abs(zs_bii - 16.0) < 1e-6, \
+        "stock on part <= Z in the margin band: %r" % zs_bii
+    print("PASS lva margin band: part>Z terrace %.3f, part<=Z stock %.3f"
+          % (zs_bi, zs_bii))
+
+
 def test_lva_off_byte_identical():
     from opencamlib import ocl
     from engine.rough import rough
@@ -127,4 +151,5 @@ def test_lva_off_byte_identical():
 
 if __name__ == "__main__":
     test_lva_start_values()
+    test_lva_margin_band()
     test_lva_off_byte_identical()
