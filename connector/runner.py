@@ -165,6 +165,16 @@ def _check_zmap_gates(check):
             "zmap gate: %d rapid collisions (first line %s)"
             % (rapids["count"], rapids.get("first_line", "?")),
             code="rapid_collisions", where=_xy_where(rapids))
+    # task ZH1: a descent entry must not start its first feed under standing
+    # stock anywhere in the run's swept footprint (helix first-turn side cut)
+    es = check.get("entry_stock")
+    if isinstance(es, dict) and es.get("count", 0) > 0:
+        raise EngineError(
+            "zmap gate: %d entries start under standing stock (worst %.3f mm "
+            "over the bar %s, first line %s)"
+            % (es["count"], es.get("max_over_bar_mm", 0.0), es.get("bar"),
+               es.get("first_line", "?")),
+            code="entry_stock", where=_xy_where(es))
     of = check.get("over_flute")
     if isinstance(of, dict) and of.get("count", 0) > 0:
         raise EngineError(

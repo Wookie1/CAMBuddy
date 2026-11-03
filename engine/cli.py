@@ -527,6 +527,15 @@ def main(argv=None):
                   help="parallel waterline workers (default $ENGINE_WORKERS or 4)")
     r.add_argument("--tolerance", type=float, default=ROUGH_A2D_TOLERANCE,
                   help="Adaptive2d path tolerance mm")
+    r.add_argument("--air-descent-g0", dest="air_descent_g0", type=int,
+                   default=None,
+                   help="helix entries start at their own column's clear "
+                        "height (G0 down to it) instead of the link plane: 1 "
+                        "on (default), 0 off (also --no-air-descent-g0 or env "
+                        "ENGINE_AIR_G0=0); needs a known holder")
+    r.add_argument("--no-air-descent-g0", dest="air_descent_g0",
+                   action="store_const", const=0,
+                   help="same as --air-descent-g0 0")
     r.add_argument("--ll-overlap", dest="ll_overlap", type=int, default=None,
                    help="run the --load-limit feed limiter in a worker while "
                         "rough's closing clcheck runs: 0 off (all-inline), 1 "
@@ -928,6 +937,7 @@ def main(argv=None):
                                     side_entry_min_z=a.side_entry_min_z,
                                     flute_mm=flute,
                                     a2d_pool=a.a2d_pool,
+                                    air_descent_g0=a.air_descent_g0,
                                     side_entry_holder=table_holder(
                                         kind, dia, a.tool_number,
                                         a.tools_json),

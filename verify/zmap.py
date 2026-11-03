@@ -1112,6 +1112,120 @@ def _helix_pitch(run):
     return round(dz / (arc / (2.0 * math.pi * r)), 4)
 
 
+ZH1_MIN_BAR = 0.5  # mm: entry-stock bar floor, constant, never raise it later
+
+
+def _zh1_start(resolved, szmax):
+    """Machine position before resolved[0], exactly as simulate() starts."""
+    if not resolved:
+        return [0.0, 0.0, float(szmax)]
+    xy = next(((m["x"], m["y"]) for m in resolved
+               if m["x"] is not None and m["y"] is not None), (0.0, 0.0))
+    fz = next((m["z"] for m in resolved if m.get("z") is not None),
+              float(szmax))
+    return [xy[0], xy[1], fz]
+
+
+def zh1_entries(resolved, cur, xs, ys, R, cell, dzf):
+    """Task ZH1: every descent entry of the program, from geometry only.
+
+    An entry is any G0 followed directly by a feed move (G1/G2/G3): a
+    descent G0 onto a feed, or a traverse G0 to a helix / ramp start. Its
+    run is that feed move and the consecutive
+    descending feed moves after it (the helix / ramp / straight feed-down);
+    a first feed move that does not descend (side / offset feed-in, a link
+    at depth) makes a run of the G0 end point alone. The run's footprint is
+    every grid cell whose centre lies within R of any zmap sample of the
+    run (the same samples and the same d <= R test the cut uses); each
+    cell is judged against the tool SURFACE at the run's closest approach to
+    it (dzf(d_min): 0 for a flat bottom, the sphere / corner rise for a
+    ball / bull), so a ball's rim never counts stock it cannot touch. The bar
+    is max(pitch, ZH1_MIN_BAR): the measured helix pitch of the run's
+    points (None for a ramp / straight feed). Keyed by the global index of
+    the first feed move; simulate() measures the live stock there."""
+    ends, c = [], list(cur)
+    for mv in resolved:   # mirrors simulate()'s position bookkeeping
+        if mv["motion"] in ("G2", "G3") and (mv["x"] is None
+                                             or mv["y"] is None):
+            ends.append(None)
+            continue
+        e = (mv["x"] if mv["x"] is not None else c[0],
+             mv["y"] if mv["y"] is not None else c[1],
+             mv["z"] if mv["z"] is not None else c[2])
+        ends.append((tuple(c), e))
+        c = list(e)
+    feed = ("G1", "G2", "G3")
+
+    def desc(k):
+        return (ends[k] is not None and resolved[k]["motion"] in feed
+                and ends[k][1][2] < ends[k][0][2] - 1e-6)
+
+    def mask(pts):
+        P = np.asarray(pts, dtype=float)
+        ilo = max(0, int(np.searchsorted(xs, P[:, 0].min() - R - cell)))
+        ihi = min(len(xs), int(np.searchsorted(xs, P[:, 0].max() + R + cell)))
+        jlo = max(0, int(np.searchsorted(ys, P[:, 1].min() - R - cell)))
+        jhi = min(len(ys), int(np.searchsorted(ys, P[:, 1].max() + R + cell)))
+        dmin = np.full((max(0, jhi - jlo), max(0, ihi - ilo)), np.inf)
+        gx, gy = xs[ilo:ihi], ys[jlo:jhi]
+        for (sx, sy) in P[:, :2]:
+            np.minimum(dmin, np.hypot((gx - sx)[None, :], (gy - sy)[:, None]),
+                       out=dmin)
+        m = dmin <= R + 1e-9
+        return (jlo, jhi, ilo, ihi, m, dzf(np.minimum(dmin[m], R)))
+
+    out = {}
+    for i in range(len(resolved) - 1):
+        j = i + 1
+        if ends[i] is None or resolved[i]["motion"] != "G0" or \
+                ends[j] is None or resolved[j]["motion"] not in feed:
+            continue
+        e = ends[i][1]
+        pts, smp, k = [e], [e], j
+        while k < len(resolved) and desc(k):
+            m = dict(resolved[k])
+            m["x"], m["y"], m["z"] = ends[k][1]
+            smp += _move_samples(m, list(ends[k][0]), cell)[0]
+            pts.append(ends[k][1])
+            k += 1
+        pitch = _helix_pitch(pts)
+        out[j] = {"line": resolved[j].get("line"), "x": e[0], "y": e[1],
+                  "z": e[2], "pitch": pitch,
+                  "bar": max(pitch or 0.0, ZH1_MIN_BAR),
+                  "disk": mask(smp), "col": mask([e])}
+    return out
+
+
+def _zh1_measure(e, stock):
+    """Max live stock above the entry's tool surface in a footprint, mm
+    over the tip height (-inf if none)."""
+    def top(b):
+        jlo, jhi, ilo, ihi, m, lift = b
+        v = stock[jlo:jhi, ilo:ihi][m] - lift
+        return float(v.max()) - e["z"] if v.size else -math.inf
+    return top(e["col"]), top(e["disk"])
+
+
+def _zh1_report(recs):
+    """Task ZH1 gate block from per-entry records [idx, line, x, y, z,
+    pitch, bar, col_mm, disk_mm]: count = entries whose standing stock
+    above the tip anywhere in the run's footprint exceeds the bar."""
+    recs = sorted(recs)
+    bad = [r for r in recs if r[8] > r[6] + 1e-6]
+    fin = [r[8] for r in recs if r[8] > -math.inf]
+    w = max(bad, key=lambda r: r[8] - r[6]) if bad else None
+    return {"count": len(bad), "entries": len(recs),
+            "max_mm": round(max(fin), 4) if fin else None,
+            "max_over_bar_mm": round(w[8] - w[6], 4) if w else 0.0,
+            "worst_xy": [w[2], w[3]] if w else None,
+            "first_line": bad[0][1] if bad else None,
+            "bar": "max(helix pitch, %.1f mm)" % ZH1_MIN_BAR,
+            "records": [[r[1], round(r[4], 4), r[5], round(r[6], 4),
+                         None if r[7] == -math.inf else round(r[7], 4),
+                         None if r[8] == -math.inf else round(r[8], 4)]
+                        for r in recs]}
+
+
 def _ae2_engagement_keys(win_recs, dia, design_ae=None, design_stepdown=None,
                          load_rule=None):
     """Task ZE2 (report-only): engagement keys from the ae2 windows. Old keys
@@ -1354,7 +1468,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
              corner=0.0, stock_init=None, window=None, rapid_feed=RAPID_FEED,
              start=None, flute=None, shank_dia=None, holder=None,
              stickout=None, engage_max=None, ramp_angle=3.0,
-             engage_report=False, idx_offset=0):
+             engage_report=False, idx_offset=0, zh1=None):
     """Run the toolpath over a stock heightfield.
 
     part      : (ny, nx) array of part top-Z heights
@@ -1406,6 +1520,9 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
                 the nose. Reported as holder_hits: count of cutting moves with
                 a hit, max intrusion mm above the nose, worst xy, first line.
     stickout  : holder nose distance above the tool tip mm (with holder).
+    zh1       : task ZH1 entries {global idx: entry} from zh1_entries (the
+                parallel driver builds them once on the full list); None =
+                build them here from this (whole) program.
     Returns dict with 'stock' array and report fields.
     """
     sxmin, sxmax, symin, symax, szmin, szmax = stock_box
@@ -1571,6 +1688,9 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         cur = [first_xy[0], first_xy[1], fz]
     else:
         cur = [0.0, 0.0, float(szmax)]
+    if zh1 is None:
+        zh1 = zh1_entries(resolved, list(cur), xs, ys, R, cell, dz)
+    zh1_recs = []
     rapid_collisions = 0
     first_rapid_line = None
     cut_length = 0.0
@@ -1625,6 +1745,11 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     bsb_raw = []  # task ZG1: {line, x, y, depth} below the stock bottom
 
     for mi, mv in enumerate(resolved):
+        ze = zh1.get(mi + idx_offset)
+        if ze is not None:   # task ZH1: live stock BEFORE the run's first cut
+            zc, zd = _zh1_measure(ze, stock)
+            zh1_recs.append([mi + idx_offset, ze["line"], ze["x"], ze["y"],
+                             ze["z"], ze["pitch"], ze["bar"], zc, zd])
         if mv.get("comp"):
             comp_moves += 1
             if comp_first_line is None:
@@ -2141,6 +2266,8 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         "zcut_kernel": "c" if kern is not None else "python",
         "rapid_collisions": {"count": rapid_collisions,
                             "first_line": first_rapid_line},
+        "entry_stock": _zh1_report(zh1_recs),
+        "_zh1_raw": zh1_recs,
         "outside_grid": {"count": outside_grid,
                          "first_line": first_outside_line},
         "below_stock_bottom": _bsb_report(bsb_raw),
@@ -2243,7 +2370,7 @@ def _chunk_worker(idx):
                     shank_dia=g["shank_dia"], holder=g["holder"],
                     stickout=g["stickout"], engage_max=g["engage_max"],
                     ramp_angle=g["ramp_angle"], engage_report=g["engage_report"],
-                    idx_offset=g["spans"][idx].start)
+                    idx_offset=g["spans"][idx].start, zh1=g["zh1"])
 
 
 def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
@@ -2258,6 +2385,11 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                  float(stock_box[5]))
     moves = resolve_moves(moves, z_init=z_init)
     spans, n = [], len(moves)
+    ny_, nx_ = part.shape   # task ZH1: entries from the FULL program
+    zh1 = zh1_entries(moves, _zh1_start(moves, stock_box[5]),
+                      x0 + (np.arange(nx_) + 0.5) * cell,
+                      y0 + (np.arange(ny_) + 0.5) * cell, dia / 2.0, cell,
+                      tool_dz(tool, dia, corner))
     per = int(math.ceil(n / float(jobs)))
     for c in range(0, n, per):
         spans.append(slice(c, min(n, c + per)))
@@ -2267,7 +2399,7 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                   window=window, rapid_feed=rapid_feed, flute=flute,
                   shank_dia=shank_dia, holder=holder, stickout=stickout,
                   engage_max=engage_max, ramp_angle=ramp_angle,
-                  engage_report=engage_report)
+                  engage_report=engage_report, zh1=zh1)
     # true machine position at each chunk start = end of the previous chunk's
     # last move (chunks must not simulate their first move from its own target)
     start_per = []
@@ -2306,6 +2438,9 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                              default=None),
             "note": "exact under --jobs (two-pass prefix stock + chunk starts)",
         },
+        # task ZH1: pass-2 chunks start from the exact prefix stock
+        "entry_stock": _zh1_report([r for x in results for r in x["_zh1_raw"]]),
+        "_zh1_raw": [r for x in results for r in x["_zh1_raw"]],
         "outside_grid": {
             "count": sum(r["outside_grid"]["count"] for r in results),
             "first_line": min((r["outside_grid"]["first_line"]
@@ -2786,6 +2921,7 @@ def main(argv=None):
         "leftover": res["leftover"],
         "within_0p5mm_fraction": res["within_0p5mm_fraction"],
         "rapid_collisions": res["rapid_collisions"],
+        "entry_stock": res["entry_stock"],
         "plunge_over_flute": res["plunge_over_flute"],
         "over_flute": res["over_flute"],
         "holder_hits": res["holder_hits"],

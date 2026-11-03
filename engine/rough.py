@@ -1319,6 +1319,59 @@ def holder_clears(stock, pts, z, holder_r, stickout):
         <= z + stickout - 1.0
 
 
+def _cut_top_max(stock, x, y, rad, z):
+    """A1b: highest stock within rad of (x, y) that a helix legal at level z
+    can reach: cells whose part is at or below z. A cell whose part stands
+    above z is island at z (and, for a heightfield, at every higher Z), so
+    whatever stock sits on it is out of the helix's reach. -inf when none."""
+    c = stock.cell
+    k = int(math.ceil(rad / c)) + 1
+    i0, j0 = stock._ci(x), stock._cj(y)
+    ia, ib = max(i0 - k, 0), min(i0 + k + 1, stock.nx)
+    ja, jb = max(j0 - k, 0), min(j0 + k + 1, stock.ny)
+    if ia >= ib or ja >= jb:
+        return -np.inf
+    t = stock.top[ja:jb, ia:ib]
+    xs = stock.x0 + (np.arange(ia, ib) + 0.5) * c
+    ys = stock.y0 + (np.arange(ja, jb) + 0.5) * c
+    m = ((xs[None, :] - x) ** 2 + (ys[:, None] - y) ** 2) <= rad * rad
+    if stock.part is not None:
+        m &= ~(stock.part[ja:jb, ia:ib] > z)
+    m &= np.isfinite(t)
+    return float(t[m].max()) if m.any() else -np.inf
+
+
+def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder):
+    """LVA (lever A, A1b rule): the lowest height a helix entry may start at,
+    G0 down the column at its start point s. Never under z + 0.3, and:
+    - margin over the highest stock in the helix's swept disk (r + tool_r +
+      margin about (cx, cy)) standing on cells whose part is at or below z:
+      the first turns must not side-cut it. The PART in that disk, and stock
+      sitting on part above z, are not counted: the helix circle
+      is island-legal at its level (try_cand validates it with isl_ok), and
+      for a 3-axis heightfield the island at any higher Z is a subset of the
+      island at the level, so the descending helix cannot reach the part;
+    - margin over max(stock, part) within tool_r + margin of the G0 column s
+      (the R5 rapid convention; emit() checks it again);
+    - the holder nose >= 1 mm over stock/part within holder_r + 1 at s
+      (holder_clears, M2).
+    None when the holder is unknown (today's start stays)."""
+    if holder is None:
+        return None
+    zc = max(_cut_top_max(stock, cx, cy, r + tool_r + margin, z),
+             stock.link_top_max([(s[0], s[1]), (s[0], s[1])],
+                                tool_r + margin))
+    zs = max(zc + margin, z + 0.3) if zc > -1e8 else z + 0.3
+    h_r, h_so = holder
+    zhd = stock.link_top_max([(s[0], s[1]), (s[0], s[1])], h_r + 1.0)
+    if zhd > -1e8:
+        zs = max(zs, zhd - h_so + 1.0)
+    zs = round(zs, 4)
+    # a zero-length segment: link_top_max reads segments, not lone points
+    return zs if holder_clears(stock, [(s[0], s[1]), (s[0], s[1])], zs, h_r,
+                               h_so) else None
+
+
 def vise_height_guard(moves, stock_box, tool_r, min_z, stats=None):
     """M1 (vise avoidance by height): with side entry on, the vise jaws sit
     beside the stock below min_z (the finished part's bottom). EVERY move -
@@ -1425,7 +1478,7 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           progress=None, stock_out=None, ramp_angle_deg=2.0,
           side_entry_faces=None, side_entry_min_z=None, flute_mm=None,
           side_entry_holder=None, a2d_pool=None, _pl1_held=None,
-           on_moves=None):
+          on_moves=None, air_descent_g0=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -1502,6 +1555,14 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     # M2: (holder max radius, stick-out) of the cutting tool; None = unknown,
     # and an air column is then never used (fail closed)
     _sk1_holder = side_entry_holder
+    # LVA (lever A): a helix entry starts at its own column's clear height
+    # (G0 down to it) instead of spiralling at ramp feed from the link plane
+    # through ground earlier levels already cleared. Default ON; off with
+    # ENGINE_AIR_G0=0 or --no-air-descent-g0 / --air-descent-g0 0.
+    if air_descent_g0 is not None:
+        _lva_on = bool(air_descent_g0)
+    else:
+        _lva_on = int(os.environ.get("ENGINE_AIR_G0", "1")) != 0
     sk1_block = [None]   # why the last SK1 search found no column
     if clearance_z is None:
         clearance_z = szmax + 2.0
@@ -1947,6 +2008,18 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # verified-clear bump), descend from the ACTUAL height: otherwise
             # the first helix segment bridges the lift at ~90 deg - a plunge.
             zt = prev[2] if (prev[2] is not None and prev[2] > zh) else zh
+            if _lva_on:   # A1b relies on the helix circle being island-legal
+                assert circ is not None and all(isl_ok(circ)), \
+                    "LVA: helix circle not island-legal at Z"
+            zs = _lva_start(stock, cx, cy, r, s, z, tool_r, rapid_margin,
+                            _sk1_holder) if _lva_on else None
+            if zs is not None and zs < zt - 1e-6:
+                # LVA: G0 down the column to zs (emit() still R5-checks it)
+                z_from = prev[2]
+                emit({"g": 0, "x": s[0], "y": s[1], "z": zs})
+                zt = prev[2]
+                stats["lva"]["g0"] += 1
+                stats["lva"]["g0_mm"] += z_from - zt
             hx, hy, hz = s[0], s[1], zt
             for hv in _helix_moves(cx, cy, s[0], s[1], zt, z, ramp_feed, r,
                                   ramp_angle_deg):
@@ -2791,6 +2864,8 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 continue
             a2d_pre[zo] = job[:3]
             a2d_futs[zo] = fut
+    stats["lva"] = {"on": int(_lva_on and _sk1_holder is not None),
+                    "g0": 0, "g0_mm": 0.0}
     stats["pl1"] = {"openers": len(a2d_openers),
                     "precomputed": len(a2d_futs), "used": 0, "fallback": 0,
                     "error": pl1_err, "t_wait_s": 0.0}
