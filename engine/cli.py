@@ -531,8 +531,11 @@ def main(argv=None):
                    default=None,
                    help="helix entries start at their own column's clear "
                         "height (G0 down to it) instead of the link plane: 1 "
-                        "on, 0 off (default; env ENGINE_AIR_G0=1 also turns "
-                        "it on); needs a known holder")
+                        "on (default), 0 off (also --no-air-descent-g0 or env "
+                        "ENGINE_AIR_G0=0); needs a known holder")
+    r.add_argument("--no-air-descent-g0", dest="air_descent_g0",
+                   action="store_const", const=0,
+                   help="same as --air-descent-g0 0")
     r.add_argument("--ll-overlap", dest="ll_overlap", type=int, default=None,
                    help="run the --load-limit feed limiter in a worker while "
                         "rough's closing clcheck runs: 0 off (all-inline), 1 "

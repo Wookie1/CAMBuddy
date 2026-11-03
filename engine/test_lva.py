@@ -6,7 +6,7 @@ _lva_start() instead of spiralling at ramp feed from the link plane.
     standing in that disk does; part at the G0 column (R5 term) does; a wall
     inside the holder radius lifts it to the holder-safe height; unknown
     holder -> None (today's start);
-(b) rough() on the BS1d scene: default == explicit off byte for byte.
+(b) LVA default ON; explicit off / ENGINE_AIR_G0=0 / --no-air-descent-g0 off.
 Runnable directly or under pytest from VibeCAD python."""
 import json
 import os
@@ -122,34 +122,80 @@ def test_lva_margin_band():
           % (zs_bi, zs_bii))
 
 
-def test_lva_off_byte_identical():
+class _Parsed(Exception):
+    def __init__(self, ns):
+        super().__init__("parsed")
+        self.ns = ns
+
+
+def test_lva_default_on_and_off_switches():
+    """(b) LVA is ON by default (stats lva.on == 1 with no flag or env);
+    explicit off (air_descent_g0=0) and ENGINE_AIR_G0=0 both turn it off and
+    give the same program; on the BS1d scene (no G0 fires) default == off
+    byte for byte. Also: engine.cli parses --no-air-descent-g0 to 0."""
     from opencamlib import ocl
+    from engine import cli
     from engine.rough import rough
     from engine.test_engine import _box_tris, _write_stl
     bt = _box_tris
     tris = (bt(-40, 40, -30, 30, -1, 0) + bt(-40, -30, -30, 30, 0, 14)
             + bt(30, 40, -30, 30, 0, 14) + bt(-30, 30, -30, -25, 0, 14)
             + bt(-30, 30, 25, 30, 0, 14) + bt(-11, 11, -6, 6, 0, 14))
-    out = []
-    with tempfile.TemporaryDirectory() as td:
-        stl = os.path.join(td, "lva_off.stl")
-        _write_stl(stl, tris)
-        surf = ocl.STLSurf()
-        ocl.STLReader(stl, surf)
-        for flag in (None, 0):
-            m, st = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 14.0), 6.343,
-                          0.0, leave=0.381, axial_leave=0.381, stepdown=19.05,
-                          stepup=1.905, tolerance=0.05, threads=4,
-                          stock_cell=0.5, min_rest=0.5, corner_r=0.0,
-                          stl_path=stl, side_entry_holder=(25.0, 71.6),
-                          air_descent_g0=flag)
-            assert st["lva"]["g0"] == 0, st["lva"]
-            out.append(json.dumps(m))
-    assert out[0] == out[1], "default != explicit off"
-    print("PASS lva off: default == explicit off byte for byte")
+    out, ons = {}, {}
+    old = os.environ.pop("ENGINE_AIR_G0", None)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stl = os.path.join(td, "lva_def.stl")
+            _write_stl(stl, tris)
+            surf = ocl.STLSurf()
+            ocl.STLReader(stl, surf)
+            for tag, flag, env in (("default", None, None), ("off", 0, None),
+                                   ("env0", None, "0")):
+                if env is None:
+                    os.environ.pop("ENGINE_AIR_G0", None)
+                else:
+                    os.environ["ENGINE_AIR_G0"] = env
+                m, st = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 14.0),
+                              6.343, 0.0, leave=0.381, axial_leave=0.381,
+                              stepdown=19.05, stepup=1.905, tolerance=0.05,
+                              threads=4, stock_cell=0.5, min_rest=0.5,
+                              corner_r=0.0, stl_path=stl,
+                              side_entry_holder=(25.0, 71.6),
+                              air_descent_g0=flag)
+                out[tag], ons[tag] = json.dumps(m), st["lva"]["on"]
+    finally:
+        os.environ.pop("ENGINE_AIR_G0", None)
+        if old is not None:
+            os.environ["ENGINE_AIR_G0"] = old
+    assert ons == {"default": 1, "off": 0, "env0": 0}, ons
+    assert out["off"] == out["env0"], "explicit off != ENGINE_AIR_G0=0"
+    assert out["default"] == out["off"], "BS1d: no G0 fires, yet on != off"
+    # the parser: --no-air-descent-g0 -> 0, nothing -> None (= default ON)
+    import argparse
+    orig = argparse.ArgumentParser.parse_args
+
+    def grab(self, args=None, namespace=None):
+        ns = orig(self, args, namespace)
+        raise _Parsed(ns)
+    argparse.ArgumentParser.parse_args = grab
+    try:
+        for argv, want in ((["--no-air-descent-g0"], 0), ([], None),
+                           (["--air-descent-g0", "1"], 1)):
+            try:
+                cli.main(["rough", "--step", "x.step", "--stock", "0", "1",
+                          "0", "1", "0", "1", "--tool", "flat:12.686",
+                          "--out", os.devnull, "--floor", "0"] + argv)
+            except _Parsed as e:
+                assert e.ns.air_descent_g0 == want, (argv, e.ns.air_descent_g0)
+            else:
+                raise AssertionError("parser not reached")
+    finally:
+        argparse.ArgumentParser.parse_args = orig
+    print("PASS lva default ON; off via flag/env byte-identical; "
+          "--no-air-descent-g0 parses to 0")
 
 
 if __name__ == "__main__":
     test_lva_start_values()
     test_lva_margin_band()
-    test_lva_off_byte_identical()
+    test_lva_default_on_and_off_switches()

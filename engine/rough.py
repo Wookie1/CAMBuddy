@@ -1557,11 +1557,12 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     _sk1_holder = side_entry_holder
     # LVA (lever A): a helix entry starts at its own column's clear height
     # (G0 down to it) instead of spiralling at ramp feed from the link plane
-    # through ground earlier levels already cleared. Default OFF.
+    # through ground earlier levels already cleared. Default ON; off with
+    # ENGINE_AIR_G0=0 or --no-air-descent-g0 / --air-descent-g0 0.
     if air_descent_g0 is not None:
         _lva_on = bool(air_descent_g0)
     else:
-        _lva_on = int(os.environ.get("ENGINE_AIR_G0", "0")) != 0
+        _lva_on = int(os.environ.get("ENGINE_AIR_G0", "1")) != 0
     sk1_block = [None]   # why the last SK1 search found no column
     if clearance_z is None:
         clearance_z = szmax + 2.0
