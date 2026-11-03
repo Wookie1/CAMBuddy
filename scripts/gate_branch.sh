@@ -30,7 +30,7 @@ for t in $(cd "$ROOT" && ls engine/test_*.py); do
   s=$(date +%s); run_engine "$ROOT" "$t" "$LOG/$(basename "$t" .py).log"; rc=$?
   echo "$t rc=$rc $(( $(date +%s) - s ))s"; [ $rc = 0 ] || FAILS+=("engine:$t")
 done
-s=$(date +%s); run_conn "$ROOT" "$LOG/connector.log" "connector verify/test_zmap.py"; rc=$?
+s=$(date +%s); run_conn "$ROOT" "$LOG/connector.log" "connector verify/test_zmap.py verify/test_zh1.py"; rc=$?
 echo "connector+verify/test_zmap(pytest) rc=$rc $(( $(date +%s) - s ))s"
 if [ $rc != 0 ]; then
   ids=$(grep -E '^FAILED ' "$LOG/connector.log" | awk '{print $2}')

@@ -2993,9 +2993,12 @@ def _assert_pinned_plus_zg1(pinned, new, part_mask, label):
     extra = set(new) - set(pinned)
     # SP-K2: zcut_kernel is the one additional key the task brief mandates
     # in the report JSON; every pinned b1688b8 value stays byte-identical.
-    assert extra == {"below_stock_bottom", "part_mask", "zcut_kernel"}, \
+    assert extra == {"below_stock_bottom", "part_mask", "zcut_kernel",
+                     "entry_stock"}, \
         "extra keys %r: %r" % (sorted(extra), label)
     assert new["below_stock_bottom"]["count"] == 0, new["below_stock_bottom"]
+    # ZH1 (coordinator-approved pin extension): the entry_stock gate block
+    assert new["entry_stock"]["count"] == 0, new["entry_stock"]
     assert new["part_mask"] == part_mask, (new["part_mask"], label)
 
 
