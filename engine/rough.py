@@ -1344,9 +1344,11 @@ def _cut_top_max(stock, x, y, rad, z):
 def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder):
     """LVA (lever A, A1b rule): the lowest height a helix entry may start at,
     G0 down the column at its start point s. Never under z + 0.3, and:
-    - margin over the highest stock in the helix's swept disk (r + tool_r +
-      margin about (cx, cy)) standing on cells whose part is at or below z:
-      the first turns must not side-cut it. The PART in that disk, and stock
+    - margin over the highest stock in the helix's swept disk (r + tool_r
+      about (cx, cy), scanned out to r + tool_r + cell*sqrt(2)/2: a cell
+      whose centre lies outside the disk can still overlap it by up to half
+      its diagonal - A2, grid discretisation only) standing on cells whose
+      part is at or below z: the first turns must not side-cut it. The PART in that disk, and stock
       sitting on part above z, are not counted: the helix circle
       is island-legal at its level (try_cand validates it with isl_ok), and
       for a 3-axis heightfield the island at any higher Z is a subset of the
@@ -1358,7 +1360,8 @@ def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder):
     None when the holder is unknown (today's start stays)."""
     if holder is None:
         return None
-    zc = max(_cut_top_max(stock, cx, cy, r + tool_r + margin, z),
+    zc = max(_cut_top_max(stock, cx, cy,
+                          r + tool_r + stock.cell * math.sqrt(2.0) / 2.0, z),
              stock.link_top_max([(s[0], s[1]), (s[0], s[1])],
                                 tool_r + margin))
     zs = max(zc + margin, z + 0.3) if zc > -1e8 else z + 0.3
