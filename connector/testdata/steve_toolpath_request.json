@@ -1,0 +1,377 @@
+{
+ "_note": "Captured from STEVE's first live toolpath run run_2574c56fce3257b62d26 (2026-11-04, SteveCAM test block, T13 flat); part STEP not kept, stock url/headers (one-time) removed.",
+ "load_limit": true,
+ "optimal_load_mm": 2.032,
+ "request": {
+  "action": "act_tqmcvdnp9qdp",
+  "design": {
+   "branch": "main",
+   "program_id": "ee0c30db-bfec-452d-8737-7c14d0a368a1",
+   "revision": 1,
+   "revision_sha256": "5cc34d3903b89e67b00472de2d08ef4e98740a1370096b92be560bffa796657d"
+  },
+  "format": "steve_connector_toolpath",
+  "limits": {
+   "bottom_mm": 20.0,
+   "clearance_mm": 45.0,
+   "feed_mm_min": 3429.0,
+   "maximum_feed_mm_min": 10000.0,
+   "plunge_mm_min": 1270.0,
+   "spindle_rpm": 7500.0,
+   "tolerance_mm": 0.01,
+   "top_mm": 35.0
+  },
+  "margin_box": {
+   "maximum_mm": [
+    61.343,
+    51.343,
+    78.4
+   ],
+   "minimum_mm": [
+    -61.343,
+    -51.343,
+    20.0
+   ]
+  },
+  "operation": "rough_steveCAM",
+  "posts_arcs": false,
+  "predecessor_stock_sha256": "64d2e8306bb0fbabc9755499072e1c57f531cc38523df6627c40c290e677d314",
+  "retract_z_mm": 45.0,
+  "settings": {
+   "load_limit": true,
+   "optimal_load_mm": 2.032,
+   "stepdown_mm": 7.619,
+   "stock_to_leave_mm": 0.381
+  },
+  "setup": {
+   "model_to_work": {
+    "origin_mm": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "x": [
+     1.0,
+     0.0,
+     0.0
+    ],
+    "y": [
+     0.0,
+     1.0,
+     0.0
+    ],
+    "z": [
+     0.0,
+     0.0,
+     1.0
+    ]
+   },
+   "stock_mm": {
+    "maximum_mm": [
+     50.0,
+     40.0,
+     38.0
+    ],
+    "minimum_mm": [
+     -50.0,
+     -40.0,
+     0.0
+    ]
+   },
+   "work_offset": 1,
+   "work_to_machine": {
+    "origin_mm": [
+     200.0,
+     150.0,
+     -220.0
+    ],
+    "x": [
+     1.0,
+     0.0,
+     0.0
+    ],
+    "y": [
+     0.0,
+     1.0,
+     0.0
+    ],
+    "z": [
+     0.0,
+     0.0,
+     1.0
+    ]
+   }
+  },
+  "start_tip_mm": [
+   -200.0,
+   -150.0,
+   78.4
+  ],
+  "tip_envelope": {
+   "maximum_mm": [
+    200.0,
+    150.0,
+    78.4
+   ],
+   "minimum_mm": [
+    -200.0,
+    -150.0,
+    -301.6
+   ]
+  },
+  "tool": {
+   "assembly_sha256": "d2c0ec6ea7451a16bc22ae65d6770cab92086f771b9dc9d508c4c754bc4cbcf8",
+   "cutter_type": "flat_end_mill",
+   "geometry": {
+    "bounds": {
+     "maximum_mm": [
+      27.0,
+      27.0,
+      141.6
+     ],
+     "minimum_mm": [
+      -27.0,
+      -27.0,
+      0.0
+     ]
+    },
+    "center_cutting": true,
+    "checks": [
+     {
+      "error_bound_mm": null,
+      "geometry": null,
+      "id": "interfaces",
+      "message": "Computed using estimated library inputs; confirm the values before treating this check as passed. Coaxial component interfaces agree.",
+      "operation": null,
+      "status": "unassessed"
+     },
+     {
+      "error_bound_mm": null,
+      "geometry": null,
+      "id": "clamping",
+      "message": "Computed using estimated library inputs; confirm the values before treating this check as passed. Shank diameter and engagement fit the declared clamp.",
+      "operation": null,
+      "status": "unassessed"
+     },
+     {
+      "error_bound_mm": null,
+      "geometry": null,
+      "id": "rpm_data",
+      "message": "Every component needs a speed rating; known ratings still constrain maximum RPM.",
+      "operation": null,
+      "status": "unassessed"
+     },
+     {
+      "error_bound_mm": null,
+      "geometry": null,
+      "id": "mass_data",
+      "message": "Every component needs mass data to check a machine mass limit.",
+      "operation": null,
+      "status": "unassessed"
+     },
+     {
+      "error_bound_mm": null,
+      "geometry": null,
+      "id": "dimension_provenance",
+      "message": "Dimension provenance is retained; estimated geometry requires confirmation.",
+      "operation": null,
+      "status": "unassessed"
+     },
+     {
+      "error_bound_mm": null,
+      "geometry": null,
+      "id": "input_provenance",
+      "message": "Estimated library inputs need confirmation: tool_holder 5a011e09:dimension_source. Source claims are not independent measurements.",
+      "operation": null,
+      "status": "unassessed"
+     }
+    ],
+    "cutter_diameter_mm": 12.686,
+    "cutting_coverage": "outer_envelope_only",
+    "engagement_mm": 30.0,
+    "gauge_frame": {
+     "origin_mm": [
+      0.0,
+      0.0,
+      141.6
+     ],
+     "x": [
+      1.0,
+      0.0,
+      0.0
+     ],
+     "y": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "z": [
+      0.0,
+      0.0,
+      1.0
+     ]
+    },
+    "gauge_length_mm": 141.6,
+    "hand": "right",
+    "input_sha256": "5626cbb46d3d104f61ab3ed98e16ddc4e969c8cc9917d29abbcbea91e7052ebb",
+    "interface": "bt30",
+    "mass_kg": null,
+    "max_rpm": 15000.0,
+    "maximum_diameter_mm": 54.0,
+    "physical_qualification": "unassessed",
+    "placements": [
+     {
+      "frame": {
+       "origin_mm": [
+        0.0,
+        0.0,
+        0.0
+       ],
+       "x": [
+        1.0,
+        0.0,
+        0.0
+       ],
+       "y": [
+        0.0,
+        1.0,
+        0.0
+       ],
+       "z": [
+        0.0,
+        0.0,
+        1.0
+       ]
+      },
+      "id": "cutter",
+      "source": {
+       "id": "beb292fb-64e5-4c04-874a-1ccadc53b274",
+       "kind": "rotary_cutter",
+       "revision": 1,
+       "sha256": "7c45cade0cafd5cef5a1a965682a6bc5e4887778f4f4f4a4a605e13a2652927a"
+      }
+     },
+     {
+      "frame": {
+       "origin_mm": [
+        0.0,
+        0.0,
+        141.6
+       ],
+       "x": [
+        1.0,
+        0.0,
+        0.0
+       ],
+       "y": [
+        0.0,
+        1.0,
+        0.0
+       ],
+       "z": [
+        0.0,
+        0.0,
+        1.0
+       ]
+      },
+      "id": "h1",
+      "source": {
+       "id": "5a011e09-edcd-4847-9d51-ef9d428a54ee",
+       "kind": "tool_holder",
+       "revision": 1,
+       "sha256": "8ed105c042455a77cc7a82892dcd6e4de297fddc8af52090892f2c8772083ef6"
+      }
+     }
+    ],
+    "regions": [
+     {
+      "component": "cutter",
+      "id": "cut_0",
+      "occupancy": "rotating_cut_envelope",
+      "role": "cutter",
+      "segment": {
+       "corner_radius_mm": null,
+       "radius_end_mm": 6.343,
+       "radius_start_mm": 6.343,
+       "shape": "frustum",
+       "z_end_mm": 50.8,
+       "z_start_mm": 0.0
+      }
+     },
+     {
+      "component": "cutter",
+      "id": "shank",
+      "occupancy": "outer_envelope",
+      "role": "shank",
+      "segment": {
+       "corner_radius_mm": null,
+       "radius_end_mm": 6.343,
+       "radius_start_mm": 6.343,
+       "shape": "frustum",
+       "z_end_mm": 101.6,
+       "z_start_mm": 50.8
+      }
+     },
+     {
+      "component": "h1",
+      "id": "holder_0_0",
+      "occupancy": "outer_envelope",
+      "role": "holder",
+      "segment": {
+       "corner_radius_mm": null,
+       "radius_end_mm": 25.0,
+       "radius_start_mm": 25.0,
+       "shape": "frustum",
+       "z_end_mm": 106.6,
+       "z_start_mm": 71.6
+      }
+     },
+     {
+      "component": "h1",
+      "id": "holder_0_1",
+      "occupancy": "outer_envelope",
+      "role": "holder",
+      "segment": {
+       "corner_radius_mm": null,
+       "radius_end_mm": 23.0,
+       "radius_start_mm": 27.0,
+       "shape": "frustum",
+       "z_end_mm": 141.6,
+       "z_start_mm": 106.6
+      }
+     }
+    ],
+    "resolver": "coaxial_rotary_v1",
+    "stickout_mm": 71.6,
+    "version": 1
+   }
+  },
+  "version": 1
+ },
+ "stepdown_mm": 7.619,
+ "steve_request_sha256": "e8a9c63ffce1207583d6ffd506d42a4e11da01614e5c89386995c27133a0920b",
+ "stock": {
+  "bounds_mm": {
+   "maximum_mm": [
+    50.0,
+    39.999998,
+    36.0
+   ],
+   "minimum_mm": [
+    -49.999994,
+    -40.000001,
+    1e-06
+   ]
+  },
+  "bytes": 5397228,
+  "cell_mm": 1.0,
+  "format": "glb",
+  "frame": "work",
+  "kind": "file",
+  "name": "stock.glb",
+  "sha256": "f7ade4b4bea14fd0b4cc10d84e1fff40f11ad6fc22dfebe1969b68a3984c8073",
+  "snapshot_sha256": "64d2e8306bb0fbabc9755499072e1c57f531cc38523df6627c40c290e677d314",
+  "units": "m"
+ },
+ "stock_to_leave_mm": 0.381
+}
