@@ -2526,7 +2526,7 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             a = b
         return tot
 
-    def gap_relink(z, to):
+    def gap_relink(z, to, site):
         """GR: from the tool's position AT DEPTH Z straight to `to` at Z, as a
         deep link - only when _gr_link_ok passes on the dense corridor
         (0.4 mm samples). Emits the feed at Z, mills it, returns True; else
@@ -2543,6 +2543,11 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             return False
         stats["gr"]["relinked"] += 1
         stats["gr"]["relink_mm"] += math.dist(corridor[0], corridor[-1])
+        stats["gr"]["by_site"][site] += 1
+        if len(stats["gr"]["log"]) < 20:   # endpoints, for tests / review
+            stats["gr"]["log"].append([corridor[0][0], corridor[0][1],
+                                       corridor[-1][0], corridor[-1][1],
+                                       round(z, 4), site])
         trans_guard(corridor[0], z, False)
         for (x, y) in corridor:
             if x == prev[0] and y == prev[1]:
@@ -2918,7 +2923,9 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             a2d_pre[zo] = job[:3]
             a2d_futs[zo] = fut
     if _gr_on:   # GR: present only when on (off = byte-identical stats)
-        stats["gr"] = {"tried": 0, "relinked": 0, "relink_mm": 0.0}
+        stats["gr"] = {"tried": 0, "relinked": 0, "relink_mm": 0.0,
+                       "by_site": {"link_fallback": 0, "a2d_notclear": 0,
+                                   "clip_reentry": 0}, "log": []}
     stats["lva"] = {"on": int(_lva_on and _sk1_holder is not None),
                     "g0": 0, "g0_mm": 0.0}
     stats["pl1"] = {"openers": len(a2d_openers),
@@ -3380,7 +3387,8 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                 if (prev[2] is None or abs(prev[2] - z) > 1e-6 or
                                         d_chord is None or d_chord > 0.6) and \
                                         not gap_relink(z, (round(pts[i][0], 4),
-                                                           round(pts[i][1], 4))):
+                                                           round(pts[i][1], 4)),
+                                                       "clip_reentry"):
                                     p0r = (prev[0], prev[1], prev[2])
                                     i0r = len(moves)
                                     enter_at(round(pts[i][0], 4),
@@ -3512,7 +3520,7 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                       "z": round(z, 4)})
                                 level_pts.append((x, y, "alink r%d" % nreg))
                         continue
-                    if gap_relink(z, land):   # GR: stay down when it verifies
+                    if gap_relink(z, land, "link_fallback"):   # GR: stay down when it verifies
                         continue
                     if not isl_ok([land])[0] or \
                             not stock.link_clear(corridor, z + lift):
@@ -3552,7 +3560,8 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                      "liftland r%d" % nreg))
                 else:  # notclear -> clear of everything, re-plunge at end
                     if pts and gap_relink(z, (round(pts[-1][0], 4),
-                                              round(pts[-1][1], 4))):
+                                              round(pts[-1][1], 4)),
+                                          "a2d_notclear"):
                         continue   # GR: stayed down to the next path start
                     stats["n_notclear_links"] += 1
                     px, py = prev[0], prev[1]
