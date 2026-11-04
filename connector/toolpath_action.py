@@ -6,10 +6,8 @@ ToolpathRequest) and `steve_request_sha256`; we run the existing engine rough
 limits, judge it with zmap, convert it to toolpath.json moves and validate
 those against every request limit before anything is uploaded.
 
-GUESS: docs/steve_toolpath_actions.md names the request fields but not their
-nested shapes. Every shape read below that the docs do not state is marked
-GUESS and is read ONLY in parse_request(), so TP1b (a real request) fixes
-one function.
+The request is read ONLY in parse_request(), with the field names STEVE sent
+in the first live run (connector/testdata/steve_toolpath_request.json).
 """
 import json
 import os
@@ -94,42 +92,59 @@ def _box(d, path):
     return [float(v) for v in lo], [float(v) for v in hi]
 
 
+def _regions(req, role):
+    """request.tool.geometry.regions of one role, tip-up (z from the tip)."""
+    regs = [r for r in _need(req, "tool.geometry.regions")
+            if r.get("role") == role]
+    if not regs:
+        _fail("request.tool.geometry.regions has no %s region" % role,
+              "request.tool.geometry.regions", code="request_field_missing")
+    return sorted(regs, key=lambda r: r["segment"]["z_start_mm"])
+
+
 def parse_request(req):
-    """The ToolpathRequest -> the flat numbers the run uses."""
-    if _need(req, "tool.cutter_type") != "flat":
+    """The ToolpathRequest -> the flat numbers the run uses. Field names as
+    STEVE sent them in the first live run (2026-11-04, TP1b)."""
+    kind = _need(req, "tool.cutter_type")
+    if kind != "flat_end_mill":
         _fail("this action cuts with a flat end mill only; request.tool."
-              "cutter_type is %r" % req["tool"]["cutter_type"],
-              "request.tool.cutter_type", req["tool"]["cutter_type"],
+              "cutter_type is %r" % kind, "request.tool.cutter_type", kind,
               code="tool_not_supported")
-    g = "tool.geometry.tool."               # GUESS
-    holder = _need(req, "tool.geometry.holder.segments")   # GUESS
-    lim = "limits."                         # GUESS: key names below
-    out = {
-        "dia": float(_need(req, g + "diameter_mm")),
-        "flute": float(_need(req, g + "flute_length_mm")),
-        "shank": float(_need(req, g + "shank_diameter_mm")),
-        "stickout": float(_need(req, g + "stickout_mm")),
+    cut = _regions(req, "cutter")
+    seg = cut[-1]["segment"]
+    if any(r["segment"].get("corner_radius_mm") for r in cut):
+        _fail("request.tool is a flat end mill with a corner radius",
+              "request.tool.geometry.regions", code="tool_not_supported")
+    stickout = float(_need(req, "tool.geometry.stickout_mm"))
+    shank = _regions(req, "shank")
+    # holder outline above the holder nose (tip + stick-out), the
+    # [z_lo, z_hi, r_lo, r_hi] form our tool table and zmap read
+    holder = [[r["segment"]["z_start_mm"] - stickout,
+               r["segment"]["z_end_mm"] - stickout,
+               r["segment"]["radius_start_mm"],
+               r["segment"]["radius_end_mm"]]
+              for r in _regions(req, "holder")]
+    lim = "limits."
+    return {
+        "dia": float(_need(req, "tool.geometry.cutter_diameter_mm")),
+        "flute": float(seg["z_end_mm"]),
+        "shank": 2.0 * max(r["segment"]["radius_start_mm"] for r in shank),
+        "stickout": stickout,
         "holder": holder,
-        "stock": _box(req, "setup.stock_mm"),           # GUESS shape
+        "stock": _box(req, "setup.stock_mm"),
         "rpm": float(_need(req, lim + "spindle_rpm")),
         "feed": float(_need(req, lim + "feed_mm_min")),
         "plunge": float(_need(req, lim + "plunge_mm_min")),
-        "max_feed": float(_need(req, lim + "machine_max_feed_mm_min")),
+        "max_feed": float(_need(req, lim + "maximum_feed_mm_min")),
         "top": float(_need(req, lim + "top_mm")),
         "bottom": float(_need(req, lim + "bottom_mm")),
         "clearance": float(_need(req, lim + "clearance_mm")),
         "start": [float(v) for v in _need(req, "start_tip_mm")],
         "retract_z": float(_need(req, "retract_z_mm")),
-        "margin_box": _box(req, "margin_box"),          # GUESS shape
-        "tip_envelope": _box(req, "tip_envelope"),      # GUESS shape
+        "margin_box": _box(req, "margin_box"),
+        "tip_envelope": _box(req, "tip_envelope"),
         "posts_arcs": bool(req.get("posts_arcs")),
     }
-    cr = float(req["tool"]["geometry"]["tool"].get("corner_radius_mm") or 0)
-    if cr > 0:
-        _fail("request.tool says flat but has a %.3f mm corner radius" % cr,
-              "request.tool.geometry.tool.corner_radius_mm", cr,
-              code="tool_not_supported")
-    return out
 
 
 def settings_for(values, tp):
@@ -190,10 +205,12 @@ def ngc_to_moves(text, tp):
         if end == cur:
             continue
         if w[0] == "G0":
-            if not moves and end[2] < cur[2]:
-                # leave the start: over to XY at the start height, then down
+            if not moves:
+                # leave start_tip_mm (machine home: may lie outside
+                # margin_box) over the first point at retract_z_mm, which
+                # sits inside the box, then down
                 moves.append({"kind": "rapid",
-                              "end_mm": [end[0], end[1], cur[2]]})
+                              "end_mm": [end[0], end[1], tp["retract_z"]]})
             moves.append({"kind": "rapid", "end_mm": end})
         else:
             f = feed

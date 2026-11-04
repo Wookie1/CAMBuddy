@@ -86,18 +86,26 @@ File-input fields plus: `format: "glb"`, `name: "stock.glb"`, `sha256`, `bytes` 
 - Posted coordinates are rounded: keep one control resolution step inside each limit.
 - Stale when part revision, stock, tool, settings or limits change.
 
-## What our connector reads (TP1) - GUESSES to confirm in TP1b
+## The real request (TP1b, confirmed 2026-11-04)
 
-`connector/toolpath_action.py parse_request()` is the only reader. Shapes not given by the docs:
+STEVE's first live request is kept as `connector/testdata/steve_toolpath_request.json` (run
+run_2574c56fce3257b62d26, SteveCAM test block, T13 flat). What it showed, against the TP1 guesses:
 
-| request field | our guess | basis |
+| field | real shape | TP1 guess |
 |---|---|---|
-| `setup.stock_mm` | `{"minimum_mm":[x,y,z],"maximum_mm":[x,y,z]}` | program stock `bounds` and `stock.bounds_mm` use this shape |
-| `margin_box`, `tip_envelope` | same min/max box | same |
-| `tool.cutter_type` | `"flat"` / `"ball"` / `"bull_nose"` | catalog `cutters` names |
-| `tool.geometry.tool` | `diameter_mm, corner_radius_mm, flute_length_mm, shank_diameter_mm, stickout_mm` | none - pure guess |
-| `tool.geometry.holder` | `{"segments": [[z_lo, z_hi, r_lo, r_hi], ...]}` above the holder nose | our x7_tools.json holder form (copied from James's STEVE library) |
-| `limits` | `spindle_rpm, feed_mm_min, plunge_mm_min, machine_max_feed_mm_min, top_mm, bottom_mm, clearance_mm, tolerance_mm` | strategy field names; machine max is a guess |
-| `part`, `operation_id` | `{"document_id","revision"}`, string | not read by the run |
-| `request` input | a JSON object (a `kind:"file"` input is also accepted) | docs list it as an input, form unstated |
-| `steve_request_sha256` | presence only; we do not recompute it | docs do not say how it is computed |
+| top level | `format: "steve_connector_toolpath"`, `version: 1`, `action` (the action **id**, `act_…`), `operation` (op id), `design` `{program_id, revision, branch, revision_sha256}`, `settings` | `part`, `operation_id`: wrong names |
+| `setup.stock_mm`, `margin_box`, `tip_envelope` | `{minimum_mm, maximum_mm}` | right |
+| `setup.model_to_work`, `work_to_machine` | frames `{x, y, z, origin_mm}` | not read |
+| `tool.cutter_type` | `"flat_end_mill"` | `"flat"`: wrong (first run refused the tool) |
+| `tool.geometry` | `cutter_diameter_mm`, `stickout_mm`, `gauge_length_mm`, `engagement_mm`, `max_rpm`, `regions[]` (each `{role: cutter/shank/holder, segment: {shape: frustum, z_start_mm, z_end_mm, radius_start_mm, radius_end_mm, corner_radius_mm}}`, z from the tip) | `geometry.tool.*` / `geometry.holder.segments`: wrong |
+| `limits` | `spindle_rpm, feed_mm_min, plunge_mm_min, maximum_feed_mm_min, top_mm, bottom_mm, clearance_mm, tolerance_mm` | `machine_max_feed_mm_min`: wrong |
+| `start_tip_mm` | machine home in the work frame, e.g. `[-200, -150, 78.4]`, **outside `margin_box`** at its top Z | inside the box |
+| `request` input | a JSON value | right |
+| `steve_request_sha256` | sha256 of the request as canonical JSON (sorted keys, no spaces, UTF-8) - verified on the real request | unknown |
+| `stock` input | file input `stock.glb`, `cell_mm: 1.0`, `bounds_mm`, `snapshot_sha256` = `predecessor_stock_sha256`; 5.4 MB for the faced test block | right |
+
+Reader mapping (`parse_request`): diameter = `cutter_diameter_mm`; flute = top of the `cutter` region;
+shank = 2 x `shank` radius; holder outline = `holder` regions shifted down by `stickout_mm` (our
+`[z_lo, z_hi, r_lo, r_hi]` above the nose); a `cutter` region with a corner radius is refused.
+The first move leaves `start_tip_mm` over the first point at `retract_z_mm` (inside the box): the
+start height can equal the box top, which is not one step inside.
