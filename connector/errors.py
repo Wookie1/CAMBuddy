@@ -19,6 +19,19 @@ CODES = {
                       "`allowed` lists the closest valid names."),
     "input_out_of_range": ("error", "Use a value inside `allowed` (in the "
                            "units you sent) for `field`, then run again."),
+    # --- TP1: STEVE toolpath action ---
+    "request_field_missing": ("blocker", "STEVE's request lacks the field "
+                              "named in `field`: the connector's request "
+                              "reader needs updating for it."),
+    "tool_not_supported": ("blocker", "Pick a flat end mill (no corner "
+                           "radius) for this operation, then generate the "
+                           "toolpath again."),
+    "toolpath_limit": ("blocker", "The toolpath would break the request "
+                       "limit named in `field`/`allowed`: widen the "
+                       "operation's heights/feeds or change the settings, "
+                       "then generate again."),
+    "request_sha256_mismatch": ("blocker", "Generate the toolpath again "
+                                "from STEVE."),
     "action_unknown": ("error", "Use one of the connector's actions (see "
                        "the catalog)."),
     "input_digest_mismatch": ("error", "Send the run again: the downloaded "

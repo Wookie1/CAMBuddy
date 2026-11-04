@@ -127,7 +127,8 @@ def build(attention, what):
 _WHAT = {"adaptive_rough": "The roughing program",
          "slope_split_finish": "The rough + finish programs",
          "check_program": "The checked program",
-         "model.measure": "The measurement"}
+         "model.measure": "The measurement",
+         "adaptive_rough_toolpath": "The toolpath"}
 
 
 def for_result(action, check):
