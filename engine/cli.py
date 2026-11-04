@@ -539,8 +539,11 @@ def main(argv=None):
     r.add_argument("--gap-relink", dest="gap_relink", type=int, default=None,
                    help="GR: before a link lifts the tool or a clip break "
                         "re-bores, try a straight at-depth link under the "
-                        "deep-link checks: 1 on, 0 off (default; env "
-                        "ENGINE_GAP_RELINK)")
+                        "deep-link checks: 1 on (default), 0 off (also "
+                        "--no-gap-relink or env ENGINE_GAP_RELINK=0)")
+    r.add_argument("--no-gap-relink", dest="gap_relink",
+                   action="store_const", const=0,
+                   help="same as --gap-relink 0")
     r.add_argument("--ll-overlap", dest="ll_overlap", type=int, default=None,
                    help="run the --load-limit feed limiter in a worker while "
                         "rough's closing clcheck runs: 0 off (all-inline), 1 "

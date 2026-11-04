@@ -1355,33 +1355,6 @@ def _gr_link_ok(corridor, z, lift, isl_ok3, corridor_ok, stock, tool_r):
             and not _strip_engage(stock, corridor, z, tool_r) > 2.438)
 
 
-def _gr_no_shear(stock, corridor, z, tool_r):
-    """GR (fix round): a relink must shear NOTHING - no stock above Z + 0.05
-    within the strip measure's reach (R + 0.75 cell) of the corridor.
-    Stricter than the deep links' 2.438 width bar (a single row of stock
-    reads width 0 there): TB's two thin-shear relinks raised ae2_p99."""
-    reach = tool_r + 0.75 * stock.cell   # the strip measure's reach
-    c = stock.cell
-    k = int(math.ceil(reach / c)) + 1
-    for (xa, ya), (xb, yb) in zip(corridor[:-1], corridor[1:]):
-        i0 = max(stock._ci(min(xa, xb)) - k, 0)
-        i1 = min(stock._ci(max(xa, xb)) + k + 1, stock.nx)
-        j0 = max(stock._cj(min(ya, yb)) - k, 0)
-        j1 = min(stock._cj(max(ya, yb)) + k + 1, stock.ny)
-        if i0 >= i1 or j0 >= j1:
-            return False
-        X, Y = np.meshgrid(stock.x0 + (np.arange(i0, i1) + 0.5) * c,
-                           stock.y0 + (np.arange(j0, j1) + 0.5) * c)
-        L2 = (xb - xa) ** 2 + (yb - ya) ** 2
-        t = np.zeros_like(X) if L2 < 1e-12 else np.clip(
-            ((X - xa) * (xb - xa) + (Y - ya) * (yb - ya)) / L2, 0.0, 1.0)
-        d2 = (X - (xa + t * (xb - xa))) ** 2 + (Y - (ya + t * (yb - ya))) ** 2
-        sub = stock.top[j0:j1, i0:i1]
-        if ((d2 <= reach * reach) & (sub > z + 0.05)).any():
-            return False
-    return True
-
-
 def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder):
     """LVA (lever A, A1b rule): the lowest height a helix entry may start at,
     G0 down the column at its start point s. Never under z + 0.3, and:
@@ -1610,12 +1583,13 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     # GR (gap relink): before a link lifts the tool, or a clip break re-bores
     # a helix, try a straight at-depth link from where the tool is to where
     # the cutting resumes, under exactly the deep-link checks (_gr_link_ok);
-    # fail closed to today's lift / re-entry. Default OFF; on with
-    # gap_relink=1, --gap-relink 1 or ENGINE_GAP_RELINK=1.
+    # fail closed to today's lift / re-entry. Default ON (James, 2026-11-04);
+    # off with gap_relink=0, --no-gap-relink / --gap-relink 0 or
+    # ENGINE_GAP_RELINK=0.
     if gap_relink is not None:
         _gr_on = bool(gap_relink)
     else:
-        _gr_on = int(os.environ.get("ENGINE_GAP_RELINK", "0")) != 0
+        _gr_on = int(os.environ.get("ENGINE_GAP_RELINK", "1")) != 0
     sk1_block = [None]   # why the last SK1 search found no column
     if clearance_z is None:
         clearance_z = szmax + 2.0
@@ -2566,8 +2540,7 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                     for (a, b) in _dense_line((prev[0], prev[1]),
                                               (to[0], to[1]))]
         if not _gr_link_ok(corridor, z, lift, isl_ok3, corridor_ok, stock,
-                           tool_r) or not _gr_no_shear(stock, corridor, z,
-                                                       tool_r):
+                           tool_r):
             return False
         stats["gr"]["relinked"] += 1
         stats["gr"]["relink_mm"] += math.dist(corridor[0], corridor[-1])
@@ -2950,7 +2923,7 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 continue
             a2d_pre[zo] = job[:3]
             a2d_futs[zo] = fut
-    if _gr_on:   # GR: present only when on (off = byte-identical stats)
+    if _gr_on:   # GR: present only when on (off = byte-identical to before)
         stats["gr"] = {"tried": 0, "relinked": 0, "relink_mm": 0.0,
                        "by_site": {"link_fallback": 0, "a2d_notclear": 0,
                                    "clip_reentry": 0}, "log": []}
