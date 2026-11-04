@@ -1021,6 +1021,10 @@ class Connector:
             # GUESS: the docs list request as an input, not its form
             request = json.loads(self._steve_file(
                 request, "request", os.path.join(work, "request.json")))
+        # TP1b: keep what STEVE actually sent (request shapes are GUESSES)
+        with open(os.path.join(work, "steve_inputs.json"), "w") as fh:
+            json.dump({k: v for k, v in inputs.items() if k != "part"},
+                      fh, indent=1, default=str)
         sha = inputs.get("steve_request_sha256")
         if not isinstance(request, dict) or not isinstance(sha, str) \
                 or not sha:
