@@ -536,6 +536,11 @@ def main(argv=None):
     r.add_argument("--no-air-descent-g0", dest="air_descent_g0",
                    action="store_const", const=0,
                    help="same as --air-descent-g0 0")
+    r.add_argument("--gap-relink", dest="gap_relink", type=int, default=None,
+                   help="GR: before a link lifts the tool or a clip break "
+                        "re-bores, try a straight at-depth link under the "
+                        "deep-link checks: 1 on, 0 off (default; env "
+                        "ENGINE_GAP_RELINK)")
     r.add_argument("--ll-overlap", dest="ll_overlap", type=int, default=None,
                    help="run the --load-limit feed limiter in a worker while "
                         "rough's closing clcheck runs: 0 off (all-inline), 1 "
@@ -938,6 +943,7 @@ def main(argv=None):
                                     flute_mm=flute,
                                     a2d_pool=a.a2d_pool,
                                     air_descent_g0=a.air_descent_g0,
+                                    gap_relink=a.gap_relink,
                                     side_entry_holder=table_holder(
                                         kind, dia, a.tool_number,
                                         a.tools_json),
