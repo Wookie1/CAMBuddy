@@ -61,6 +61,9 @@ rewrites this table; a test fails when it drifts).
 | `input_missing` | error | Add the missing input named in `field`. |
 | `input_unknown` | error | Remove or rename the input in `field`; `allowed` lists the closest valid names. |
 | `input_out_of_range` | error | Use a value inside `allowed` (in the units you sent) for `field`, then run again. |
+| `request_field_missing` | blocker | STEVE's request lacks the field named in `field`: the connector's request reader needs updating for it. |
+| `tool_not_supported` | blocker | Pick a flat end mill (no corner radius) for this operation, then generate the toolpath again. |
+| `toolpath_limit` | blocker | The toolpath would break the request limit named in `field`/`allowed`: widen the operation's heights/feeds or change the settings, then generate again. |
 | `action_unknown` | error | Use one of the connector's actions (see the catalog). |
 | `input_digest_mismatch` | error | Send the run again: the downloaded file did not match its sha256/size. |
 | `connector_stopping` | error | The SteveCAM connector was shutting down; start it again (menu bar: Start) and re-run. |

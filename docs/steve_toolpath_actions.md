@@ -85,3 +85,19 @@ File-input fields plus: `format: "glb"`, `name: "stock.glb"`, `sha256`, `bytes` 
 - Refused -> run `failed`, `toolpath_refused` names field/move/limit. `succeeded` without the file is refused too.
 - Posted coordinates are rounded: keep one control resolution step inside each limit.
 - Stale when part revision, stock, tool, settings or limits change.
+
+## What our connector reads (TP1) - GUESSES to confirm in TP1b
+
+`connector/toolpath_action.py parse_request()` is the only reader. Shapes not given by the docs:
+
+| request field | our guess | basis |
+|---|---|---|
+| `setup.stock_mm` | `{"minimum_mm":[x,y,z],"maximum_mm":[x,y,z]}` | program stock `bounds` and `stock.bounds_mm` use this shape |
+| `margin_box`, `tip_envelope` | same min/max box | same |
+| `tool.cutter_type` | `"flat"` / `"ball"` / `"bull_nose"` | catalog `cutters` names |
+| `tool.geometry.tool` | `diameter_mm, corner_radius_mm, flute_length_mm, shank_diameter_mm, stickout_mm` | none - pure guess |
+| `tool.geometry.holder` | `{"segments": [[z_lo, z_hi, r_lo, r_hi], ...]}` above the holder nose | our x7_tools.json holder form (copied from James's STEVE library) |
+| `limits` | `spindle_rpm, feed_mm_min, plunge_mm_min, machine_max_feed_mm_min, top_mm, bottom_mm, clearance_mm, tolerance_mm` | strategy field names; machine max is a guess |
+| `part`, `operation_id` | `{"document_id","revision"}`, string | not read by the run |
+| `request` input | a JSON object (a `kind:"file"` input is also accepted) | docs list it as an input, form unstated |
+| `steve_request_sha256` | presence only; we do not recompute it | docs do not say how it is computed |

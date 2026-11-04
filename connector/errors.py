@@ -30,8 +30,6 @@ CODES = {
                        "limit named in `field`/`allowed`: widen the "
                        "operation's heights/feeds or change the settings, "
                        "then generate again."),
-    "request_sha256_mismatch": ("blocker", "Generate the toolpath again "
-                                "from STEVE."),
     "action_unknown": ("error", "Use one of the connector's actions (see "
                        "the catalog)."),
     "input_digest_mismatch": ("error", "Send the run again: the downloaded "
