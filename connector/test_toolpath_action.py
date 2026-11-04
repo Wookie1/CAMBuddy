@@ -1,9 +1,8 @@
 """TP1: adaptive_rough_toolpath against mock STEVE.
 
 Run: /opt/homebrew/bin/python3 -m pytest connector/test_toolpath_action.py -q
-GUESS: REQUEST below follows docs/steve_toolpath_actions.md; every nested
-shape the docs do not state is marked GUESS (TP1b confirms with a real
-request).
+REQUEST is STEVE's first real request (testdata/steve_toolpath_request.json)
+with synth_pocket's stock, heights and boxes.
 """
 import copy
 import json
@@ -20,38 +19,27 @@ import toolpath_action as tpa  # noqa: E402
 from runner import EngineError  # noqa: E402
 from test_connector import live, _final_body, STEP  # noqa: E402,F401
 
-with open(os.path.join(HERE, "..", "tools", "x7_tools.json")) as _fh:
-    _HOLDER = json.load(_fh)["holders"]["BT30-ER32-70"]["segments"]
+# STEVE's first live request (TP1b, SteveCAM test block, T13 flat)
+with open(os.path.join(HERE, "testdata", "steve_toolpath_request.json")) as _fh:
+    REAL = json.load(_fh)
 
 # synth_pocket.step: 60 x 60 x 12 block (z 0..12) with pockets; stock = the
-# block + 1 mm per side, 0.4 on top, 1 below (as test_connector's runs)
-REQUEST = {
-    "action": tpa.ACTION,
-    "part": {"document_id": "doc-tp", "revision": 1},          # GUESS
-    "operation_id": "rough",                                   # GUESS
-    "setup": {"stock_mm": {"minimum_mm": [-31, -31, -1],       # GUESS shape
-                           "maximum_mm": [31, 31, 12.4]},
-              "work_offset": 1, "model_to_work": None,
-              "work_to_machine": None},
-    "tool": {"assembly_sha256": "0" * 64, "cutter_type": "flat",
-             "geometry": {                                     # GUESS
-                 "tool": {"diameter_mm": 12.686, "corner_radius_mm": 0.0,
-                          "flute_length_mm": 50.8,
-                          "shank_diameter_mm": 12.686, "stickout_mm": 71.6},
-                 "holder": {"segments": _HOLDER}}},
-    "predecessor_stock_sha256": None,
-    "limits": {"spindle_rpm": 7500, "feed_mm_min": 3000,      # GUESS keys
-               "plunge_mm_min": 800, "machine_max_feed_mm_min": 10000,
-               "top_mm": 12.4, "bottom_mm": 4.0, "clearance_mm": 20.0,
-               "tolerance_mm": 0.01},
-    "start_tip_mm": [0, 0, 50.0],
+# block + 1 mm per side, 0.4 on top, 1 below (as test_connector's runs). The
+# real request with this part's stock, heights and boxes; tool, frames and
+# every field name stay as STEVE sent them.
+REQUEST = copy.deepcopy(REAL["request"])
+REQUEST.update({
+    "setup": dict(REQUEST["setup"], stock_mm={"minimum_mm": [-31, -31, -1],
+                                              "maximum_mm": [31, 31, 12.4]}),
+    "limits": dict(REQUEST["limits"], feed_mm_min=3000.0, plunge_mm_min=800.0,
+                   top_mm=12.4, bottom_mm=4.0, clearance_mm=20.0),
+    "start_tip_mm": [-200.0, -150.0, 50.0],     # machine home, outside the box
     "retract_z_mm": 20.0,
-    "margin_box": {"minimum_mm": [-45, -45, -2],              # GUESS shape
-                   "maximum_mm": [45, 45, 60]},
-    "tip_envelope": {"minimum_mm": [-45, -45, -2],            # GUESS shape
-                     "maximum_mm": [45, 45, 60]},
-    "posts_arcs": False,
-}
+    "margin_box": {"minimum_mm": [-45, -45, -2], "maximum_mm": [45, 45, 60]},
+    "tip_envelope": {"minimum_mm": [-200, -150, -300],
+                     "maximum_mm": [200, 150, 60]},
+    "predecessor_stock_sha256": None,
+})
 SETTINGS = {"stepdown_mm": 4.0, "optimal_load_mm": 2.0}
 TP = tpa.parse_request(REQUEST)
 SHA = "a" * 64
@@ -111,15 +99,87 @@ class TestCatalog:
 
     def test_request_refusals(self):
         ball = copy.deepcopy(REQUEST)
-        ball["tool"]["cutter_type"] = "ball"
+        ball["tool"]["cutter_type"] = "ball_end_mill"
         with pytest.raises(EngineError) as e:
             tpa.parse_request(ball)
         assert e.value.code == "tool_not_supported"
         nofl = copy.deepcopy(REQUEST)
-        del nofl["tool"]["geometry"]["tool"]["flute_length_mm"]
+        del nofl["tool"]["geometry"]["cutter_diameter_mm"]
         with pytest.raises(EngineError) as e:
             tpa.parse_request(nofl)
-        assert e.value.field == "request.tool.geometry.tool.flute_length_mm"
+        assert e.value.field == "request.tool.geometry.cutter_diameter_mm"
+
+
+# ----------------------------------------------- the real request ----
+
+class TestRealRequest:
+    """Every value the reader takes from STEVE's real request, measured."""
+
+    def test_reader_values(self):
+        tp = tpa.parse_request(REAL["request"])
+        assert tp["dia"] == 12.686
+        assert tp["flute"] == 50.8                   # cutter region top
+        assert tp["shank"] == 2 * 6.343
+        assert tp["stickout"] == 71.6
+        # holder regions 71.6..106.6 r25 and 106.6..141.6 r27->23, above
+        # the nose at tip + stick-out
+        assert tp["holder"] == [[0.0, pytest.approx(35.0), 25.0, 25.0],
+                                [pytest.approx(35.0), pytest.approx(70.0),
+                                 27.0, 23.0]]
+        assert tp["stock"] == ([-50.0, -40.0, 0.0], [50.0, 40.0, 38.0])
+        assert (tp["feed"], tp["plunge"], tp["max_feed"], tp["rpm"]) == \
+            (3429.0, 1270.0, 10000.0, 7500.0)
+        assert (tp["top"], tp["bottom"], tp["clearance"]) == (35.0, 20.0, 45.0)
+        assert tp["start"] == [-200.0, -150.0, 78.4]
+        assert tp["retract_z"] == 45.0
+        assert tp["margin_box"] == ([-61.343, -51.343, 20.0],
+                                    [61.343, 51.343, 78.4])
+        assert tp["posts_arcs"] is False
+
+    def test_flat_end_mill_accepted_others_refused(self):
+        for kind in ("ball_end_mill", "bull_nose_end_mill", "flat"):
+            r = copy.deepcopy(REAL["request"])
+            r["tool"]["cutter_type"] = kind
+            with pytest.raises(EngineError) as e:
+                tpa.parse_request(r)
+            assert e.value.code == "tool_not_supported" and kind in str(e.value)
+        r = copy.deepcopy(REAL["request"])
+        r["tool"]["geometry"]["regions"][0]["segment"]["corner_radius_mm"] = 0.5
+        with pytest.raises(EngineError) as e:
+            tpa.parse_request(r)
+        assert e.value.code == "tool_not_supported"
+
+    def test_fingerprint_is_canonical_json_sha256(self):
+        import crypto
+        import hashlib
+        assert hashlib.sha256(crypto.canonical_json(REAL["request"])) \
+            .hexdigest() == REAL["steve_request_sha256"]
+
+    def test_settings_and_stock_inputs_are_not_settings(self):
+        values = {k: v for k, v in REAL.items()
+                  if k not in tpa.STEVE_INPUTS and not k.startswith("_")}
+        ok, out = catalog_mod.validate(values, tpa.ACTION)
+        assert ok, out
+        assert REAL["request"]["settings"] == {
+            k: out[k] for k in REAL["request"]["settings"]}
+        assert REAL["stock"]["format"] == "glb" and \
+            REAL["stock"]["snapshot_sha256"] == \
+            REAL["request"]["predecessor_stock_sha256"]
+
+    def test_first_move_from_home_lands_inside_margin_box(self):
+        """start_tip_mm is machine home, outside margin_box at its very top
+        Z: the first move goes over at retract_z_mm (inside), never at the
+        start height (78.4 = the box top, not one step inside)."""
+        tp = tpa.parse_request(REAL["request"])
+        ngc = "G21\nG0 X0 Y0 Z40\nG1 Z36 F1270\nG1 X10 F3429\nG0 Z40\n"
+        mv = tpa.ngc_to_moves(ngc, tp)
+        assert mv[0]["end_mm"] == [0.0, 0.0, 45.0]
+        doc = tpa.document(mv, REAL["steve_request_sha256"])
+        assert tpa.violations(doc, tp, REAL["steve_request_sha256"]) == []
+        doc["moves"][0]["end_mm"][2] = 78.4         # the old start-height hop
+        assert [lim for _f, _m, lim, _s in tpa.violations(
+            doc, tp, REAL["steve_request_sha256"])] == ["margin_box",
+                                                         "tip_envelope"]
 
 
 # ------------------------------------------------- validator mutants ----
@@ -187,7 +247,7 @@ class TestValidatorMutants:
     def test_converter_plunge_and_retract(self):
         ngc = "G21\nG0 X10 Y10 Z13.4\nG1 Z5 F3000\nG1 X20 F3000\nG0 Z14.4\n"
         mv = tpa.ngc_to_moves(ngc, TP)
-        assert mv[0] == {"kind": "rapid", "end_mm": [10.0, 10.0, 50.0]}
+        assert mv[0] == {"kind": "rapid", "end_mm": [10.0, 10.0, 20.0]}
         assert mv[2]["feed_mm_min"] == 800              # plunge held down
         assert mv[3]["feed_mm_min"] == 3000
         assert mv[-1]["end_mm"][2] == 20.0              # up to retract_z
