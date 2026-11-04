@@ -10,9 +10,9 @@ is exactly the deep-link checks; each one is shown to refuse on its own:
     refused;
 (f) OFF is the default (no "gr" stats key, default == off), --gap-relink
     parses;
-(g) wiring, on a two-pocket scene: relinks through the link-fallback and
-    clip re-entry sites, fewer helices than OFF, relinks emitted as G1 feeds
-    at Z (the a2d LinkNotClear site does not fire there).
+(g) wiring, on a two-pocket scene: relinks through the link-fallback site,
+    fewer helices than OFF, relinks emitted as G1 feeds at Z (the clip
+    re-entry and a2d LinkNotClear sites do not relink there).
 The link_clear at Z + lift check cannot fail alone while link_clear at Z
 passes (heights are monotone), so it has no separate case.
 Runnable directly or under pytest from VibeCAD python."""
@@ -58,8 +58,24 @@ def test_gr_link_ok_each_check():
     from engine.rough import _strip_engage  # noqa: F401  (the measure)
     assert _case(raise_cells=side, yc=0.15) is False, \
         "(e) a wide shear just outside R must refuse"
+    # GR's own no-shear rule: a thin shear (one stock row 6.40 mm from the
+    # corridor, inside the strip reach, width < 2.438) passes the deep-link
+    # verdict but must be refused by _gr_no_shear
+    from engine.rough import _gr_no_shear, _dense_line as _dl
+    from engine.stock import StockField
+    st = StockField((-30.0, 30.0, -30.0, 30.0, 0.0, 20.0), cell=0.5)
+    st.top[:] = Z
+    st.set_tool(R)
+    for x in range(-8, 9):
+        st.top[st._cj(-6.25), st._ci(x * 0.5)] = Z + 3.0
+    cor = [(round(a, 4), round(b, 4)) for (a, b) in _dl((-5.0, 0.15), (5.0, 0.15))]
+    assert _case(raise_cells=[(x * 0.5, -6.25, 3.0) for x in range(-8, 9)],
+                 yc=0.15) is True, "thin shear must pass the deep-link verdict"
+    assert _gr_no_shear(st, cor, Z, R) is False, "GR must refuse any shear"
+    st.top[:] = Z
+    assert _gr_no_shear(st, cor, Z, R) is True
     print("PASS gr verdict: clean relinks; island, corridor, stock at Z and "
-          "wide shear each refuse")
+          "wide shear each refuse; GR refuses a thin shear the deep links allow")
 
 
 def _twopock(flag):
@@ -103,19 +119,23 @@ def _helices(moves):
 
 def test_gr_wiring_two_pocket():
     """(g) wiring: on the two-pocket scene GR relinks through the link
-    fallback and the clip re-entry sites (both pinned, so unwiring either
-    turns this red); the program has fewer helices than OFF; every logged
-    relink is in the program as G1 feeds at the level Z ending on its end
-    point at the cutting feed. The a2d LinkNotClear site does not fire here
-    (uncovered by this scene)."""
+    fallback site (pinned, so unwiring it turns this red); the program has
+    fewer G0 moves than OFF (no more helices); every logged relink is G1
+    feeds at the level Z ending on its end point at the cutting feed. The
+    clip re-entry relinks here all shear some stock, so the no-shear rule
+    refuses them, and the a2d LinkNotClear site does not fire: both are
+    uncovered by this scene."""
     m_on, s_on = _twopock(1)
     m_off, _s = _twopock(0)
     g = s_on["gr"]
     assert g["relinked"] >= 1, g
-    for site in ("link_fallback", "clip_reentry"):
-        assert g["by_site"][site] >= 1, ("site not relinking", site, g)
+    assert g["by_site"]["link_fallback"] >= 1, ("site not relinking", g)
     h_on, h_off = _helices(m_on), _helices(m_off)
-    assert h_on < h_off, (h_on, h_off)
+    g0_on = sum(1 for mv in m_on if mv["g"] == 0)
+    g0_off = sum(1 for mv in m_off if mv["g"] == 0)
+    # with the no-shear rule the relinks here replace retract + traverse
+    # rapids (the following re-entries are unchanged): fewer G0 moves
+    assert g0_on < g0_off and h_on <= h_off, (g0_on, g0_off, h_on, h_off)
     cut = max(mv.get("f") or 0 for mv in m_on if mv["g"] == 1)
     for x0, y0, x1, y1, zl, _site in g["log"]:
         hit = [k for k, mv in enumerate(m_on)
@@ -128,9 +148,10 @@ def test_gr_wiring_two_pocket():
                 if abs(mv["x"] - x0) < 1e-4 and abs(mv["y"] - y0) < 1e-4
                 and abs(mv["z"] - zl) < 1e-6]
         assert back, ("relink start not at depth before its end", x0, y0, zl)
-    print("PASS gr wiring: %d relinks %s, helices %d vs %d, %d logged relinks"
-          " are G1 feeds at Z" % (g["relinked"], g["by_site"], h_on, h_off,
-                                   len(g["log"])))
+    print("PASS gr wiring: %d relinks %s, G0 %d vs %d, helices %d vs %d, %d "
+          "logged relinks are G1 feeds at Z" % (g["relinked"], g["by_site"],
+                                                g0_on, g0_off, h_on, h_off,
+                                                len(g["log"])))
 
 
 class _Parsed(Exception):
