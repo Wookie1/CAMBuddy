@@ -6,6 +6,7 @@ values converted by the runner after validation.
 import difflib
 
 import errors
+import toolpath_action
 
 ACTION = "adaptive_rough"
 SLOPE_ACTION = "slope_split_finish"
@@ -23,7 +24,8 @@ VIEW_ACTION = "view.load"
 TOOL_ACTIONS = TOOL_ACTIONS + (VIEW_ACTION,)
 # track 2 (b): measure the oriented model (engine prepare path, no cutting)
 MEASURE_ACTION = "model.measure"
-ENGINE_ACTIONS = ACTIONS + (MEASURE_ACTION,)
+TOOLPATH_ACTION = "adaptive_rough_toolpath"  # TP1: STEVE toolpath action
+ENGINE_ACTIONS = ACTIONS + (MEASURE_ACTION, TOOLPATH_ACTION)
 EVENT = "engine_state"
 # SHOW3D: the newest cutting/check runs, posted after every one of them ends
 LAST_RUNS_EVENT = "last_runs"
@@ -501,7 +503,8 @@ def _annotate(action):
 
 CATALOG = {"actions": [ROUGHING_ACTION, SLOPE_ACTION_SPEC,
                        CHECK_ACTION_SPEC, MEASURE_ACTION_SPEC]
-           + TOOL_ACTION_SPECS + [_VIEW_LOAD_ACTION_SPEC],
+           + TOOL_ACTION_SPECS + [_VIEW_LOAD_ACTION_SPEC,
+                                  toolpath_action.SPEC],
            "events": [{
                "name": EVENT,
                "description": "Engine state: idle or busy, the current "

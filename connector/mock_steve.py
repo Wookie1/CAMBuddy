@@ -112,6 +112,27 @@ class MockSteve:
             self.cond.notify_all()
         return msg
 
+    def toolpath_inputs(self, step_path, request, settings=None,
+                        sha_over=None):
+        """TP1: the inputs STEVE sends a toolpath action (docs, Toolpath
+        actions): part (STEP file input served from serve_dir), request,
+        steve_request_sha256 and the settings, also in request.settings.
+        GUESS: the docs do not say how the fingerprint is computed; here it
+        is sha256 of the canonical request JSON."""
+        with open(step_path, "rb") as fh:
+            data = fh.read()
+        name = os.path.basename(step_path)
+        request = dict(request, settings=dict(settings or {}))
+        return dict(settings or {}, part={
+            "kind": "file", "format": "step", "name": name,
+            "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
+            "url": self.base_url + "/files/" + name,
+            "headers": {"X-Steve-Ticket": "tp-%s" % os.urandom(4).hex()},
+            "document": {"id": "doc-tp"}, "revision": 1},
+            request=request,
+            steve_request_sha256=sha_over or hashlib.sha256(
+                crypto.canonical_json(request)).hexdigest())
+
     def confirm(self):
         with self.lock:
             self.confirmed = True
@@ -395,6 +416,8 @@ class MockSteve:
                 "sha256": hashlib.sha256(body).hexdigest(),
                 "media": h.headers.get("Content-Type"),
             }
+            if name == "toolpath.json":   # TP1: kept for the tests to judge
+                self.files[run_id][name]["body"] = body
         return h._send(200, {"accepted": True, "name": name,
                              "bytes": len(body),
                              "sha256": hashlib.sha256(body).hexdigest()})
