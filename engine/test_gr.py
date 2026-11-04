@@ -9,7 +9,10 @@ is exactly the deep-link checks; each one is shown to refuse on its own:
     strip measure reaches R + 0.75 cell and reads a full-width shear) ->
     refused;
 (f) OFF is the default (no "gr" stats key, default == off), --gap-relink
-    parses.
+    parses;
+(g) wiring, on a two-pocket scene: relinks through the link-fallback and
+    clip re-entry sites, fewer helices than OFF, relinks emitted as G1 feeds
+    at Z (the a2d LinkNotClear site does not fire there).
 The link_clear at Z + lift check cannot fail alone while link_clear at Z
 passes (heights are monotone), so it has no separate case.
 Runnable directly or under pytest from VibeCAD python."""
@@ -57,6 +60,77 @@ def test_gr_link_ok_each_check():
         "(e) a wide shear just outside R must refuse"
     print("PASS gr verdict: clean relinks; island, corridor, stock at Z and "
           "wide shear each refuse")
+
+
+def _twopock(flag):
+    """Two pockets joined at both ends of a centre wall gap (one 2.286 mm
+    level): Adaptive2d links between them lift, and clip breaks re-enter."""
+    from opencamlib import ocl
+    from engine.rough import rough
+    from engine.test_engine import _box_tris as bt, _write_stl
+    tris = (bt(-40, 40, -30, 30, -1, 0) + bt(-40, -30, -30, 30, 0, 14)
+            + bt(30, 40, -30, 30, 0, 14) + bt(-30, 30, -30, -25, 0, 14)
+            + bt(-30, 30, 25, 30, 0, 14) + bt(-2, 2, -25, -4, 0, 14)
+            + bt(-2, 2, 4, 25, 0, 14))
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "gr2.stl")
+        _write_stl(stl, tris)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        return rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 14.0), 6.343, 0.0,
+                     leave=0.381, axial_leave=0.381, stepdown=19.05,
+                     stepup=1.905, tolerance=0.05, threads=4, stock_cell=0.5,
+                     min_rest=0.5, corner_r=0.0, stl_path=stl,
+                     side_entry_holder=(25.0, 71.6), gap_relink=flag)
+
+
+def _helices(moves):
+    """descent runs of >= 4 descending feed moves right after a G0"""
+    n, i = 0, 1
+    while i < len(moves):
+        if moves[i - 1]["g"] == 0 and moves[i]["g"] == 1 and \
+                moves[i]["z"] < moves[i - 1]["z"] - 1e-6:
+            j = i
+            while j + 1 < len(moves) and moves[j + 1]["g"] == 1 and \
+                    moves[j + 1]["z"] < moves[j]["z"] - 1e-6:
+                j += 1
+            n += (j - i + 1) >= 4
+            i = j + 1
+        else:
+            i += 1
+    return n
+
+
+def test_gr_wiring_two_pocket():
+    """(g) wiring: on the two-pocket scene GR relinks through the link
+    fallback and the clip re-entry sites (both pinned, so unwiring either
+    turns this red); the program has fewer helices than OFF; every logged
+    relink is in the program as G1 feeds at the level Z ending on its end
+    point at the cutting feed. The a2d LinkNotClear site does not fire here
+    (uncovered by this scene)."""
+    m_on, s_on = _twopock(1)
+    m_off, _s = _twopock(0)
+    g = s_on["gr"]
+    assert g["relinked"] >= 1, g
+    for site in ("link_fallback", "clip_reentry"):
+        assert g["by_site"][site] >= 1, ("site not relinking", site, g)
+    h_on, h_off = _helices(m_on), _helices(m_off)
+    assert h_on < h_off, (h_on, h_off)
+    cut = max(mv.get("f") or 0 for mv in m_on if mv["g"] == 1)
+    for x0, y0, x1, y1, zl, _site in g["log"]:
+        hit = [k for k, mv in enumerate(m_on)
+               if mv["g"] == 1 and abs(mv["x"] - x1) < 1e-4
+               and abs(mv["y"] - y1) < 1e-4 and abs(mv["z"] - zl) < 1e-6
+               and mv.get("f") == cut]
+        assert hit, ("relink end not emitted as a feed at Z", x1, y1, zl)
+        k = hit[0]
+        back = [mv for mv in m_on[max(0, k - 400):k]
+                if abs(mv["x"] - x0) < 1e-4 and abs(mv["y"] - y0) < 1e-4
+                and abs(mv["z"] - zl) < 1e-6]
+        assert back, ("relink start not at depth before its end", x0, y0, zl)
+    print("PASS gr wiring: %d relinks %s, helices %d vs %d, %d logged relinks"
+          " are G1 feeds at Z" % (g["relinked"], g["by_site"], h_on, h_off,
+                                   len(g["log"])))
 
 
 class _Parsed(Exception):
@@ -120,3 +194,4 @@ def test_gr_default_off_and_flag():
 if __name__ == "__main__":
     test_gr_link_ok_each_check()
     test_gr_default_off_and_flag()
+    test_gr_wiring_two_pocket()
