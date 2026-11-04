@@ -993,6 +993,7 @@ def main(argv=None):
                 return_stock=one)
         moves, lst, *ll_stock = res
         stats["ll_overlap"] = stats_ov
+        stats["load_limit"] = lst  # TP1: reduced_feed_windows for toolpath runs
         print("load_limit: windows_slowed=%d mm_slowed=%.1f min_feed=%.0f "
               "floor_bound=%d" % (lst["windows_slowed"], lst["mm_slowed"],
                                   lst["min_feed"] or 0.0,

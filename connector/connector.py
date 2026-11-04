@@ -32,6 +32,7 @@ import errors                  # noqa: E402
 from client import SteveClient, SteveError  # noqa: E402
 import runner as runner_mod    # noqa: E402
 from runner import EngineRun, EngineError, Cancelled  # noqa: E402
+import toolpath_action           # noqa: E402
 
 VERSION = "1.0.0"
 PANEL_NAME = catalog_mod.ACTION
@@ -877,6 +878,10 @@ class Connector:
                 self.emit_state("busy", action, round(p, 2))
 
         try:
+            if action == catalog_mod.TOOLPATH_ACTION:
+                self._run_toolpath(run_id, env, work, engine, on_progress)
+                end_run()
+                return
             # download + verify inputs (files and posted programs)
             step_path = None
             program_path = None
@@ -989,6 +994,53 @@ class Connector:
         finally:
             self.running = None
             self.current_run = None
+
+    def _steve_file(self, inp, name, dest):
+        """Download a STEVE file input and check its sha256 and bytes."""
+        if not isinstance(inp, dict) or not inp.get("url"):
+            raise EngineError("missing STEVE input %s" % name,
+                              code="input_missing", field=name)
+        data = self.client.download(inp["url"], inp.get("headers"))
+        if hashlib.sha256(data).hexdigest() != inp.get("sha256") \
+                or len(data) != inp.get("bytes"):
+            raise EngineError("download failed sha256/bytes check",
+                              code="input_digest_mismatch", field=name)
+        with open(dest, "wb") as fh:
+            fh.write(data)
+        return data
+
+    def _run_toolpath(self, run_id, env, work, engine, on_progress):
+        """TP1: a STEVE toolpath run -> toolpath.json only, after our gates
+        and the request-limit check. Failures raise into _run_job."""
+        inputs = env.get("inputs") or {}
+        os.makedirs(work, exist_ok=True)
+        step_path = os.path.join(work, "input.step")
+        self._steve_file(inputs.get("part"), "part", step_path)
+        request = inputs.get("request")
+        if isinstance(request, dict) and request.get("kind") == "file":
+            # GUESS: the docs list request as an input, not its form
+            request = json.loads(self._steve_file(
+                request, "request", os.path.join(work, "request.json")))
+        sha = inputs.get("steve_request_sha256")
+        if not isinstance(request, dict) or not isinstance(sha, str) \
+                or not sha:
+            raise EngineError("missing request or steve_request_sha256",
+                              code="input_missing", field="request")
+        values = {k: v for k, v in inputs.items()
+                  if k not in toolpath_action.STEVE_INPUTS}
+        ok, values = catalog_mod.validate(values, catalog_mod.TOOLPATH_ACTION)
+        if not ok:
+            raise EngineError(values["message"], code=values["code"],
+                              field=values.get("field"),
+                              got=values.get("got"),
+                              allowed=values.get("allowed"))
+        result, path, check = toolpath_action.run(
+            engine, step_path, request, sha, values, on_progress)
+        result.update(envelope.for_result(catalog_mod.TOOLPATH_ACTION, check))
+        with open(path, "rb") as fh:
+            self.client.put_file(run_id, "toolpath.json", fh.read(),
+                                 "application/json")
+        self._report(run_id, "succeeded", result=result, message="done")
 
     def _copy_program(self, path_nc, program_number, stem="rough"):
         try:
