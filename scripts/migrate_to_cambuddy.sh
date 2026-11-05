@@ -18,7 +18,9 @@ if [ -d "$HOME/.stevecam" ] && [ ! -e "$HOME/.cambuddy" ]; then
     mv "$HOME/.stevecam" "$HOME/.cambuddy"
     echo "moved ~/.stevecam -> ~/.cambuddy"
 fi
+osascript -e 'quit app id "studio.stevecam.menubar"' 2>/dev/null || true
 rm -rf "$HOME/Applications/SteveCAM.app"
 "$REPO/menubar/make_app.sh"
 "$REPO/menubar/install_agent.sh"
+open "$HOME/Applications/CAMBuddy.app"
 echo "done: CAMBuddy connector and menu-bar app installed"

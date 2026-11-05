@@ -33,7 +33,7 @@
     20.0
    ]
   },
-  "operation": "rough_CAMBuddy",
+  "operation": "rough_steveCAM",
   "posts_arcs": false,
   "predecessor_stock_sha256": "64d2e8306bb0fbabc9755499072e1c57f531cc38523df6627c40c290e677d314",
   "retract_z_mm": 45.0,
