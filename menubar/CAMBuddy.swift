@@ -415,14 +415,40 @@ struct SettingsView: View {
     }
 }
 
+// -------------------------------------------------------------------- icon --
+// Facing toolpath: back-and-forth raster passes, drawn as a template image so
+// macOS tints it for light / dark menu bars.
+let menuBarIcon: NSImage = {
+    let img = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+        let path = NSBezierPath()
+        path.lineWidth = 1.6
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        let ys: [CGFloat] = [3, 7, 11, 15]
+        path.move(to: NSPoint(x: 2.5, y: ys[0]))
+        for (i, y) in ys.enumerated() {
+            let (a, b): (CGFloat, CGFloat) = i % 2 == 0 ? (2.5, 15.5) : (15.5, 2.5)
+            if i > 0 { path.line(to: NSPoint(x: a, y: y)) }
+            path.line(to: NSPoint(x: b, y: y))
+        }
+        NSColor.black.setStroke()
+        path.stroke()
+        return true
+    }
+    img.isTemplate = true
+    return img
+}()
+
 // --------------------------------------------------------------------- app --
 @main
 struct CAMBuddyApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        MenuBarExtra("CAMBuddy", systemImage: "c.circle") {
+        MenuBarExtra {
             MenuContent(model: AppState.shared.model)
+        } label: {
+            Image(nsImage: menuBarIcon)
         }
         Settings {
             SettingsView(model: AppState.shared.model)
