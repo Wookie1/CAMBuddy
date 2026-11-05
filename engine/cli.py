@@ -545,8 +545,11 @@ def main(argv=None):
                    default=None,
                    help="ES1: the air-descent disk scan counts a stock cell "
                         "iff its square meets the helix's swept disk exactly "
-                        "(no centre dilation): 1 on, 0 off (default; env "
-                        "CAMBUDDY_EXACT_SQUARE)")
+                        "(no centre dilation): 1 on (default), 0 off (also "
+                        "--no-exact-square or env CAMBUDDY_EXACT_SQUARE=0)")
+    r.add_argument("--no-exact-square", dest="exact_square",
+                   action="store_const", const=0,
+                   help="same as --exact-square 0")
     r.add_argument("--no-gap-relink", dest="gap_relink",
                    action="store_const", const=0,
                    help="same as --gap-relink 0")

@@ -1605,12 +1605,13 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     else:
         _gr_on = int(os.environ.get("ENGINE_GAP_RELINK", "1")) != 0
     # ES1: the air-descent disk scan uses the exact disk / cell-square test
-    # instead of the cell*sqrt(2)/2 centre dilation. Default OFF; on with
-    # exact_square=1, --exact-square 1 or CAMBUDDY_EXACT_SQUARE=1.
+    # instead of the cell*sqrt(2)/2 centre dilation. Default ON (James,
+    # 2026-11-05); off with exact_square=0, --no-exact-square /
+    # --exact-square 0 or CAMBUDDY_EXACT_SQUARE=0.
     if exact_square is not None:
         _es_on = bool(exact_square)
     else:
-        _es_on = int(os.environ.get("CAMBUDDY_EXACT_SQUARE", "0")) != 0
+        _es_on = int(os.environ.get("CAMBUDDY_EXACT_SQUARE", "1")) != 0
     sk1_block = [None]   # why the last SK1 search found no column
     if clearance_z is None:
         clearance_z = szmax + 2.0

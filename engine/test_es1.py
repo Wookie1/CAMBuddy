@@ -1,4 +1,4 @@
-"""ES1 (--exact-square / CAMBUDDY_EXACT_SQUARE, default OFF): the LVA disk
+"""ES1 (--exact-square / CAMBUDDY_EXACT_SQUARE, default ON): the LVA disk
 scan counts a stock cell iff its 0.5 mm square meets the helix's swept disk
 r + R exactly, instead of dilating cell centres by cell*sqrt(2)/2. On
 test_lva's synthetic field (helix about (0, 0), r + R = 9.513, cells centred
@@ -9,7 +9,9 @@ on .25 / .75):
     (9.83 <= 9.867) but whose square's nearest point is 9.552 does NOT count
     -> start 11.0 (with ES1 off the dilation counts it -> 16.0);
 (c) the R5 column term and (d) the holder clamp still apply unchanged;
-(e) OFF is the default and --exact-square parses.
+(e) ON is the default (James, 2026-11-05); OFF (exact_square=0,
+    CAMBUDDY_EXACT_SQUARE=0, --no-exact-square) is main's program (pinned
+    hash).
 Runnable directly or under pytest from VibeCAD python."""
 import json
 import os
@@ -54,7 +56,12 @@ class _Parsed(Exception):
         self.ns = ns
 
 
-def test_es1_default_off_and_flag():
+# main's program on the BS1d scene (sha256 of the move list, first 16 hex;
+# main f47377d, engine == df60a95): ES1 OFF must reproduce it exactly
+MAIN_BS1D_SHA16 = "d9091c2b946f26aa"
+
+
+def _bs1d(flag):
     import tempfile
     from opencamlib import ocl
     from engine.rough import rough
@@ -62,27 +69,41 @@ def test_es1_default_off_and_flag():
     tris = (bt(-40, 40, -30, 30, -1, 0) + bt(-40, -30, -30, 30, 0, 14)
             + bt(30, 40, -30, 30, 0, 14) + bt(-30, 30, -30, -25, 0, 14)
             + bt(-30, 30, 25, 30, 0, 14) + bt(-11, 11, -6, 6, 0, 14))
+    with tempfile.TemporaryDirectory() as td:
+        stl = os.path.join(td, "es1.stl")
+        _write_stl(stl, tris)
+        surf = ocl.STLSurf()
+        ocl.STLReader(stl, surf)
+        m, _st = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 14.0),
+                       6.343, 0.0, leave=0.381, axial_leave=0.381,
+                       stepdown=19.05, stepup=1.905, tolerance=0.05,
+                       threads=4, stock_cell=0.5, min_rest=0.5,
+                       corner_r=0.0, stl_path=stl,
+                       side_entry_holder=(25.0, 71.6), exact_square=flag)
+    return json.dumps(m)
+
+
+def test_es1_default_on_and_off_is_main():
+    """ES1 is ON by default (James, 2026-11-05): the default program equals
+    exact_square=1 and differs from OFF on the BS1d scene; exact_square=0 and
+    CAMBUDDY_EXACT_SQUARE=0 both turn it off and give main's program (pinned
+    hash). The parser maps nothing to None (= default ON), --exact-square 1
+    to 1 and --no-exact-square to 0."""
+    import hashlib
     old = os.environ.pop("CAMBUDDY_EXACT_SQUARE", None)
-    out = {}
     try:
-        with tempfile.TemporaryDirectory() as td:
-            stl = os.path.join(td, "es1.stl")
-            _write_stl(stl, tris)
-            surf = ocl.STLSurf()
-            ocl.STLReader(stl, surf)
-            for tag, flag in (("default", None), ("off", 0)):
-                m, _st = rough(surf, (-40.0, 40.0, -30.0, 30.0, -1.0, 14.0),
-                               6.343, 0.0, leave=0.381, axial_leave=0.381,
-                               stepdown=19.05, stepup=1.905, tolerance=0.05,
-                               threads=4, stock_cell=0.5, min_rest=0.5,
-                               corner_r=0.0, stl_path=stl,
-                               side_entry_holder=(25.0, 71.6),
-                               exact_square=flag)
-                out[tag] = json.dumps(m)
+        p_def, p_on, p_off = _bs1d(None), _bs1d(1), _bs1d(0)
+        os.environ["CAMBUDDY_EXACT_SQUARE"] = "0"
+        p_env = _bs1d(None)
     finally:
+        os.environ.pop("CAMBUDDY_EXACT_SQUARE", None)
         if old is not None:
             os.environ["CAMBUDDY_EXACT_SQUARE"] = old
-    assert out["default"] == out["off"], "default != explicit off"
+    assert p_def == p_on, "default != ON"
+    assert p_off == p_env, "off != CAMBUDDY_EXACT_SQUARE=0"
+    h = hashlib.sha256(p_off.encode()).hexdigest()[:16]
+    assert h == MAIN_BS1D_SHA16, ("OFF is not main's program", h)
+    assert p_def != p_off, "ES1 changes nothing on the BS1d scene"
     import argparse
     from engine import cli
     orig = argparse.ArgumentParser.parse_args
@@ -91,7 +112,8 @@ def test_es1_default_off_and_flag():
         raise _Parsed(orig(self, args, namespace))
     argparse.ArgumentParser.parse_args = grab
     try:
-        for argv, want in (([], None), (["--exact-square", "1"], 1)):
+        for argv, want in (([], None), (["--exact-square", "1"], 1),
+                           (["--no-exact-square"], 0)):
             try:
                 cli.main(["rough", "--step", "x.step", "--stock", "0", "1",
                           "0", "1", "0", "1", "--tool", "flat:12.686",
@@ -102,9 +124,10 @@ def test_es1_default_off_and_flag():
                 raise AssertionError("parser not reached")
     finally:
         argparse.ArgumentParser.parse_args = orig
-    print("PASS es1 default OFF (default == off); --exact-square parses")
+    print("PASS es1 default ON (== ON, != OFF); OFF / env 0 identical == main"
+          " %s; --no-exact-square parses to 0" % h)
 
 
 if __name__ == "__main__":
     test_es1_square_rule()
-    test_es1_default_off_and_flag()
+    test_es1_default_on_and_off_is_main()
