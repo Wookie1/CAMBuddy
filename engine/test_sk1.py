@@ -268,13 +268,25 @@ def _tb_program(mod=None):
                                       tol=0.01), TB_STL)
     surf = ocl.STLSurf()
     ocl.STLReader(TB_STL, surf)
-    moves, stats = (mod or rough)(surf, (-50.0, 50.0, -40.0, 40.0, 0.0, 38.0),
-                                  6.343, 20.0, leave=0.381,
-                                  axial_leave=0.381, stepdown=19.05,
-                                  final_zmin=20.381, stepover=0.16,
-                                  tolerance=0.05, threads=4, stock_cell=0.5,
-                                  min_rest=1.0, corner_r=0.0,
-                                  stl_path=TB_STL)
+    # GR (gap relink) is default ON by design and changes this program; the
+    # guard is "SK1 off == main", so both sides run with GR off (main's
+    # rough.py ignores the variable).
+    old_gr = os.environ.get("ENGINE_GAP_RELINK")
+    os.environ["ENGINE_GAP_RELINK"] = "0"
+    try:
+        moves, stats = (mod or rough)(surf, (-50.0, 50.0, -40.0, 40.0, 0.0,
+                                             38.0),
+                                      6.343, 20.0, leave=0.381,
+                                      axial_leave=0.381, stepdown=19.05,
+                                      final_zmin=20.381, stepover=0.16,
+                                      tolerance=0.05, threads=4,
+                                      stock_cell=0.5, min_rest=1.0,
+                                      corner_r=0.0, stl_path=TB_STL)
+    finally:
+        if old_gr is None:
+            os.environ.pop("ENGINE_GAP_RELINK", None)
+        else:
+            os.environ["ENGINE_GAP_RELINK"] = old_gr
     assert stats["n_axial_plunge"] == 0
     return "\n".join(moves_to_gcode(moves)) + "\n"
 
