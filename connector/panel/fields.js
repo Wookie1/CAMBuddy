@@ -1,5 +1,5 @@
 "use strict";
-/* SteveCAM panel: form fields, units and client-side checks. No DOM, no bridge.
+/* CAMBuddy panel: form fields, units and client-side checks. No DOM, no bridge.
 
    Units rule (connector/catalog.py): when units == "inch" the server multiplies every
    MM_FIELDS value by 25.4 BEFORE its range checks. So every length and feed is shown
@@ -185,7 +185,7 @@
 
   function specOf(form, name) { return (FORMS[form] || []).find((s) => s.name === name) || null; }
 
-  root.SteveCAMFields = {
+  root.CAMBuddyFields = {
     MM_PER_IN, DECIMALS, FORMS, ORIENT_BASE, ORIENT_TIPS, ORIGINS,
     isLen, round, numText, unitText, initial, parse, fromMm, fromUnit, view, serverMm,
     rangeText, check, specOf, limText,

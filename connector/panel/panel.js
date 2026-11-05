@@ -1,10 +1,10 @@
 "use strict";
-/* SteveCAM panel for STEVE (SYIL X7).
+/* CAMBuddy panel for STEVE (SYIL X7).
    Bridge rules (steve_panel_bridge.md): all data comes from STEVE through postMessage to the
    parent frame. No network, no storage, no cookies, no popups, no navigation. */
 (function () {
-  const FX = window.SteveCAMFields;
-  const RP = window.SteveCAMReport;
+  const FX = window.CAMBuddyFields;
+  const RP = window.CAMBuddyReport;
   const FINAL = new Set(["succeeded", "failed", "rejected", "cancelled", "expired"]);
   const ACTION = { rough: "adaptive_rough", finish: "slope_split_finish", check: "check_program", measure: "model.measure" };
   const NAME = { rough: "roughing", finish: "the slope-split finish", measure: "measuring" };
@@ -15,16 +15,16 @@
   const STATE_TEXT = {
     awaiting_confirmation: "Waiting for you to confirm in STEVE",
     pending: "Waiting to start", queued: "Waiting to start", created: "Waiting to start", waiting: "Waiting to start",
-    received: "SteveCAM got it", running: "Working", succeeded: "Done", failed: "Failed",
+    received: "CAMBuddy got it", running: "Working", succeeded: "Done", failed: "Failed",
     rejected: "Not accepted", cancelled: "Cancelled", expired: "Expired: nobody answered in time",
   };
   const PLAIN = {
     caller_not_allowed: "This panel isn't allowed to run that. Allow it for panels in STEVE's connector settings.",
     rate_limited: "Too many runs in the last minute. Wait a moment, then try again.",
-    action_not_found: "SteveCAM doesn't offer this right now. Check that SteveCAM is running and up to date.",
-    input_out_of_range: "A value is outside what SteveCAM accepts.",
+    action_not_found: "CAMBuddy doesn't offer this right now. Check that CAMBuddy is running and up to date.",
+    input_out_of_range: "A value is outside what CAMBuddy accepts.",
     input_missing: "A needed value is missing.",
-    input_unknown: "SteveCAM didn't recognise one of the values sent.",
+    input_unknown: "CAMBuddy didn't recognise one of the values sent.",
   };
 
   const $ = (id) => document.getElementById(id);
@@ -109,7 +109,7 @@
   }
   function runToEnd(action, inputs) {
     return new Promise((resolve, reject) => {
-      startRun(action, inputs, "SteveCAM panel", (run) => {
+      startRun(action, inputs, "CAMBuddy panel", (run) => {
         if (run.state === "error") reject(run.callError);
         else if (FINAL.has(run.state)) resolve(run);
       });
@@ -357,7 +357,7 @@
       return size + ", placed as drawn in the model (the model's own origin)." + orient;
     }
     if (["x", "y", "z"].some(hasBlank)) {
-      return "Blank size typed: press Measure model so SteveCAM can fit the model in it." + orient;
+      return "Blank size typed: press Measure model so CAMBuddy can fit the model in it." + orient;
     }
     const t = (name) => {
       const v = viewOf("setup." + name);
@@ -744,7 +744,7 @@
       c.btn.disabled = !canRun(form);
       let reason = "";
       if (!S.actionsLoaded) reason = "Loading…";
-      else if (!present(ACTION[form])) reason = "SteveCAM doesn't offer this.";
+      else if (!present(ACTION[form])) reason = "CAMBuddy doesn't offer this.";
       else if (!allowed(ACTION[form])) reason = "Not allowed from this panel. Allow it for panels in STEVE's connector settings.";
       else if (!S.doc) reason = "Open the part in STEVE first.";
       c.reason.textContent = reason;
@@ -767,7 +767,7 @@
     setBusy(form, true);
     resetCard(form);
     // Start the run right here in the click handler, with context().document: no await or timer before it.
-    startRun(ACTION[form], inputs, "SteveCAM panel: " + NAME[form], (run) => showRunState(form, run));
+    startRun(ACTION[form], inputs, "CAMBuddy panel: " + NAME[form], (run) => showRunState(form, run));
     S.setupTouched = true;
     saveSetup(false);  // after the run is on its way
   }
@@ -923,7 +923,7 @@
     S.results[form] = { run, check, checkErr, files };
     paintResults(form);
     showPreview(run, files, c.preview, c);
-    if (window.SteveCAMViewer) window.SteveCAMViewer.attach(c, run, files, call);
+    if (window.CAMBuddyViewer) window.CAMBuddyViewer.attach(c, run, files, call);
   }
   function outputDir(result) {
     if (!isObj(result)) return null;
@@ -973,7 +973,7 @@
     if (FINAL.has(run.state) && (run.result || c.check)) {
       c.body.append(RP.render(RP.build(run.result, c.check), S.units, { files: c.files, outputDir: outputDir(run.result) }));
     }
-    if (window.SteveCAMViewer && c.files.indexOf("view.bin") >= 0) window.SteveCAMViewer.noteInto(c.body);
+    if (window.CAMBuddyViewer && c.files.indexOf("view.bin") >= 0) window.CAMBuddyViewer.noteInto(c.body);
   }
 
   // --------------------------------------------------------- recent runs --
@@ -998,7 +998,7 @@
           if (btn.disabled) return;
           btn.disabled = true;   // from click until this run ends
           holder.replaceChildren(el("p", { class: "muted small", text: "Loading this run's 3D view…" }));
-          startRun("view.load", { run_id: r.run_id }, "SteveCAM panel: show 3D", (run) => {
+          startRun("view.load", { run_id: r.run_id }, "CAMBuddy panel: show 3D", (run) => {
             if (run.state === "error") {
               holder.replaceChildren(el("p", { class: "run-err", text: errText(run.callError) }));
               btn.disabled = false;
@@ -1013,7 +1013,7 @@
             }
             btn.disabled = false;
             holder.replaceChildren();
-            if (window.SteveCAMViewer) window.SteveCAMViewer.attach({ results: holder }, run, fileNames(run.files), call);
+            if (window.CAMBuddyViewer) window.CAMBuddyViewer.attach({ results: holder }, run, fileNames(run.files), call);
             else holder.append(el("p", { class: "muted small", text: "The 3D viewer is not available." }));
           });
         });
@@ -1034,7 +1034,7 @@
     setBusy("measure", true);
     $("measure-state").textContent = "Starting…";
     startRun(ACTION.measure, { model: { document_id: doc.id, revision: doc.revision }, orientation },
-      "SteveCAM panel: measure model", (run) => onMeasureRun(run, doc, orientation));
+      "CAMBuddy panel: measure model", (run) => onMeasureRun(run, doc, orientation));
   }
   function onMeasureRun(run, doc, orientation) {
     const ms = $("measure-state");
@@ -1050,7 +1050,7 @@
       for (const key in F) if (F[key].form === "setup") paint(key);
       paintSetupInfo();
     } else if (run.state === "succeeded") {
-      ms.textContent = "Couldn't read the model size from SteveCAM.";
+      ms.textContent = "Couldn't read the model size from CAMBuddy.";
     } else {
       ms.textContent = "Couldn't measure: " + (run.error ? errText(run.error) : (STATE_TEXT[run.state] || run.state));
     }
@@ -1064,7 +1064,7 @@
   }
   function applyTheme(theme) {
     document.documentElement.setAttribute("data-theme", theme === "dark" ? "dark" : "light");
-    if (window.SteveCAMViewer) window.SteveCAMViewer.theme();
+    if (window.CAMBuddyViewer) window.CAMBuddyViewer.theme();
   }
   function applyContext(ctx) {
     if (ctx.theme) applyTheme(ctx.theme);
@@ -1242,7 +1242,7 @@
       setActions(await call("actions"));
     } catch (e) {
       setActions([]);
-      setNotice("Couldn't read what SteveCAM offers: " + errText(e));
+      setNotice("Couldn't read what CAMBuddy offers: " + errText(e));
     }
     S.loaded = true;
     if (allowed("tools.list")) await loadTools();

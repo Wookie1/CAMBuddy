@@ -5,7 +5,7 @@ pytest-compatible under any python that can import `area`):
   pooled  - every pooled z is re-computed serially here (level_islands with
             the rough's own thread count) and must be identical
             (forbidden loops ==, Fm np.array_equal);
-  off     - STEVECAM_NO_ISLAND_POOL=1: no pool, stats island_pool == 0;
+  off     - CAMBUDDY_NO_ISLAND_POOL=1: no pool, stats island_pool == 0;
   miss    - a cache missing half the levels: those levels fall back to the
             serial call in the loop.
 All three programs must be byte-identical."""
@@ -74,7 +74,7 @@ def test_sp_p3a_pool_equals_serial():
             len(mism), mism[:5])
         assert st_pool["island_pool"] > 0, st_pool.get("island_pool")
 
-        nc_off, st_off = _rough(td, "off", {"STEVECAM_NO_ISLAND_POOL": "1"})
+        nc_off, st_off = _rough(td, "off", {"CAMBUDDY_NO_ISLAND_POOL": "1"})
         assert st_off["island_pool"] == 0
         assert nc_off == nc_pool, "env off-switch program differs"
 

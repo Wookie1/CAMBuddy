@@ -10,7 +10,7 @@
     stock padded with -inf: L np.array_equal (bit-wise, tobytes) after every
     move and (area, depth) exactly equal against _stamp_move_ref.
 (c) test_sp_k1_limit_feeds_parity: limit_feeds on the synth_pocket flat
-    rough with and without STEVECAM_NO_CKERN: identical output moves,
+    rough with and without CAMBUDDY_NO_CKERN: identical output moves,
     identical stats dict, array_equal returned stock.
 (d) test_sp_k1_mutations: scratch builds (temp dirs; the committed source is
     never touched) of R+1e-9 -> R-1e-9, skip-the-last-sample and
@@ -306,15 +306,15 @@ def test_sp_k1_limit_feeds_parity():
                               min_rest=0.5, min_level_area=20.0,
                               rapid_margin=1.0)
     assert len(moves) > 100, "synth rough produced too few moves"
-    os.environ.pop("STEVECAM_NO_CKERN", None)
+    os.environ.pop("CAMBUDDY_NO_CKERN", None)
     out_c, stats_c, stock_c = load_limit.limit_feeds(
         moves, 6.0, 0.0, STOCK, STOCK[5], CUT_FEED, return_stock=True)
-    os.environ["STEVECAM_NO_CKERN"] = "1"
+    os.environ["CAMBUDDY_NO_CKERN"] = "1"
     try:
         out_p, stats_p, stock_p = load_limit.limit_feeds(
             moves, 6.0, 0.0, STOCK, STOCK[5], CUT_FEED, return_stock=True)
     finally:
-        os.environ.pop("STEVECAM_NO_CKERN", None)
+        os.environ.pop("CAMBUDDY_NO_CKERN", None)
     assert out_c == out_p, "output moves differ"
     assert stats_c == stats_p, "stats differ: %s vs %s" % (stats_c, stats_p)
     assert np.array_equal(stock_c[0], stock_p[0]), "returned stock differs"

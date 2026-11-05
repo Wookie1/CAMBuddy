@@ -1,7 +1,7 @@
 #!/bin/bash
 # Task MENUBAR: install the connector LaunchAgent. Renders
-# menubar/com.stevecam.connector.plist.in into
-# ~/Library/LaunchAgents/com.stevecam.connector.plist, lints it with plutil
+# menubar/com.cambuddy.connector.plist.in into
+# ~/Library/LaunchAgents/com.cambuddy.connector.plist, lints it with plutil
 # and bootstraps it into gui/<uid> - only if the label is not already
 # loaded. Refuses if connector.pid names a live connector.py that launchd
 # did not start (stop it first, e.g. from the menu-bar app).
@@ -9,15 +9,15 @@ set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
-TPL="$HERE/com.stevecam.connector.plist.in"
-LABEL=com.stevecam.connector
+TPL="$HERE/com.cambuddy.connector.plist.in"
+LABEL=com.cambuddy.connector
 OUT="$HOME/Library/LaunchAgents/$LABEL.plist"
 UID_NUM="$(id -u)"
 
 [ -f "$TPL" ] || { echo "template missing: $TPL" >&2; exit 1; }
 
 # Refuse while a manually started (non-launchd) connector is running.
-PIDFILE="$HOME/.stevecam/connector.pid"
+PIDFILE="$HOME/.cambuddy/connector.pid"
 if [ -f "$PIDFILE" ]; then
     PID="$(tr -dc '0-9' < "$PIDFILE")"
     if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null \
@@ -26,7 +26,7 @@ if [ -f "$PIDFILE" ]; then
         if [ "$PARENT" != "1" ]; then
             echo "connector pid $PID is running but was not started by" \
                  "launchd (parent $PARENT);" >&2
-            echo "stop it first (SteveCAM menu: Stop) and run this script" \
+            echo "stop it first (CAMBuddy menu: Stop) and run this script" \
                  "again." >&2
             exit 1
         fi

@@ -1,7 +1,7 @@
 """Task MENUBAR red test (d): the menubar/ deliverables are well-formed.
 
 Rendered LaunchAgent plist lints with plutil and carries the required keys;
-no ckern/jobs env overrides in the menubar sources; SteveCAM.swift passes
+no ckern/jobs env overrides in the menubar sources; CAMBuddy.swift passes
 `swiftc -typecheck -parse-as-library` and never kills by name; the shell
 scripts pass `bash -n`.
 
@@ -23,7 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 LANE_TEST = os.path.abspath(__file__)
 
-FORBIDDEN = ["ZMAP_NO_" "CKERN", "STEVECAM_NO_" "CKERN", "ZMAP_" "JOBS"]
+FORBIDDEN = ["ZMAP_NO_" "CKERN", "CAMBUDDY_NO_" "CKERN", "ZMAP_" "JOBS"]
 
 
 def _menubar_files():
@@ -40,18 +40,18 @@ def _menubar_files():
 
 
 def test_plist_template_renders_and_lints(tmp_path):
-    src = os.path.join(HERE, "com.stevecam.connector.plist.in")
+    src = os.path.join(HERE, "com.cambuddy.connector.plist.in")
     text = open(src).read()
     rendered = text.replace("@REPO@", REPO).replace(
         "@HOME@", str(tmp_path))
-    path = tmp_path / "com.stevecam.connector.plist"
+    path = tmp_path / "com.cambuddy.connector.plist"
     with open(path, "w") as fh:
         fh.write(rendered)
     out = subprocess.run(["plutil", "-lint", str(path)],
                          capture_output=True, text=True)
     assert out.returncode == 0, out.stdout + out.stderr
     d = plistlib.loads(path.read_bytes())
-    assert d["Label"] == "com.stevecam.connector"
+    assert d["Label"] == "com.cambuddy.connector"
     assert d["ProgramArguments"] == ["/opt/homebrew/bin/python3",
                                      os.path.join(REPO, "connector",
                                                   "connector.py")]
@@ -60,9 +60,9 @@ def test_plist_template_renders_and_lints(tmp_path):
     assert d["KeepAlive"] == {"SuccessfulExit": False}
     assert d["ThrottleInterval"] == 10
     home = str(tmp_path)
-    assert d["StandardOutPath"] == os.path.join(home, ".stevecam",
+    assert d["StandardOutPath"] == os.path.join(home, ".cambuddy",
                                                 "connector.log")
-    assert d["StandardErrorPath"] == os.path.join(home, ".stevecam",
+    assert d["StandardErrorPath"] == os.path.join(home, ".cambuddy",
                                                   "connector.log")
     env = d["EnvironmentVariables"]
     assert "/usr/bin" in env["PATH"]
@@ -81,7 +81,7 @@ def test_no_ckern_env_names_in_menubar():
 
 
 def test_swift_typechecks():
-    src = os.path.join(HERE, "SteveCAM.swift")
+    src = os.path.join(HERE, "CAMBuddy.swift")
     out = subprocess.run(["/usr/bin/swiftc", "-typecheck",
                           "-parse-as-library", src],
                          capture_output=True, text=True, timeout=600)
@@ -89,7 +89,7 @@ def test_swift_typechecks():
 
 
 def test_swift_never_kills_by_name():
-    text = open(os.path.join(HERE, "SteveCAM.swift")).read()
+    text = open(os.path.join(HERE, "CAMBuddy.swift")).read()
     for bad in ("pkill", "killall", "kill -9"):
         assert bad not in text
 
@@ -106,11 +106,11 @@ def test_shell_scripts_parse():
 # ------------------------------------------------ MENUBAR2: busy guard ----
 
 def test_swift_stop_guard():
-    """MENUBAR2: the Stop/Restart busy guard in SteveCAM.swift. Checks:
+    """MENUBAR2: the Stop/Restart busy guard in CAMBuddy.swift. Checks:
     1. the exact alert text and the Stop / Cancel buttons;
     2. the pure decision function stopDecision(state:force:fromURL:) with
        proceed/confirm/refuse, force read only from the URL (force=1) and
-       stevecam://start unchanged;
+       cambuddy://start unchanged;
     3. a refusal is recorded ("... refused <action>: run in progress");
     4. every kill( call site is reached only after the decision: scanning
        the file brace-by-brace, the function whose body contains a kill(
@@ -121,7 +121,7 @@ def test_swift_stop_guard():
        stopDecision( before performStop(, and kill(pid, SIGTERM) appears
        exactly once in the file.
     """
-    text = open(os.path.join(HERE, "SteveCAM.swift")).read()
+    text = open(os.path.join(HERE, "CAMBuddy.swift")).read()
     # 1. the alert shown by the menu's Stop/Restart while a run is in progress
     assert '"A run is in progress. Stop anyway?"' in text
     assert 'addButton(withTitle: "Stop")' in text
@@ -132,11 +132,11 @@ def test_swift_stop_guard():
     assert "-> StopDecision" in text
     for case in ("case proceed", "case confirm", "case refuse"):
         assert case in text, case
-    assert "force=1" in text                       # stevecam://stop?force=1
+    assert "force=1" in text                       # cambuddy://stop?force=1
     assert 'stop(fromURL: true, force: force)' in text
     assert 'restart(fromURL: true, force: force)' in text
     assert 'case "start": start()' in text
-    # 3. refusals are logged to ~/.stevecam/menubar.log
+    # 3. refusals are logged to ~/.cambuddy/menubar.log
     assert 'logRefusal("stop")' in text
     assert 'logRefusal("restart")' in text
     assert "run in progress" in text               # the logged line
@@ -186,13 +186,13 @@ def test_settings_uses_settingslink():
     """MENUBAR3: the menu opens the SwiftUI Settings scene through
     SettingsLink (the legacy showSettingsWindow:/showPreferencesWindow:
     selectors are broken on this macOS). Checks:
-    1. SteveCAM.swift contains "SettingsLink" inside an
+    1. CAMBuddy.swift contains "SettingsLink" inside an
        `#available(macOS 14` branch, i.e. on a line after
        `if #available(macOS 14` and before the closing `} else {` that
        carries the macOS 13 Button fallback;
     2. `swiftc -typecheck -parse-as-library` is green.
     """
-    text = open(os.path.join(HERE, "SteveCAM.swift")).read()
+    text = open(os.path.join(HERE, "CAMBuddy.swift")).read()
     lines = text.splitlines()
     start = None
     for i, ln in enumerate(lines):
@@ -212,7 +212,7 @@ def test_settings_uses_settingslink():
     assert 'Text("Settings...")' in branch
     assert 'Button("Settings...") { openSettingsWindow() }' \
         in "\n".join(lines[end:end + 4]), "macOS 13 fallback missing"
-    src = os.path.join(HERE, "SteveCAM.swift")
+    src = os.path.join(HERE, "CAMBuddy.swift")
     out = subprocess.run(["/usr/bin/swiftc", "-typecheck",
                           "-parse-as-library", src],
                          capture_output=True, text=True, timeout=600)
@@ -227,10 +227,10 @@ def test_plist_exit_timeout(tmp_path):
     SIGTERM at logout/stop and SIGKILLs after ExitTimeOut; the connector's
     worst-case tail is ~28 s with P3C's 5 s cancel, see connector.py's
     SHUTDOWN_* constants; 45 leaves ~17 s spare)."""
-    src = os.path.join(HERE, "com.stevecam.connector.plist.in")
+    src = os.path.join(HERE, "com.cambuddy.connector.plist.in")
     text = open(src).read()
     rendered = text.replace("@REPO@", REPO).replace("@HOME@", str(tmp_path))
-    path = tmp_path / "com.stevecam.connector.plist"
+    path = tmp_path / "com.cambuddy.connector.plist"
     with open(path, "w") as fh:
         fh.write(rendered)
     d = plistlib.loads(path.read_bytes())

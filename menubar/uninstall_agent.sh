@@ -1,10 +1,10 @@
 #!/bin/bash
 # Task MENUBAR: uninstall the connector LaunchAgent: bootout gui/<uid> and
-# remove ~/Library/LaunchAgents/com.stevecam.connector.plist. Does not stop
+# remove ~/Library/LaunchAgents/com.cambuddy.connector.plist. Does not stop
 # a connector that is already running.
 set -u
 
-LABEL=com.stevecam.connector
+LABEL=com.cambuddy.connector
 OUT="$HOME/Library/LaunchAgents/$LABEL.plist"
 UID_NUM="$(id -u)"
 

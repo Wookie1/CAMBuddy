@@ -1,7 +1,7 @@
 """SP-P1A: rough --load-limit --stock-out writes load_limit's own final
 stock instead of a second entry_depth.replay_stock pass. Proof: on a small
 synthetic flat-tool rough the new path and the forced old path
-(STEVECAM_FORCE_REPLAY=1) write byte-identical .npy, .json and .nc.
+(CAMBUDDY_FORCE_REPLAY=1) write byte-identical .npy, .json and .nc.
 Runs the CLI with VibeCAD python (opencamlib + area); runnable directly or
 under pytest from any python."""
 import os
@@ -21,9 +21,9 @@ STEP = os.path.join(ROOT, "connector", "testdata", "synth_pocket.step")
 def _rough(td, tag, force):
     out = os.path.join(td, tag)
     env = dict(os.environ, ENGINE_WORKERS="4")
-    env.pop("STEVECAM_FORCE_REPLAY", None)
+    env.pop("CAMBUDDY_FORCE_REPLAY", None)
     if force:
-        env["STEVECAM_FORCE_REPLAY"] = "1"
+        env["CAMBUDDY_FORCE_REPLAY"] = "1"
     r = subprocess.run(
         [model.python311(), "-m", "engine.cli", "rough", "--step", STEP,
          "--stock", "-31", "31", "-31", "31", "-1", "12.4",

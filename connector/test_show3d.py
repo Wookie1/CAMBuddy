@@ -63,7 +63,7 @@ def make_view_run(home, run_id, pngs=True):
     d = home / "runs" / str(run_id)
     d.mkdir(parents=True)
     data = {"view.bin": b"VIEWBIN-" + str(run_id).encode() + b"\x00\x01\x02",
-            "view.json": json.dumps({"format": "stevecam-view",
+            "view.json": json.dumps({"format": "cambuddy-view",
                                      "version": 2}).encode()}
     if pngs:
         data["view_iso.png"] = b"\x89PNG-iso"

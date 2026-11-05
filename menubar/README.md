@@ -1,32 +1,32 @@
-# SteveCAM menu-bar app (menubar/)
+# CAMBuddy menu-bar app (menubar/)
 
 Menu-bar (status-bar) app for the STEVE connector plus a LaunchAgent that
 keeps `connector/connector.py` running. Reads the connector's
-`~/.stevecam/status.json` and `~/.stevecam/connector.pid`; the connector
+`~/.cambuddy/status.json` and `~/.cambuddy/connector.pid`; the connector
 refuses to start twice while another live `connector.py` holds the pidfile.
 
 ## Build the app
 
     menubar/make_app.sh
 
-Compiles `SteveCAM.swift` with `/usr/bin/swiftc` into
-`~/Applications/SteveCAM.app` (LSUIElement, URL scheme `stevecam`, repo path
-in the `SCRepo` Info.plist key). Build log: `~/.stevecam/app-build.log`.
+Compiles `CAMBuddy.swift` with `/usr/bin/swiftc` into
+`~/Applications/CAMBuddy.app` (LSUIElement, URL scheme `cambuddy`, repo path
+in the `SCRepo` Info.plist key). Build log: `~/.cambuddy/app-build.log`.
 The script exits non-zero on a failed build. Launch it from Launchpad or
-`open ~/Applications/SteveCAM.app`.
+`open ~/Applications/CAMBuddy.app`.
 
 ## Install / uninstall the LaunchAgent
 
     menubar/install_agent.sh      # render plist, plutil -lint, bootstrap
     menubar/uninstall_agent.sh    # bootout + remove the plist
 
-`install_agent.sh` renders `com.stevecam.connector.plist.in` (`@REPO@`,
-`@HOME@`) into `~/Library/LaunchAgents/com.stevecam.connector.plist` and
+`install_agent.sh` renders `com.cambuddy.connector.plist.in` (`@REPO@`,
+`@HOME@`) into `~/Library/LaunchAgents/com.cambuddy.connector.plist` and
 bootstraps it into `gui/<uid>` only when the label is not already loaded.
-It refuses (with a message) while `~/.stevecam/connector.pid` names a live
+It refuses (with a message) while `~/.cambuddy/connector.pid` names a live
 `connector.py` that launchd did not start — stop it first. The agent runs
 `/opt/homebrew/bin/python3 <repo>/connector/connector.py` from the repo
-root, logging to `~/.stevecam/connector.log`, `RunAtLoad`, `KeepAlive
+root, logging to `~/.cambuddy/connector.log`, `RunAtLoad`, `KeepAlive
 SuccessfulExit=false` (a clean exit 0 — e.g. a refusal or a SIGTERM stop —
 is not respawned), `ThrottleInterval 10`. `ExitTimeOut 45` gives the
 connector 45 s to shut down cleanly before launchd SIGKILLs it.
@@ -39,29 +39,29 @@ connector 45 s to shut down cleanly before launchd SIGKILLs it.
 - **<connector name> · <fingerprint>** — the connector's own name + short
   fingerprint (never keys or pairing codes)
 - **Last run** — action + UTC time of the newest run, when any
-- **Start** — `launchctl kickstart gui/<uid>/com.stevecam.connector`
+- **Start** — `launchctl kickstart gui/<uid>/com.cambuddy.connector`
   (only when not already running)
 - **Stop** — SIGTERM to the exact pidfile PID, after re-checking that its
   command line contains `connector.py`; waits up to 45 s. Never by name.
 - **Restart** — Stop, then Start
-- **Open log** — opens `~/.stevecam/connector.log`
+- **Open log** — opens `~/.cambuddy/connector.log`
 - **Settings...** — *Start at login* rewrites `RunAtLoad` in the LaunchAgent
   plist (takes effect at next login); *Turn off after* (Never / 30 min /
-  2 h / 8 h, saved in `~/.stevecam/menubar.json`) Stops the connector once
+  2 h / 8 h, saved in `~/.cambuddy/menubar.json`) Stops the connector once
   status.json has said idle for that long
-- **Quit SteveCAM** — quits the app only; the connector keeps running
+- **Quit CAMBuddy** — quits the app only; the connector keeps running
 
-URL scheme: `stevecam://start`, `stevecam://stop`, `stevecam://restart` do
+URL scheme: `cambuddy://start`, `cambuddy://stop`, `cambuddy://restart` do
 the same as the menu items.
 
 **Busy guard.** While the connector's status.json says a run is in progress
 (`state` = `busy`), menu **Stop** / **Restart** first ask *"A run is in
 progress. Stop anyway?"* (Stop / Cancel; Cancel does nothing), and the URL
-actions `stevecam://stop` / `stevecam://restart` REFUSE instead — no signal
+actions `cambuddy://stop` / `cambuddy://restart` REFUSE instead — no signal
 is sent and one timestamped line `refused stop: run in progress` (or
-`refused restart: ...`) is appended to `~/.stevecam/menubar.log`. A URL with
-`force=1` (`stevecam://stop?force=1`) stops without asking;
-`stevecam://start` is unchanged and the *Turn off after* timer still only
+`refused restart: ...`) is appended to `~/.cambuddy/menubar.log`. A URL with
+`force=1` (`cambuddy://stop?force=1`) stops without asking;
+`cambuddy://start` is unchanged and the *Turn off after* timer still only
 acts while idle.
 
 ## Tests

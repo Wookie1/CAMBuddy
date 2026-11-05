@@ -1,5 +1,5 @@
 "use strict";
-// SteveCAM panel tests. Run: node run_tests.js   (Chromium + Playwright, no other deps)
+// CAMBuddy panel tests. Run: node run_tests.js   (Chromium + Playwright, no other deps)
 // Every test runs the panel in an iframe under tests/mock_parent.html, which records every postMessage.
 // Every test also enforces: no network (only the panel's own file:// files), no storage/cookie/popup access,
 // no navigation of the panel, and no console errors.
@@ -12,7 +12,7 @@ const CATALOG = require("./catalog.js");
 const OUT = path.resolve(__dirname, "..");
 const PANEL_DIR = path.join(OUT, "connector", "panel");
 const TESTS_DIR = __dirname;
-const SCREENS = process.env.SCREENS || path.join(require("os").tmpdir(), "stevecam_panel_screens");
+const SCREENS = process.env.SCREENS || path.join(require("os").tmpdir(), "cambuddy_panel_screens");
 const TESTDATA = path.join(OUT, "connector", "testdata");
 const MOCK_URL = "file://" + path.join(TESTS_DIR, "mock_parent.html");
 const DEV_URL = "file://" + path.join(PANEL_DIR, "dev.html");

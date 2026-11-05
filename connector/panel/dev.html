@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SteveCAM panel dev</title>
+<title>CAMBuddy panel dev</title>
 <style>
   :root { --bg: #eef0f3; --fg: #1b1c20; --line: #c9ccd3; --card: #fff; }
   :root[data-theme="dark"] { --bg: #0f1013; --fg: #e9e9ee; --line: #34363e; --card: #1b1c21; }
@@ -36,12 +36,12 @@
   <button type="button" id="doc-btn">New revision</button>
 </div>
 <div class="wrap">
-  <iframe id="panel" title="SteveCAM panel" width="420"></iframe>
+  <iframe id="panel" title="CAMBuddy panel" width="420"></iframe>
   <pre id="log"></pre>
 </div>
 <script>
 "use strict";
-// Fake STEVE bridge for the SteveCAM panel. No network: everything is answered here.
+// Fake STEVE bridge for the CAMBuddy panel. No network: everything is answered here.
 const MM_FIELDS = ["stock_xy","stock_x","stock_y","stock_top","stock_bottom","floor_z","tool_diameter","corner_radius",
   "flute_length","stepdown","optimal_load","stock_to_leave","rest_stepup","feed","ramp_feed","stepover",
   "rough_tool_diameter","rough_corner_radius","rough_flute_length","rough_stepdown","rough_optimal_load",
@@ -82,7 +82,7 @@ function validate(action, inputs, sch) {
   if (!props) return null;
   const v = {};
   for (const k in inputs) {
-    if (!props[k]) return { code: "input_unknown", field: k, message: "SteveCAM doesn't know the input \u201c" + k + "\u201d.", next_step: "Update the panel or SteveCAM." };
+    if (!props[k]) return { code: "input_unknown", field: k, message: "CAMBuddy doesn't know the input \u201c" + k + "\u201d.", next_step: "Update the panel or CAMBuddy." };
     v[k] = inputs[k];
   }
   const inch = (inputs.units || "inch") === "inch";
@@ -138,7 +138,7 @@ const ATTN_REVIEW = [
 ];
 function roughResult(outcome) {
   const base = { estimated_time_min: 0.82, cut_length_mm: 1253.9, zmap_gouges: { count: 0 }, rapid_collisions: { count: 0 },
-    over_flute: { count: 0 }, leftover: { mean_mm: 0.42, p95_mm: 0.5, within_0p5mm_fraction: 0.98 }, output_dir: "C:\\SteveCAM\\jobs\\doc-42" };
+    over_flute: { count: 0 }, leftover: { mean_mm: 0.42, p95_mm: 0.5, within_0p5mm_fraction: 0.98 }, output_dir: "C:\\CAMBuddy\\jobs\\doc-42" };
   if (outcome === "needs_review") {
     return Object.assign(base, { verdict: "needs_review", summary: "No gouges or collisions, but two things need a look before you run it.",
       attention: ATTN_REVIEW, engagement: { overloads: 2, limit_mm: 2.438, reduced_feed_windows: [{ line: 1234, feed_pct: 70 }, { line: 1388, feed_pct: 80 }] } });
@@ -157,7 +157,7 @@ function finishResult(outcome, rest) {
   const r = { chain_time_min: 3.4, chain_cut_length_mm: 8120.5, probe_clcheck: { count: 0 },
     chain: { zmap_gouges: { count: 0 }, rapid_collisions: { count: 0 }, over_flute: { count: 0 },
       leftover: { mean_mm: 0.05, p95_mm: 0.11, within_0p5mm_fraction: 0.999 } },
-    output_dir: "C:\\SteveCAM\\jobs\\doc-42" };
+    output_dir: "C:\\CAMBuddy\\jobs\\doc-42" };
   const left = { code: "area_left_for_next_op", severity: "info", message: "Pocket floor corners are narrower than the 6 mm ball.",
     where: { program: "finish.nc", line: 4410, x: 88.2, y: -31.5, z: 4.0 }, next_step: "Add a smaller ball or a pencil pass." };
   if (outcome === "needs_review") return Object.assign(r, { verdict: "needs_review", summary: "The chain is clean, but check two places.", attention: ATTN_REVIEW.concat([left]) });
@@ -313,7 +313,7 @@ window.addEventListener("message", (event) => {
   if (!m || m.steve !== 1) return;
   log("->", m);
   const { id, method, params } = m;
-  if (method === "context") post({ steve: 1, id, result: { panel: "stevecam", connector: "stevecam", document: doc, theme } });
+  if (method === "context") post({ steve: 1, id, result: { panel: "cambuddy", connector: "cambuddy", document: doc, theme } });
   else if (method === "events") post({ steve: 1, id, result: [{ name: "engine_state", data: { state: "idle", action: null, progress: null }, at: Date.now() }] });
   else if (method === "actions") post({ steve: 1, id, result: actions() });
   else if (method === "run") answerRun(id, params || {});
@@ -325,7 +325,7 @@ window.addEventListener("message", (event) => {
     if (r && !["succeeded","failed","rejected","cancelled","expired"].includes(r.state)) push(Object.assign(r, { state: "cancelled", message: "Cancelled" }));
   } else post({ steve: 1, id, error: { code: "action_not_found", message: "unknown method " + method } });
 });
-function pushContext() { post({ steve: 1, event: "context", context: { panel: "stevecam", connector: "stevecam", document: doc, theme } }); }
+function pushContext() { post({ steve: 1, event: "context", context: { panel: "cambuddy", connector: "cambuddy", document: doc, theme } }); }
 document.getElementById("theme").addEventListener("click", () => {
   theme = theme === "light" ? "dark" : "light";
   document.documentElement.setAttribute("data-theme", theme);

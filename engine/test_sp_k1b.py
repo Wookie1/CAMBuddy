@@ -11,7 +11,7 @@
     _stamp_move_ref; the batch entry point must equal the per-move calls
     (per-move (area, depth) and final L).
 (b) test_sp_k1b_limit_feeds_parity: limit_feeds on the synth_pocket flat
-    rough, C batch vs STEVECAM_NO_CKERN: identical moves, stats, stock.
+    rough, C batch vs CAMBUDDY_NO_CKERN: identical moves, stats, stock.
 (c) test_sp_k1b_autobuild: ensure_built() rebuilds a missing library and a
     library older than stamp.c; a broken toolchain leaves the caller on the
     Python fallback (no exception).
@@ -377,15 +377,15 @@ def test_sp_k1b_limit_feeds_parity():
     from engine import load_limit
     assert load_limit._CKERN is not None, "ckern lib not loaded"
     moves = _synth_rough_moves()
-    os.environ.pop("STEVECAM_NO_CKERN", None)
+    os.environ.pop("CAMBUDDY_NO_CKERN", None)
     out_c, stats_c, stock_c = load_limit.limit_feeds(
         moves, 6.0, 0.0, STOCK, STOCK[5], CUT_FEED, return_stock=True)
-    os.environ["STEVECAM_NO_CKERN"] = "1"
+    os.environ["CAMBUDDY_NO_CKERN"] = "1"
     try:
         out_p, stats_p, stock_p = load_limit.limit_feeds(
             moves, 6.0, 0.0, STOCK, STOCK[5], CUT_FEED, return_stock=True)
     finally:
-        os.environ.pop("STEVECAM_NO_CKERN", None)
+        os.environ.pop("CAMBUDDY_NO_CKERN", None)
     assert out_c == out_p, "output moves differ"
     assert stats_c == stats_p, "stats differ: %s vs %s" % (stats_c, stats_p)
     assert np.array_equal(stock_c[0], stock_p[0]), "returned stock differs"

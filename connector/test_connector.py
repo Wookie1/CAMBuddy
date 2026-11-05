@@ -103,7 +103,7 @@ class TestCryptoUnit:
         assert not crypto.verify_signature(want_pub, b"x", sig_b64)
 
     def test_sign_verify_roundtrip_and_keyfile(self, tmp_path):
-        keyfile = tmp_path / "stevecam" / "identity.key"
+        keyfile = tmp_path / "cambuddy" / "identity.key"
         sk = crypto.load_or_create_key(str(keyfile))
         mode = stat.S_IMODE(os.stat(keyfile).st_mode)
         assert mode == 0o600
@@ -240,7 +240,7 @@ _tick = iter(range(1, 10 ** 6))
 @pytest.fixture(scope="module")
 def live(tmp_path_factory):
     """Mock STEVE + the connector subprocess on a temporary HOME."""
-    home = tmp_path_factory.mktemp("stevecam-home")
+    home = tmp_path_factory.mktemp("cambuddy-home")
     programs = home / "programs"
     mock = MockSteve(code="PAIR-1234")
     base = mock.serve_forever()

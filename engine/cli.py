@@ -896,7 +896,7 @@ def main(argv=None):
     # returned moves pickle to the same bytes as the moves it was given;
     # otherwise (or on any worker error) it runs inline as before.
     one = bool(a.stock_out) and \
-        os.environ.get("STEVECAM_FORCE_REPLAY") != "1"
+        os.environ.get("CAMBUDDY_FORCE_REPLAY") != "1"
     if a.ll_overlap is not None:
         ov_on = bool(a.ll_overlap)
     else:
@@ -961,7 +961,7 @@ def main(argv=None):
     # SP-K1B: which stamping kernel the load-limit replay will use
     from engine import load_limit as _load_limit
     stats["stamp_kernel"] = ("c" if _load_limit._CKERN is not None
-                             and not os.environ.get("STEVECAM_NO_CKERN")
+                             and not os.environ.get("CAMBUDDY_NO_CKERN")
                              else "python")
     print("stamp_kernel: %s" % stats["stamp_kernel"], flush=True)
     if a.load_limit:
@@ -969,7 +969,7 @@ def main(argv=None):
         # post-pass never runs and the emitted program is untouched)
         from engine import load_limit
         # SP-P1A: limit_feeds already replays the final stock; reuse it
-        # (STEVECAM_FORCE_REPLAY=1 keeps the separate replay, for proofs)
+        # (CAMBUDDY_FORCE_REPLAY=1 keeps the separate replay, for proofs)
         res = None
         if "fut" in ov:
             import pickle

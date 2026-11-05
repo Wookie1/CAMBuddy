@@ -1,7 +1,7 @@
 """Connector configuration and state locations.
 
-Key, config.toml, ledger, cursor and run work dirs live in ~/.stevecam
-(override with env STEVECAM_HOME or --home, e.g. for tests). Never in the
+Key, config.toml, ledger, cursor and run work dirs live in ~/.cambuddy
+(override with env CAMBUDDY_HOME or --home, e.g. for tests). Never in the
 repo. Tokens/keys are never logged.
 """
 import os
@@ -10,7 +10,7 @@ import tomllib
 DEFAULTS = {
     "base_url": "https://stevecad.studio/connect/v1",
     "pairing_code": "",
-    "connector_name": "stevecam-rough",
+    "connector_name": "cambuddy-rough",
     "programs_dir": "~/ai-sandbox/stevecam/out/steve",
     "engine_python": "/Applications/VibeCAD.app/Contents/Resources/bin/python",
     "repo_root": "~/ai-sandbox/stevecam",
@@ -21,8 +21,14 @@ DEFAULTS = {
 
 
 def state_dir(home_override=None) -> str:
-    return os.path.abspath(os.path.expanduser(
-        home_override or os.environ.get("STEVECAM_HOME") or "~/.stevecam"))
+    explicit = home_override or os.environ.get("CAMBUDDY_HOME")
+    if not explicit:
+        new_dir = os.path.expanduser("~/.cambuddy")
+        old_dir = os.path.expanduser("~/.stevecam")   # pre-rename install
+        if not os.path.isdir(new_dir) and os.path.isdir(old_dir):
+            return os.path.abspath(old_dir)
+        return os.path.abspath(new_dir)
+    return os.path.abspath(os.path.expanduser(explicit))
 
 
 def load(home_override=None) -> dict:

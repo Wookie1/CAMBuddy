@@ -1,6 +1,6 @@
-# SteveCAM connector — plain words for James
+# CAMBuddy connector — plain words for James
 
-The connector runs SteveCAM on this Mac for STEVE. You send in a STEP
+The connector runs CAMBuddy on this Mac for STEVE. You send in a STEP
 model; you get back a checked LNC program for the X7, plus a report and a
 leftover preview picture.
 

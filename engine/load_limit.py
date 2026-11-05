@@ -73,10 +73,10 @@ _CKERN_PRINTED = False
 
 
 def _ckern_for_call():
-    """The kernel library for this call: None while STEVECAM_NO_CKERN is set
+    """The kernel library for this call: None while CAMBUDDY_NO_CKERN is set
     (or the .dylib is missing); prints the chosen path once."""
     global _CKERN_PRINTED
-    use = None if os.environ.get("STEVECAM_NO_CKERN") else _CKERN
+    use = None if os.environ.get("CAMBUDDY_NO_CKERN") else _CKERN
     if not _CKERN_PRINTED:
         print("load_limit._stamp_move: %s kernel"
               % ("compiled C (ckern)" if use is not None else "Python"))

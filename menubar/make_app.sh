@@ -1,18 +1,18 @@
 #!/bin/bash
-# Task MENUBAR: build ~/Applications/SteveCAM.app from menubar/SteveCAM.swift
-# using swiftc. Build log: ~/.stevecam/app-build.log. Exits non-zero when
+# Task MENUBAR: build ~/Applications/CAMBuddy.app from menubar/CAMBuddy.swift
+# using swiftc. Build log: ~/.cambuddy/app-build.log. Exits non-zero when
 # the build fails. Does NOT touch the LaunchAgent (see install_agent.sh).
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
-APP="$HOME/Applications/SteveCAM.app"
-BIN="$APP/Contents/MacOS/SteveCAM"
-LOG="$HOME/.stevecam/app-build.log"
+APP="$HOME/Applications/CAMBuddy.app"
+BIN="$APP/Contents/MacOS/CAMBuddy"
+LOG="$HOME/.cambuddy/app-build.log"
 
-mkdir -p "$HOME/.stevecam"
+mkdir -p "$HOME/.cambuddy"
 {
-    echo "== SteveCAM build $(date -u +%Y-%m-%dT%H:%M:%SZ) repo=$REPO"
+    echo "== CAMBuddy build $(date -u +%Y-%m-%dT%H:%M:%SZ) repo=$REPO"
     rm -rf "$APP"
     mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" || exit 1
 
@@ -22,11 +22,11 @@ mkdir -p "$HOME/.stevecam"
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>studio.stevecam.menubar</string>
+    <string>studio.cambuddy.menubar</string>
     <key>CFBundleName</key>
-    <string>SteveCAM</string>
+    <string>CAMBuddy</string>
     <key>CFBundleExecutable</key>
-    <string>SteveCAM</string>
+    <string>CAMBuddy</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -41,10 +41,10 @@ mkdir -p "$HOME/.stevecam"
     <array>
         <dict>
             <key>CFBundleURLName</key>
-            <string>studio.stevecam.menubar</string>
+            <string>studio.cambuddy.menubar</string>
             <key>CFBundleURLSchemes</key>
             <array>
-                <string>stevecam</string>
+                <string>cambuddy</string>
             </array>
         </dict>
     </array>
@@ -53,7 +53,7 @@ mkdir -p "$HOME/.stevecam"
 PLIST
 
     /usr/bin/swiftc -O -swift-version 5 -parse-as-library \
-        "$HERE/SteveCAM.swift" -o "$BIN"
+        "$HERE/CAMBuddy.swift" -o "$BIN"
     rc=$?
     if [ $rc -ne 0 ]; then
         echo "swiftc failed (exit $rc)"
@@ -65,7 +65,7 @@ PLIST
 } >> "$LOG" 2>&1
 rc=$?
 if [ $rc -ne 0 ]; then
-    echo "SteveCAM build FAILED (exit $rc); see $LOG" >&2
+    echo "CAMBuddy build FAILED (exit $rc); see $LOG" >&2
     exit $rc
 fi
 echo "built $APP (log: $LOG)"

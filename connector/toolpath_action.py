@@ -50,17 +50,17 @@ SETTINGS = {
 
 SPEC = {
     "name": ACTION,
-    "title": "Adaptive roughing (SteveCAM)",
-    "description": ("Constant-engagement adaptive roughing from SteveCAM, "
+    "title": "Adaptive roughing (CAMBuddy)",
+    "description": ("Constant-engagement adaptive roughing from CAMBuddy, "
                     "generated from a STEVE milling operation."),
     "confirm": False,
     "inputs": {"type": "object", "properties": SETTINGS},
     "x-steve": {"toolpath": {
-        "title": "SteveCAM adaptive rough",
+        "title": "CAMBuddy adaptive rough",
         "description": ("Adaptive roughing with a flat end mill: level by "
                         "level at the stepdown, holding a steady side load "
                         "(the optimal load), leaving stock for finishing. "
-                        "Judged by SteveCAM's own zmap check before it is "
+                        "Judged by CAMBuddy's own zmap check before it is "
                         "returned."),
         "cutters": ["flat"]}},
 }

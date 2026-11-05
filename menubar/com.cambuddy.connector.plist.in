@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.stevecam.connector</string>
+	<string>com.cambuddy.connector</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/opt/homebrew/bin/python3</string>
@@ -23,9 +23,9 @@
 	<key>ExitTimeOut</key>
 	<integer>45</integer>
 	<key>StandardOutPath</key>
-	<string>@HOME@/.stevecam/connector.log</string>
+	<string>@HOME@/.cambuddy/connector.log</string>
 	<key>StandardErrorPath</key>
-	<string>@HOME@/.stevecam/connector.log</string>
+	<string>@HOME@/.cambuddy/connector.log</string>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
