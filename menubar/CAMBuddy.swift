@@ -1,7 +1,7 @@
-// SteveCAM menu-bar app (task MENUBAR): shows the connector's status from
-// ~/.stevecam/status.json + connector.pid and can start / stop / restart it.
+// CAMBuddy menu-bar app (task MENUBAR): shows the connector's status from
+// ~/.cambuddy/status.json + connector.pid and can start / stop / restart it.
 // SwiftUI MenuBarExtra, macOS 13+, compiled with:
-//   swiftc -O -swift-version 5 -parse-as-library SteveCAM.swift -o SteveCAM
+//   swiftc -O -swift-version 5 -parse-as-library CAMBuddy.swift -o CAMBuddy
 // Never shows or stores pairing codes or keys. The repo path comes from the
 // Info.plist key SCRepo.
 
@@ -10,12 +10,12 @@ import Darwin
 import Foundation
 import SwiftUI
 
-let agentLabel = "com.stevecam.connector"
+let agentLabel = "com.cambuddy.connector"
 let repoPath = (Bundle.main.infoDictionary?["SCRepo"] as? String) ?? ""
 
 // ---------------------------------------------------------------- helpers --
 func homeDir() -> String { NSHomeDirectory() }
-func steveHome() -> String { homeDir() + "/.stevecam" }
+func steveHome() -> String { homeDir() + "/.cambuddy" }
 
 @discardableResult
 func runTool(_ launch: String, _ args: [String]) -> (Int32, String) {
@@ -66,7 +66,7 @@ func readStatusJSON() -> [String: Any]? {
 // MENUBAR2: what Stop / Restart should do while status.json "state" may
 // mark a run as in progress. Pure decision, no UI, no process access.
 // "busy" is the state connector.py writes during a run ("working" is the
-// label the menu shows for it); force=1 on a stevecam:// URL overrides.
+// label the menu shows for it); force=1 on a cambuddy:// URL overrides.
 enum StopDecision {
     case proceed
     case confirm
@@ -75,7 +75,7 @@ enum StopDecision {
 
 func stopDecision(state: String?, force: Bool, fromURL: Bool)
     -> StopDecision {
-    if force { return .proceed }            // stevecam://stop?force=1
+    if force { return .proceed }            // cambuddy://stop?force=1
     if state == "busy" || state == "working" {
         return fromURL ? .refuse : .confirm
     }
@@ -181,7 +181,7 @@ final class AppModel: ObservableObject {
         (readStatusJSON()?["state"] as? String) ?? ""
     }
 
-    /// One timestamped line in ~/.stevecam/menubar.log when a URL action is
+    /// One timestamped line in ~/.cambuddy/menubar.log when a URL action is
     /// refused because a run is in progress.
     func logRefusal(_ action: String) {
         let ts = ISO8601DateFormatter().string(from: Date())
@@ -276,7 +276,7 @@ final class AppModel: ObservableObject {
 
     func handle(_ url: URL) {
         // MENUBAR2: force=1 is only ever read from the URL
-        // (stevecam://stop?force=1 / stevecam://restart?force=1); the menu
+        // (cambuddy://stop?force=1 / cambuddy://restart?force=1); the menu
         // path always runs the decision (alert while busy). start is
         // unchanged.
         let force = url.query.map {
@@ -321,7 +321,7 @@ final class AppModel: ObservableObject {
         return v
     }
 
-    /// Rewrites RunAtLoad in ~/Library/LaunchAgents/com.stevecam.connector
+    /// Rewrites RunAtLoad in ~/Library/LaunchAgents/com.cambuddy.connector
     /// .plist; takes effect at next login. No-op if the plist is not there.
     func setRunAtLoad(_ on: Bool) {
         guard let d = NSMutableDictionary(contentsOfFile: agentPlistPath())
@@ -348,7 +348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// Global so the delegate can reach the model (URL scheme stevecam://...).
+// Global so the delegate can reach the model (URL scheme cambuddy://...).
 final class AppState {
     static let shared = AppState()
     let model = AppModel()
@@ -388,7 +388,7 @@ struct MenuContent: View {
             Button("Settings...") { openSettingsWindow() }
         }
         Divider()
-        Button("Quit SteveCAM") { NSApplication.shared.terminate(nil) }
+        Button("Quit CAMBuddy") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")
     }
 }
@@ -417,11 +417,11 @@ struct SettingsView: View {
 
 // --------------------------------------------------------------------- app --
 @main
-struct SteveCAMApp: App {
+struct CAMBuddyApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        MenuBarExtra("SteveCAM", systemImage: "c.circle") {
+        MenuBarExtra("CAMBuddy", systemImage: "c.circle") {
             MenuContent(model: AppState.shared.model)
         }
         Settings {

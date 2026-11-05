@@ -34,7 +34,7 @@ CODES = {
                        "the catalog)."),
     "input_digest_mismatch": ("error", "Send the run again: the downloaded "
                               "file did not match its sha256/size."),
-    "connector_stopping": ("error", "The SteveCAM connector was shutting "
+    "connector_stopping": ("error", "The CAMBuddy connector was shutting "
                            "down; start it again (menu bar: Start) and "
                            "re-run."),
     # --- tool library / jobs ---
@@ -53,11 +53,11 @@ CODES = {
     "bad_document_id": ("error", "Pass the STEVE document id as sent by "
                         "STEVE (letters, digits, '.', '_', '-', <= 128)."),
     "no_library": ("error", "Run the connector with its state directory "
-                   "(~/.stevecam or --home)."),
+                   "(~/.cambuddy or --home)."),
     "no_view": ("error", "Pick one of the last_runs event's recent "
                 "cutting/check runs with has_view true (view.load shows a "
                 "run's stored 3D view)."),
-    "library_error": ("error", "Check ~/.stevecam/tools.json is valid JSON; "
+    "library_error": ("error", "Check ~/.cambuddy/tools.json is valid JSON; "
                       "delete it to re-seed from the repo table."),
     "tool_not_in_table": ("error", "add this tool to tools/x7_tools.json "
                           "(the table the engine and judges read), or pick a "

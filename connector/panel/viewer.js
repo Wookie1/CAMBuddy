@@ -1,5 +1,5 @@
 "use strict";
-// SteveCAM panel 3D viewer (task VIEW3D): display-only rendering of a run's
+// CAMBuddy panel 3D viewer (task VIEW3D): display-only rendering of a run's
 // view.bin/view.json for runs THIS panel started. WebGL (orbit/pan/zoom,
 // layer toggles: part, stock-left heat map with below-part in red, each
 // program's path, markers; follows the STEVE light/dark theme). When
@@ -410,7 +410,7 @@
         return res[0].blob.text().then(function (txt) {
           return res[1].blob.arrayBuffer().then(function (buf) {
             var hdr = JSON.parse(txt);
-            if (hdr.format !== "stevecam-view" || (hdr.version !== 1 && hdr.version !== 2)) return fail("unknown view format");
+            if (hdr.format !== "cambuddy-view" || (hdr.version !== 1 && hdr.version !== 2)) return fail("unknown view format");
             mount(holder, hdr, decode(hdr, buf), buf);
           });
         });
@@ -418,5 +418,5 @@
     },
     theme: function () { live.forEach(function (v) { if (v.redraw) v.redraw(); }); }
   };
-  window.SteveCAMViewer = api;
+  window.CAMBuddyViewer = api;
 })();

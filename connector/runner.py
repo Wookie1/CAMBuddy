@@ -2,7 +2,7 @@
 
 Every engine call uses subprocess list args (never shell=True), env
 ENGINE_WORKERS=4, cwd = repo root, and its own work dir
-~/.stevecam/runs/<run_id>/. Engine JSON progress lines
+~/.cambuddy/runs/<run_id>/. Engine JSON progress lines
 ({"progress":0.4,"message":"level 3/7"}) are mapped to run progress.
 """
 import hashlib

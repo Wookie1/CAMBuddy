@@ -84,7 +84,7 @@ def test_view3d_file_written_and_bounded(tmp_path, monkeypatch):
     assert "--stock-out" in zc, "the judging zmap call has no --stock-out"
 
     hdr = json.load(open(json_path))
-    assert hdr["format"] == "stevecam-view" and hdr["version"] == 2
+    assert hdr["format"] == "cambuddy-view" and hdr["version"] == 2
     assert hdr["units"] == "mm"
     for k in ("x0", "y0", "cell", "nx", "ny"):
         assert k in hdr["grid"], "grid.%s missing" % k

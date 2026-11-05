@@ -5,7 +5,7 @@ in a temp file in engine/ckern/ and is renamed atomically; on any failure
 the Python fallback stays in use), and exposes the batch entry point.
 
 get_lib() returns the loaded CDLL, or None when the kernel could not be
-built or loaded. Callers must also honour STEVECAM_NO_CKERN (load_limit
+built or loaded. Callers must also honour CAMBUDDY_NO_CKERN (load_limit
 does)."""
 import ctypes
 import os

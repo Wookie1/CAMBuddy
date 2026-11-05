@@ -1,6 +1,6 @@
 """Track 2 (toollib): tool library, per-document job renumbering, and the
 runner wiring. Fast: no engine (runner subprocesses are faked). Every test
-uses a temp state dir - never the real ~/.stevecam.
+uses a temp state dir - never the real ~/.cambuddy.
 
 Run: /opt/homebrew/bin/python3 -m pytest connector/test_toollib.py -q
 """

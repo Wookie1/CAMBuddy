@@ -1,5 +1,5 @@
 "use strict";
-/* SteveCAM panel: turns run.result and check.json into a plain Results view.
+/* CAMBuddy panel: turns run.result and check.json into a plain Results view.
    Every field is optional: a missing field is skipped, a null shows as "unknown",
    extra fields are ignored. */
 (function (root) {
@@ -402,7 +402,7 @@
       const p = h("p", "programs");
       p.append(h("strong", null, nc.join(", ")));
       p.append(document.createTextNode(" — attached to this run in STEVE" +
-        (extra.outputDir ? "; also saved on the SteveCAM computer in " + extra.outputDir : "") + "."));
+        (extra.outputDir ? "; also saved on the CAMBuddy computer in " + extra.outputDir : "") + "."));
       box.append(p);
     }
     return box;
@@ -442,5 +442,5 @@
     return sec;
   }
 
-  root.SteveCAMReport = { build, render, len, duration, pct, where, item, gateOf };
+  root.CAMBuddyReport = { build, render, len, duration, pct, where, item, gateOf };
 })(typeof window !== "undefined" ? window : globalThis);

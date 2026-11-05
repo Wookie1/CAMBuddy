@@ -19,7 +19,7 @@ import toolpath_action as tpa  # noqa: E402
 from runner import EngineError  # noqa: E402
 from test_connector import live, _final_body, STEP  # noqa: E402,F401
 
-# STEVE's first live request (TP1b, SteveCAM test block, T13 flat)
+# STEVE's first live request (TP1b, CAMBuddy test block, T13 flat)
 with open(os.path.join(HERE, "testdata", "steve_toolpath_request.json")) as _fh:
     REAL = json.load(_fh)
 

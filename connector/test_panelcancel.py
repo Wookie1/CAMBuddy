@@ -120,7 +120,7 @@ def start_connector(tmp_path, mock, duration, connector_dir=None,
             "duration": duration})
     env = dict(os.environ)
     env["STEVE_BASE_URL"] = mock.base_url
-    env.pop("STEVECAM_HOME", None)
+    env.pop("CAMBUDDY_HOME", None)
     if extra_env:
         env.update(extra_env)
     proc = subprocess.Popen([PY, str(launcher), "--home", str(home)],
@@ -465,7 +465,7 @@ def start_connector_lockhold(tmp_path, mock, duration, hold):
                                       "duration": duration, "hold": hold})
     env = dict(os.environ)
     env["STEVE_BASE_URL"] = mock.base_url
-    env.pop("STEVECAM_HOME", None)
+    env.pop("CAMBUDDY_HOME", None)
     proc = subprocess.Popen([PY, str(launcher), "--home", str(home)],
                             cwd=REPO, env=env,
                             stdout=subprocess.DEVNULL,

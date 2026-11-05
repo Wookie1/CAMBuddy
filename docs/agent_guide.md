@@ -1,6 +1,6 @@
-# SteveCAM connector: guide for agents
+# CAMBuddy connector: guide for agents
 
-The connector runs SteveCAM's engine on this Mac for STEVE. Nothing is ever
+The connector runs CAMBuddy's engine on this Mac for STEVE. Nothing is ever
 sent to a machine: every program still needs a graphics check and a dry
 run above the part on the X7.
 
@@ -66,7 +66,7 @@ rewrites this table; a test fails when it drifts).
 | `toolpath_limit` | blocker | The toolpath would break the request limit named in `field`/`allowed`: widen the operation's heights/feeds or change the settings, then generate again. |
 | `action_unknown` | error | Use one of the connector's actions (see the catalog). |
 | `input_digest_mismatch` | error | Send the run again: the downloaded file did not match its sha256/size. |
-| `connector_stopping` | error | The SteveCAM connector was shutting down; start it again (menu bar: Start) and re-run. |
+| `connector_stopping` | error | The CAMBuddy connector was shutting down; start it again (menu bar: Start) and re-run. |
 | `unknown_tool` | error | Use a tool_id from tools.list. |
 | `duplicate_t` | error | Pick a T no other tool uses in this job (job.get / tools.list show the T numbers in use), or renumber the other tool first. |
 | `out_of_range` | error | Use a T inside `allowed` (job.renumber: 1..pockets; tools.update: 1..999); tools.update {pockets} changes the pocket count. |
@@ -74,9 +74,9 @@ rewrites this table; a test fails when it drifts).
 | `unknown_holder` | error | Use a holder name from `allowed`, or null. |
 | `duplicate_tool` | error | Change the type, diameter or corner so the tool differs from the one named in the message. |
 | `bad_document_id` | error | Pass the STEVE document id as sent by STEVE (letters, digits, '.', '_', '-', <= 128). |
-| `no_library` | error | Run the connector with its state directory (~/.stevecam or --home). |
+| `no_library` | error | Run the connector with its state directory (~/.cambuddy or --home). |
 | `no_view` | error | Pick one of the last_runs event's recent cutting/check runs with has_view true (view.load shows a run's stored 3D view). |
-| `library_error` | error | Check ~/.stevecam/tools.json is valid JSON; delete it to re-seed from the repo table. |
+| `library_error` | error | Check ~/.cambuddy/tools.json is valid JSON; delete it to re-seed from the repo table. |
 | `tool_not_in_table` | error | add this tool to tools/x7_tools.json (the table the engine and judges read), or pick a tool that is in it |
 | `tool_table_unreadable` | error | Fix or re-seed the tool library file named in the message. |
 | `tool_entry_incomplete` | error | Fill the missing field of that tool with tools.update. |

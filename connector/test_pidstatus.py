@@ -43,7 +43,7 @@ def test_second_connector_refuses(tmp_path):
         (home / "connector.pid").write_text("%d\n" % dummy.pid)
         env = dict(os.environ)
         env["STEVE_BASE_URL"] = "http://127.0.0.1:9"
-        env["STEVECAM_HOME"] = str(home)
+        env["CAMBUDDY_HOME"] = str(home)
         out = subprocess.run(
             [sys.executable, os.path.join(REPO, "connector", "connector.py"),
              "--home", str(home)],
@@ -182,7 +182,7 @@ def test_sigterm_exits_zero(tmp_path):
     base = mock.serve_forever()          # 127.0.0.1 on a free port
     env = dict(os.environ)
     env["STEVE_BASE_URL"] = base
-    env.pop("STEVECAM_HOME", None)
+    env.pop("CAMBUDDY_HOME", None)
     proc = subprocess.Popen(
         [sys.executable, os.path.join(HERE, "connector.py"), "--home",
          str(home)], cwd=REPO, env=env,

@@ -1707,7 +1707,7 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     isl_cache = {}
     stats["island_pool"], stats["island_pool_s"] = 0, 0.0
     if stl_path and len(order) > 1 and \
-            os.environ.get("STEVECAM_NO_ISLAND_POOL") != "1":
+            os.environ.get("CAMBUDDY_NO_ISLAND_POOL") != "1":
         t0 = time.time()
         isl_cache, stats["island_pool"] = precompute_islands(
             stl_path, order, tool_r, leave, corner_r, Zg, gxs, gys, axl)

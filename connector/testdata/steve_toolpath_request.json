@@ -1,5 +1,5 @@
 {
- "_note": "Captured from STEVE's first live toolpath run run_2574c56fce3257b62d26 (2026-11-04, SteveCAM test block, T13 flat); part STEP not kept, stock url/headers (one-time) removed.",
+ "_note": "Captured from STEVE's first live toolpath run run_2574c56fce3257b62d26 (2026-11-04, CAMBuddy test block, T13 flat); part STEP not kept, stock url/headers (one-time) removed.",
  "load_limit": true,
  "optimal_load_mm": 2.032,
  "request": {

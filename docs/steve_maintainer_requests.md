@@ -1,10 +1,10 @@
-# Requests to STEVE's maintainer (from SteveCAM, TP1, 2026-11-04)
+# Requests to STEVE's maintainer (from CAMBuddy, TP1, 2026-11-04)
 
 **Status 2026-11-05:** James submitted these requests and the `artifact_unavailable` bug report (run
 1376db35-1181-4abd-b56f-9a4e35221f45) to STEVE's maintainer. R2 was answered by the first live request
 before submission: the fingerprint is sha256 of the canonical request JSON (docs/steve_toolpath_actions.md).
 
-These come from building SteveCAM's toolpath action, `adaptive_rough_toolpath`, against the "Toolpath actions" section of the connector docs. Each request covers one feature.
+These come from building CAMBuddy's toolpath action, `adaptive_rough_toolpath`, against the "Toolpath actions" section of the connector docs. Each request covers one feature.
 
 ---
 

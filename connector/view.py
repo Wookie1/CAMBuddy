@@ -257,7 +257,7 @@ def build_view(out_bin, out_json, part_npy, stock_npy, programs, checks,
                          % (len(body), MAX_BYTES))
     with open(out_bin, "wb") as fh:
         fh.write(body)
-    hdr = {"format": "stevecam-view", "version": 2, "units": "mm",
+    hdr = {"format": "cambuddy-view", "version": 2, "units": "mm",
            "grid": {"x0": float(x0), "y0": float(y0),
                     "cell": float(cell * k), "nx": int(nx), "ny": int(ny)},
            "z": {"offset": float(zoff), "scale": float(scale),

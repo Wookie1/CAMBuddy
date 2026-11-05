@@ -89,7 +89,7 @@ File-input fields plus: `format: "glb"`, `name: "stock.glb"`, `sha256`, `bytes` 
 ## The real request (TP1b, confirmed 2026-11-04)
 
 STEVE's first live request is kept as `connector/testdata/steve_toolpath_request.json` (run
-run_2574c56fce3257b62d26, SteveCAM test block, T13 flat). What it showed, against the TP1 guesses:
+run_2574c56fce3257b62d26, CAMBuddy test block, T13 flat). What it showed, against the TP1 guesses:
 
 | field | real shape | TP1 guess |
 |---|---|---|

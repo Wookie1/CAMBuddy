@@ -36,7 +36,7 @@
   M.pushRun = function (run) { M.runs[run.id] = run; send({ steve: 1, event: "run", run: plainRun(run) }); };
   M.pushContext = function (patch) {
     Object.assign(CFG, patch);
-    send({ steve: 1, event: "context", context: { panel: "stevecam", connector: "stevecam", document: CFG.doc, theme: CFG.theme } });
+    send({ steve: 1, event: "context", context: { panel: "cambuddy", connector: "cambuddy", document: CFG.doc, theme: CFG.theme } });
   };
   M.pushEvent = function (name, data) { send({ steve: 1, event: "event", name, data }); };
   M.sent = function (method, action) {
@@ -146,7 +146,7 @@
     M.log.push({ dir: "in", data: strip(m) });
     if (!m || m.steve !== 1) return;  // markers from tests
     const { id, method, params } = m;
-    if (method === "context") send({ steve: 1, id, result: { panel: "stevecam", connector: "stevecam", document: CFG.doc, theme: CFG.theme } });
+    if (method === "context") send({ steve: 1, id, result: { panel: "cambuddy", connector: "cambuddy", document: CFG.doc, theme: CFG.theme } });
     else if (method === "events") {
       const evs = [{ name: "engine_state", data: { state: "idle", action: null, progress: null }, at: 1 }];
       if (CFG.lastRuns) evs.push({ name: "last_runs", data: { runs: CFG.lastRuns }, at: 2 });

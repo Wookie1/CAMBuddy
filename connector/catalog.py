@@ -398,7 +398,7 @@ _VIEW_LOAD_ACTION_SPEC = {
 
 TOOL_ACTION_SPECS = [
     {"name": TOOLS_LIST, "title": "List the tool library",
-     "description": "The X7 tool library (~/.stevecam/tools.json): every "
+     "description": "The X7 tool library (~/.cambuddy/tools.json): every "
                     "tool with its stable tool_id and library T/H/D, plus "
                     "the pocket count. Unknown fields are null.",
      "confirm": False,
