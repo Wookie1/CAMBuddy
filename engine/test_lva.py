@@ -182,6 +182,11 @@ def test_lva_default_on_and_off_switches():
             + bt(-30, 30, 25, 30, 0, 14) + bt(-11, 11, -6, 6, 0, 14))
     out, ons, raw, sts = {}, {}, {}, {}
     old = os.environ.pop("ENGINE_AIR_G0", None)
+    # ES1 off (coordinator-approved edit, 2026-11-05): this test pins the
+    # pre-ES1 LVA behaviour on the scene (exactly one LVA G0); ES1 is default
+    # ON and lowers more starts there
+    old_es = os.environ.get("CAMBUDDY_EXACT_SQUARE")
+    os.environ["CAMBUDDY_EXACT_SQUARE"] = "0"
     try:
         with tempfile.TemporaryDirectory() as td:
             stl = os.path.join(td, "lva_def.stl")
@@ -207,6 +212,10 @@ def test_lva_default_on_and_off_switches():
         os.environ.pop("ENGINE_AIR_G0", None)
         if old is not None:
             os.environ["ENGINE_AIR_G0"] = old
+        if old_es is None:
+            os.environ.pop("CAMBUDDY_EXACT_SQUARE", None)
+        else:
+            os.environ["CAMBUDDY_EXACT_SQUARE"] = old_es
     assert ons == {"default": 1, "off": 0, "env0": 0}, ons
     assert out["off"] == out["env0"], "explicit off != ENGINE_AIR_G0=0"
     # A2 (coordinator-approved edit, replaces default == off byte for byte):
