@@ -20,9 +20,10 @@ def test_lva_call_site_passes_rapid_margin():
             + bt(-30, 30, 25, 30, 0, 14) + bt(-11, 11, -6, 6, 0, 14))
     seen, orig = [], rmod._lva_start
 
-    def spy(stock, cx, cy, r, s, z, tool_r, margin, holder):
+    # **kw (coordinator-approved edit, 2026-11-05): ES1 passes exact_square=
+    def spy(stock, cx, cy, r, s, z, tool_r, margin, holder, **kw):
         seen.append(margin)
-        return orig(stock, cx, cy, r, s, z, tool_r, margin, holder)
+        return orig(stock, cx, cy, r, s, z, tool_r, margin, holder, **kw)
     rmod._lva_start = spy
     try:
         with tempfile.TemporaryDirectory() as td:
