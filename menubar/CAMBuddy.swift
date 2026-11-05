@@ -433,6 +433,9 @@ let menuBarIcon: NSImage = {
         }
         NSColor.black.setStroke()
         path.stroke()
+        // Tool: a dot at the end of the last pass.
+        NSColor.black.setFill()
+        NSBezierPath(ovalIn: NSRect(x: 0, y: ys[3] - 2.5, width: 5, height: 5)).fill()
         return true
     }
     img.isTemplate = true
