@@ -152,6 +152,10 @@ def test_gr_default_on_and_off_is_main():
     --no-gap-relink to 0 and nothing to None (= default ON)."""
     import hashlib
     old = os.environ.pop("ENGINE_GAP_RELINK", None)
+    # ES1 off (coordinator-approved edit, 2026-11-05): this test pins main's
+    # pre-ES1 behaviour; ES1 is default ON and changes the scene's program
+    old_es = os.environ.get("CAMBUDDY_EXACT_SQUARE")
+    os.environ["CAMBUDDY_EXACT_SQUARE"] = "0"
     try:
         m_def, s_def = _twopock(None)
         m_on, _s_on = _twopock(1)
@@ -162,6 +166,10 @@ def test_gr_default_on_and_off_is_main():
         os.environ.pop("ENGINE_GAP_RELINK", None)
         if old is not None:
             os.environ["ENGINE_GAP_RELINK"] = old
+        if old_es is None:
+            os.environ.pop("CAMBUDDY_EXACT_SQUARE", None)
+        else:
+            os.environ["CAMBUDDY_EXACT_SQUARE"] = old_es
     assert "gr" in s_def and s_def["gr"]["relinked"] >= 1, s_def.get("gr")
     assert json.dumps(m_def) == json.dumps(m_on), "default != ON"
     assert "gr" not in s_off and "gr" not in s_env
