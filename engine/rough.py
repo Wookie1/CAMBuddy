@@ -1319,7 +1319,7 @@ def holder_clears(stock, pts, z, holder_r, stickout):
         <= z + stickout - 1.0
 
 
-def _cut_top_max(stock, x, y, rad, z):
+def _cut_top_max(stock, x, y, rad, z, square=False):
     """A1b: highest stock within rad of (x, y) that a helix legal at level z
     can reach: cells whose part is at or below z. A cell whose part stands
     above z is island at z (and, for a heightfield, at every higher Z), so
@@ -1334,7 +1334,14 @@ def _cut_top_max(stock, x, y, rad, z):
     t = stock.top[ja:jb, ia:ib]
     xs = stock.x0 + (np.arange(ia, ib) + 0.5) * c
     ys = stock.y0 + (np.arange(ja, jb) + 0.5) * c
-    m = ((xs[None, :] - x) ** 2 + (ys[:, None] - y) ** 2) <= rad * rad
+    if square:
+        # ES1: a cell counts iff the nearest point of its square lies within
+        # rad (exact disk / cell-square intersection, no centre dilation)
+        dx = np.maximum(np.abs(xs[None, :] - x) - c / 2.0, 0.0)
+        dy = np.maximum(np.abs(ys[:, None] - y) - c / 2.0, 0.0)
+        m = (dx * dx + dy * dy) <= rad * rad
+    else:
+        m = ((xs[None, :] - x) ** 2 + (ys[:, None] - y) ** 2) <= rad * rad
     if stock.part is not None:
         m &= ~(stock.part[ja:jb, ia:ib] > z)
     m &= np.isfinite(t)
@@ -1355,7 +1362,8 @@ def _gr_link_ok(corridor, z, lift, isl_ok3, corridor_ok, stock, tool_r):
             and not _strip_engage(stock, corridor, z, tool_r) > 2.438)
 
 
-def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder):
+def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder,
+               exact_square=False):
     """LVA (lever A, A1b rule): the lowest height a helix entry may start at,
     G0 down the column at its start point s. Never under z + 0.3, and:
     - margin over the highest stock in the helix's swept disk (r + tool_r
@@ -1371,10 +1379,15 @@ def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder):
       (the R5 rapid convention; emit() checks it again);
     - the holder nose >= 1 mm over stock/part within holder_r + 1 at s
       (holder_clears, M2).
+    ES1 (exact_square=True): the disk scan counts a cell iff its square
+    meets the swept disk r + tool_r exactly, instead of dilating cell centres
+    by cell*sqrt(2)/2; every other term is unchanged.
     None when the holder is unknown (today's start stays)."""
     if holder is None:
         return None
-    zc = max(_cut_top_max(stock, cx, cy,
+    zc = max(_cut_top_max(stock, cx, cy, r + tool_r, z, square=True)
+             if exact_square else
+             _cut_top_max(stock, cx, cy,
                           r + tool_r + stock.cell * math.sqrt(2.0) / 2.0, z),
              stock.link_top_max([(s[0], s[1]), (s[0], s[1])],
                                 tool_r + margin))
@@ -1495,7 +1508,8 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           progress=None, stock_out=None, ramp_angle_deg=2.0,
           side_entry_faces=None, side_entry_min_z=None, flute_mm=None,
           side_entry_holder=None, a2d_pool=None, _pl1_held=None,
-          on_moves=None, air_descent_g0=None, gap_relink=None):
+          on_moves=None, air_descent_g0=None, gap_relink=None,
+          exact_square=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -1590,6 +1604,13 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         _gr_on = bool(gap_relink)
     else:
         _gr_on = int(os.environ.get("ENGINE_GAP_RELINK", "1")) != 0
+    # ES1: the air-descent disk scan uses the exact disk / cell-square test
+    # instead of the cell*sqrt(2)/2 centre dilation. Default OFF; on with
+    # exact_square=1, --exact-square 1 or CAMBUDDY_EXACT_SQUARE=1.
+    if exact_square is not None:
+        _es_on = bool(exact_square)
+    else:
+        _es_on = int(os.environ.get("CAMBUDDY_EXACT_SQUARE", "0")) != 0
     sk1_block = [None]   # why the last SK1 search found no column
     if clearance_z is None:
         clearance_z = szmax + 2.0
@@ -2040,7 +2061,8 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 # explicit raise (not assert) so it also holds under -O
                 raise RuntimeError("LVA: helix circle not island-legal at Z")
             zs = _lva_start(stock, cx, cy, r, s, z, tool_r, rapid_margin,
-                            _sk1_holder) if _lva_on else None
+                            _sk1_holder, exact_square=_es_on) \
+                if _lva_on else None
             if zs is not None and zs < zt - 1e-6:
                 # LVA: G0 down the column to zs (emit() still R5-checks it)
                 z_from = prev[2]

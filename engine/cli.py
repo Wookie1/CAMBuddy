@@ -541,6 +541,12 @@ def main(argv=None):
                         "re-bores, try a straight at-depth link under the "
                         "deep-link checks: 1 on (default), 0 off (also "
                         "--no-gap-relink or env ENGINE_GAP_RELINK=0)")
+    r.add_argument("--exact-square", dest="exact_square", type=int,
+                   default=None,
+                   help="ES1: the air-descent disk scan counts a stock cell "
+                        "iff its square meets the helix's swept disk exactly "
+                        "(no centre dilation): 1 on, 0 off (default; env "
+                        "CAMBUDDY_EXACT_SQUARE)")
     r.add_argument("--no-gap-relink", dest="gap_relink",
                    action="store_const", const=0,
                    help="same as --gap-relink 0")
@@ -947,6 +953,7 @@ def main(argv=None):
                                     a2d_pool=a.a2d_pool,
                                     air_descent_g0=a.air_descent_g0,
                                     gap_relink=a.gap_relink,
+                                    exact_square=a.exact_square,
                                     side_entry_holder=table_holder(
                                         kind, dia, a.tool_number,
                                         a.tools_json),
