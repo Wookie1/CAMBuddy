@@ -32,7 +32,7 @@ from test_track2 import ROUGH_VALUES  # noqa: E402
 PY = "/opt/homebrew/bin/python3"
 STEP = os.path.join(HERE, "testdata", "synth_pocket.step")
 CHECK_OK = os.path.join(HERE, "testdata", "check_ok.nc")
-BASE_COMMIT = "7326fec"
+BASE_COMMIT = "afd1faf"  # was 7326fec before the GitHub history cleanup
 
 
 def _run_rough(tmp_path, monkeypatch):

@@ -233,6 +233,24 @@ def precheck_holders(cfg, action, values):
             code="tool_holder_missing", field="tool_number", got=n)
 
 
+def panel_files(panel_dir):
+    """The panel's files for PUT /panels: skips dev.html and hidden files
+    (.DS_Store, .fuse_hidden*), which STEVE rejects as panel paths."""
+    files = {}
+    for name in sorted(os.listdir(panel_dir)):
+        path = os.path.join(panel_dir, name)
+        if not os.path.isfile(path) or name == "dev.html" \
+                or name.startswith("."):
+            continue
+        with open(path, "rb") as fh:
+            data = fh.read()
+        try:
+            files[name] = data.decode("utf-8")
+        except UnicodeDecodeError:
+            files[name] = "base64:" + crypto.b64(data)
+    return files
+
+
 class Connector:
     def __init__(self, home_override=None):
         self.cfg = config_mod.load(home_override)
@@ -416,19 +434,8 @@ class Connector:
         self.client.put_catalog(catalog_mod.published_catalog())
         panel_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "panel")
-        files = {}
-        for name in sorted(os.listdir(panel_dir)):
-            path = os.path.join(panel_dir, name)
-            if not os.path.isfile(path) or name == "dev.html":
-                continue
-            with open(path, "rb") as fh:
-                data = fh.read()
-            try:
-                files[name] = data.decode("utf-8")
-            except UnicodeDecodeError:
-                files[name] = "base64:" + crypto.b64(data)
-        self.client.put_panel(PANEL_NAME, "STEVE CAM roughing", ["right"],
-                             files)
+        self.client.put_panel(PANEL_NAME, "CAMBuddy", ["right"],
+                             panel_files(panel_dir))
 
     # ------------------------------------------------------------- events --
     def emit_state(self, state, action=None, progress=None):
