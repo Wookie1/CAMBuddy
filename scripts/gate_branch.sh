@@ -39,7 +39,7 @@ if [ $rc != 0 ]; then
 fi
 [ ${#FAILS[@]} = 0 ] && { echo GATE_GREEN; exit 0; }
 
-MW=${GATE_MAIN_WT:-$(dirname "$MAINREPO")/stevecam-wt/gate-main-$MSHA}
+MW=${GATE_MAIN_WT:-$(dirname "$MAINREPO")/cambuddy-wt/gate-main-$MSHA}
 [ -d "$MW" ] || git -C "$MAINREPO" worktree add --detach "$MW" main > /dev/null 2>&1 || {
   echo "cannot add main worktree $MW"; echo GATE_RED "${FAILS[@]}"; exit 1; }
 fixtures "$MW"

@@ -11,9 +11,9 @@ DEFAULTS = {
     "base_url": "https://stevecad.studio/connect/v1",
     "pairing_code": "",
     "connector_name": "cambuddy-rough",
-    "programs_dir": "~/ai-sandbox/stevecam/out/steve",
+    "programs_dir": "~/ai-sandbox/cambuddy/out/steve",
     "engine_python": "/Applications/VibeCAD.app/Contents/Resources/bin/python",
-    "repo_root": "~/ai-sandbox/stevecam",
+    "repo_root": "~/ai-sandbox/cambuddy",
     "poll_wait": 30,          # long-poll seconds for GET /messages
     "token_retry": 60,        # s between /token attempts while pending
     "engine_cmd": None,       # optional override for tests (list of strings)
