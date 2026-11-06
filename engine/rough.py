@@ -1641,12 +1641,13 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
     # stock top (StockField.lr_disk_top) instead of the 0.5 mm scan; over
     # LR1_CAP evaluated cells it falls back to today's start. AF: helix
     # moves above the fine top over r + R + AF_BAND_MM (+ AF_GUARD_MM) run at
-    # the cutting feed. Both default OFF; on with lr1=1 / air_feed=1,
-    # --lr1 1 / --air-feed 1 or CAMBUDDY_LR1=1 / CAMBUDDY_AIR_FEED=1.
+    # the cutting feed. Both default ON (James, 2026-11-06); off with
+    # lr1=0 / air_feed=0, --no-lr1 / --no-air-feed (or --lr1 0 /
+    # --air-feed 0) or CAMBUDDY_LR1=0 / CAMBUDDY_AIR_FEED=0.
     _lr1_on = bool(lr1) if lr1 is not None else \
-        int(os.environ.get("CAMBUDDY_LR1", "0")) != 0
+        int(os.environ.get("CAMBUDDY_LR1", "1")) != 0
     _af_on = bool(air_feed) if air_feed is not None else \
-        int(os.environ.get("CAMBUDDY_AIR_FEED", "0")) != 0
+        int(os.environ.get("CAMBUDDY_AIR_FEED", "1")) != 0
     sk1_block = [None]   # why the last SK1 search found no column
     if clearance_z is None:
         clearance_z = szmax + 2.0

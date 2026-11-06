@@ -1,5 +1,5 @@
 """LR1 (--lr1 / CAMBUDDY_LR1) and AF (--air-feed / CAMBUDDY_AIR_FEED), both
-default OFF. LR1: the LVA helix start takes its swept-disk stock top from
+default ON (James, 2026-11-06; off: --no-lr1 / --no-air-feed or env = 0). LR1: the LVA helix start takes its swept-disk stock top from
 fine (0.1 mm) point heights - the engine's own milling convention evaluated
 at points through a segment index - found by branch and bound over the
 upper-bound layer U. AF: helix moves above the fine stock top over the disk
@@ -19,7 +19,8 @@ widened by AF_BAND_MM (+ AF_GUARD_MM) run at the cutting feed.
 (6) the query cap falls back to today's start and ramp feed (program == OFF);
 (7) the BS1d scene, judged by zmap at 0.1 mm: gates 0 incl. entry_stock, no
     cutting-feed descent removes stock, engagement no worse, cycle lower;
-(8) OFF is the default and is main's program (pinned hash); flags parse.
+(8) ON is the default; OFF (flags or env) is main's program (pinned hash);
+    flags parse.
 Runnable directly or under pytest from VibeCAD python."""
 import hashlib
 import json
@@ -391,27 +392,35 @@ class _Parsed(Exception):
         self.ns = ns
 
 
-def test_lr1_default_off_is_main():
-    """(8) default == explicit off == env 0, no lr1/af keys, == main's
-    program (pinned hash); --lr1 / --air-feed parse."""
+def test_lr1_default_on_and_off_is_main():
+    """(8) LR1 and AF are ON by default (James, 2026-11-06): the default
+    program equals lr1=1 + air_feed=1 (with lr1 / af stats) and differs from
+    OFF; lr1=0 + air_feed=0 and CAMBUDDY_LR1=0 + CAMBUDDY_AIR_FEED=0 give the
+    same program, without the keys, and it is main's (pinned hash). The
+    parser maps nothing to None (= default ON), --lr1 1 / --air-feed 1 to 1
+    and --no-lr1 / --no-air-feed to 0."""
     olds = {k: os.environ.pop(k, None)
             for k in ("CAMBUDDY_LR1", "CAMBUDDY_AIR_FEED")}
     try:
         m_def, s_def = _scene_rough()
+        m_on, _s = _scene_rough(lr1=1, air_feed=1)
         m_off, s_off = _scene_rough(lr1=0, air_feed=0)
         os.environ["CAMBUDDY_LR1"] = "0"
         os.environ["CAMBUDDY_AIR_FEED"] = "0"
-        m_env, _s = _scene_rough()
+        m_env, s_env = _scene_rough()
     finally:
         for k, v in olds.items():
             os.environ.pop(k, None)
             if v is not None:
                 os.environ[k] = v
-    for s_ in (s_def, s_off):
+    assert "lr1" in s_def and "af" in s_def, sorted(s_def)
+    assert json.dumps(m_def) == json.dumps(m_on), "default != ON"
+    for s_ in (s_off, s_env):
         assert "lr1" not in s_ and "af" not in s_
-    assert json.dumps(m_def) == json.dumps(m_off) == json.dumps(m_env)
-    h = hashlib.sha256(json.dumps(m_def).encode()).hexdigest()[:16]
+    assert json.dumps(m_off) == json.dumps(m_env), "off != env 0"
+    h = hashlib.sha256(json.dumps(m_off).encode()).hexdigest()[:16]
     assert h == MAIN_BS1D_SHA16, ("OFF is not main's program", h)
+    assert json.dumps(m_def) != json.dumps(m_off), "ON changes nothing"
     import argparse
     from engine import cli
     orig = argparse.ArgumentParser.parse_args
@@ -421,7 +430,10 @@ def test_lr1_default_off_is_main():
     argparse.ArgumentParser.parse_args = grab
     try:
         for argv, want in (([], (None, None)),
-                           (["--lr1", "1", "--air-feed", "1"], (1, 1))):
+                           (["--lr1", "1", "--air-feed", "1"], (1, 1)),
+                           (["--no-lr1", "--no-air-feed"], (0, 0)),
+                           (["--no-lr1"], (0, None)),
+                           (["--no-air-feed"], (None, 0))):
             try:
                 cli.main(["rough", "--step", "x.step", "--stock", "0", "1",
                           "0", "1", "0", "1", "--tool", "flat:12.686",
@@ -432,8 +444,8 @@ def test_lr1_default_off_is_main():
                 raise AssertionError("parser not reached")
     finally:
         argparse.ArgumentParser.parse_args = orig
-    print("PASS lr1 default OFF (no lr1/af keys, == env 0) == main %s; flags"
-          " parse" % h)
+    print("PASS lr1 default ON (== ON, != OFF); OFF / env 0 identical, no "
+          "keys, == main %s; --no-lr1 / --no-air-feed parse to 0" % h)
 
 
 if __name__ == "__main__":
@@ -443,5 +455,5 @@ if __name__ == "__main__":
     test_lr1_overread_lowers_start()
     test_af_band_catches_sliver_outside_disk()
     test_lr1_cap_falls_back()
-    test_lr1_default_off_is_main()
+    test_lr1_default_on_and_off_is_main()
     test_lr1_bs1d_judged()

@@ -544,12 +544,17 @@ def main(argv=None):
     r.add_argument("--lr1", dest="lr1", type=int, default=None,
                    help="LR1: helix starts take the swept-disk stock top "
                         "from fine (0.1 mm) point heights instead of the "
-                        "0.5 mm grid: 1 on, 0 off (default; env "
-                        "CAMBUDDY_LR1)")
+                        "0.5 mm grid: 1 on (default), 0 off (also --no-lr1 "
+                        "or env CAMBUDDY_LR1=0)")
+    r.add_argument("--no-lr1", dest="lr1", action="store_const", const=0,
+                   help="same as --lr1 0")
     r.add_argument("--air-feed", dest="air_feed", type=int, default=None,
                    help="AF: helix moves above the fine stock top over the "
-                        "swept disk + 0.25 mm run at the cutting feed: 1 on, "
-                        "0 off (default; env CAMBUDDY_AIR_FEED)")
+                        "swept disk + 0.25 mm run at the cutting feed: 1 on "
+                        "(default), 0 off (also --no-air-feed or env "
+                        "CAMBUDDY_AIR_FEED=0)")
+    r.add_argument("--no-air-feed", dest="air_feed", action="store_const",
+                   const=0, help="same as --air-feed 0")
     r.add_argument("--no-gap-relink", dest="gap_relink",
                    action="store_const", const=0,
                    help="same as --gap-relink 0")
