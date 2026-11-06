@@ -2950,12 +2950,11 @@ def test_ze2b_helix_finite_and_descent_tagged():
 def test_ze2b_flat_and_bull_json_byte_identical(tmp_path):
     """Design case 5: flat/bull --out-json stays BYTE-IDENTICAL to b1688b8's
     zmap (the ZE2B block is ball-only)."""
+    import shutil
     import subprocess
     here = os.path.dirname(os.path.abspath(zmap.__file__))
-    root = os.path.dirname(here)
-    old = tmp_path / "zmap_b1688b8.py"
-    old.write_bytes(subprocess.check_output(
-        ["git", "-C", root, "show", "b1688b8:verify/zmap.py"]))
+    old = tmp_path / "zmap_b1688b8.py"   # pinned copy, run outside verify/
+    shutil.copy(os.path.join(here, "testdata", "zmap_b1688b8.py"), old)
     part = block_part(hi=10.0, half=15.0)
     npf = tmp_path / "part.npy"
     np.save(npf, part)

@@ -245,7 +245,7 @@ def test_cancel_mid_job_fails_on_main_connector(tmp_path):
     """
     try:
         src = subprocess.run(["git", "-C", REPO, "show",
-                              "2da9125:connector/connector.py"],
+                              "3ef883b:connector/connector.py"],  # 2da9125 pre-cleanup
                              capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError):
         pytest.skip("git show unavailable")
