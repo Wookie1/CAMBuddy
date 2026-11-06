@@ -152,6 +152,13 @@ def test_gr_default_on_and_off_is_main():
     --no-gap-relink to 0 and nothing to None (= default ON)."""
     import hashlib
     old = os.environ.pop("ENGINE_GAP_RELINK", None)
+    # LR1 / AF off (coordinator-approved edit, 2026-11-06): this test pins
+    # main's pre-LR1 behaviour; LR1 and AF are default ON and change the
+    # program it compares
+    old_lr = {k: os.environ.get(k) for k in ("CAMBUDDY_LR1",
+                                             "CAMBUDDY_AIR_FEED")}
+    os.environ["CAMBUDDY_LR1"] = "0"
+    os.environ["CAMBUDDY_AIR_FEED"] = "0"
     try:
         m_def, s_def = _twopock(None)
         m_on, _s_on = _twopock(1)
@@ -162,6 +169,11 @@ def test_gr_default_on_and_off_is_main():
         os.environ.pop("ENGINE_GAP_RELINK", None)
         if old is not None:
             os.environ["ENGINE_GAP_RELINK"] = old
+        for k, v in old_lr.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     assert "gr" in s_def and s_def["gr"]["relinked"] >= 1, s_def.get("gr")
     assert json.dumps(m_def) == json.dumps(m_on), "default != ON"
     assert "gr" not in s_off and "gr" not in s_env
