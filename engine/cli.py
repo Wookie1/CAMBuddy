@@ -541,6 +541,12 @@ def main(argv=None):
                         "re-bores, try a straight at-depth link under the "
                         "deep-link checks: 1 on (default), 0 off (also "
                         "--no-gap-relink or env ENGINE_GAP_RELINK=0)")
+    r.add_argument("--rapid-box", dest="rapid_box", type=int, default=None,
+                   help="RAPID-A: an XY rapid clears the rectangle its start "
+                        "and end span (inflated by the tool radius + margin), "
+                        "not only the straight corridor, raising the traverse "
+                        "when needed (independent-axes controls): 1 on, 0 off "
+                        "(default; env CAMBUDDY_RAPID_BOX)")
     r.add_argument("--no-gap-relink", dest="gap_relink",
                    action="store_const", const=0,
                    help="same as --gap-relink 0")
@@ -947,6 +953,7 @@ def main(argv=None):
                                     a2d_pool=a.a2d_pool,
                                     air_descent_g0=a.air_descent_g0,
                                     gap_relink=a.gap_relink,
+                                    rapid_box=a.rapid_box,
                                     side_entry_holder=table_holder(
                                         kind, dia, a.tool_number,
                                         a.tools_json),

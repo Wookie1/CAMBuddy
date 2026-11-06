@@ -246,6 +246,33 @@ class StockField:
             return True
         return self.top_at(x, y) <= z_from + eps
 
+    def box_top_max(self, xa, ya, xb, yb, pad):
+        """RAPID-A: highest tracked material - max(stock top, part surface)
+        - at cell centres within `pad` of the axis-aligned rectangle spanned
+        by (xa, ya) and (xb, yb) (its Minkowski sum with the tool disk):
+        everywhere an independent-axes rapid between the two points can put
+        the tool. -inf when none."""
+        top = self.top
+        if self.part is not None:
+            top = np.maximum(top, self.part)
+        c = self.cell
+        i0 = max(int(math.ceil((min(xa, xb) - pad - self.x0) / c - 0.5)), 0)
+        i1 = min(int(math.floor((max(xa, xb) + pad - self.x0) / c - 0.5)) + 1,
+                 self.nx)
+        j0 = max(int(math.ceil((min(ya, yb) - pad - self.y0) / c - 0.5)), 0)
+        j1 = min(int(math.floor((max(ya, yb) + pad - self.y0) / c - 0.5)) + 1,
+                 self.ny)
+        if i0 >= i1 or j0 >= j1:
+            return -np.inf
+        xs = self.x0 + (np.arange(i0, i1) + 0.5) * c
+        ys = self.y0 + (np.arange(j0, j1) + 0.5) * c
+        dx = np.maximum(np.maximum(min(xa, xb) - xs, xs - max(xa, xb)), 0.0)
+        dy = np.maximum(np.maximum(min(ya, yb) - ys, ys - max(ya, yb)), 0.0)
+        w = top[j0:j1, i0:i1]
+        f = np.isfinite(w) & ((dx[None, :] ** 2 + dy[:, None] ** 2)
+                              <= pad * pad)
+        return float(w[f].max()) if f.any() else -np.inf
+
     def link_top_max(self, pts, r):
         """Highest tracked material Z - max(stock top, part surface) - at
         cell centres within r of the polyline (list of (x, y)). -inf when no

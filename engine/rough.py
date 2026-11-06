@@ -1495,7 +1495,8 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           progress=None, stock_out=None, ramp_angle_deg=2.0,
           side_entry_faces=None, side_entry_min_z=None, flute_mm=None,
           side_entry_holder=None, a2d_pool=None, _pl1_held=None,
-          on_moves=None, air_descent_g0=None, gap_relink=None):
+          on_moves=None, air_descent_g0=None, gap_relink=None,
+          rapid_box=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -1590,6 +1591,13 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         _gr_on = bool(gap_relink)
     else:
         _gr_on = int(os.environ.get("ENGINE_GAP_RELINK", "1")) != 0
+    # RAPID-A: an XY rapid's verified height covers the rectangle its start
+    # and end span (inflated by tool_r + rapid_margin), not only the straight
+    # corridor - an independent-axes control (lnc5800) may dogleg anywhere
+    # inside it. Default OFF; on with rapid_box=1, --rapid-box 1 or
+    # CAMBUDDY_RAPID_BOX=1.
+    _ra_on = bool(rapid_box) if rapid_box is not None else \
+        int(os.environ.get("CAMBUDDY_RAPID_BOX", "0")) != 0
     sk1_block = [None]   # why the last SK1 search found no column
     if clearance_z is None:
         clearance_z = szmax + 2.0
@@ -2375,6 +2383,15 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             # otherwise lift to that verified height.
             req = stock.link_top_max([(x0, y0), (mv["x"], mv["y"])],
                                     tool_r + rapid_margin)
+            if _ra_on and (abs(mv["x"] - x0) > 1e-9
+                           or abs(mv["y"] - y0) > 1e-9):
+                rb = stock.box_top_max(x0, y0, mv["x"], mv["y"],
+                                       tool_r + rapid_margin)
+                if rb > req:
+                    if req > -1e8 and mv["z"] < rb + rapid_margin and \
+                            mv["z"] >= req + rapid_margin:
+                        stats["rapid_box"] = stats.get("rapid_box", 0) + 1
+                    req = rb
             if req > -1e8 and mv["z"] < req + rapid_margin:
                 mv = dict(mv, z=round(max(mv["z"], req + rapid_margin), 4))
                 stats["n_rapid_bumps"] += 1

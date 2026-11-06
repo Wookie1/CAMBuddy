@@ -1206,6 +1206,20 @@ def _zh1_measure(e, stock):
     return top(e["col"]), top(e["disk"])
 
 
+def _dogleg_report(recs):
+    """RAPID-A (report only, never a gate): XY rapids whose bounding
+    rectangle swept by the tool disk (cells within R of it) holds stock or
+    part above the tip - an independent-axes control could run them
+    through it."""
+    recs = sorted(recs)
+    return {"count": len(recs),
+            "first_line": recs[0][1] if recs else None,
+            "max_over_mm": max((r[7] for r in recs), default=0.0),
+            "gate": False,
+            "moves": [{"line": r[1], "from": r[2:4], "to": r[4:6],
+                       "z": r[6], "over_mm": r[7]} for r in recs[:50]]}
+
+
 def _zh1_report(recs):
     """Task ZH1 gate block from per-entry records [idx, line, x, y, z,
     pitch, bar, col_mm, disk_mm]: count = entries whose standing stock
@@ -1468,7 +1482,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
              corner=0.0, stock_init=None, window=None, rapid_feed=RAPID_FEED,
              start=None, flute=None, shank_dia=None, holder=None,
              stickout=None, engage_max=None, ramp_angle=3.0,
-             engage_report=False, idx_offset=0, zh1=None):
+             engage_report=False, idx_offset=0, zh1=None, dogleg=False):
     """Run the toolpath over a stock heightfield.
 
     part      : (ny, nx) array of part top-Z heights
@@ -1691,6 +1705,7 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
     if zh1 is None:
         zh1 = zh1_entries(resolved, list(cur), xs, ys, R, cell, dz)
     zh1_recs = []
+    dogleg_recs = []   # RAPID-A: XY rapids judged over their bounding box
     rapid_collisions = 0
     first_rapid_line = None
     cut_length = 0.0
@@ -1762,6 +1777,33 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         z1 = mv["z"] if mv["z"] is not None else cur[2]
         if mv["motion"] in ("G2", "G3") and (mv["x"] is None or mv["y"] is None):
             continue  # arc without a resolvable endpoint
+        if dogleg and mv["motion"] == "G0" and \
+                (abs(x1 - cur[0]) > 1e-9 or abs(y1 - cur[1]) > 1e-9):
+            # RAPID-A (report only): an independent-axes control may run an
+            # XY rapid along any path inside the rectangle its start and end
+            # span; judge every cell centre within R of that rectangle (the
+            # rectangle's Minkowski sum with the tool disk) against live stock
+            # and part at the lower of the two tip heights
+            zt = min(z1, cur[2])
+            ia = max(int(math.ceil((min(x1, cur[0]) - R - x0) / cell - 0.5)), 0)
+            ib = min(int(math.floor((max(x1, cur[0]) + R - x0) / cell - 0.5)) + 1, nx)
+            ja = max(int(math.ceil((min(y1, cur[1]) - R - y0) / cell - 0.5)), 0)
+            jb = min(int(math.floor((max(y1, cur[1]) + R - y0) / cell - 0.5)) + 1, ny)
+            if ia < ib and ja < jb:
+                win_ = np.maximum(stock[ja:jb, ia:ib], part[ja:jb, ia:ib])
+                ddx = np.maximum(np.maximum(min(x1, cur[0]) - xs[ia:ib],
+                                            xs[ia:ib] - max(x1, cur[0])), 0.0)
+                ddy = np.maximum(np.maximum(min(y1, cur[1]) - ys[ja:jb],
+                                            ys[ja:jb] - max(y1, cur[1])), 0.0)
+                fin = np.isfinite(win_) & \
+                    ((ddx[None, :] ** 2 + ddy[:, None] ** 2) <= R * R)
+                if fin.any():
+                    over = float(win_[fin].max()) - zt
+                    if over > 1e-6:
+                        dogleg_recs.append([mi + idx_offset, mv["line"],
+                                            round(cur[0], 4), round(cur[1], 4),
+                                            round(x1, 4), round(y1, 4),
+                                            round(zt, 4), round(over, 4)])
         m = dict(mv)
         m["x"], m["y"], m["z"] = x1, y1, z1
         samples, length = _move_samples(m, cur, cell)
@@ -2264,8 +2306,11 @@ def simulate(moves, part, cell, x0, y0, stock_box, tool="flat", dia=6.0,
         "stock": stock,
         # task SP-K2: which per-sample cut kernel produced this report
         "zcut_kernel": "c" if kern is not None else "python",
-        "rapid_collisions": {"count": rapid_collisions,
-                            "first_line": first_rapid_line},
+        "rapid_collisions": dict({"count": rapid_collisions,
+                                  "first_line": first_rapid_line},
+                                 **({"dogleg": _dogleg_report(dogleg_recs)}
+                                    if dogleg else {})),
+        "_dogleg_raw": dogleg_recs,
         "entry_stock": _zh1_report(zh1_recs),
         "_zh1_raw": zh1_recs,
         "outside_grid": {"count": outside_grid,
@@ -2370,14 +2415,15 @@ def _chunk_worker(idx):
                     shank_dia=g["shank_dia"], holder=g["holder"],
                     stickout=g["stickout"], engage_max=g["engage_max"],
                     ramp_angle=g["ramp_angle"], engage_report=g["engage_report"],
-                    idx_offset=g["spans"][idx].start, zh1=g["zh1"])
+                    idx_offset=g["spans"][idx].start, zh1=g["zh1"],
+                    dogleg=g.get("dogleg", False))
 
 
 def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                       dia=6.0, corner=0.0, stock_init=None, window=None,
                       rapid_feed=RAPID_FEED, flute=None, shank_dia=None,
                       holder=None, stickout=None, engage_max=None,
-                      ramp_angle=3.0, engage_report=False):
+                      ramp_angle=3.0, engage_report=False, dogleg=False):
     import multiprocessing as mp
     # leading moves without a Z word: Z unknown = above stock, not machine 0;
     # use the first explicit Z (as serial simulate does), else the stock top
@@ -2399,7 +2445,7 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                   window=window, rapid_feed=rapid_feed, flute=flute,
                   shank_dia=shank_dia, holder=holder, stickout=stickout,
                   engage_max=engage_max, ramp_angle=ramp_angle,
-                  engage_report=engage_report, zh1=zh1)
+                  engage_report=engage_report, zh1=zh1, dogleg=dogleg)
     # true machine position at each chunk start = end of the previous chunk's
     # last move (chunks must not simulate their first move from its own target)
     start_per = []
@@ -2437,6 +2483,9 @@ def simulate_parallel(moves, part, cell, x0, y0, stock_box, jobs, tool="flat",
                               if r["rapid_collisions"]["first_line"]),
                              default=None),
             "note": "exact under --jobs (two-pass prefix stock + chunk starts)",
+            **({"dogleg": _dogleg_report([d for r in results
+                                          for d in r["_dogleg_raw"]])}
+               if _CHUNK.get("dogleg") else {}),
         },
         # task ZH1: pass-2 chunks start from the exact prefix stock
         "entry_stock": _zh1_report([r for x in results for r in x["_zh1_raw"]]),
@@ -2751,6 +2800,14 @@ def main(argv=None):
                         "'unsupported: <code> at line N' and the full list in "
                         "the check json \"unsupported\". Default off: "
                         "behaviour is exactly as before")
+    p.add_argument("--dogleg-report", dest="dogleg_report",
+                   action="store_true",
+                   help="RAPID-A (report only, never a gate): add "
+                        "rapid_collisions.dogleg - XY rapids whose start/end "
+                        "rectangle swept by the tool disk holds stock or "
+                        "part above the tip (an independent-axes control may "
+                        "run them anywhere inside it). Default off: the JSON "
+                        "is unchanged")
     p.add_argument("--engage-report", dest="engage_report",
                    action="store_true",
                    help="report engagement stats (max/percentiles) without a "
@@ -2885,7 +2942,8 @@ def main(argv=None):
                                holder=holder_segs, stickout=holder_stick,
                                engage_max=engage_max,
                                ramp_angle=args.ramp_angle,
-                               engage_report=args.engage_report)
+                               engage_report=args.engage_report,
+                               dogleg=args.dogleg_report)
     else:
         res = simulate(moves, part, cell, x0, y0, stock_box,
                        tool=args.tool, dia=args.dia, corner=args.corner,
@@ -2894,7 +2952,8 @@ def main(argv=None):
                        shank_dia=args.shank_dia,
                        holder=holder_segs, stickout=holder_stick,
                        engage_max=engage_max, ramp_angle=args.ramp_angle,
-                       engage_report=args.engage_report)
+                       engage_report=args.engage_report,
+                       dogleg=args.dogleg_report)
 
     report = {
         "gcode": os.path.abspath(args.gcode),
