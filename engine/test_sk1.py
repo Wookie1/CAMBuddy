@@ -273,6 +273,13 @@ def _tb_program(mod=None):
     # rough.py ignores the variable).
     old_gr = os.environ.get("ENGINE_GAP_RELINK")
     os.environ["ENGINE_GAP_RELINK"] = "0"
+    # LR1 / AF off (coordinator-approved edit, 2026-11-06): this test pins
+    # main's pre-LR1 behaviour; LR1 and AF are default ON and change the
+    # program it compares
+    old_lr = {k: os.environ.get(k) for k in ("CAMBUDDY_LR1",
+                                             "CAMBUDDY_AIR_FEED")}
+    os.environ["CAMBUDDY_LR1"] = "0"
+    os.environ["CAMBUDDY_AIR_FEED"] = "0"
     try:
         moves, stats = (mod or rough)(surf, (-50.0, 50.0, -40.0, 40.0, 0.0,
                                              38.0),
@@ -287,6 +294,11 @@ def _tb_program(mod=None):
             os.environ.pop("ENGINE_GAP_RELINK", None)
         else:
             os.environ["ENGINE_GAP_RELINK"] = old_gr
+        for k, v in old_lr.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     assert stats["n_axial_plunge"] == 0
     return "\n".join(moves_to_gcode(moves)) + "\n"
 
