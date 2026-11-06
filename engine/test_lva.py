@@ -182,6 +182,13 @@ def test_lva_default_on_and_off_switches():
             + bt(-30, 30, 25, 30, 0, 14) + bt(-11, 11, -6, 6, 0, 14))
     out, ons, raw, sts = {}, {}, {}, {}
     old = os.environ.pop("ENGINE_AIR_G0", None)
+    # LR1 / AF off (coordinator-approved edit, 2026-11-06): this test pins
+    # main's pre-LR1 behaviour; LR1 and AF are default ON and change the
+    # program it compares
+    old_lr = {k: os.environ.get(k) for k in ("CAMBUDDY_LR1",
+                                             "CAMBUDDY_AIR_FEED")}
+    os.environ["CAMBUDDY_LR1"] = "0"
+    os.environ["CAMBUDDY_AIR_FEED"] = "0"
     try:
         with tempfile.TemporaryDirectory() as td:
             stl = os.path.join(td, "lva_def.stl")
@@ -207,6 +214,11 @@ def test_lva_default_on_and_off_switches():
         os.environ.pop("ENGINE_AIR_G0", None)
         if old is not None:
             os.environ["ENGINE_AIR_G0"] = old
+        for k, v in old_lr.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     assert ons == {"default": 1, "off": 0, "env0": 0}, ons
     assert out["off"] == out["env0"], "explicit off != ENGINE_AIR_G0=0"
     # A2 (coordinator-approved edit, replaces default == off byte for byte):
