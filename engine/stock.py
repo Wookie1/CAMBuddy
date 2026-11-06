@@ -53,6 +53,7 @@ class StockField:
         self.inb = inb
         self.top = np.where(inb, float(szmax), -np.inf)
         self.part = None
+        self.U = None    # LR1 upper-bound layer + segment index (lr_enable)
 
     # ------------------------------------------------------------------ grid
     def _ci(self, x):
@@ -117,6 +118,9 @@ class StockField:
         dx = X - (xa + t * abx)
         dy = Y - (ya + t * aby)
         d = np.sqrt(dx * dx + dy * dy)
+        if self.U is not None:   # LR1: index every segment, even off-centre
+            self._lr_mill(xa, ya, xb, yb, zc, tool_r, corner_r, d, i0, i1,
+                          j0, j1)
         near = d <= tool_r
         if not near.any():
             return
@@ -128,6 +132,144 @@ class StockField:
         newtop = zc + hh
         sub = self.top[j0:j1, i0:i1]
         np.putmask(sub, near & (sub > newtop), newtop)
+
+    # ------------------------------------------------- LR1 fine stock tops
+    # LR1: the true (0.1 mm) stock height at a point is min(initial top,
+    # min over milled segments covering it of zc + h(d)) - the engine's own
+    # milling convention, evaluated at points instead of cell centres. A
+    # segment index (LR_BUCKET mm buckets over each segment's bbox) finds the
+    # covering segments; U is an upper bound of every point in a cell: a
+    # segment lowers U only where the cell's WHOLE square lies inside the
+    # tool (centre distance + half diagonal <= R), at the profile height of
+    # that farthest distance. Branch and bound over U answers "highest point
+    # stock in a disk" while exactly evaluating few cells.
+    LR_BUCKET = 2.0
+    LR_FINE = 0.1
+
+    def lr_enable(self):
+        self.U = self.top.copy()
+        self._top0 = self.top.copy()
+        self._lr_seg = np.zeros((1024, 7))   # xa ya xb yb zc tool_r corner_r
+        self._lr_n = 0
+        self._lr_bk = {}
+        self._lr_rmax = 0.0
+
+    def lr_snap(self):
+        return None if self.U is None else (self.U.copy(), self._lr_n)
+
+    def lr_restore(self, snap):
+        # ponytail: truncation leaves stale ids in buckets; ids are reused by
+        # later segments and every candidate is distance-checked, so a stale
+        # entry only costs a little query time, never a wrong height
+        if snap is not None:
+            self.U[:] = snap[0]
+            self._lr_n = snap[1]
+
+    def _lr_mill(self, xa, ya, xb, yb, zc, tool_r, corner_r, d, i0, i1, j0,
+                 j1):
+        c = self.cell
+        df = d + c * math.sqrt(2.0) / 2.0
+        full = df <= tool_r
+        if full.any():
+            hh = corner_r - np.sqrt(np.maximum(
+                corner_r ** 2 - np.maximum(df - (tool_r - corner_r), 0.0)
+                ** 2, 0.0)) if corner_r > 1e-9 else 0.0
+            nu = zc + hh
+            sub = self.U[j0:j1, i0:i1]
+            np.putmask(sub, full & (sub > nu), nu)
+        n = self._lr_n
+        if n >= len(self._lr_seg):
+            self._lr_seg = np.concatenate([self._lr_seg,
+                                           np.zeros_like(self._lr_seg)])
+        self._lr_seg[n] = (xa, ya, xb, yb, zc, tool_r, corner_r)
+        self._lr_n = n + 1
+        self._lr_rmax = max(self._lr_rmax, tool_r)
+        B = self.LR_BUCKET
+        for bx in range(int(math.floor(min(xa, xb) / B)),
+                        int(math.floor(max(xa, xb) / B)) + 1):
+            for by in range(int(math.floor(min(ya, yb) / B)),
+                            int(math.floor(max(ya, yb) / B)) + 1):
+                self._lr_bk.setdefault((bx, by), []).append(n)
+
+    def lr_point_heights(self, px, py, ji):
+        """Fine (point) stock heights at points (px, py) inside coarse cell
+        ji = (j, i): the initial top lowered by every indexed segment whose
+        tool covers the point."""
+        j, i = ji
+        h = np.full(len(px), self._top0[j, i])
+        if not np.isfinite(h[0]):
+            return h
+        B = self.LR_BUCKET
+        reach = self._lr_rmax + self.cell
+        xm, ym = float(np.mean(px)), float(np.mean(py))
+        ids = []
+        for bx in range(int(math.floor((xm - reach) / B)),
+                        int(math.floor((xm + reach) / B)) + 1):
+            for by in range(int(math.floor((ym - reach) / B)),
+                            int(math.floor((ym + reach) / B)) + 1):
+                ids.extend(self._lr_bk.get((bx, by), ()))
+        if not ids:
+            return h
+        ids = np.unique(np.array(ids))
+        S = self._lr_seg[ids[ids < self._lr_n]]
+        ax, ay, bx_, by_ = S[:, 0], S[:, 1], S[:, 2], S[:, 3]
+        abx, aby = bx_ - ax, by_ - ay
+        L2 = np.maximum(abx * abx + aby * aby, 1e-24)
+        X, Y = px[:, None], py[:, None]
+        t = np.clip(((X - ax) * abx + (Y - ay) * aby) / L2, 0.0, 1.0)
+        dd = np.hypot(X - (ax + t * abx), Y - (ay + t * aby))
+        R, cr = S[:, 5], S[:, 6]
+        hh = np.where(cr > 1e-9, cr - np.sqrt(np.maximum(
+            cr ** 2 - np.maximum(dd - (R - cr), 0.0) ** 2, 0.0)), 0.0)
+        zz = np.where(dd <= R, S[:, 4] + hh, np.inf).min(axis=1)
+        return np.minimum(h, zz)
+
+    def lr_disk_top(self, cx, cy, rad, z, cap=400):
+        """LR1: highest fine stock (LR_FINE points; a point counts iff its
+        LR_FINE square meets the disk of radius rad about (cx, cy)) on
+        cuttable cells (part at or below z, as _cut_top_max) - by branch and
+        bound over U. Returns (top or -inf, cells evaluated), or (None, n)
+        when more than `cap` cells would need an exact evaluation."""
+        c, f = self.cell, self.LR_FINE
+        k = int(math.ceil((rad + c) / c)) + 1
+        i0, j0 = self._ci(cx), self._cj(cy)
+        ia, ib = max(i0 - k, 0), min(i0 + k + 1, self.nx)
+        ja, jb = max(j0 - k, 0), min(j0 + k + 1, self.ny)
+        if ia >= ib or ja >= jb:
+            return -np.inf, 0
+        xs = self.x0 + (np.arange(ia, ib) + 0.5) * c
+        ys = self.y0 + (np.arange(ja, jb) + 0.5) * c
+        dx = np.maximum(np.abs(xs[None, :] - cx) - c / 2.0, 0.0)
+        dy = np.maximum(np.abs(ys[:, None] - cy) - c / 2.0, 0.0)
+        m = (dx * dx + dy * dy) <= rad * rad
+        if self.part is not None:
+            m &= ~(self.part[ja:jb, ia:ib] > z)
+        Ub = self.U[ja:jb, ia:ib]
+        m &= np.isfinite(Ub)
+        jj, ii = np.nonzero(m)
+        if not len(jj):
+            return -np.inf, 0
+        order = np.argsort(-Ub[jj, ii], kind="stable")
+        n = int(round(c / f))
+        off = (np.arange(n) - (n - 1) / 2.0) * f
+        best, ev = -np.inf, 0
+        for q in order:
+            if Ub[jj[q], ii[q]] <= best:
+                break
+            if ev >= cap:
+                return None, ev
+            ev += 1
+            px = (xs[ii[q]] + off)[None, :].repeat(n, 0).ravel()
+            py = (ys[jj[q]] + off)[:, None].repeat(n, 1).ravel()
+            ddx = np.maximum(np.abs(px - cx) - f / 2.0, 0.0)
+            ddy = np.maximum(np.abs(py - cy) - f / 2.0, 0.0)
+            inn = (ddx * ddx + ddy * ddy) <= rad * rad
+            if not inn.any():
+                continue
+            hv = self.lr_point_heights(px[inn], py[inn],
+                                       (ja + jj[q], ia + ii[q]))
+            best = max(best, float(hv.max()))
+        return best, ev
 
     def mill_path(self, pts, z, tool_r, corner_r=0.0):
         """Mill a polyline at constant tip Z (list of (x, y))."""

@@ -1355,7 +1355,8 @@ def _gr_link_ok(corridor, z, lift, isl_ok3, corridor_ok, stock, tool_r):
             and not _strip_engage(stock, corridor, z, tool_r) > 2.438)
 
 
-def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder):
+def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder,
+               disk_top=None):
     """LVA (lever A, A1b rule): the lowest height a helix entry may start at,
     G0 down the column at its start point s. Never under z + 0.3, and:
     - margin over the highest stock in the helix's swept disk (r + tool_r
@@ -1371,11 +1372,14 @@ def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder):
       (the R5 rapid convention; emit() checks it again);
     - the holder nose >= 1 mm over stock/part within holder_r + 1 at s
       (holder_clears, M2).
+    LR1: disk_top, when given, replaces the disk scan with the caller's
+    fine (0.1 mm) stock top over r + tool_r; every other term is unchanged.
     None when the holder is unknown (today's start stays)."""
     if holder is None:
         return None
     zc = max(_cut_top_max(stock, cx, cy,
-                          r + tool_r + stock.cell * math.sqrt(2.0) / 2.0, z),
+                          r + tool_r + stock.cell * math.sqrt(2.0) / 2.0, z)
+             if disk_top is None else disk_top,
              stock.link_top_max([(s[0], s[1]), (s[0], s[1])],
                                 tool_r + margin))
     zs = max(zc + margin, z + 0.3) if zc > -1e8 else z + 0.3
@@ -1387,6 +1391,48 @@ def _lva_start(stock, cx, cy, r, s, z, tool_r, margin, holder):
     # a zero-length segment: link_top_max reads segments, not lone points
     return zs if holder_clears(stock, [(s[0], s[1]), (s[0], s[1])], zs, h_r,
                                h_so) else None
+
+
+LR1_CAP = 400        # LR1: most cells one fine query may evaluate exactly
+AF_BAND_MM = 0.25    # AF: no standing stock within this of the swept disk
+AF_GUARD_MM = 0.05   # AF: switch this far above that stock
+
+
+def _af_switch_z(stock, cx, cy, r, tool_r, z, cap=None):
+    """AF: the height above which a helix about (cx, cy) at level z may run
+    at the cutting feed - the fine stock top over the swept disk widened by
+    AF_BAND_MM, plus AF_GUARD_MM (never below z). None (ramp feed
+    throughout) when the fine query hits its cap or no stock is known."""
+    tb, ev = stock.lr_disk_top(cx, cy, r + tool_r + AF_BAND_MM, z,
+                               LR1_CAP if cap is None else cap)
+    if tb is None or not tb > -1e8:
+        return None, ev
+    return max(tb + AF_GUARD_MM, z), ev
+
+
+def _af_split(hmoves, z_top, sx, sy, zsw, cut_feed):
+    """AF: the descending helix moves (start (sx, sy, z_top)) at the cutting
+    feed while they stay at or above zsw, then at their own (ramp) feed; the
+    move crossing zsw is split at exactly that height (rounded UP to the 4 dp
+    the post writes, so no cutting-feed point lies below zsw). zsw None, or
+    not below the start: the moves are returned unchanged."""
+    if zsw is None or zsw >= z_top - 1e-9:
+        return hmoves
+    zr = math.ceil(zsw * 1e4 - 1e-6) / 1e4
+    out, px, py, pz = [], sx, sy, z_top
+    for mv in hmoves:
+        if mv["z"] >= zr - 1e-9:
+            out.append(dict(mv, f=cut_feed))
+        elif pz > zr + 1e-9:
+            t = (pz - zr) / (pz - mv["z"])
+            out.append({"g": 1, "x": round(px + (mv["x"] - px) * t, 4),
+                        "y": round(py + (mv["y"] - py) * t, 4), "z": zr,
+                        "f": cut_feed})
+            out.append(mv)
+        else:
+            out.append(mv)
+        px, py, pz = mv["x"], mv["y"], mv["z"]
+    return out
 
 
 def vise_height_guard(moves, stock_box, tool_r, min_z, stats=None):
@@ -1495,7 +1541,8 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
           progress=None, stock_out=None, ramp_angle_deg=2.0,
           side_entry_faces=None, side_entry_min_z=None, flute_mm=None,
           side_entry_holder=None, a2d_pool=None, _pl1_held=None,
-          on_moves=None, air_descent_g0=None, gap_relink=None):
+          on_moves=None, air_descent_g0=None, gap_relink=None,
+          lr1=None, air_feed=None):
     """Plan the rest-aware roughing toolpath. Returns (moves, stats).
 
     moves: neutral dicts {g:0|1, x,y,z, f (mm/min or None)}.
@@ -1590,6 +1637,16 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
         _gr_on = bool(gap_relink)
     else:
         _gr_on = int(os.environ.get("ENGINE_GAP_RELINK", "1")) != 0
+    # LR1: the LVA helix start takes its disk term from the fine (0.1 mm)
+    # stock top (StockField.lr_disk_top) instead of the 0.5 mm scan; over
+    # LR1_CAP evaluated cells it falls back to today's start. AF: helix
+    # moves above the fine top over r + R + AF_BAND_MM (+ AF_GUARD_MM) run at
+    # the cutting feed. Both default OFF; on with lr1=1 / air_feed=1,
+    # --lr1 1 / --air-feed 1 or CAMBUDDY_LR1=1 / CAMBUDDY_AIR_FEED=1.
+    _lr1_on = bool(lr1) if lr1 is not None else \
+        int(os.environ.get("CAMBUDDY_LR1", "0")) != 0
+    _af_on = bool(air_feed) if air_feed is not None else \
+        int(os.environ.get("CAMBUDDY_AIR_FEED", "0")) != 0
     sk1_block = [None]   # why the last SK1 search found no column
     if clearance_z is None:
         clearance_z = szmax + 2.0
@@ -1610,6 +1667,8 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                              drop_z=szmin - 1.0)
         stock.set_part_from_other_grid(part, stock.x0, stock.y0, stock.cell,
                                       fill=-1e9)
+    if _lr1_on or _af_on:
+        stock.lr_enable()
     stock.set_tool(tool_r)
 
     # Task RS: the cutting region comes from the STOCK box, never from the
@@ -2039,18 +2098,51 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 # A1b relies on the helix circle being island-legal; an
                 # explicit raise (not assert) so it also holds under -O
                 raise RuntimeError("LVA: helix circle not island-legal at Z")
+            zf = None
+            if _lva_on and _lr1_on:
+                zf, ev = stock.lr_disk_top(cx, cy, r + tool_r, z, LR1_CAP)
+                lr = stats["lr1"]
+                lr["queries"] += 1
+                lr["cells"] += ev
+                lr["cap_hits"] += int(zf is None)
+            # disk_top only when LR1 supplies one: off, the call is today's
             zs = _lva_start(stock, cx, cy, r, s, z, tool_r, rapid_margin,
-                            _sk1_holder) if _lva_on else None
-            if zs is not None and zs < zt - 1e-6:
+                            _sk1_holder,
+                            **({"disk_top": zf} if zf is not None else {})) \
+                if _lva_on else None
+            if zf is not None and zf > -1e8 and zf + rapid_margin > zt + 1e-6:
+                # LR1: the fine stock top stands higher than this start (the
+                # coarse grid under-read it): rise in the column first
+                emit({"g": 0, "x": s[0], "y": s[1],
+                      "z": round(zf + rapid_margin, 4)})
+                zt = prev[2]
+                stats["lr1"]["raised"] += 1
+            elif zs is not None and zs < zt - 1e-6:
                 # LVA: G0 down the column to zs (emit() still R5-checks it)
                 z_from = prev[2]
                 emit({"g": 0, "x": s[0], "y": s[1], "z": zs})
                 zt = prev[2]
                 stats["lva"]["g0"] += 1
                 stats["lva"]["g0_mm"] += z_from - zt
+                if zf is not None:
+                    stats["lr1"]["lowered"] += 1
             hx, hy, hz = s[0], s[1], zt
-            for hv in _helix_moves(cx, cy, s[0], s[1], zt, z, ramp_feed, r,
-                                  ramp_angle_deg):
+            hmv = _helix_moves(cx, cy, s[0], s[1], zt, z, ramp_feed, r,
+                               ramp_angle_deg)
+            if _af_on:
+                zsw, ev = _af_switch_z(stock, cx, cy, r, tool_r, z)
+                af = stats["af"]
+                af["queries"] += 1
+                af["cap_hits"] += int(ev >= LR1_CAP and zsw is None)
+                if zsw is not None:
+                    n0 = len(hmv)
+                    hmv = _af_split(hmv, zt, s[0], s[1], zsw, cut_feed)
+                    if len(hmv) > n0 or zsw <= z:
+                        af["split"] += 1
+                        af["air_mm"] += zt - zsw
+                        if len(af["switch_z"]) < 200:
+                            af["switch_z"].append(round(zsw, 4))
+            for hv in hmv:
                 emit(hv)
                 stock.mill_segment(hx, hy, hv["x"], hv["y"], hz, tool_r,
                                   corner_r)
@@ -2929,6 +3021,12 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                                    "clip_reentry": 0}, "log": []}
     stats["lva"] = {"on": int(_lva_on and _sk1_holder is not None),
                     "g0": 0, "g0_mm": 0.0}
+    if _lr1_on:   # LR1 / AF: present only when on (off = byte-identical)
+        stats["lr1"] = {"queries": 0, "cells": 0, "cap_hits": 0,
+                        "lowered": 0, "raised": 0}
+    if _af_on:
+        stats["af"] = {"queries": 0, "cap_hits": 0, "split": 0,
+                       "air_mm": 0.0, "switch_z": []}
     stats["pl1"] = {"openers": len(a2d_openers),
                     "precomputed": len(a2d_futs), "used": 0, "fallback": 0,
                     "error": pl1_err, "t_wait_s": 0.0}
@@ -3126,6 +3224,7 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
             h0 = helix_n[0]
             sn9 = copy.deepcopy(stats) if res.get("replan0") else None
             ts9 = stock.top.copy() if sn9 is not None else None
+            lr9 = stock.lr_snap() if sn9 is not None else None
             # SKN: a region whose cutting centres all sit within tool_r of a
             # stock face may be a thin skin: probe its entry, and if the only
             # way in is a 'wide' straight plunge AND its material is a band
@@ -3137,7 +3236,8 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                        p[1] - stock_box[2], stock_box[3] - p[1]) <= tool_r
                    for (kk, pp) in res["paths"] if kk == "cutting"
                    for p in pp):
-                snap = (stock.top.copy(), copy.deepcopy(stats))
+                snap = (stock.top.copy(), copy.deepcopy(stats),
+                        stock.lr_snap())
                 skin_arm[0] = (ex, ey, z)
                 sk1_block[0] = None
             try:
@@ -3147,6 +3247,7 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                 skin_arm[0] = None
                 band = _skin_band(res, stock, stock_box, tool_r, z)
                 stock.top[:] = snap[0]
+                stock.lr_restore(snap[2])
                 del moves[i0m:]
                 prev[0], prev[1], prev[2] = pxy0 + (pz0,)
                 helix_n[0] = h0
@@ -3230,6 +3331,7 @@ def _rough(surf, stock_box, tool_r, floor_z, leave=0.381, stepdown=19.05,
                             rk9 = {k: v for k, v in stats.items()
                                    if k.startswith("rjoin")}
                             stock.top[:] = ts9
+                            stock.lr_restore(lr9)
                             del moves[i0m:]
                             prev[0], prev[1], prev[2] = pxy0 + (pz0,)
                             helix_n[0] = h0

@@ -541,6 +541,15 @@ def main(argv=None):
                         "re-bores, try a straight at-depth link under the "
                         "deep-link checks: 1 on (default), 0 off (also "
                         "--no-gap-relink or env ENGINE_GAP_RELINK=0)")
+    r.add_argument("--lr1", dest="lr1", type=int, default=None,
+                   help="LR1: helix starts take the swept-disk stock top "
+                        "from fine (0.1 mm) point heights instead of the "
+                        "0.5 mm grid: 1 on, 0 off (default; env "
+                        "CAMBUDDY_LR1)")
+    r.add_argument("--air-feed", dest="air_feed", type=int, default=None,
+                   help="AF: helix moves above the fine stock top over the "
+                        "swept disk + 0.25 mm run at the cutting feed: 1 on, "
+                        "0 off (default; env CAMBUDDY_AIR_FEED)")
     r.add_argument("--no-gap-relink", dest="gap_relink",
                    action="store_const", const=0,
                    help="same as --gap-relink 0")
@@ -947,6 +956,7 @@ def main(argv=None):
                                     a2d_pool=a.a2d_pool,
                                     air_descent_g0=a.air_descent_g0,
                                     gap_relink=a.gap_relink,
+                                    lr1=a.lr1, air_feed=a.air_feed,
                                     side_entry_holder=table_holder(
                                         kind, dia, a.tool_number,
                                         a.tools_json),
